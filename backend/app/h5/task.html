@@ -31,18 +31,20 @@
     .upload-box input[type=file] { display: none; }
     /* 图片上传：虚线方块 + 缩略图并排（与后台预览一致） */
     .upload-grid { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
-    .upload-tile { width: 104px; height: 104px; border: 1px dashed #c7d2fe; background: #f8faff; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: #4f46e5; font-size: 12px; font-weight: 600; cursor: pointer; text-align: center; }
-    .upload-tile .plus { font-size: 18px; line-height: 1; }
-    .upload-tile input[type=file] { display: none; }
+    label.upload-tile { width: 104px; min-width: 104px; height: 104px; flex: 0 0 auto; padding: 6px; border: 1px dashed #c7d2fe; background: #f8faff; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: #4f46e5; font-size: 12px; font-weight: 600; cursor: pointer; text-align: center; line-height: 1.2; }
+    label.upload-tile > span { display: block; width: 100%; text-align: center; }
+    label.upload-tile .plus { font-size: 17px; line-height: 1; }
+    label.upload-tile input[type=file] { display: none; }
+    label.upload-tile, label.upload-file { margin-bottom: 0; }
     /* 文件上传：紫色虚线按钮 */
-    .upload-file { border: 1px dashed #ddd6fe; background: #faf5ff; color: #7c3aed; border-radius: 12px; padding: 15px; text-align: center; font-size: 13px; font-weight: 600; display: block; cursor: pointer; }
-    .upload-file input[type=file] { display: none; }
+    label.upload-file { border: 1px dashed #ddd6fe; background: #faf5ff; color: #7c3aed; border-radius: 12px; padding: 15px; text-align: center; font-size: 13px; font-weight: 600; display: block; cursor: pointer; }
+    label.upload-file input[type=file] { display: none; }
     .thumb-row { display: flex; flex-wrap: wrap; gap: 10px; }
     .thumb { width: 104px; height: 104px; border-radius: 12px; border: 1px solid #e3e9f2; object-fit: cover; background: #f1f5f9; }
     .locked-tip { background: #f0f9ff; border: 1px solid #bae6fd; color: #0369a1; border-radius: 12px; padding: 12px 14px; font-size: 13px; font-weight: 600; margin-top: 10px; }
     /* 已提交锁定态：控件变灰、上传块禁止点击 */
     input:disabled, textarea:disabled, select:disabled { background: #f1f5f9 !important; color: #94a3b8 !important; cursor: not-allowed; }
-    .upload-tile:has(input:disabled), .upload-file:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
+    label.upload-tile:has(input:disabled), label.upload-file:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
     .btn { width: 100%; padding: 14px; border: none; border-radius: 12px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 14px; }
     .btn:disabled { background: #94a3b8; cursor: not-allowed; }
     .msg { margin-top: 12px; padding: 11px 13px; border-radius: 10px; font-size: 13px; display: none; }
@@ -271,7 +273,7 @@
               body.appendChild(ta);
             }
             if (modules.includes("image")) {
-              makeUploadBlock("图片上传（现场拍照 / 晒图）", "🖼", ["#eff6ff", "#2563eb"], "支持 JPG/PNG", "image/*", true, "image");
+              makeUploadBlock("图片上传（现场拍照 / 晒图）", "🖼", ["#eff6ff", "#2563eb"], "JPG / PNG / WEBP", "image/*", true, "image");
             }
             if (modules.includes("file")) {
               makeUploadBlock("文件附件上传", "📎", ["#f5f3ff", "#7c3aed"], "Excel / PDF / Word", "", false, "file");
@@ -286,18 +288,30 @@
           if (data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
 
           /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
-             只有 pending（待上传）才允许填写和提交。 */
-          if (data.instance.status !== "pending") {
+             只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。 */
+          const __status = data.instance.status;
+          const __canResubmit = __status === "rejected" && !!data.window_open;
+          if (__canResubmit) {
+            const tip = document.createElement("div");
+            tip.className = "locked-tip";
+            tip.style.background = "#fff7ed";
+            tip.style.borderColor = "#fed7aa";
+            tip.style.color = "#c2410c";
+            tip.textContent = data.instance.resubmit_deadline
+              ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
+              : "该提交已被驳回，请按审核意见修改后重新提交。";
+            content.insertBefore(tip, submitBtn);
+          } else if (__status !== "pending") {
             const LOCKED_TEXT = {
               submitted: "已提交，等待管理员审核。如需修改请联系管理员驳回后重新提交。",
               approved: "已审核通过，本条任务已完成。",
-              rejected: "该提交已被驳回，请联系管理员重新获取提交链接。",
+              rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
               overdue: "已超过截止时间，无法再提交。",
               expired: "该任务已过期，无法提交。",
             };
             const tip = document.createElement("div");
             tip.className = "locked-tip";
-            tip.textContent = LOCKED_TEXT[data.instance.status] || "当前状态不可提交。";
+            tip.textContent = LOCKED_TEXT[__status] || "当前状态不可提交。";
             const content = document.getElementById("content");
             content.insertBefore(tip, submitBtn);
             content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });

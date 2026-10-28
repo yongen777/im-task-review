@@ -1192,7 +1192,10 @@ class StateStore:
             sub_id = int(cur.lastrowid)
             for r in ref_rows:
                 self.conn.execute("UPDATE upload_ref SET consumed = 1 WHERE ref = ?", (r["ref"],))
-            self.conn.execute("UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ? WHERE id = ?", (new_status, now_s, late_submit, int(inst["id"])))
+            self.conn.execute(
+                "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL WHERE id = ?",
+                (new_status, now_s, late_submit, int(inst["id"])),
+            )
             self.conn.execute("UPDATE h5_token SET consumed = 1 WHERE token_id = ?", (tok["token_id"],))
 
         return {"ok": True, "submission_id": sub_id, "status": new_status, "late_submit": bool(late_submit), "message": "已提交，等待审核" if tpl["need_review"] else "已完成"}

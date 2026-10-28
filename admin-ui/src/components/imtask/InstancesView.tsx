@@ -1042,19 +1042,15 @@ export const InstancesView: React.FC = () => {
                                           </div>
                                         </div>
                                         <div className="flex items-center gap-1.5 shrink-0">
-                                          <a
-                                            href={a.url}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-semibold hover:bg-blue-100"
-                                          >
-                                            在线查看
-                                          </a>
+                                          {/* 2026-10-28：docx/xlsx 等浏览器无法内联渲染，点「在线查看」也只会变下载，
+                                              按用户口径统一去掉该按钮，只留下载。图片仍可点缩略图在线查看。 */}
                                           <a
                                             href={`${a.url}?dl=1`}
-                                            className="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 border border-slate-200 text-[11px] font-semibold hover:bg-slate-200"
+                                            download={a.file_name}
+                                            className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-semibold hover:bg-blue-100 inline-flex items-center gap-1"
                                           >
-                                            下载
+                                            <Download className="w-3 h-3" />
+                                            <span>下载</span>
                                           </a>
                                         </div>
                                       </div>

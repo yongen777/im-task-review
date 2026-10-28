@@ -194,9 +194,6 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
               </div>
 
               <div className="flex items-start gap-2.5">
-                <div className="w-8 h-8 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
-                  密
-                </div>
                 <div className="bg-white rounded-2xl rounded-tl-xs p-3.5 shadow-xs border border-slate-200/80 max-w-[92%]">
                   {/* 2026-10-28：预览按实际推送的纯文本渲染（密信不支持富文本卡片/超链接），
                       与实际发送内容一字不差，避免「预览一套、实发一套」。 */}
@@ -329,12 +326,12 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                         <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
                         <span>图片上传（现场拍照 / 晒图）</span>
                       </span>
-                      <span className="text-[10px] text-slate-400">支持 JPG/PNG</span>
+                      <span className="text-[10px] text-slate-400">JPG / PNG / WEBP</span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
-                      <div className="h-16 rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 flex flex-col items-center justify-center text-indigo-600">
-                        <ImageIcon className="w-4 h-4" />
-                        <span className="text-[10px] mt-0.5 font-medium">+ 拍照/选图</span>
+                      <div className="h-16 w-full rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 flex flex-col items-center justify-center text-center gap-1 text-indigo-600">
+                        <ImageIcon className="w-4 h-4 shrink-0" />
+                        <span className="text-[10px] font-medium leading-none whitespace-nowrap">+ 拍照/选图</span>
                       </div>
                       <div className="h-16 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-[10px] text-slate-400">
                         示例晒图1.jpg

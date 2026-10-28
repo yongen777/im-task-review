@@ -15,10 +15,11 @@ except ImportError:  # pragma: no cover
     APIRouter = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
 
 from ..scheduler import NotifierProtocol
-from ..state import BizError, StateStore
+from ..state import BizError, StateStore, calc_resubmit_deadline
 
-ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "png"}
-IMAGE_EXTENSIONS = {"jpg", "png"}
+# 2026-10-28：补齐日常拍照格式——jpeg（Windows/相机常见）与 webp（微信转发常见）
+ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp"}
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 MAX_HARD_UPLOAD_MB = 20
 
@@ -45,10 +46,12 @@ def sniff_magic_mime(ext: str, header_bytes: bytes) -> Optional[str]:
     e = (ext or "").lower().lstrip(".")
     if not header_bytes:
         return None
-    if e == "jpg":
+    if e in ("jpg", "jpeg"):
         return "image/jpeg" if header_bytes.startswith(JPG_MAGIC) else None
     if e == "png":
         return "image/png" if header_bytes.startswith(PNG_MAGIC) else None
+    if e == "webp":
+        return "image/webp" if (header_bytes[:4] == b"RIFF" and header_bytes[8:12] == b"WEBP") else None
     if e == "pdf":
         return "application/pdf" if header_bytes.startswith(PDF_MAGIC) else None
     if e in ZIP_BASED_MIMES:
@@ -193,6 +196,10 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
         return 404, {"code": "NOT_FOUND", "message": "任务模板不存在"}
 
     window_open, window_reason = _check_submission_window(state, inst)
+    # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
+    # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
+    if inst.get("status") == "rejected":
+        inst["resubmit_deadline"] = calc_resubmit_deadline(inst["deadline_at"], inst.get("reviewed_at"))
     return 200, {
         "ok": True,
         "window_open": window_open,

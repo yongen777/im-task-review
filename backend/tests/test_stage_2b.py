@@ -17,7 +17,7 @@ from app.api.h5 import load_h5_html, process_h5_bind, process_h5_task_info, proc
 from app.channels.zdxlz import ZdxlzChannel, encrypt_event_payload
 from app.config import SHANGHAI_TZ, Config
 from app.scheduler import FakeNotifier, Scheduler, calc_resubmit_deadline, make_idem_key
-from app.state import StateStore
+from app.state import BizError, StateStore
 
 
 def make_dt(s: str) -> datetime:
@@ -249,6 +249,62 @@ class TestStage2B(unittest.TestCase):
         adv = self.store.advance_instance_statuses(self.current_dt)
         self.assertGreaterEqual(adv["to_expired"], 1)
         self.assertEqual(self.store.get_instance(inst_yi["id"])["status"], "expired")
+
+    def test_rejected_instance_can_resubmit_inside_window(self) -> None:
+        """2026-10-28 回归：驳回后重新提交的链接必须可用（页面不能锁死、接口要放行）。
+
+        场景：18:00 截止 -> 次日 06:00 驳回（重交截止 = max(截止+72h, 驳回+24h)）。
+        窗口内：h5 info 给出 window_open=True 且带 resubmit_deadline；提交成功并回到 submitted。
+        窗口外：window_open=False，提交被拒。
+        """
+        from app.api.h5 import process_h5_task_info
+
+        rid = self.store.create_role("重交组", actor="admin")["role_id"]
+        self.store.add_role_member(rid, "13900000021", "甲", "一部", actor="admin")
+        self.store.upsert_delivery_target("13900000021", "uid_resubmit")
+        tpl = self.store.create_template(
+            {
+                "name": "重交验证", "kind": "form", "role_ids": [rid],
+                "schema_json": [{"key": "summary", "label": "总结", "type": "text", "required": True}],
+                "text_tpl": "{姓名}请交{任务名}", "remind_at": "17:30", "deadline": "18:00",
+                "period": "day", "need_review": True,
+            },
+            actor="admin",
+        )
+        tid = tpl["template_id"]
+        self.current_dt = make_dt("2026-10-25 17:30:00")
+        self.scheduler.run_once()
+        inst = self.store.get_instance_by_key(tid, "13900000021", "2026-10-25")
+        tok1 = self.store.issue_h5_token("13900000021", tid, "2026-10-25", inst["id"])
+        self.current_dt = make_dt("2026-10-25 17:40:00")
+        self.store.submit_h5_task(raw_token=tok1, fields={"summary": "初稿"})
+
+        self.current_dt = make_dt("2026-10-26 06:00:00")
+        rej = self.store.review_instance(inst["id"], action="reject", reason="图片太糊", reviewer="admin")
+        self.assertEqual(rej["status"], "rejected")
+
+        # 窗口内：重交链接可用
+        tok2 = self.store.issue_h5_token("13900000021", tid, "2026-10-25", inst["id"])
+        self.current_dt = make_dt("2026-10-26 09:00:00")
+        code, info = process_h5_task_info(state=self.store, raw_token=tok2)
+        self.assertEqual(code, 200)
+        self.assertTrue(info["window_open"], info.get("window_reason"))
+        self.assertEqual(info["instance"]["resubmit_deadline"], rej["resubmit_deadline"])
+
+        res = self.store.submit_h5_task(raw_token=tok2, fields={"summary": "改好的"})
+        self.assertEqual(res["status"], "submitted")
+        fresh = self.store.get_instance(inst["id"])
+        self.assertEqual((fresh["status"], fresh["reviewed_at"]), ("submitted", None))
+
+        # 窗口外（超过重交截止）：拒绝提交
+        self.store.review_instance(inst["id"], action="reject", reason="还是不行", reviewer="admin")
+        self.current_dt = make_dt("2026-11-05 09:00:00")
+        tok3 = self.store.issue_h5_token("13900000021", tid, "2026-10-25", inst["id"])
+        code2, info2 = process_h5_task_info(state=self.store, raw_token=tok3)
+        self.assertEqual(code2, 200)
+        self.assertFalse(info2["window_open"])
+        with self.assertRaises(BizError):
+            self.store.submit_h5_task(raw_token=tok3, fields={"summary": "超期了"})
 
     def test_app_events_three_paths_and_three_guardrails(self) -> None:
         rid = self.store.create_role("全员角色", actor="admin")["role_id"]
