@@ -1,0 +1,1105 @@
+{
+  "说明": "IMTask P0 接口契约快照（2026-10-26）。后台原型按 admin 部分对接；平台回调与 H5 由 bot 端口提供。",
+  "ports": {
+    "bot": 18090,
+    "admin": 18091
+  },
+  "bot": {
+    "openapi": "3.1.0",
+    "info": {
+      "title": "IMTask · 机器人服务（回调 + H5）",
+      "version": "0.2.0-p0"
+    },
+    "paths": {
+      "/healthz": {
+        "get": {
+          "summary": "Healthz",
+          "operationId": "healthz_healthz_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/app-events": {
+        "get": {
+          "summary": "Verify Url",
+          "description": "平台「点击测试」：常见形态 ?echostr=... 需原样返回。",
+          "operationId": "verify_url_api_app_events_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        },
+        "post": {
+          "summary": "Receive",
+          "operationId": "receive_api_app_events_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/h5/task": {
+        "get": {
+          "summary": "Page Task",
+          "operationId": "page_task_h5_task_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "text/html": {
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/h5/activate": {
+        "get": {
+          "summary": "Page Activate",
+          "operationId": "page_activate_h5_activate_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "text/html": {
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/h5/task/info": {
+        "post": {
+          "summary": "Task Info",
+          "operationId": "task_info_api_h5_task_info_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/h5/task/upload": {
+        "post": {
+          "summary": "Task Upload",
+          "operationId": "task_upload_api_h5_task_upload_post",
+          "requestBody": {
+            "content": {
+              "multipart/form-data": {
+                "schema": {
+                  "$ref": "#/components/schemas/Body_task_upload_api_h5_task_upload_post"
+                }
+              }
+            },
+            "required": true
+          },
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/h5/task/submit": {
+        "post": {
+          "summary": "Task Submit",
+          "operationId": "task_submit_api_h5_task_submit_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/h5/activate/info": {
+        "post": {
+          "summary": "Activate Info",
+          "operationId": "activate_info_api_h5_activate_info_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/h5/activate/bind": {
+        "post": {
+          "summary": "Activate Bind",
+          "operationId": "activate_bind_api_h5_activate_bind_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "components": {
+      "schemas": {
+        "Body_task_upload_api_h5_task_upload_post": {
+          "properties": {
+            "token": {
+              "type": "string",
+              "title": "Token"
+            },
+            "file": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream",
+              "title": "File"
+            }
+          },
+          "type": "object",
+          "required": [
+            "token",
+            "file"
+          ],
+          "title": "Body_task_upload_api_h5_task_upload_post"
+        },
+        "HTTPValidationError": {
+          "properties": {
+            "detail": {
+              "items": {
+                "$ref": "#/components/schemas/ValidationError"
+              },
+              "type": "array",
+              "title": "Detail"
+            }
+          },
+          "type": "object",
+          "title": "HTTPValidationError"
+        },
+        "ValidationError": {
+          "properties": {
+            "loc": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ]
+              },
+              "type": "array",
+              "title": "Location"
+            },
+            "msg": {
+              "type": "string",
+              "title": "Message"
+            },
+            "type": {
+              "type": "string",
+              "title": "Error Type"
+            },
+            "input": {
+              "title": "Input"
+            },
+            "ctx": {
+              "type": "object",
+              "title": "Context"
+            }
+          },
+          "type": "object",
+          "required": [
+            "loc",
+            "msg",
+            "type"
+          ],
+          "title": "ValidationError"
+        }
+      }
+    },
+    "servers": [
+      {
+        "url": "http://<host>:18090"
+      }
+    ]
+  },
+  "admin": {
+    "openapi": "3.1.0",
+    "info": {
+      "title": "IMTask · 后台管理",
+      "version": "0.2.0-p0"
+    },
+    "paths": {
+      "/healthz": {
+        "get": {
+          "summary": "Healthz",
+          "operationId": "healthz_healthz_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/admin": {
+        "get": {
+          "summary": "Admin Page",
+          "operationId": "admin_page_admin_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "text/html": {
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/login": {
+        "post": {
+          "summary": "Login",
+          "operationId": "login_api_admin_login_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/logout": {
+        "post": {
+          "summary": "Logout",
+          "operationId": "logout_api_admin_logout_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/me": {
+        "get": {
+          "summary": "Me",
+          "operationId": "me_api_admin_me_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/overview": {
+        "get": {
+          "summary": "Overview",
+          "operationId": "overview_api_admin_overview_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/roles": {
+        "get": {
+          "summary": "List Roles",
+          "operationId": "list_roles_api_admin_roles_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        },
+        "post": {
+          "summary": "Create Role",
+          "operationId": "create_role_api_admin_roles_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/roles/{role_id}": {
+        "put": {
+          "summary": "Update Role",
+          "operationId": "update_role_api_admin_roles__role_id__put",
+          "parameters": [
+            {
+              "name": "role_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Role Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "delete": {
+          "summary": "Delete Role",
+          "operationId": "delete_role_api_admin_roles__role_id__delete",
+          "parameters": [
+            {
+              "name": "role_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Role Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/roles/{role_id}/members": {
+        "get": {
+          "summary": "List Members",
+          "operationId": "list_members_api_admin_roles__role_id__members_get",
+          "parameters": [
+            {
+              "name": "role_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Role Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "post": {
+          "summary": "Add Members",
+          "description": "单个加人（{phone,name,dept}）或部门批量（{rows:[...], dept}）走同一入口。",
+          "operationId": "add_members_api_admin_roles__role_id__members_post",
+          "parameters": [
+            {
+              "name": "role_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Role Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/roles/{role_id}/members/{phone}": {
+        "delete": {
+          "summary": "Remove Member",
+          "operationId": "remove_member_api_admin_roles__role_id__members__phone__delete",
+          "parameters": [
+            {
+              "name": "role_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Role Id"
+              }
+            },
+            {
+              "name": "phone",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Phone"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/templates": {
+        "get": {
+          "summary": "List Templates",
+          "operationId": "list_templates_api_admin_templates_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        },
+        "post": {
+          "summary": "Create Template",
+          "operationId": "create_template_api_admin_templates_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/templates/{template_id}": {
+        "put": {
+          "summary": "Update Template",
+          "operationId": "update_template_api_admin_templates__template_id__put",
+          "parameters": [
+            {
+              "name": "template_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Template Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "delete": {
+          "summary": "Delete Template",
+          "operationId": "delete_template_api_admin_templates__template_id__delete",
+          "parameters": [
+            {
+              "name": "template_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Template Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/instances": {
+        "get": {
+          "summary": "List Instances",
+          "operationId": "list_instances_api_admin_instances_get",
+          "parameters": [
+            {
+              "name": "template_id",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Template Id"
+              }
+            },
+            {
+              "name": "period_key",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Period Key"
+              }
+            },
+            {
+              "name": "status",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Status"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/instances/{instance_id}": {
+        "get": {
+          "summary": "Instance Detail",
+          "operationId": "instance_detail_api_admin_instances__instance_id__get",
+          "parameters": [
+            {
+              "name": "instance_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "integer",
+                "title": "Instance Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/instances/{instance_id}/submit": {
+        "post": {
+          "summary": "Submit As Admin",
+          "operationId": "submit_as_admin_api_admin_instances__instance_id__submit_post",
+          "parameters": [
+            {
+              "name": "instance_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "integer",
+                "title": "Instance Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/instances/{instance_id}/review": {
+        "post": {
+          "summary": "Review Instance",
+          "operationId": "review_instance_api_admin_instances__instance_id__review_post",
+          "parameters": [
+            {
+              "name": "instance_id",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "integer",
+                "title": "Instance Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/stats": {
+        "get": {
+          "summary": "Stats",
+          "operationId": "stats_api_admin_stats_get",
+          "parameters": [
+            {
+              "name": "template_id",
+              "in": "query",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "title": "Template Id"
+              }
+            },
+            {
+              "name": "period_key",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Period Key"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/unactivated": {
+        "get": {
+          "summary": "Unactivated",
+          "operationId": "unactivated_api_admin_unactivated_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/unactivated.csv": {
+        "get": {
+          "summary": "Unactivated Csv",
+          "description": "§3.5#20：后台必须标状态并可导出名单，由管理员人工催。",
+          "operationId": "unactivated_csv_api_admin_unactivated_csv_get",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/reminders": {
+        "get": {
+          "summary": "Reminders",
+          "operationId": "reminders_api_admin_reminders_get",
+          "parameters": [
+            {
+              "name": "template_id",
+              "in": "query",
+              "required": false,
+              "schema": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Template Id"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            },
+            "422": {
+              "description": "Validation Error",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/HTTPValidationError"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "/api/admin/tick": {
+        "post": {
+          "summary": "Run Tick",
+          "operationId": "run_tick_api_admin_tick_post",
+          "responses": {
+            "200": {
+              "description": "Successful Response",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "components": {
+      "schemas": {
+        "HTTPValidationError": {
+          "properties": {
+            "detail": {
+              "items": {
+                "$ref": "#/components/schemas/ValidationError"
+              },
+              "type": "array",
+              "title": "Detail"
+            }
+          },
+          "type": "object",
+          "title": "HTTPValidationError"
+        },
+        "ValidationError": {
+          "properties": {
+            "loc": {
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  }
+                ]
+              },
+              "type": "array",
+              "title": "Location"
+            },
+            "msg": {
+              "type": "string",
+              "title": "Message"
+            },
+            "type": {
+              "type": "string",
+              "title": "Error Type"
+            },
+            "input": {
+              "title": "Input"
+            },
+            "ctx": {
+              "type": "object",
+              "title": "Context"
+            }
+          },
+          "type": "object",
+          "required": [
+            "loc",
+            "msg",
+            "type"
+          ],
+          "title": "ValidationError"
+        }
+      }
+    },
+    "servers": [
+      {
+        "url": "http://<host>:18091"
+      }
+    ]
+  }
+}

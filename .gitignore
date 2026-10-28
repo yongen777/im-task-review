@@ -1,0 +1,26 @@
+# 依赖与产物
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 运行时数据与密钥
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+*.env
+!*.env.example
+logs/
+.backups/
+*.log
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

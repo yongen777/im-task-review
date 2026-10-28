@@ -1,0 +1,180 @@
+Html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="referrer" content="no-referrer" />
+  <title>任务提交 - IMTask</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f6f9; color: #1f2937; padding: 16px; line-height: 1.5; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    .title { font-size: 18px; font-weight: 600; margin-bottom: 6px; color: #111827; }
+    .meta { font-size: 13px; color: #6b7280; margin-bottom: 12px; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e5e7eb; color: #374151; }
+    .field { margin-bottom: 14px; }
+    .field label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; }
+    .field input, .field select, .field textarea { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+    .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
+    .btn:disabled { background: #9ca3af; cursor: not-allowed; }
+    .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
+    .msg.error { display: block; background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    .msg.success { display: block; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+    .ref-list { font-size: 13px; color: #4b5563; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="loading">正在加载任务信息...</div>
+    <div id="content" style="display:none;">
+      <div class="title" id="tplName"></div>
+      <div class="meta">提交人：<span id="memberName"></span> · 周期：<span id="periodKey"></span> · 状态：<span class="badge" id="instStatus"></span></div>
+      <div class="meta">截止时间：<span id="deadlineAt"></span></div>
+      <div id="dynamicArea"></div>
+      <div class="field" id="noteField" style="display:none;">
+        <label for="noteInput">备注说明（选填）</label>
+        <textarea id="noteInput" rows="2" placeholder="请输入补充说明"></textarea>
+      </div>
+      <button class="btn" id="submitBtn" type="button">确认提交</button>
+    </div>
+    <div id="msgBox" class="msg"></div>
+  </div>
+  <script>
+    (function () {
+      const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const token = params.get("t") || "";
+      const loadingEl = document.getElementById("loading");
+      const contentEl = document.getElementById("content");
+      const msgBox = document.getElementById("msgBox");
+      const submitBtn = document.getElementById("submitBtn");
+      let taskInfo = null;
+      let uploadedRefs = [];
+
+      function showMsg(text, type) {
+        msgBox.textContent = text;
+        msgBox.className = "msg " + type;
+      }
+
+      if (!token) {
+        loadingEl.style.display = "none";
+        showMsg("链接缺少任务令牌 (#t=...)", "error");
+        return;
+      }
+
+      fetch("/api/h5/task/info", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token })
+      })
+        .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+        .then(({ ok, data }) => {
+          loadingEl.style.display = "none";
+          if (!ok) return showMsg(data.message || "任务加载失败", "error");
+          taskInfo = data;
+          contentEl.style.display = "block";
+          document.getElementById("tplName").textContent = data.template.name;
+          document.getElementById("memberName").textContent = data.instance.name_snap;
+          document.getElementById("periodKey").textContent = data.instance.period_key;
+          document.getElementById("instStatus").textContent = data.instance.status;
+          document.getElementById("deadlineAt").textContent = data.instance.deadline_at;
+          if (data.template.allow_note) document.getElementById("noteField").style.display = "block";
+
+          const area = document.getElementById("dynamicArea");
+          if (data.template.kind === "form") {
+            const fields = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
+            fields.forEach(f => {
+              const wrap = document.createElement("div");
+              wrap.className = "field";
+              const lbl = document.createElement("label");
+              lbl.textContent = f.label + (f.required ? " *" : "");
+              wrap.appendChild(lbl);
+              let inp;
+              if (f.type === "select" && Array.isArray(f.options)) {
+                inp = document.createElement("select");
+                f.options.forEach(opt => {
+                  const o = document.createElement("option");
+                  o.value = opt;
+                  o.textContent = opt;
+                  inp.appendChild(o);
+                });
+              } else {
+                inp = document.createElement("input");
+                inp.type = f.type === "number" ? "number" : (f.type === "date" ? "date" : "text");
+              }
+              inp.dataset.fieldKey = f.key;
+              wrap.appendChild(inp);
+              area.appendChild(wrap);
+            });
+          } else {
+            const wrap = document.createElement("div");
+            wrap.className = "field";
+            const lbl = document.createElement("label");
+            lbl.textContent = data.template.kind === "image" ? "上传图片 *" : "上传文件 *";
+            wrap.appendChild(lbl);
+            const fileInp = document.createElement("input");
+            fileInp.type = "file";
+            const refList = document.createElement("div");
+            refList.className = "ref-list";
+            fileInp.addEventListener("change", async () => {
+              uploadedRefs = [];
+              for (const f of fileInp.files) {
+                const fd = new FormData();
+                fd.append("token", token);
+                fd.append("file", f);
+                const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
+                const res = await r.json();
+                if (!r.ok) return showMsg(res.message || "上传失败", "error");
+                uploadedRefs.push(res.ref);
+                refList.textContent = "已上传: " + (res.file_name || res.ref);
+              }
+            });
+            wrap.appendChild(fileInp);
+            wrap.appendChild(refList);
+            area.appendChild(wrap);
+          }
+
+          if (!data.window_open) {
+            submitBtn.disabled = true;
+            showMsg(data.window_reason || "当前任务提交窗口已关闭", "error");
+          }
+        })
+        .catch(() => {
+          loadingEl.style.display = "none";
+          showMsg("网络请求异常", "error");
+        });
+
+      submitBtn.addEventListener("click", () => {
+        if (!taskInfo) return;
+        let payload = {};
+        if (taskInfo.template.kind === "form") {
+          const fieldsObj = {};
+          document.querySelectorAll("[data-field-key]").forEach(el => { fieldsObj[el.dataset.fieldKey] = el.value; });
+          payload = { fields: fieldsObj };
+        } else {
+          payload = { refs: uploadedRefs, file_ref: uploadedRefs[0] || "" };
+        }
+        const note = document.getElementById("noteInput").value;
+        submitBtn.disabled = true;
+        fetch("/api/h5/task/submit", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: token, payload: payload, note: note })
+        })
+          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
+          .then(({ ok, data }) => {
+            if (!ok) {
+              submitBtn.disabled = false;
+              return showMsg(data.message || "提交失败", "error");
+            }
+            showMsg(data.message || "提交成功！", "success");
+          })
+          .catch(() => {
+            submitBtn.disabled = false;
+            showMsg("提交网络异常", "error");
+          });
+      });
+    })();
+  </script>
+</body>
+</html>

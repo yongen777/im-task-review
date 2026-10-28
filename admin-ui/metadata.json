@@ -1,0 +1,6 @@
+{
+  "name": "DesignLens - 网页设计风格走查与AI智能重构工作台",
+  "description": "专业的网页与B端后台UI/UX设计风格分析系统，基于Gemini多模态图像理解、设计雷达多维评分、语音诊断播报与智能设计顾问对话，提供一站式界面重构建议。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
