@@ -139,6 +139,8 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   const displayRemindText =
     remindText.trim() ||
     '请各片长/分支局长于今日截止时间前，点击下方专属 H5 链接完成今日上门走访报数及现场图片上传。';
+  /* 预览里的链接用占位形式，避免把真实域名/令牌暴露在截图里 */
+  const linkPreviewUrl = 'https://<你的域名>/h5/task#t=****';
 
   return (
     <div className="bg-indigo-50/50 rounded-2xl p-4 text-slate-800 space-y-3.5 border border-indigo-200/80 shadow-xs">
@@ -195,43 +197,11 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                 <div className="w-8 h-8 rounded-xl bg-blue-600 text-white flex items-center justify-center font-bold text-xs shrink-0 shadow-xs">
                   密
                 </div>
-                <div className="bg-white rounded-2xl rounded-tl-xs p-3.5 shadow-xs border border-slate-200/80 space-y-2.5 max-w-[90%]">
-                  <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-1.5">
-                    <span className="font-bold text-slate-900 text-xs">【任务提醒】{displayTitle}</span>
-                    {deadline && (
-                      <span className="text-[10px] font-mono text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded">
-                        截止 {deadline}
-                      </span>
-                    )}
-                  </div>
-
-                  {/* 后台配置的提醒文本 */}
-                  <div className="text-xs text-slate-700 whitespace-pre-line leading-relaxed">
-                    {displayRemindText}
-                  </div>
-
-                  {/* 自动配上的专属 H5 链接卡片 */}
-                  <div
-                    onClick={() => setStep('h5')}
-                    className="p-2.5 rounded-xl bg-blue-50/90 border border-blue-200 hover:bg-blue-100/80 transition-colors cursor-pointer space-y-1.5"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-bold text-blue-800 flex items-center gap-1">
-                        <ExternalLink className="w-3 h-3" />
-                        <span>点击打开 H5 任务上传链接</span>
-                      </span>
-                      <ArrowRight className="w-3.5 h-3.5 text-blue-600" />
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      {modules.map((m) => (
-                        <span
-                          key={m}
-                          className="px-1.5 py-0.2 rounded bg-white text-blue-700 border border-blue-200/80 text-[10px] font-medium"
-                        >
-                          {UPLOAD_MODULE_META[m]?.shortLabel || m}
-                        </span>
-                      ))}
-                    </div>
+                <div className="bg-white rounded-2xl rounded-tl-xs p-3.5 shadow-xs border border-slate-200/80 max-w-[92%]">
+                  {/* 2026-10-28：预览按实际推送的纯文本渲染（密信不支持富文本卡片/超链接），
+                      与实际发送内容一字不差，避免「预览一套、实发一套」。 */}
+                  <div className="text-xs text-slate-800 whitespace-pre-line leading-relaxed">
+                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：今天 ${deadline || '18:00'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
                   </div>
                 </div>
               </div>

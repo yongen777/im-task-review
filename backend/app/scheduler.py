@@ -146,23 +146,6 @@ def render_text_tpl(
     return rendered
 
 
-_MODULE_DISPLAY = {"fields": "字段报数", "text": "文字说明", "image": "图片上传", "file": "文件上传"}
-
-
-def _upload_module_labels(template: Dict[str, Any]) -> List[str]:
-    """消息尾部「需填写：…」用：把模板勾选的 H5 模块翻译成中文（与预览里的标签一致）。"""
-    spec = template.get("spec_json")
-    modules = spec.get("upload_modules") if isinstance(spec, dict) else None
-    if not isinstance(modules, list) or not modules:
-        return []
-    out: List[str] = []
-    for m in modules:
-        label = _MODULE_DISPLAY.get(str(m))
-        if label and label not in out:
-            out.append(label)
-    return out
-
-
 def make_idem_key(template_id: str, phone: str, period_key_val: str, kind: str, seq: int = 1, planned_str: str = "") -> str:
     """§6.2 幂等键：sha1(f"{template_id}|{phone}|{period_key}|{kind}|{seq}|{planned_at}")。
 
@@ -581,15 +564,14 @@ class Scheduler:
                         phone=instance["phone"], template_id=template["template_id"],
                         period_key_val=instance["period_key"], instance_id=int(instance["id"]),
                     )
-                    # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示复制到浏览器打开；
-                    # 与通知类消息统一为「正文 + 空行 + 标签行」的版式。
+                    # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示点击打开；
+                    # 版式与后台「实时预览」严格一致（预览为纯文本，不再有模块徽章/卡片）。
                     dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                    module_labels = _upload_module_labels(template)
-                    tail = f"截止时间：{dl_disp}\n"
-                    if module_labels:
-                        tail += f"需填写：{' · '.join(module_labels)}\n"
-                    tail += f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
-                    return f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n{tail}"
+                    return (
+                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                        f"截止时间：{dl_disp}\n"
+                        f"提交入口（点击链接打开上传任务）：\n{h5_url}"
+                    )
 
                 self._deliver_with_log(
                     template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,

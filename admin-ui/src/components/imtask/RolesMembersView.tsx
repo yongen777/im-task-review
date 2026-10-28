@@ -499,13 +499,6 @@ export const RolesMembersView: React.FC = () => {
               </span>
             </p>
           </div>
-          <button
-            onClick={handleOpenCreateRole}
-            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            <span>新建业务角色</span>
-          </button>
         </div>
 
         {/* 业务角色分组横向选择卡片带 */}
