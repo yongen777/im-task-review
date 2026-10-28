@@ -1235,7 +1235,8 @@ class StateStore:
 
     def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str) -> List[Dict[str, Any]]:
         tpl = self.get_template(template_id, include_deleted=False)
-        if not tpl or tpl["kind"] == "notice" or not tpl["enabled"]:
+        # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
+        if not tpl or not tpl["enabled"]:
             return []
         members = self.get_dedup_enabled_members_for_roles(tpl["role_ids"])
         now_s = self.now_str()
@@ -1250,6 +1251,14 @@ class StateStore:
     def list_instances_for_period(self, template_id: str, period_key: str) -> List[Dict[str, Any]]:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
+
+    def update_instance_status(self, instance_id: int, status: str) -> None:
+        """2026-10-28 方案A：通知实例发送成功后标记为 sent（只在 pending 上生效，避免覆盖后续状态）。"""
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE task_instance SET status = ? WHERE id = ? AND status = 'pending'",
+                (str(status), int(instance_id)),
+            )
 
     def list_overdue_instances(self) -> List[Dict[str, Any]]:
         with self.lock:
@@ -1268,9 +1277,18 @@ class StateStore:
     def advance_instance_statuses(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
         cur_dt = now_dt or self.now()
         now_s, cutoff_72h = format_dt(cur_dt), format_dt(cur_dt - timedelta(hours=72))
+        # 2026-10-28 方案A：通知类实例只有 pending → sent 两个状态，没有补交概念，
+        # 不参与 overdue / expired 流转（否则每天 23:59 之后会整片变成「已逾期」）。
+        not_notice = "template_id NOT IN (SELECT template_id FROM task_template WHERE kind = 'notice')"
         with self.lock, self.conn:
-            c1 = self.conn.execute("UPDATE task_instance SET status = 'overdue' WHERE status = 'pending' AND deadline_at < ?", (now_s,))
-            c2 = self.conn.execute("UPDATE task_instance SET status = 'expired' WHERE status = 'overdue' AND deadline_at < ?", (cutoff_72h,))
+            c1 = self.conn.execute(
+                f"UPDATE task_instance SET status = 'overdue' WHERE status = 'pending' AND deadline_at < ? AND {not_notice}",
+                (now_s,),
+            )
+            c2 = self.conn.execute(
+                f"UPDATE task_instance SET status = 'expired' WHERE status = 'overdue' AND deadline_at < ? AND {not_notice}",
+                (cutoff_72h,),
+            )
             to_expired = int(c2.rowcount or 0)
             for r in self.conn.execute("SELECT id, deadline_at, reviewed_at FROM task_instance WHERE status = 'rejected'").fetchall():
                 if calc_resubmit_deadline(r["deadline_at"], r["reviewed_at"]) < now_s:

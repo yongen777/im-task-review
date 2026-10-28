@@ -292,6 +292,7 @@ function statsToMock(d: any): InstanceStats {
   const s = (d && d.stats) || d || {};
   const by: Record<string, number> = {
     pending: s.pending || 0,
+    sent: s.sent || 0,
     submitted: s.submitted || 0,
     approved: s.approved || 0,
     rejected: s.rejected || 0,
@@ -304,8 +305,9 @@ function statsToMock(d: any): InstanceStats {
     ok: true,
     total,
     by_status: by as any,
-    completion_rate: rate(by.submitted + by.approved, total),
-    on_time_rate: rate(by.approved + by.submitted, total),
+    /* 通知类实例的终态是 sent，应和「审核通过」一起算作完成 */
+    completion_rate: rate(by.submitted + by.approved + by.sent, total),
+    on_time_rate: rate(by.approved + by.submitted + by.sent, total),
     overdue_rate: rate(by.overdue + by.expired, total),
   } as InstanceStats;
 }

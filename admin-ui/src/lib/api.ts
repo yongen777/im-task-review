@@ -667,6 +667,7 @@ function filterInstances(query: URLSearchParams): TaskInstanceItem[] {
 function computeStats(items: TaskInstanceItem[]): InstanceStats {
   const by_status: Record<InstanceStatus, number> = {
     pending: 0,
+    sent: 0,
     submitted: 0,
     approved: 0,
     rejected: 0,
@@ -725,8 +726,9 @@ function validateRemindAt(
 
 function normalizeRoleIdsFromBody(body: any, fallbackRoleIds: string[] = []): string[] {
   if (Array.isArray(body?.role_ids)) {
-    const cleaned = Array.from(
-      new Set(body.role_ids.map((r: unknown) => String(r || '').trim()).filter(Boolean)),
+    const rows: unknown[] = body.role_ids;
+    const cleaned: string[] = Array.from(
+      new Set(rows.map((r) => String(r || '').trim()).filter(Boolean)),
     );
     return cleaned;
   }

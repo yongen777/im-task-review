@@ -236,3 +236,109 @@ def test_notice_unactivated_member_skipped_and_image_skipped():
     assert len(img_sender.sent) == 0
 
 
+# ── 5. 2026-10-28 方案A：notice 也生成任务实例（pending → sent） ──────────────
+
+PKEY = "2026-10-28"
+
+
+def _scheduler_at(store: StateStore, hour: int, minute: int, *, notifier=None, image_sender=None) -> Scheduler:
+    return Scheduler(
+        state=store,
+        public_base_url="http://127.0.0.1:18090",
+        notifier=notifier or FakeNotifier(),
+        now_fn=lambda: datetime(2026, 10, 28, hour, minute, 0, tzinfo=SHANGHAI_TZ),
+        image_sender=image_sender,
+    )
+
+
+def test_notice_creates_instance_and_marks_sent():
+    """notice 模板到点后为每个成员生成 1 条实例，发送成功即标记 sent（且幂等）。"""
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=False)
+    store.upsert_delivery_target("13800000001", "ext_user_001")
+
+    notifier = FakeNotifier()
+    scheduler = _mk_scheduler(store, notifier=notifier, image_sender=None)  # 08:05，08:00 已到点
+    stats = scheduler.run_once()
+
+    assert stats["sent"] == 1
+    instances = store.list_instances_for_period(tpl_id, PKEY)
+    assert len(instances) == 1
+    assert instances[0]["phone"] == "13800000001"
+    assert instances[0]["status"] == "sent"
+    assert instances[0]["name_snap"] == "张三"
+    # 通知没有截止概念：deadline 用当天 23:59 占位
+    assert instances[0]["deadline_at"].startswith("2026-10-28 23:59")
+
+    # 幂等：同一时刻再跑一轮，不重复建实例、不重复发
+    stats2 = scheduler.run_once()
+    assert stats2["sent"] == 0
+    assert len(store.list_instances_for_period(tpl_id, PKEY)) == 1
+    assert len(notifier.sent_messages) == 1
+
+
+def test_notice_instance_not_created_before_trigger_and_disabled():
+    """未到点不产生实例；停用模板也不产生实例。"""
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=False)
+    store.upsert_delivery_target("13800000001", "ext_user_001")
+
+    early = _scheduler_at(store, 7, 0)  # 07:00 早于 08:00
+    early.run_once()
+    assert store.list_instances_for_period(tpl_id, PKEY) == []
+
+    # 停用后再到点，也不应产生实例
+    store.update_template(tpl_id, {"enabled": False}, actor="t3")
+    _scheduler_at(store, 8, 5).run_once()
+    assert store.list_instances_for_period(tpl_id, PKEY) == []
+
+
+def test_notice_instance_sent_with_image():
+    """带数据看板图片的 notice：文本 + 图片都发出，实例仍然标记 sent。"""
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=True)
+    store.upsert_delivery_target("13800000001", "ext_user_001")
+    store.upsert_data_snapshot(tpl_id, PKEY, {"completion_rate": "86.5", "intent_count": "45"})
+
+    notifier = FakeNotifier()
+    img_sender = FakeImageSender()
+    scheduler = _mk_scheduler(store, notifier=notifier, image_sender=img_sender)
+    stats = scheduler.run_once()
+
+    assert stats["sent"] == 2  # 文本 + 图片
+    instances = store.list_instances_for_period(tpl_id, PKEY)
+    assert len(instances) == 1
+    assert instances[0]["status"] == "sent"
+    assert len(img_sender.sent) == 1
+
+
+def test_notice_instance_stays_pending_for_unactivated_member():
+    """未绑定成员的实例要建出来，但状态保持 pending（发送记录为 skipped）。"""
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=False)
+
+    notifier = FakeNotifier()
+    scheduler = _mk_scheduler(store, notifier=notifier, image_sender=None)
+    stats = scheduler.run_once()
+
+    assert stats["skipped"] == 1
+    instances = store.list_instances_for_period(tpl_id, PKEY)
+    assert len(instances) == 1
+    assert instances[0]["status"] == "pending"
+    assert [r["result"] for r in store.list_reminder_logs(tpl_id)] == ["skipped"]
+
+
+def test_notice_instance_not_advanced_to_overdue():
+    """通知实例不参与 overdue / expired 流转（过了 23:59 也不会变已逾期）。"""
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=False)
+    store.upsert_delivery_target("13800000001", "ext_user_001")
+    _mk_scheduler(store).run_once()
+
+    late = _scheduler_at(store, 23, 59)  # 当天最后一分钟，deadline_at 已过
+    late.state.advance_instance_statuses(datetime(2026, 10, 29, 0, 30, tzinfo=SHANGHAI_TZ))
+    instances = store.list_instances_for_period(tpl_id, PKEY)
+    assert instances[0]["status"] == "sent"
+
+
+

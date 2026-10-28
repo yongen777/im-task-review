@@ -43,8 +43,15 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
   className: string;
   icon: React.ReactNode;
 } {
-  // 纯通知提醒任务：只区分「待提醒」与「已提醒」
+  // 纯通知提醒任务：只区分「待提醒」与「已提醒」（2026-10-28 方案A：notice 也有实例了）
   if (inst.kind === 'notice') {
+    if (inst.status === 'sent') {
+      return {
+        label: '已提醒',
+        className: 'bg-blue-50 text-blue-700 border-blue-200',
+        icon: <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
+      };
+    }
     if (inst.status === 'approved' || inst.submitted_at) {
       return {
         label: '已提醒',
@@ -396,7 +403,7 @@ export const InstancesView: React.FC = () => {
           >
             <div className="text-xs text-emerald-700 font-semibold">已提醒 / 已完成</div>
             <div className="text-xl font-bold text-emerald-600 font-mono mt-1">
-              {localStats.by_status.approved || 0}
+              {(localStats.by_status.approved || 0) + (localStats.by_status.sent || 0)}
             </div>
           </div>
 
@@ -566,7 +573,8 @@ export const InstancesView: React.FC = () => {
           >
             <option value="">全部执行状态</option>
             <option value="pending">待提醒 / 待上传</option>
-            <option value="approved">已提醒 / 已完成</option>
+            <option value="sent">已提醒（通知类已送达）</option>
+            <option value="approved">已完成（审核通过）</option>
             <option value="submitted">待人工审核</option>
             <option value="rejected">已驳回待重交</option>
             <option value="overdue">已逾期未交</option>
@@ -712,6 +720,19 @@ export const InstancesView: React.FC = () => {
                             <Eye className="w-3.5 h-3.5 shrink-0" />
                             <span>{loadingDetailId === inst.id ? '加载中…' : '详情'}</span>
                           </button>
+
+                          {/* 2026-10-28 方案A：通知类实例没有审核动作，用「送达状态」占位说明 */}
+                          {isNotice && (
+                            <span
+                              className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold whitespace-nowrap shrink-0 ${
+                                inst.status === 'sent'
+                                  ? 'bg-blue-50 text-blue-700 border-blue-200'
+                                  : 'bg-slate-50 text-slate-500 border-slate-200'
+                              }`}
+                            >
+                              {inst.status === 'sent' ? '通知已送达' : '待提醒'}
+                            </span>
+                          )}
 
                           {needReview && inst.status === 'submitted' && (
                             <>

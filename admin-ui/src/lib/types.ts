@@ -119,6 +119,7 @@ export interface UnactivatedMemberItem {
 
 export type InstanceStatus =
   | 'pending'
+  | 'sent'
   | 'submitted'
   | 'approved'
   | 'rejected'

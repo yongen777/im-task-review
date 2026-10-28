@@ -1233,6 +1233,8 @@ def create_admin_router(state: StateStore) -> APIRouter:
             "overdue": 0,
             "expired": 0,
             "late_submit": 0,
+            # 2026-10-28 方案A：通知类实例发送成功后的终态（计入 total，单独计数）
+            "sent": 0,
         }
         with state.lock:
             rows = state.conn.execute(

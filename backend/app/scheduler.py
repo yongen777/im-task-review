@@ -262,7 +262,8 @@ class Scheduler:
         return f"{self.public_base_url}/h5/task#t={raw_token}", raw_token
 
     def ensure_instances_for_template(self, template: Dict[str, Any], now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        if not template.get("enabled") or template.get("deleted") or template.get("kind") == "notice":
+        # 2026-10-28 方案A：notice 也生成实例（pending → sent），与上传类统一在「任务实例」页展示。
+        if not template.get("enabled") or template.get("deleted"):
             return []
         cur_dt = now_dt or self.now()
         if not is_template_anchor_day(template, cur_dt):
@@ -324,10 +325,14 @@ class Scheduler:
         now_s: str,
         stats: Dict[str, int],
         send_fn: Optional[Callable[[str, str, str], SendResult]] = None,
-    ) -> None:
+    ) -> bool:
+        """发一条并记账；返回是否**真的发出去了**（True=result 为 sent）。
+
+        2026-10-28 方案A：notice 实例需要据此把状态从 pending 改成 sent。
+        """
         retry_no = self._resolve_retry_slot(idem_key, cur_dt=cur_dt)
         if retry_no is None:
-            return
+            return False
 
         if retry_no == 0 and delay_sec > self.COMPENSATION_WINDOW_SECONDS:
             self.state.record_reminder_log(
@@ -336,7 +341,7 @@ class Scheduler:
                 error="COMPENSATION_WINDOW_EXCEEDED", idem_key=idem_key,
             )
             stats["missed"] += 1
-            return
+            return False
 
         if not external_id:
             self.state.record_reminder_log(
@@ -345,7 +350,7 @@ class Scheduler:
                 error="UNACTIVATED", idem_key=idem_key,
             )
             stats["skipped"] += 1
-            return
+            return False
 
         msg_text = msg_text_fn()
         active_send = send_fn or self.notifier.send_text
@@ -361,6 +366,7 @@ class Scheduler:
             stats["failed"] += 1
             if send_res.need_activate:
                 self.state.mark_delivery_target_unusable(phone)
+        return bool(send_res.ok)
 
     def send_reject_notification(
         self, instance: Dict[str, Any], reason: str, now_dt: Optional[datetime] = None
@@ -425,25 +431,51 @@ class Scheduler:
                         continue
                     planned_str = format_dt(planned_dt)
                     delay_sec = (cur_dt - planned_dt).total_seconds()
-                    for m in members:
-                        idem = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice", seq_idx, planned_str)
-                        ext_id = m["external_id"] if m["activated"] else None
 
-                        def _make_notice_msg(member=m, template=tpl, planned=planned_dt) -> str:
+                    # 整跳已超出补偿窗口：按原语义记 missed，但**不建实例**——
+                    # 通知没有补交概念，建了只会留下永远 pending 的僵尸行。
+                    if delay_sec > self.COMPENSATION_WINDOW_SECONDS:
+                        for m in members:
+                            idem = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice", seq_idx, planned_str)
+                            self.state.record_reminder_log(
+                                template_id=tpl["template_id"], instance_id=None, phone=m["phone"], kind="notice",
+                                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="missed", retry=0,
+                                error="COMPENSATION_WINDOW_EXCEEDED", idem_key=idem,
+                            )
+                            stats["missed"] += 1
+                        continue
+
+                    # 2026-10-28 方案A：通知类在「到点这一刻」按人为单位生成实例，
+                    # pending → 发送成功 → sent；未到点不生成，不会堆一堆待提醒行。
+                    # 通知没有截止概念，deadline 用当天 23:59 占位，且不参与 overdue/expired 流转。
+                    notice_deadline = calc_deadline_at(cur_dt, "23:59", 0, "day")
+                    before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
+                    instances = self.state.ensure_template_instances(tpl["template_id"], p_key, notice_deadline)
+                    stats["generated_instances"] += max(0, len(instances) - before_cnt)
+
+                    for inst in instances:
+                        target = self.state.get_delivery_target(inst["phone"])
+                        ext_id = (target or {}).get("external_id") if target else None
+                        idem = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str)
+
+                        def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
                             # 2026-10-26 定档：notice 正文不加【模板名】前缀，文案原样发出。
                             # 2026-10-28：补统一的尾部时间行，和上报类消息格式对齐。
                             body = render_text_tpl(
-                                template["text_tpl"], member_name=member["name"], member_dept=member["dept"],
+                                template["text_tpl"], member_name=instance["name_snap"],
+                                member_dept=instance.get("dept_snap"),
                                 template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
                                 extra_vars=snap_values,
                             )
                             return f"{body.rstrip()}\n\n发送时间：{format_deadline_display(format_dt(planned), ref_dt=cur_dt)}"
 
-                        self._deliver_with_log(
-                            template_id=tpl["template_id"], instance_id=None, phone=m["phone"], external_id=ext_id,
-                            kind="notice", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem,
-                            msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                        sent_ok = self._deliver_with_log(
+                            template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                            external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
+                            idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
                         )
+                        if sent_ok:
+                            self.state.update_instance_status(int(inst["id"]), "sent")
 
                     # 2026-10-28 通知类附图：优先推管理员上传的图片（attach_image_path），
                     # 没上传图时才退回「数据看板自动出图」的旧路径（依赖当天人工填报的快照值）。
@@ -483,9 +515,10 @@ class Scheduler:
                                 except Exception as exc:  # 看板渲染/上传失败不影响文本主链路
                                     logger.warning("看板渲染或上传失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
                         if prepared:
-                            for m in members:
-                                idem_img = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice_img", seq_idx, planned_str)
-                                ext_id = m["external_id"] if m["activated"] else None
+                            for inst in instances:
+                                idem_img = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice_img", seq_idx, planned_str)
+                                target = self.state.get_delivery_target(inst["phone"])
+                                ext_id = (target or {}).get("external_id") if target else None
                                 if not ext_id:
                                     continue  # 未激活成员文本链路已记 skipped，图片直接跳过避免重复记一条
 
@@ -493,9 +526,9 @@ class Scheduler:
                                     return ""
 
                                 self._deliver_with_log(
-                                    template_id=tpl["template_id"], instance_id=None, phone=m["phone"], external_id=ext_id,
-                                    kind="notice_img", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_img,
-                                    msg_text_fn=_noop_text, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                                    external_id=ext_id, kind="notice_img", planned_str=planned_str, delay_sec=delay_sec,
+                                    idem_key=idem_img, msg_text_fn=_noop_text, cur_dt=cur_dt, now_s=now_s, stats=stats,
                                     send_fn=lambda rid, _t, idem, _prep=prepared: self.image_sender.send_image_prepared(rid, _prep, idem),
                                 )
                 continue
