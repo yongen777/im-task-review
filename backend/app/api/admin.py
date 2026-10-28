@@ -11,6 +11,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -1133,10 +1134,23 @@ def create_admin_router(state: StateStore) -> APIRouter:
         disk_path = uploads_dir / up["rel_path"]
         if not disk_path.is_file():
             return error_response(404, "NOT_FOUND", "附件文件不存在")
+        # 2026-10-28：能在线看的（图片 / PDF / 纯文本）走 inline，浏览器直接打开；
+        # 其余（docx/xlsx/zip…）才按附件下载，避免「点开图片却是下载」。
+        mime = str(up["mime"] or "application/octet-stream")
+        force_download = str(request.query_params.get("dl") or "") in ("1", "true", "yes")
+        inline = (mime.startswith("image/") or mime in ("application/pdf", "text/plain")) and not force_download
+        disposition = "inline" if inline else "attachment"
+        # ⚠️ 中文文件名不能直接塞进 header（latin-1 编码会 500），
+        # 按 RFC 5987 用 filename*=UTF-8'' 转义，另给 ASCII fallback。
+        raw_name = str(up["file_name"] or "file")
+        ascii_name = raw_name.encode("ascii", "ignore").decode() or "file"
+        ascii_name = ascii_name.replace('"', "").replace("\\", "")
         return FileResponse(
             path=str(disk_path),
-            media_type=up["mime"],
-            filename=up["file_name"],
+            media_type=mime,
+            headers={
+                "Content-Disposition": f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(raw_name)}"
+            },
         )
 
     # ==================================================================

@@ -1138,6 +1138,9 @@ class StateStore:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
         if inst["status"] == "approved":
             raise BizError(400, "VALIDATION_FAILED", "该任务已提交成功，无需重复提交")
+        # 2026-10-28：已提交待审核的也不能再交一次（H5 页面已锁，这里做服务端兜底）
+        if inst["status"] == "submitted":
+            raise BizError(400, "VALIDATION_FAILED", "该任务已提交，正在等待审核，不能重复提交")
         if inst["status"] == "expired" or tok["expires_at"] < now_s or self.is_instance_window_closed(inst, cur_dt):
             raise BizError(400, "WINDOW_CLOSED", "该任务已超过补交期限（72 小时），无法提交")
         if bool(tok["consumed"]):

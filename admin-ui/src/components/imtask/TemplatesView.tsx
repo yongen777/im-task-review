@@ -232,7 +232,10 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                   </span>
                 )}
               </div>
-              <p className="text-[11px] text-slate-500 line-clamp-2">{displayRemindText}</p>
+              {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
+              <div className="text-[11px] text-slate-500">
+                提交人：张三 · 周期：{new Date().toISOString().slice(0, 10)} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
+              </div>
             </div>
 
             {modules.length === 0 ? (

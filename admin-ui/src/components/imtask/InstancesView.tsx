@@ -972,53 +972,99 @@ export const InstancesView: React.FC = () => {
                           </div>
                         )}
 
-                        <div>
-                          <div className="text-[11px] font-semibold text-slate-500 mb-1">
-                            图片 / 文件附件（{attachments.length}）
-                          </div>
-                          {attachments.length === 0 ? (
-                            <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 text-slate-400 text-center">
-                              本次提交没有上传附件。
-                            </div>
-                          ) : (
-                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                              {attachments.map((a) => (
-                                <a
-                                  key={a.ref}
-                                  href={a.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="group rounded-xl border border-slate-200 overflow-hidden hover:border-blue-400 transition-colors bg-white"
-                                  title={a.is_image ? '点击查看大图' : '点击下载文件'}
-                                >
-                                  {a.is_image ? (
-                                    <div className="h-24 bg-slate-50 flex items-center justify-center overflow-hidden">
-                                      <img
-                                        src={a.url}
-                                        alt={a.file_name}
-                                        className="w-full h-24 object-cover group-hover:opacity-90"
-                                      />
-                                    </div>
-                                  ) : (
-                                    <div className="h-24 bg-slate-50 flex items-center justify-center">
-                                      <Paperclip className="w-6 h-6 text-slate-400" />
-                                    </div>
-                                  )}
-                                  <div className="px-2.5 py-2 border-t border-slate-100">
-                                    <div className="text-[11px] font-semibold text-slate-800 truncate">
-                                      {a.file_name}
-                                    </div>
-                                    <div className="text-[10px] text-slate-400 flex items-center gap-1 mt-0.5">
-                                      {a.is_image ? <Eye className="w-3 h-3" /> : <Download className="w-3 h-3" />}
-                                      <span>{a.is_image ? '点击查看' : '点击下载'}</span>
-                                      {a.size > 0 && <span>· {(a.size / 1024).toFixed(0)} KB</span>}
-                                    </div>
+                        {/* 2026-10-28：图片与文件分两行单独展示；图片优先在线查看，文件给「在线查看 + 下载」 */}
+                        {(() => {
+                          const imgs = attachments.filter((a) => a.is_image);
+                          const files = attachments.filter((a) => !a.is_image);
+                          return (
+                            <>
+                              <div>
+                                <div className="text-[11px] font-semibold text-slate-500 mb-1">
+                                  图片（{imgs.length}）
+                                </div>
+                                {imgs.length === 0 ? (
+                                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 text-slate-400 text-center">
+                                    本次未上传图片。
                                   </div>
-                                </a>
-                              ))}
-                            </div>
-                          )}
-                        </div>
+                                ) : (
+                                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+                                    {imgs.map((a) => (
+                                      <a
+                                        key={a.ref}
+                                        href={a.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="group rounded-xl border border-slate-200 overflow-hidden hover:border-blue-400 transition-colors bg-white"
+                                        title="点击在线查看大图"
+                                      >
+                                        <img
+                                          src={a.url}
+                                          alt={a.file_name}
+                                          className="w-full h-24 object-cover group-hover:opacity-90"
+                                        />
+                                        <div className="px-2 py-1.5 border-t border-slate-100">
+                                          <div className="text-[10px] text-slate-500 truncate">{a.file_name}</div>
+                                          <div className="text-[10px] text-blue-600 flex items-center gap-1 mt-0.5">
+                                            <Eye className="w-3 h-3" />
+                                            <span>在线查看</span>
+                                          </div>
+                                        </div>
+                                      </a>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+
+                              <div>
+                                <div className="text-[11px] font-semibold text-slate-500 mb-1">
+                                  文件（{files.length}）
+                                </div>
+                                {files.length === 0 ? (
+                                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/70 text-slate-400 text-center">
+                                    本次未上传文件。
+                                  </div>
+                                ) : (
+                                  <div className="space-y-2">
+                                    {files.map((a) => (
+                                      <div
+                                        key={a.ref}
+                                        className="p-2.5 rounded-xl border border-slate-200 bg-white flex items-center justify-between gap-3"
+                                      >
+                                        <div className="min-w-0 flex items-center gap-2">
+                                          <Paperclip className="w-4 h-4 text-slate-400 shrink-0" />
+                                          <div className="min-w-0">
+                                            <div className="text-[12px] font-semibold text-slate-800 truncate">
+                                              {a.file_name}
+                                            </div>
+                                            <div className="text-[10px] text-slate-400">
+                                              {a.size > 0 ? `${(a.size / 1024).toFixed(0)} KB` : ''}
+                                            </div>
+                                          </div>
+                                        </div>
+                                        <div className="flex items-center gap-1.5 shrink-0">
+                                          <a
+                                            href={a.url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-semibold hover:bg-blue-100"
+                                          >
+                                            在线查看
+                                          </a>
+                                          <a
+                                            href={`${a.url}?dl=1`}
+                                            className="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-600 border border-slate-200 text-[11px] font-semibold hover:bg-slate-200"
+                                          >
+                                            下载
+                                          </a>
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </>
+                          );
+                        })()}
 
                         {sub.submitted_at && (
                           <div className="text-[11px] text-slate-400">提交时间：{sub.submitted_at}</div>

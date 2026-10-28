@@ -29,8 +29,20 @@
     .task-head .meta { font-size: 12px; color: #94a3b8; margin-top: 8px; }
     .upload-box { border: 1px dashed #c7d2fe; background: #f8faff; border-radius: 12px; padding: 14px; text-align: center; color: #4f46e5; font-size: 13px; font-weight: 600; cursor: pointer; display: block; }
     .upload-box input[type=file] { display: none; }
-    .thumb-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-    .thumb { width: 76px; height: 76px; border-radius: 10px; border: 1px solid #e3e9f2; object-fit: cover; background: #f1f5f9; }
+    /* 图片上传：虚线方块 + 缩略图并排（与后台预览一致） */
+    .upload-grid { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+    .upload-tile { width: 104px; height: 104px; border: 1px dashed #c7d2fe; background: #f8faff; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; color: #4f46e5; font-size: 12px; font-weight: 600; cursor: pointer; text-align: center; }
+    .upload-tile .plus { font-size: 18px; line-height: 1; }
+    .upload-tile input[type=file] { display: none; }
+    /* 文件上传：紫色虚线按钮 */
+    .upload-file { border: 1px dashed #ddd6fe; background: #faf5ff; color: #7c3aed; border-radius: 12px; padding: 15px; text-align: center; font-size: 13px; font-weight: 600; display: block; cursor: pointer; }
+    .upload-file input[type=file] { display: none; }
+    .thumb-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .thumb { width: 104px; height: 104px; border-radius: 12px; border: 1px solid #e3e9f2; object-fit: cover; background: #f1f5f9; }
+    .locked-tip { background: #f0f9ff; border: 1px solid #bae6fd; color: #0369a1; border-radius: 12px; padding: 12px 14px; font-size: 13px; font-weight: 600; margin-top: 10px; }
+    /* 已提交锁定态：控件变灰、上传块禁止点击 */
+    input:disabled, textarea:disabled, select:disabled { background: #f1f5f9 !important; color: #94a3b8 !important; cursor: not-allowed; }
+    .upload-tile:has(input:disabled), .upload-file:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
     .btn { width: 100%; padding: 14px; border: none; border-radius: 12px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 14px; }
     .btn:disabled { background: #94a3b8; cursor: not-allowed; }
     .msg { margin-top: 12px; padding: 11px 13px; border-radius: 10px; font-size: 13px; display: none; }
@@ -61,7 +73,7 @@
         <div class="block-head"><span class="ico" style="background:#ecfdf5;color:#059669">✎</span><span class="name">备注说明（选填）</span></div>
         <div class="field"><textarea id="noteInput" rows="3" placeholder="请输入补充说明"></textarea></div>
       </div>
-      <button class="btn" id="submitBtn" type="button">提交上传</button>
+      <button class="btn" id="submitBtn" type="button">✈ 提交上传</button>
     </div>
     <div id="msgBox" class="msg"></div>
   </div>
@@ -101,7 +113,7 @@
           document.getElementById("tplName").textContent = data.template.name;
           document.getElementById("memberName").textContent = data.instance.name_snap;
           document.getElementById("periodKey").textContent = data.instance.period_key;
-          const STATUS_TEXT = { pending: "待提交", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期" };
+          const STATUS_TEXT = { pending: "待上传", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期" };
           document.getElementById("instStatus").textContent = STATUS_TEXT[data.instance.status] || data.instance.status;
 
           /* 顶部任务卡：标题 + 截止徽章 + 提醒正文（与预览版式一致） */
@@ -158,25 +170,33 @@
           }
           function makeUploadBlock(title, icon, iconColor, hint, accept, previewImages, moduleKey) {
             const body = makeBlock(title, icon, iconColor, hint);
+            // 图片：虚线方块 + 缩略图并排；文件：紫色虚线按钮（与后台预览一致）
+            const grid = document.createElement("div");
+            grid.className = previewImages ? "upload-grid" : "";
+            body.appendChild(grid);
+
             const label = document.createElement("label");
-            label.className = "upload-box";
-            label.textContent = title.indexOf("图片") >= 0 ? "＋ 拍照 / 选图" : "⇧ 点击选择手机中的表格或文档上传";
+            if (previewImages) {
+              label.className = "upload-tile";
+              label.innerHTML = '<span class="plus">＋</span><span>拍照 / 选图</span>';
+            } else {
+              label.className = "upload-file";
+              label.textContent = "⇧ 点击选择手机中的表格或文档上传";
+            }
             const fileInp = document.createElement("input");
             fileInp.type = "file";
             fileInp.multiple = true;
             if (accept) fileInp.accept = accept;
             label.appendChild(fileInp);
-            body.appendChild(label);
+            grid.appendChild(label);
+
             const refList = document.createElement("div");
             refList.className = "ref-list";
-            const thumbRow = document.createElement("div");
-            thumbRow.className = "thumb-row";
             body.appendChild(refList);
-            if (previewImages) body.appendChild(thumbRow);
             fileInp.addEventListener("change", async () => {
               const myRefs = [];
               refList.textContent = "";
-              thumbRow.innerHTML = "";
+              grid.querySelectorAll("img.thumb").forEach((el) => el.remove());
               for (const f of fileInp.files) {
                 const fd = new FormData();
                 fd.append("token", token);
@@ -193,7 +213,7 @@
                     const img = document.createElement("img");
                     img.className = "thumb";
                     img.src = URL.createObjectURL(f);
-                    thumbRow.appendChild(img);
+                    grid.appendChild(img);
                   }
                 } catch (e) {
                   showMsg("上传网络异常", "error");
@@ -203,6 +223,7 @@
               moduleRefs[moduleKey] = myRefs;
               syncRefs();
             });
+            return fileInp;
           }
 
           if (data.template.kind === "form") {
@@ -263,6 +284,26 @@
           }
           /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
           if (data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
+
+          /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
+             只有 pending（待上传）才允许填写和提交。 */
+          if (data.instance.status !== "pending") {
+            const LOCKED_TEXT = {
+              submitted: "已提交，等待管理员审核。如需修改请联系管理员驳回后重新提交。",
+              approved: "已审核通过，本条任务已完成。",
+              rejected: "该提交已被驳回，请联系管理员重新获取提交链接。",
+              overdue: "已超过截止时间，无法再提交。",
+              expired: "该任务已过期，无法提交。",
+            };
+            const tip = document.createElement("div");
+            tip.className = "locked-tip";
+            tip.textContent = LOCKED_TEXT[data.instance.status] || "当前状态不可提交。";
+            const content = document.getElementById("content");
+            content.insertBefore(tip, submitBtn);
+            content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
+            submitBtn.disabled = true;
+            submitBtn.style.display = "none";
+          }
 
           if (!data.window_open) {
             submitBtn.disabled = true;
