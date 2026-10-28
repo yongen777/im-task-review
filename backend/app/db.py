@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS submission (
   mime        TEXT,
   size        INTEGER,
   note        TEXT,
+  refs_json   TEXT,
   source      TEXT NOT NULL,
   status      TEXT NOT NULL,
   created_at  TEXT NOT NULL
@@ -282,6 +283,10 @@ class Database:
             # 2026-10-27 春促数据看板：模板附带数据图开关 + 依赖的数据变量清单
             _ensure_column(self.conn, "task_template", "attach_image", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(self.conn, "task_template", "data_keys", "TEXT")
+            # 2026-10-28 上报任务多模块：文字说明 + 图片/文件可同时提交，附件从单个扩展为多个
+            _ensure_column(self.conn, "submission", "refs_json", "TEXT")
+            # 2026-10-28 通知类「数据图片提醒」：管理员上传图片，到点直接随消息推送
+            _ensure_column(self.conn, "task_template", "attach_image_path", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
 

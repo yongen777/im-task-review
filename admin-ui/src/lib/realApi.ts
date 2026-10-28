@@ -190,9 +190,9 @@ function tplFromMock(t: any, partial = false) {
   if (hasNoticeItems) {
     const texts = t.spec.notice_items.filter((x: any) => x.format === 'text').map((x: any) => x.text_content).filter(Boolean);
     if (texts.length) text = texts.join('\n');
-    attach = t.spec.notice_items.some((x: any) => x.format === 'file');
-    const caps = t.spec.notice_items.filter((x: any) => x.format === 'file').map((x: any) => x.file_caption).filter(Boolean);
-    if (caps.length) text = text ? `${text}\n${caps.join('\n')}` : caps.join('\n');
+    /* 2026-10-28：数据图片提醒改为「上传图片 → 到点直接推图」，正文里不再拼任何说明文字
+       （原来会把「当日数据看板（到点自动生成并推送）」这类描述写进消息）。 */
+    attach = t.spec.notice_items.some((x: any) => x.format === 'file' && !!x.image_path);
   }
   const roleIds = Array.isArray(t.role_ids) && t.role_ids.length ? t.role_ids : t.role_id ? [t.role_id] : [];
   const out: Record<string, unknown> = {};
@@ -227,6 +227,7 @@ function tplFromMock(t: any, partial = false) {
     if (t.text_tpl !== undefined || hasNoticeItems) out.text_tpl = text;
     if (t.enabled !== undefined) out.enabled = t.enabled !== false;
     if (t.attach_image !== undefined) out.attach_image = !!t.attach_image;
+    if (t.attach_image_path !== undefined) out.attach_image_path = t.attach_image_path || null;
     if (t.data_keys !== undefined) out.data_keys = t.data_keys;
     applySpec();
     return out;
@@ -245,6 +246,7 @@ function tplFromMock(t: any, partial = false) {
   out.deadline = isNotice ? '' : t.deadline || '';
   out.period = t.period || 'day';
   out.attach_image = attach;
+  out.attach_image_path = t.attach_image_path || null;
   out.data_keys = t.data_keys || [];
   out.enabled = t.enabled !== false;
   applySpec();

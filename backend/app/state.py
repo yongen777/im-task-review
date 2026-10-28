@@ -626,7 +626,8 @@ class StateStore:
             "period": d["period"], "anchor_weekday": d.get("anchor_weekday"), "anchor_dom": d.get("anchor_dom"),
             "deadline_offset": int(d.get("deadline_offset") or 0), "need_review": bool(d.get("need_review", 0)),
             "max_file_mb": d.get("max_file_mb"), "enabled": bool(d.get("enabled", 1)), "deleted": bool(d.get("deleted", 0)),
-            "attach_image": bool(d.get("attach_image", 0)), "data_keys": data_keys, "spec_json": spec_json,
+            "attach_image": bool(d.get("attach_image", 0)), "attach_image_path": d.get("attach_image_path"),
+            "data_keys": data_keys, "spec_json": spec_json,
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
 
@@ -763,8 +764,15 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", f"data_keys.key 重复: {k}")
             seen_keys.add(k)
             data_keys_norm.append({"key": k, "label": label, "unit": str(item.get("unit") or "").strip()})
-        if attach_image and not data_keys_norm:
-            raise BizError(400, "VALIDATION_FAILED", "attach_image=1 时 data_keys 不能为空")
+        # 2026-10-28 通知类「数据图片提醒」：管理员上传的图片/文件路径（相对 data 目录）
+        attach_image_path = str(merged.get("attach_image_path") or "").strip() or None
+        if attach_image_path:
+            attach_image = True  # 有图就等价于开启附图，避免前端只传了路径没传开关
+        if attach_image and not data_keys_norm and not attach_image_path:
+            raise BizError(
+                400, "VALIDATION_FAILED",
+                "勾选了「数据图片提醒」就必须先上传要推送的图片/文件，否则到点无图可发",
+            )
         data_keys_str = json.dumps(data_keys_norm, ensure_ascii=False)
 
         return {
@@ -773,7 +781,8 @@ class StateStore:
             "remind_at": remind_at, "notice_times": notice_times_str, "deadline": deadline, "period": period,
             "anchor_weekday": anchor_weekday, "anchor_dom": anchor_dom, "deadline_offset": deadline_offset,
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
-            "attach_image": 1 if attach_image else 0, "data_keys": data_keys_str,
+            "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
+            "data_keys": data_keys_str,
             "spec_json": json.dumps(merged.get("spec_json"), ensure_ascii=False) if merged.get("spec_json") not in (None, "") else None,
         }
 
@@ -783,13 +792,14 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
-                    norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["data_keys"], norm["spec_json"],
+                    norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
+                    norm["data_keys"], norm["spec_json"],
                     norm["enabled"], actor, now_s, now_s,
                 ),
             )
@@ -831,12 +841,13 @@ class StateStore:
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
                     norm["anchor_dom"], norm["deadline_offset"], norm["need_review"], norm["max_file_mb"],
-                    norm["attach_image"], norm["data_keys"], norm["spec_json"], norm["enabled"], now_s, clean_id,
+                    norm["attach_image"], norm["attach_image_path"], norm["data_keys"], norm["spec_json"],
+                    norm["enabled"], now_s, clean_id,
                 ),
             )
             self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"])}, now_s)
@@ -1109,7 +1120,8 @@ class StateStore:
         return now_s > format_dt(parse_dt(instance["deadline_at"]) + timedelta(hours=72))
 
     def submit_h5_task(
-        self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None, note: Optional[str] = None
+        self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
+        note: Optional[str] = None, refs: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         tok = self.get_h5_token(raw_token)
         if not tok or tok.get("purpose") != "submit":
@@ -1134,10 +1146,23 @@ class StateStore:
         fields_json_str, up_row = None, None
         clean_note = str(note).strip()[:500] if ((tpl.get("allow_note") or tpl["kind"] == "form") and note is not None and str(note).strip()) else None
 
+        # 上报类（form）可以同时带多个附件：文字说明走 note，图片/文件走 refs
+        clean_refs = [str(r).strip() for r in (refs or []) if str(r or "").strip()] if isinstance(refs, list) else []
+        if not clean_refs and file_ref:
+            clean_refs = [str(file_ref).strip()]
+        ref_rows: List[Dict[str, Any]] = []
+
         if tpl["kind"] == "form":
             fields_json_str = json.dumps(validate_form_submission_fields(tpl.get("schema_json") or [], fields), ensure_ascii=False)
+            for r in clean_refs:
+                row = self.get_upload_ref(r)
+                if not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]:
+                    raise BizError(400, "VALIDATION_FAILED", "上传文件引用无效")
+                if row["consumed"]:
+                    raise BizError(400, "VALIDATION_FAILED", "该文件已被使用，请重新上传")
+                ref_rows.append(row)
         elif tpl["kind"] in ("image", "file"):
-            clean_ref = (file_ref or "").strip()
+            clean_ref = (clean_refs[0] if clean_refs else "").strip()
             if not clean_ref:
                 raise BizError(400, "VALIDATION_FAILED", "请先上传文件后再提交")
             up_row = self.get_upload_ref(clean_ref)
@@ -1145,22 +1170,25 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", "上传文件引用无效")
             if up_row["consumed"]:
                 raise BizError(400, "VALIDATION_FAILED", "该文件已被使用，请重新上传")
+            ref_rows = [up_row]
 
+        refs_json_str = json.dumps([r["ref"] for r in ref_rows], ensure_ascii=False) if ref_rows else None
         new_status = "submitted" if tpl["need_review"] else "approved"
         late_submit = 1 if (now_s > inst["deadline_at"] or int(inst.get("late_submit") or 0) == 1) else 0
 
         with self.lock, self.conn:
             cur = self.conn.execute(
-                "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, source, status, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)",
+                "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, refs_json, source, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)",
                 (
                     int(inst["id"]), fields_json_str, up_row["ref"] if up_row else None, up_row["file_name"] if up_row else None,
-                    up_row["mime"] if up_row else None, up_row["size"] if up_row else None, clean_note, new_status, now_s,
+                    up_row["mime"] if up_row else None, up_row["size"] if up_row else None, clean_note, refs_json_str,
+                    new_status, now_s,
                 ),
             )
             sub_id = int(cur.lastrowid)
-            if up_row:
-                self.conn.execute("UPDATE upload_ref SET consumed = 1 WHERE ref = ?", (up_row["ref"],))
+            for r in ref_rows:
+                self.conn.execute("UPDATE upload_ref SET consumed = 1 WHERE ref = ?", (r["ref"],))
             self.conn.execute("UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ? WHERE id = ?", (new_status, now_s, late_submit, int(inst["id"])))
             self.conn.execute("UPDATE h5_token SET consumed = 1 WHERE token_id = ?", (tok["token_id"],))
 

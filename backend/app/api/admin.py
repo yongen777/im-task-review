@@ -2,10 +2,14 @@
 """后台管理 API（§9.1 会话 / §9.2 模板 / §9.3 角色成员 / §9.4 实例与审核 / §9.5 日志 / §9.6 统计与导出 + v1.2 §16 P2 守卫）。"""
 from __future__ import annotations
 
+import base64
 import csv
 import hmac
 import io
 import json
+import os
+import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, FastAPI, Request
@@ -459,6 +463,68 @@ def create_admin_router(state: StateStore) -> APIRouter:
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True}
+
+    # ── 2026-10-28 通知类「数据图片提醒」素材上传 ──
+    # 管理员在模板里上传一张图片，到点随通知消息直接推送；不再依赖「人工填报 + 服务端出图」。
+    @router.post("/template-assets")
+    async def upload_template_asset(request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        filename = str(body.get("filename") or "").strip()
+        b64 = str(body.get("content_base64") or "").strip()
+        if b64.lower().startswith("data:") and "," in b64:
+            b64 = b64.split(",", 1)[1]
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            return error_response(400, "VALIDATION_FAILED", "图片内容解析失败，请重新选择文件")
+
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext not in ("png", "jpg", "jpeg", "webp"):
+            return error_response(400, "FILE_TYPE_REJECTED", "仅支持 png / jpg / jpeg / webp 图片")
+        if not raw:
+            return error_response(400, "FILE_TYPE_REJECTED", "不能上传空文件")
+        if len(raw) > 9 * 1024 * 1024:
+            return error_response(400, "FILE_TYPE_REJECTED", "图片不能超过 9MB")
+        head = raw[:12]
+        is_png = head.startswith(b"\x89PNG\r\n\x1a\n")
+        is_jpg = head.startswith(b"\xff\xd8\xff")
+        is_webp = head.startswith(b"RIFF") and raw[8:12] == b"WEBP"
+        if not (is_png or is_jpg or is_webp):
+            return error_response(400, "FILE_TYPE_REJECTED", "文件内容不是有效图片")
+
+        cfg = getattr(request.app.state, "config", None)
+        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.db.db_path).parent
+        out_dir = data_dir / "notice_attach"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_ext = "jpg" if ext == "jpeg" else ext
+        name = f"notice_{uuid.uuid4().hex[:12]}.{safe_ext}"
+        (out_dir / name).write_bytes(raw)
+        state.write_audit(
+            username=sess["username"], action="template.asset_upload", target_type="task_template",
+            target_id=name, detail={"file_name": filename, "size": len(raw)},
+        )
+        return {"ok": True, "path": f"notice_attach/{name}", "file_name": filename, "size": len(raw)}
+
+    @router.get("/template-assets/{name}")
+    async def get_template_asset(name: str, request: Request):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        safe_name = os.path.basename(name or "")
+        if not safe_name:
+            return error_response(404, "NOT_FOUND", "素材不存在")
+        cfg = getattr(request.app.state, "config", None)
+        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.db.db_path).parent
+        path = data_dir / "notice_attach" / safe_name
+        if not path.exists() or not path.is_file():
+            return error_response(404, "NOT_FOUND", "素材不存在")
+        return FileResponse(str(path))
 
     @router.post("/templates/{template_id}/preview")
     async def preview_template(template_id: str, request: Request):

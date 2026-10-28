@@ -145,7 +145,13 @@ def _validate_upload_target_and_limits(
     tpl = state.get_template(inst["template_id"], include_deleted=True)
     if not tpl or tpl.get("deleted"):
         return None, None, "", "", 0, 0, (404, {"code": "NOT_FOUND", "message": "任务模板不存在"})
-    if tpl["kind"] not in ("image", "file"):
+    spec = tpl.get("spec_json") if isinstance(tpl.get("spec_json"), dict) else {}
+    modules = spec.get("upload_modules") or []
+    # 2026-10-28：上报类（form）勾了「图片 / 文件」模块也要允许上传，之前只放行 image/file 两种模板
+    allows_upload = tpl["kind"] in ("image", "file") or (
+        tpl["kind"] == "form" and any(m in modules for m in ("image", "file"))
+    )
+    if not allows_upload:
         return None, None, "", "", 0, 0, (400, {"code": "VALIDATION_FAILED", "message": "当前任务类型不支持上传文件"})
 
     orig_name = os.path.basename(filename or "").strip()
@@ -200,6 +206,12 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
             "deadline": tpl["deadline"],
             "allow_note": tpl["allow_note"],
             "schema_json": tpl.get("schema_json"),
+            "spec_json": tpl.get("spec_json"),
+            # 2026-10-28：H5 要按后台勾选的模块（字段 / 文字说明 / 图片 / 文件）逐个渲染，
+            # 之前只读 schema_json，导致勾了图片和文字说明也只有一个数字输入框。
+            "upload_modules": list(((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("upload_modules") or []),
+            "text_label": ((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("text_label") or "文字情况说明",
+            "text_placeholder": ((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("text_placeholder") or "请填写补充说明…",
             "max_file_mb": tpl.get("max_file_mb"),
             "need_review": tpl.get("need_review"),
         },
@@ -257,14 +269,16 @@ def process_h5_task_submit(*, state: StateStore, raw_token: str, data: Any) -> T
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
     fields = data.get("fields") if isinstance(data.get("fields"), dict) else payload.get("fields")
     file_ref = data.get("file_ref") or payload.get("file_ref")
-    if not file_ref:
-        refs = data.get("refs") or payload.get("refs")
-        if isinstance(refs, list) and refs:
-            file_ref = str(refs[0])
+    refs_raw = data.get("refs") if isinstance(data.get("refs"), list) else payload.get("refs")
+    refs = [str(r) for r in (refs_raw or []) if str(r or "").strip()]
+    if not file_ref and refs:
+        file_ref = refs[0]
     note = data.get("note") if data.get("note") is not None else payload.get("note")
 
     try:
-        res = state.submit_h5_task(raw_token=raw_token, fields=fields, file_ref=file_ref, note=note)
+        # ⭐ 2026-10-28：上报类模板可同时提交「字段 + 文字说明 + 多张图片/文件」，
+        # 之前只透传单个 file_ref，勾了图片/文件模块也存不下来。
+        res = state.submit_h5_task(raw_token=raw_token, fields=fields, file_ref=file_ref, note=note, refs=refs)
     except BizError as exc:
         return exc.status_code, {"code": exc.code, "message": exc.message}
 

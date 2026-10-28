@@ -140,6 +140,9 @@ def render_text_tpl(
     rendered = text_tpl or ""
     for k, v in replacements.items():
         rendered = rendered.replace(k, v)
+    # 2026-10-28：从 JSON / 文档粘贴的文案常把换行写成字面量 "\n"，密信会原样显示成「\n1、…」。
+    # 统一在渲染出口还原成真换行。
+    rendered = rendered.replace("\r\n", "\n").replace("\\n", "\n")
     return rendered
 
 
@@ -426,14 +429,15 @@ class Scheduler:
                         idem = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice", seq_idx, planned_str)
                         ext_id = m["external_id"] if m["activated"] else None
 
-                        def _make_notice_msg(member=m, template=tpl) -> str:
-                            # 2026-10-26 业务方定档：notice 正文**不加**【模板名】前缀，
-                            # 文案原样发出（后台模板名只用于列表展示，不进消息体）。
-                            return render_text_tpl(
+                        def _make_notice_msg(member=m, template=tpl, planned=planned_dt) -> str:
+                            # 2026-10-26 定档：notice 正文不加【模板名】前缀，文案原样发出。
+                            # 2026-10-28：补统一的尾部时间行，和上报类消息格式对齐。
+                            body = render_text_tpl(
                                 template["text_tpl"], member_name=member["name"], member_dept=member["dept"],
                                 template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
                                 extra_vars=snap_values,
                             )
+                            return f"{body.rstrip()}\n\n发送时间：{format_deadline_display(format_dt(planned), ref_dt=cur_dt)}"
 
                         self._deliver_with_log(
                             template_id=tpl["template_id"], instance_id=None, phone=m["phone"], external_id=ext_id,
@@ -441,53 +445,59 @@ class Scheduler:
                             msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
                         )
 
-                    # 2026-10-27 春促数据看板：attach_image=1 且当日快照有值 -> 文本后追加图片投递
-                    if tpl.get("attach_image") and data_keys and self.image_sender is not None:
-                        has_any_value = any(
-                            str(snap_values.get(str(dk.get("key") or "")) or "").strip() for dk in data_keys
-                        )
-                        if has_any_value:
-                            prepared = None
+                    # 2026-10-28 通知类附图：优先推管理员上传的图片（attach_image_path），
+                    # 没上传图时才退回「数据看板自动出图」的旧路径（依赖当天人工填报的快照值）。
+                    attach_rel = str(tpl.get("attach_image_path") or "").strip()
+                    want_dash = bool(tpl.get("attach_image")) and bool(data_keys)
+                    if self.image_sender is not None and (attach_rel or want_dash):
+                        prepared = None
+                        if attach_rel:
                             try:
-                                from .dashboard import render_snapshot_dashboard
-
-                                # 2026-10-27 修：StateStore 本身没有 db_path 属性（路径在 state.db.db_path 上），
-                                # 原来 getattr(self.state, "db_path", Path("data")) 永远走默认值，
-                                # Path("data").parent 得到 "."，看板被写到 <cwd>/dashboards。
-                                # 生产 unit 有 ReadWritePaths=/opt/imtask/data（其余只读），
-                                # 于是出图 Permission denied → 图片静默不发。改为优先取真实库路径。
                                 db_path = getattr(getattr(self.state, "db", None), "db_path", None)
-                                data_dir = Path(db_path).parent if db_path else Path("data").resolve()
-                                out_dir = data_dir / "dashboards"
-                                out_png = str(out_dir / f"{tpl['template_id']}_{p_key}_{seq_idx}.png")
-                                note_text = f"数据截至 {now_s} · 数据来源：人工填报"
-                                render_snapshot_dashboard(
-                                    title=f"{tpl['name']} · 数据看板",
-                                    subtitle=f"{p_key} · 春促按角色提醒",
-                                    data_keys=data_keys,
-                                    values=snap_values,
-                                    note=note_text,
-                                    out_path=out_png,
-                                )
-                                prepared = self.image_sender.prepare_image(out_png)
-                            except Exception as exc:  # 看板渲染/上传失败不影响文本主链路
-                                logger.warning("看板渲染或上传失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
-                            if prepared:
-                                for m in members:
-                                    idem_img = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice_img", seq_idx, planned_str)
-                                    ext_id = m["external_id"] if m["activated"] else None
-                                    if not ext_id:
-                                        continue  # 未激活成员文本链路已记 skipped，图片直接跳过避免重复记一条
+                                base_dir = Path(db_path).parent if db_path else Path("data").resolve()
+                                prepared = self.image_sender.prepare_image(str(base_dir / attach_rel))
+                            except Exception as exc:
+                                logger.warning("通知附图加载失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
+                        if prepared is None and want_dash:
+                            has_any_value = any(
+                                str(snap_values.get(str(dk.get("key") or "")) or "").strip() for dk in data_keys
+                            )
+                            if has_any_value:
+                                try:
+                                    from .dashboard import render_snapshot_dashboard
 
-                                    def _noop_text() -> str:
-                                        return ""
-
-                                    self._deliver_with_log(
-                                        template_id=tpl["template_id"], instance_id=None, phone=m["phone"], external_id=ext_id,
-                                        kind="notice_img", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_img,
-                                        msg_text_fn=_noop_text, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                                        send_fn=lambda rid, _t, idem, _prep=prepared: self.image_sender.send_image_prepared(rid, _prep, idem),
+                                    db_path = getattr(getattr(self.state, "db", None), "db_path", None)
+                                    data_dir = Path(db_path).parent if db_path else Path("data").resolve()
+                                    out_dir = data_dir / "dashboards"
+                                    out_png = str(out_dir / f"{tpl['template_id']}_{p_key}_{seq_idx}.png")
+                                    note_text = f"数据截至 {now_s} · 数据来源：人工填报"
+                                    render_snapshot_dashboard(
+                                        title=f"{tpl['name']} · 数据看板",
+                                        subtitle=f"{p_key} · 春促按角色提醒",
+                                        data_keys=data_keys,
+                                        values=snap_values,
+                                        note=note_text,
+                                        out_path=out_png,
                                     )
+                                    prepared = self.image_sender.prepare_image(out_png)
+                                except Exception as exc:  # 看板渲染/上传失败不影响文本主链路
+                                    logger.warning("看板渲染或上传失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
+                        if prepared:
+                            for m in members:
+                                idem_img = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice_img", seq_idx, planned_str)
+                                ext_id = m["external_id"] if m["activated"] else None
+                                if not ext_id:
+                                    continue  # 未激活成员文本链路已记 skipped，图片直接跳过避免重复记一条
+
+                                def _noop_text() -> str:
+                                    return ""
+
+                                self._deliver_with_log(
+                                    template_id=tpl["template_id"], instance_id=None, phone=m["phone"], external_id=ext_id,
+                                    kind="notice_img", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_img,
+                                    msg_text_fn=_noop_text, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                                    send_fn=lambda rid, _t, idem, _prep=prepared: self.image_sender.send_image_prepared(rid, _prep, idem),
+                                )
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])
@@ -518,7 +528,14 @@ class Scheduler:
                         phone=instance["phone"], template_id=template["template_id"],
                         period_key_val=instance["period_key"], instance_id=int(instance["id"]),
                     )
-                    return f"【{template['name']}】{rendered}\n👉 提交入口：{h5_url}"
+                    # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示复制到浏览器打开；
+                    # 与通知类消息统一为「正文 + 空行 + 标签行」的版式。
+                    dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
+                    return (
+                        f"【{template['name']}】\n{rendered.rstrip()}\n\n"
+                        f"截止时间：{dl_disp}\n"
+                        f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
+                    )
 
                 self._deliver_with_log(
                     template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
@@ -554,7 +571,11 @@ class Scheduler:
                     phone=instance["phone"], template_id=template["template_id"],
                     period_key_val=instance["period_key"], instance_id=int(instance["id"]),
                 )
-                return f"【{template['name']}】已逾期\n截止时间 {dl_disp}，你尚未提交。可在 {late_disp} 前补交。\n👉 提交入口：{h5_url}"
+                return (
+                    f"【{template['name']}】已逾期\n"
+                    f"截止时间：{dl_disp}，你尚未提交，可在 {late_disp} 前补交。\n\n"
+                    f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
+                )
 
             self._deliver_with_log(
                 template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,

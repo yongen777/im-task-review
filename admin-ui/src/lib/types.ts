@@ -21,6 +21,8 @@ export interface NoticeMessageItem {
   file_mime?: string;
   file_size?: number;
   file_caption?: string;
+  /** 已上传到服务端的图片相对路径（notice_attach/xxx.png），到点直接推送这张图 */
+  image_path?: string;
 }
 
 // 统一上传任务的 H5 组件模块类型：字段（报数类型）、文本、图片、文件

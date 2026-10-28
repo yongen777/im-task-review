@@ -1,4 +1,3 @@
-Html
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -76,63 +75,112 @@ Html
           document.getElementById("tplName").textContent = data.template.name;
           document.getElementById("memberName").textContent = data.instance.name_snap;
           document.getElementById("periodKey").textContent = data.instance.period_key;
-          document.getElementById("instStatus").textContent = data.instance.status;
+          const STATUS_TEXT = { pending: "待提交", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期" };
+          document.getElementById("instStatus").textContent = STATUS_TEXT[data.instance.status] || data.instance.status;
           document.getElementById("deadlineAt").textContent = data.instance.deadline_at;
-          if (data.template.allow_note) document.getElementById("noteField").style.display = "block";
 
           const area = document.getElementById("dynamicArea");
-          if (data.template.kind === "form") {
-            const fields = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
-            fields.forEach(f => {
-              const wrap = document.createElement("div");
-              wrap.className = "field";
-              const lbl = document.createElement("label");
-              lbl.textContent = f.label + (f.required ? " *" : "");
-              wrap.appendChild(lbl);
-              let inp;
-              if (f.type === "select" && Array.isArray(f.options)) {
-                inp = document.createElement("select");
-                f.options.forEach(opt => {
-                  const o = document.createElement("option");
-                  o.value = opt;
-                  o.textContent = opt;
-                  inp.appendChild(o);
-                });
-              } else {
-                inp = document.createElement("input");
-                inp.type = f.type === "number" ? "number" : (f.type === "date" ? "date" : "text");
-              }
-              inp.dataset.fieldKey = f.key;
-              wrap.appendChild(inp);
-              area.appendChild(wrap);
-            });
-          } else {
+          const spec = data.template.spec_json || {};
+          const modules = Array.isArray(spec.upload_modules) && spec.upload_modules.length
+            ? spec.upload_modules
+            : (data.template.kind === "form" ? ["fields"] : []);
+          let textModuleOn = false;
+
+          function addLabel(text) {
+            const lbl = document.createElement("label");
+            lbl.textContent = text;
+            return lbl;
+          }
+
+          /* 图片 / 文件模块：可多选，逐个上传换取 ref */
+          function makeUploadField(labelText, accept) {
             const wrap = document.createElement("div");
             wrap.className = "field";
-            const lbl = document.createElement("label");
-            lbl.textContent = data.template.kind === "image" ? "上传图片 *" : "上传文件 *";
-            wrap.appendChild(lbl);
+            wrap.appendChild(addLabel(labelText));
             const fileInp = document.createElement("input");
             fileInp.type = "file";
+            fileInp.multiple = true;
+            if (accept) fileInp.accept = accept;
             const refList = document.createElement("div");
             refList.className = "ref-list";
             fileInp.addEventListener("change", async () => {
               uploadedRefs = [];
+              refList.textContent = "";
               for (const f of fileInp.files) {
                 const fd = new FormData();
                 fd.append("token", token);
                 fd.append("file", f);
-                const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
-                const res = await r.json();
-                if (!r.ok) return showMsg(res.message || "上传失败", "error");
-                uploadedRefs.push(res.ref);
-                refList.textContent = "已上传: " + (res.file_name || res.ref);
+                try {
+                  const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
+                  const res = await r.json();
+                  if (!r.ok) { showMsg(res.message || "上传失败", "error"); return; }
+                  uploadedRefs.push(res.ref);
+                  const line = document.createElement("div");
+                  line.textContent = "已上传：" + (res.file_name || res.ref);
+                  refList.appendChild(line);
+                } catch (e) {
+                  showMsg("上传网络异常", "error");
+                  return;
+                }
               }
             });
             wrap.appendChild(fileInp);
             wrap.appendChild(refList);
             area.appendChild(wrap);
           }
+
+          if (data.template.kind === "form") {
+            /* 字段模块 */
+            if (modules.includes("fields")) {
+              const fields = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
+              fields.forEach(f => {
+                const wrap = document.createElement("div");
+                wrap.className = "field";
+                wrap.appendChild(addLabel(f.label + (f.required ? " *" : "")));
+                let inp;
+                if (f.type === "select" && Array.isArray(f.options)) {
+                  inp = document.createElement("select");
+                  const empty = document.createElement("option");
+                  empty.value = "";
+                  empty.textContent = "请选择";
+                  inp.appendChild(empty);
+                  f.options.forEach(opt => {
+                    const o = document.createElement("option");
+                    o.value = opt;
+                    o.textContent = opt;
+                    inp.appendChild(o);
+                  });
+                } else {
+                  inp = document.createElement("input");
+                  inp.type = f.type === "number" ? "number" : (f.type === "date" ? "date" : "text");
+                  if (f.type === "number") inp.step = "any";
+                }
+                inp.dataset.fieldKey = f.key;
+                wrap.appendChild(inp);
+                area.appendChild(wrap);
+              });
+            }
+            /* 文字说明模块（复用备注输入框） */
+            if (modules.includes("text")) {
+              textModuleOn = true;
+              const wrap = document.createElement("div");
+              wrap.className = "field";
+              wrap.appendChild(addLabel(spec.text_label || "文字情况说明"));
+              const ta = document.createElement("textarea");
+              ta.id = "noteInput";
+              ta.rows = 4;
+              ta.placeholder = spec.text_placeholder || "请填写补充说明…";
+              wrap.appendChild(ta);
+              area.appendChild(wrap);
+            }
+            /* 图片 / 文件模块 */
+            if (modules.includes("image")) makeUploadField("图片上传（可多选）", "image/*");
+            if (modules.includes("file")) makeUploadField("文件上传（可多选）", "");
+          } else {
+            makeUploadField(data.template.kind === "image" ? "上传图片 *" : "上传文件 *", "");
+          }
+          /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
+          if (data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
 
           if (!data.window_open) {
             submitBtn.disabled = true;
@@ -147,14 +195,12 @@ Html
       submitBtn.addEventListener("click", () => {
         if (!taskInfo) return;
         let payload = {};
-        if (taskInfo.template.kind === "form") {
-          const fieldsObj = {};
-          document.querySelectorAll("[data-field-key]").forEach(el => { fieldsObj[el.dataset.fieldKey] = el.value; });
-          payload = { fields: fieldsObj };
-        } else {
-          payload = { refs: uploadedRefs, file_ref: uploadedRefs[0] || "" };
-        }
-        const note = document.getElementById("noteInput").value;
+        const fieldsObj = {};
+        document.querySelectorAll("[data-field-key]").forEach(el => { fieldsObj[el.dataset.fieldKey] = el.value; });
+        /* 字段 + 文字说明 + 多附件一起提交（文字说明走 note，图片/文件走 refs） */
+        payload = { fields: fieldsObj, refs: uploadedRefs, file_ref: uploadedRefs[0] || "" };
+        const noteEl = document.getElementById("noteInput");
+        const note = noteEl ? noteEl.value : "";
         submitBtn.disabled = true;
         fetch("/api/h5/task/submit", {
           method: "POST",

@@ -91,20 +91,10 @@ function createDefaultNoticeItems(): NoticeMessageItem[] {
 }
 
 function summarizeNoticeItemsToText(items: NoticeMessageItem[]): string {
+  /* 2026-10-28：图片/文件提醒只负责"到点把图推过去"，**不再**往正文里塞说明文字
+     （原来会把「当日数据看板（到点自动生成并推送）」这类描述拼进消息里）。 */
   return items
-    .map((item, idx) => {
-      if (item.format === 'text') {
-        return (item.text_content || '').trim();
-      }
-      const parts: string[] = [];
-      if (item.file_name?.trim()) {
-        parts.push(`【文件/图片附件：${item.file_name.trim()}】`);
-      }
-      if (item.file_caption?.trim()) {
-        parts.push(item.file_caption.trim());
-      }
-      return parts.join('\n') || `第 ${idx + 1} 条：文件/图片提醒`;
-    })
+    .map((item) => (item.format === 'text' ? (item.text_content || '').trim() : ''))
     .filter(Boolean)
     .join('\n');
 }
@@ -443,6 +433,8 @@ export const TemplatesView: React.FC = () => {
 
   // 纯通知提醒专用状态
   const [noticeItems, setNoticeItems] = useState<NoticeMessageItem[]>(createDefaultNoticeItems);
+  /** 正在上传数据图片的通知项下标（用于禁用按钮 + 显示上传中） */
+  const [uploadingAssetId, setUploadingAssetId] = useState<number | null>(null);
 
   // 上传任务专用状态（提醒文本 + 选择 H5 上传项 [字段/文本/图片/文件] + 是否需要审核）
   const [uploadRemindText, setUploadRemindText] = useState(
@@ -608,19 +600,43 @@ export const TemplatesView: React.FC = () => {
     setNoticeItems((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  const handleNoticeFileSelect = (idx: number, file: File | null) => {
+  /* 2026-10-28：数据图片提醒改为「真上传」——图片先落到服务端 notice_attach/，
+     保存模板时把 image_path 一起提交，到点由调度器直接推送这张图。 */
+  const handleNoticeImageUpload = async (idx: number, file: File | null) => {
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      updateNoticeItem(idx, {
-        file_name: file.name,
-        file_size: file.size,
-        file_mime: file.type,
-        file_url: typeof reader.result === 'string' ? reader.result : undefined,
+    const okExt = /\.(png|jpg|jpeg|webp)$/i.test(file.name);
+    if (!okExt) {
+      toast.warning('数据图片提醒只支持 png / jpg / jpeg / webp 图片', '文件类型不支持');
+      return;
+    }
+    if (file.size > 9 * 1024 * 1024) {
+      toast.warning('图片不能超过 9MB，请压缩后再上传', '图片过大');
+      return;
+    }
+    setUploadingAssetId(idx);
+    try {
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('读取本地文件失败'));
+        reader.readAsDataURL(file);
       });
-      toast.info(`已载入文件/图片「${file.name}」`, '文件已选择');
-    };
-    reader.readAsDataURL(file);
+      const res = await api.post<{ ok: boolean; path: string; file_name: string; size: number }>(
+        '/api/admin/template-assets',
+        { filename: file.name, content_base64: dataUrl },
+      );
+      updateNoticeItem(idx, {
+        image_path: res.path,
+        file_name: res.file_name || file.name,
+        file_size: res.size || file.size,
+        file_mime: file.type,
+      });
+      toast.success(`已上传「${res.file_name || file.name}」，到点会随提醒一起推送。`, '图片已就绪');
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '图片上传失败');
+    } finally {
+      setUploadingAssetId(null);
+    }
   };
 
   const handleToggleEnabled = async (tpl: TemplateItem) => {
@@ -679,8 +695,11 @@ export const TemplatesView: React.FC = () => {
           toast.warning(`请填写第 ${i + 1} 条文本提醒内容`);
           return;
         }
-        if (item.format === 'file' && !item.file_name?.trim() && !item.file_caption?.trim()) {
-          toast.warning(`请为第 ${i + 1} 条文件/图片提醒选择文件或填写说明`);
+        if (item.format === 'file' && !item.image_path) {
+          toast.warning(
+            `第 ${i + 1} 条勾选了「数据图片提醒」，请先上传要推送的图片`,
+            '缺少提醒图片',
+          );
           return;
         }
       }
@@ -736,6 +755,10 @@ export const TemplatesView: React.FC = () => {
       };
     }
 
+    /* 通知类：取第一条已上传的「数据图片提醒」图片，作为到点直接推送的附件 */
+    const noticeImagePath =
+      noticeItems.find((ni) => ni.format === 'file' && ni.image_path)?.image_path || '';
+
     setSaving(true);
     try {
       const finalDeadline = kind === 'notice' ? '' : deadline.trim();
@@ -751,7 +774,9 @@ export const TemplatesView: React.FC = () => {
           enabled,
           /* 通知类模板的每个提醒时刻都存在 notice_times，界面上只有一个「执行时间」输入框，
              必须显式映射过去，否则改了时间不会真的改发送时刻（后端对该类模板忽略 remind_at）。 */
-          ...(kind === 'notice' ? { notice_times: [remindAt.trim()] } : {}),
+          ...(kind === 'notice'
+            ? { notice_times: [remindAt.trim()], attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null }
+            : {}),
         });
         await refreshTemplates();
         setModalOpen(false);
@@ -771,6 +796,9 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
+          ...(kind === 'notice'
+            ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null }
+            : {}),
         });
         await refreshTemplates();
         setModalOpen(false);
@@ -1465,38 +1493,47 @@ export const TemplatesView: React.FC = () => {
                               />
                             ) : (
                               <div className="space-y-2.5">
-                                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                                  <input
-                                    type="text"
-                                    value={item.file_name || ''}
-                                    onChange={(e) =>
-                                      updateNoticeItem(idx, { file_name: e.target.value })
-                                    }
-                                    placeholder="文件或图片名称，如：支局1+1155核心指标通报截图.png"
-                                    className="flex-1 bg-white border border-slate-200 rounded-xl px-3 py-2 text-slate-800 font-mono text-[11px] outline-none focus:border-indigo-500"
-                                  />
-                                  <label className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-[11px] inline-flex items-center justify-center gap-1.5 cursor-pointer shrink-0">
+                                {/* 2026-10-28：数据图片提醒只需要一张图，到点直接推图，不再填名称/描述 */}
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <label
+                                    className={`px-3.5 py-2 rounded-xl font-semibold text-[11px] inline-flex items-center justify-center gap-1.5 shrink-0 ${
+                                      uploadingAssetId === idx
+                                        ? 'bg-slate-300 text-white cursor-wait'
+                                        : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
+                                    }`}
+                                  >
                                     <Upload className="w-3.5 h-3.5" />
-                                    <span>选择本地文件/图片</span>
+                                    <span>{uploadingAssetId === idx ? '上传中…' : item.image_path ? '重新上传图片' : '上传数据提醒图片'}</span>
                                     <input
                                       type="file"
-                                      accept="image/*,.xlsx,.xls,.csv,.pdf,.doc,.docx"
+                                      accept="image/png,image/jpeg,image/webp"
                                       className="hidden"
-                                      onChange={(e) =>
-                                        handleNoticeFileSelect(idx, e.target.files?.[0] || null)
-                                      }
+                                      disabled={uploadingAssetId === idx}
+                                      onChange={(e) => {
+                                        void handleNoticeImageUpload(idx, e.target.files?.[0] || null);
+                                        e.currentTarget.value = '';
+                                      }}
                                     />
                                   </label>
+                                  {item.image_path ? (
+                                    <span className="inline-flex items-center gap-1 text-indigo-700 font-medium text-[11px]">
+                                      <Paperclip className="w-3.5 h-3.5 shrink-0" />
+                                      <span className="truncate max-w-[220px]">{item.file_name || item.image_path}</span>
+                                      <button
+                                        type="button"
+                                        onClick={() => updateNoticeItem(idx, { image_path: undefined, file_name: undefined, file_size: undefined })}
+                                        className="text-rose-600 hover:bg-rose-50 rounded px-1 cursor-pointer"
+                                      >
+                                        移除
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <span className="text-rose-600 text-[11px] font-semibold">未上传图片 —— 保存前必须先上传</span>
+                                  )}
                                 </div>
-                                <textarea
-                                  rows={2}
-                                  value={item.file_caption || ''}
-                                  onChange={(e) =>
-                                    updateNoticeItem(idx, { file_caption: e.target.value })
-                                  }
-                                  placeholder="配套说明文字（选填）"
-                                  className="w-full bg-white border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:border-indigo-500 leading-relaxed"
-                                />
+                                <div className="text-[11px] text-slate-500 leading-relaxed">
+                                  到点会把这张图直接推送给成员，不需要填写任何描述文字。
+                                </div>
                               </div>
                             )}
                           </div>
