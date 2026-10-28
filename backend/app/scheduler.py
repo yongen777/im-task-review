@@ -146,6 +146,23 @@ def render_text_tpl(
     return rendered
 
 
+_MODULE_DISPLAY = {"fields": "字段报数", "text": "文字说明", "image": "图片上传", "file": "文件上传"}
+
+
+def _upload_module_labels(template: Dict[str, Any]) -> List[str]:
+    """消息尾部「需填写：…」用：把模板勾选的 H5 模块翻译成中文（与预览里的标签一致）。"""
+    spec = template.get("spec_json")
+    modules = spec.get("upload_modules") if isinstance(spec, dict) else None
+    if not isinstance(modules, list) or not modules:
+        return []
+    out: List[str] = []
+    for m in modules:
+        label = _MODULE_DISPLAY.get(str(m))
+        if label and label not in out:
+            out.append(label)
+    return out
+
+
 def make_idem_key(template_id: str, phone: str, period_key_val: str, kind: str, seq: int = 1, planned_str: str = "") -> str:
     """§6.2 幂等键：sha1(f"{template_id}|{phone}|{period_key}|{kind}|{seq}|{planned_at}")。
 
@@ -425,6 +442,16 @@ class Scheduler:
                 snap_values: Dict[str, str] = {}
                 if data_keys:
                     snap_values = self.state.get_data_snapshot_values(tpl["template_id"], p_key)
+
+                # 2026-10-28 方案A（按业务方新要求调整）：通知类**当天一进来就按人生成实例**（pending），
+                # 到点发出后置 sent。这样「任务实例」页能看到今天所有通知归了谁，
+                # 不会只剩已完成的那几条。deadline 用当天 23:59 占位，不参与 overdue 流转；
+                # 到当天结束仍未发出的，由 advance_instance_statuses 标成 expired（未送达）。
+                notice_deadline = calc_deadline_at(cur_dt, "23:59", 0, "day")
+                before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
+                instances = self.state.ensure_template_instances(tpl["template_id"], p_key, notice_deadline)
+                stats["generated_instances"] += max(0, len(instances) - before_cnt)
+
                 for seq_idx, nt_hhmm in enumerate(tpl.get("notice_times") or [], start=1):
                     planned_dt = self._build_planned_dt(cur_dt, nt_hhmm)
                     if cur_dt < planned_dt:
@@ -445,14 +472,7 @@ class Scheduler:
                             stats["missed"] += 1
                         continue
 
-                    # 2026-10-28 方案A：通知类在「到点这一刻」按人为单位生成实例，
-                    # pending → 发送成功 → sent；未到点不生成，不会堆一堆待提醒行。
-                    # 通知没有截止概念，deadline 用当天 23:59 占位，且不参与 overdue/expired 流转。
-                    notice_deadline = calc_deadline_at(cur_dt, "23:59", 0, "day")
-                    before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
-                    instances = self.state.ensure_template_instances(tpl["template_id"], p_key, notice_deadline)
-                    stats["generated_instances"] += max(0, len(instances) - before_cnt)
-
+                    # 2026-10-28 方案A：实例已在上方按天预生成，这里只负责「到点发送 + 置 sent」。
                     for inst in instances:
                         target = self.state.get_delivery_target(inst["phone"])
                         ext_id = (target or {}).get("external_id") if target else None
@@ -564,11 +584,12 @@ class Scheduler:
                     # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示复制到浏览器打开；
                     # 与通知类消息统一为「正文 + 空行 + 标签行」的版式。
                     dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                    return (
-                        f"【{template['name']}】\n{rendered.rstrip()}\n\n"
-                        f"截止时间：{dl_disp}\n"
-                        f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
-                    )
+                    module_labels = _upload_module_labels(template)
+                    tail = f"截止时间：{dl_disp}\n"
+                    if module_labels:
+                        tail += f"需填写：{' · '.join(module_labels)}\n"
+                    tail += f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
+                    return f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n{tail}"
 
                 self._deliver_with_log(
                     template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,

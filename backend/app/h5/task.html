@@ -6,36 +6,62 @@
   <meta name="referrer" content="no-referrer" />
   <title>任务提交 - IMTask</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f6f9; color: #1f2937; padding: 16px; line-height: 1.5; }
-    .card { max-width: 520px; margin: 0 auto; background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
-    .title { font-size: 18px; font-weight: 600; margin-bottom: 6px; color: #111827; }
-    .meta { font-size: 13px; color: #6b7280; margin-bottom: 12px; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #e5e7eb; color: #374151; }
-    .field { margin-bottom: 14px; }
-    .field label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; }
-    .field input, .field select, .field textarea { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
-    .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
-    .btn:disabled { background: #9ca3af; cursor: not-allowed; }
-    .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #eef2f8; color: #1f2937; padding: 14px 12px 28px; line-height: 1.55; }
+    .card { max-width: 520px; margin: 0 auto; }
+    .topbar { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: #fff; border-radius: 14px; border: 1px solid #e3e9f2; margin-bottom: 12px; }
+    .topbar .dot { width: 8px; height: 8px; border-radius: 50%; background: #2563eb; }
+    .topbar .tname { font-size: 14px; font-weight: 700; color: #0f172a; }
+    .topbar .chan { margin-left: auto; font-size: 12px; color: #2563eb; font-weight: 600; }
+    .block { background: #fff; border: 1px solid #e3e9f2; border-radius: 14px; padding: 14px; margin-bottom: 10px; }
+    .block-head { display: flex; align-items: center; gap: 7px; margin-bottom: 10px; }
+    .block-head .ico { width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border-radius: 5px; font-size: 12px; }
+    .block-head .name { font-size: 14px; font-weight: 700; color: #0f172a; }
+    .block-head .hint { margin-left: auto; font-size: 11px; color: #94a3b8; }
+    .field label { display: block; font-size: 13px; font-weight: 600; color: #334155; margin-bottom: 6px; }
+    .field input, .field select, .field textarea { width: 100%; padding: 11px 12px; border: 1px solid #dbe3ef; border-radius: 10px; font-size: 14px; background: #f8fafc; color: #0f172a; outline: none; }
+    .field input:focus, .field select:focus, .field textarea:focus { background: #fff; border-color: #2563eb; }
+    .task-head { background: #fff; border: 1px solid #e3e9f2; border-radius: 14px; padding: 14px; margin-bottom: 10px; }
+    .task-head .row1 { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .task-head .title { font-size: 15px; font-weight: 700; color: #0f172a; }
+    .task-head .deadline { margin-left: auto; font-size: 12px; font-weight: 700; color: #b45309; background: #fffbeb; border: 1px solid #fde68a; border-radius: 7px; padding: 2px 8px; }
+    .task-head .desc { font-size: 13px; color: #475569; white-space: pre-line; }
+    .task-head .meta { font-size: 12px; color: #94a3b8; margin-top: 8px; }
+    .upload-box { border: 1px dashed #c7d2fe; background: #f8faff; border-radius: 12px; padding: 14px; text-align: center; color: #4f46e5; font-size: 13px; font-weight: 600; cursor: pointer; display: block; }
+    .upload-box input[type=file] { display: none; }
+    .thumb-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .thumb { width: 76px; height: 76px; border-radius: 10px; border: 1px solid #e3e9f2; object-fit: cover; background: #f1f5f9; }
+    .btn { width: 100%; padding: 14px; border: none; border-radius: 12px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 700; cursor: pointer; margin-top: 14px; }
+    .btn:disabled { background: #94a3b8; cursor: not-allowed; }
+    .msg { margin-top: 12px; padding: 11px 13px; border-radius: 10px; font-size: 13px; display: none; }
     .msg.error { display: block; background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
     .msg.success { display: block; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
-    .ref-list { font-size: 13px; color: #4b5563; margin-top: 8px; }
+    .ref-list { font-size: 12px; color: #4b5563; margin-top: 8px; }
   </style>
 </head>
 <body>
   <div class="card">
     <div id="loading">正在加载任务信息...</div>
     <div id="content" style="display:none;">
-      <div class="title" id="tplName"></div>
-      <div class="meta">提交人：<span id="memberName"></span> · 周期：<span id="periodKey"></span> · 状态：<span class="badge" id="instStatus"></span></div>
-      <div class="meta">截止时间：<span id="deadlineAt"></span></div>
-      <div id="dynamicArea"></div>
-      <div class="field" id="noteField" style="display:none;">
-        <label for="noteInput">备注说明（选填）</label>
-        <textarea id="noteInput" rows="2" placeholder="请输入补充说明"></textarea>
+      <div class="topbar">
+        <span class="dot"></span>
+        <span class="tname" id="tplName"></span>
+        <span class="chan">H5 专属通道</span>
       </div>
-      <button class="btn" id="submitBtn" type="button">确认提交</button>
+      <div class="task-head">
+        <div class="row1">
+          <span class="title" id="headTitle"></span>
+          <span class="deadline" id="headDeadline"></span>
+        </div>
+        <div class="desc" id="headDesc"></div>
+        <div class="meta">提交人：<span id="memberName"></span> · 周期：<span id="periodKey"></span> · 状态：<span class="badge" id="instStatus"></span></div>
+      </div>
+      <div id="dynamicArea"></div>
+      <div class="block" id="noteField" style="display:none;">
+        <div class="block-head"><span class="ico" style="background:#ecfdf5;color:#059669">✎</span><span class="name">备注说明（选填）</span></div>
+        <div class="field"><textarea id="noteInput" rows="3" placeholder="请输入补充说明"></textarea></div>
+      </div>
+      <button class="btn" id="submitBtn" type="button">提交上传</button>
     </div>
     <div id="msgBox" class="msg"></div>
   </div>
@@ -77,7 +103,13 @@
           document.getElementById("periodKey").textContent = data.instance.period_key;
           const STATUS_TEXT = { pending: "待提交", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期" };
           document.getElementById("instStatus").textContent = STATUS_TEXT[data.instance.status] || data.instance.status;
-          document.getElementById("deadlineAt").textContent = data.instance.deadline_at;
+
+          /* 顶部任务卡：标题 + 截止徽章 + 提醒正文（与预览版式一致） */
+          document.getElementById("headTitle").textContent = data.template.name;
+          const dl = String(data.instance.deadline_at || "");
+          const hhmm = dl.length >= 16 ? dl.slice(11, 16) : dl;
+          document.getElementById("headDeadline").textContent = "截止 " + hhmm;
+          document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
           const area = document.getElementById("dynamicArea");
           const spec = data.template.spec_json || {};
@@ -86,26 +118,65 @@
             : (data.template.kind === "form" ? ["fields"] : []);
           let textModuleOn = false;
 
-          function addLabel(text) {
-            const lbl = document.createElement("label");
-            lbl.textContent = text;
-            return lbl;
+          /* 统一的模块卡片：图标 + 标题 + 右侧提示 + 内容区 */
+          function makeBlock(title, icon, iconColor, hint) {
+            const block = document.createElement("div");
+            block.className = "block";
+            const head = document.createElement("div");
+            head.className = "block-head";
+            const ico = document.createElement("span");
+            ico.className = "ico";
+            ico.textContent = icon;
+            ico.style.background = iconColor[0];
+            ico.style.color = iconColor[1];
+            const name = document.createElement("span");
+            name.className = "name";
+            name.textContent = title;
+            head.appendChild(ico);
+            head.appendChild(name);
+            if (hint) {
+              const h = document.createElement("span");
+              h.className = "hint";
+              h.textContent = hint;
+              head.appendChild(h);
+            }
+            block.appendChild(head);
+            area.appendChild(block);
+            const body = document.createElement("div");
+            body.className = "field";
+            block.appendChild(body);
+            return body;
           }
 
-          /* 图片 / 文件模块：可多选，逐个上传换取 ref */
-          function makeUploadField(labelText, accept) {
-            const wrap = document.createElement("div");
-            wrap.className = "field";
-            wrap.appendChild(addLabel(labelText));
+          /* 图片 / 文件模块：可多选，逐个上传换取 ref。
+             ⚠️ 每个模块各自维护自己的 ref 列表（moduleRefs），最后合并成 uploadedRefs ——
+             以前共用一个数组、每次 change 都清空，导致「先选图片再选文件」会把图片丢掉。 */
+          const moduleRefs = {};
+          function syncRefs() {
+            uploadedRefs = [];
+            Object.keys(moduleRefs).forEach((k) => { uploadedRefs = uploadedRefs.concat(moduleRefs[k]); });
+          }
+          function makeUploadBlock(title, icon, iconColor, hint, accept, previewImages, moduleKey) {
+            const body = makeBlock(title, icon, iconColor, hint);
+            const label = document.createElement("label");
+            label.className = "upload-box";
+            label.textContent = title.indexOf("图片") >= 0 ? "＋ 拍照 / 选图" : "⇧ 点击选择手机中的表格或文档上传";
             const fileInp = document.createElement("input");
             fileInp.type = "file";
             fileInp.multiple = true;
             if (accept) fileInp.accept = accept;
+            label.appendChild(fileInp);
+            body.appendChild(label);
             const refList = document.createElement("div");
             refList.className = "ref-list";
+            const thumbRow = document.createElement("div");
+            thumbRow.className = "thumb-row";
+            body.appendChild(refList);
+            if (previewImages) body.appendChild(thumbRow);
             fileInp.addEventListener("change", async () => {
-              uploadedRefs = [];
+              const myRefs = [];
               refList.textContent = "";
+              thumbRow.innerHTML = "";
               for (const f of fileInp.files) {
                 const fd = new FormData();
                 fd.append("token", token);
@@ -114,29 +185,37 @@
                   const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
                   const res = await r.json();
                   if (!r.ok) { showMsg(res.message || "上传失败", "error"); return; }
-                  uploadedRefs.push(res.ref);
+                  myRefs.push(res.ref);
                   const line = document.createElement("div");
                   line.textContent = "已上传：" + (res.file_name || res.ref);
                   refList.appendChild(line);
+                  if (previewImages) {
+                    const img = document.createElement("img");
+                    img.className = "thumb";
+                    img.src = URL.createObjectURL(f);
+                    thumbRow.appendChild(img);
+                  }
                 } catch (e) {
                   showMsg("上传网络异常", "error");
                   return;
                 }
               }
+              moduleRefs[moduleKey] = myRefs;
+              syncRefs();
             });
-            wrap.appendChild(fileInp);
-            wrap.appendChild(refList);
-            area.appendChild(wrap);
           }
 
           if (data.template.kind === "form") {
             /* 字段模块 */
             if (modules.includes("fields")) {
               const fields = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
+              const body = makeBlock("数据报数填报", "#", ["#eef2ff", "#4f46e5"], "数值报数");
               fields.forEach(f => {
                 const wrap = document.createElement("div");
-                wrap.className = "field";
-                wrap.appendChild(addLabel(f.label + (f.required ? " *" : "")));
+                wrap.style.marginBottom = "10px";
+                const lbl = document.createElement("label");
+                lbl.textContent = f.label + (f.required ? " *" : "");
+                wrap.appendChild(lbl);
                 let inp;
                 if (f.type === "select" && Array.isArray(f.options)) {
                   inp = document.createElement("select");
@@ -153,31 +232,34 @@
                 } else {
                   inp = document.createElement("input");
                   inp.type = f.type === "number" ? "number" : (f.type === "date" ? "date" : "text");
-                  if (f.type === "number") inp.step = "any";
+                  if (f.type === "number") { inp.step = "any"; inp.placeholder = "请输入具体数值（如：18）"; }
                 }
                 inp.dataset.fieldKey = f.key;
                 wrap.appendChild(inp);
-                area.appendChild(wrap);
+                body.appendChild(wrap);
               });
             }
             /* 文字说明模块（复用备注输入框） */
             if (modules.includes("text")) {
               textModuleOn = true;
-              const wrap = document.createElement("div");
-              wrap.className = "field";
-              wrap.appendChild(addLabel(spec.text_label || "文字情况说明"));
+              const body = makeBlock(spec.text_label || "文字情况说明", "≡", ["#ecfdf5", "#059669"], "");
               const ta = document.createElement("textarea");
               ta.id = "noteInput";
               ta.rows = 4;
               ta.placeholder = spec.text_placeholder || "请填写补充说明…";
-              wrap.appendChild(ta);
-              area.appendChild(wrap);
+              body.appendChild(ta);
             }
-            /* 图片 / 文件模块 */
-            if (modules.includes("image")) makeUploadField("图片上传（可多选）", "image/*");
-            if (modules.includes("file")) makeUploadField("文件上传（可多选）", "");
+            if (modules.includes("image")) {
+              makeUploadBlock("图片上传（现场拍照 / 晒图）", "🖼", ["#eff6ff", "#2563eb"], "支持 JPG/PNG", "image/*", true, "image");
+            }
+            if (modules.includes("file")) {
+              makeUploadBlock("文件附件上传", "📎", ["#f5f3ff", "#7c3aed"], "Excel / PDF / Word", "", false, "file");
+            }
           } else {
-            makeUploadField(data.template.kind === "image" ? "上传图片 *" : "上传文件 *", "");
+            makeUploadBlock(
+              data.template.kind === "image" ? "上传图片 *" : "上传文件 *",
+              "📎", ["#f5f3ff", "#7c3aed"], "", data.template.kind === "image" ? "image/*" : "", data.template.kind === "image", "single",
+            );
           }
           /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
           if (data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";

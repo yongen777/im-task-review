@@ -772,6 +772,9 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
+          /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
+             导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
+          need_review: kind === 'notice' ? false : requireReview,
           /* 通知类模板的每个提醒时刻都存在 notice_times，界面上只有一个「执行时间」输入框，
              必须显式映射过去，否则改了时间不会真的改发送时刻（后端对该类模板忽略 remind_at）。 */
           ...(kind === 'notice'
@@ -796,6 +799,7 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
+          need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null }
             : {}),
@@ -863,7 +867,7 @@ export const TemplatesView: React.FC = () => {
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            支持「纯通知提醒」与「上传任务（发送提醒文本 + 专属 H5 上传链接）」两大类任务配置。
+            支持「通知提醒」与「上传任务（发送提醒文本 + 专属 H5 上传链接）」两大类任务配置。
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
@@ -914,7 +918,7 @@ export const TemplatesView: React.FC = () => {
               className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 text-xs font-medium text-slate-700 outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
             >
               <option value="">全部任务类型</option>
-              <option value="notice">纯通知提醒</option>
+              <option value="notice">通知提醒</option>
               <option value="upload">上传任务（H5链接反馈）</option>
             </select>
 
@@ -995,7 +999,7 @@ export const TemplatesView: React.FC = () => {
                         {isNotice ? (
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-amber-50 text-amber-700 border-amber-200 text-xs font-semibold">
                             <Bell className="w-3.5 h-3.5 shrink-0" />
-                            <span>纯通知提醒</span>
+                            <span>通知提醒</span>
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-blue-50 text-blue-700 border-blue-200 text-xs font-semibold">
@@ -1043,25 +1047,30 @@ export const TemplatesView: React.FC = () => {
                                         >
                                           {ni.text_content}
                                         </div>
+                                      ) : ni.image_path ? (
+                                        <a
+                                          href={`/api/admin/template-assets/${encodeURIComponent(
+                                            String(ni.image_path).split('/').pop() || '',
+                                          )}`}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="inline-flex items-center gap-2 group"
+                                          title="点击查看原图"
+                                        >
+                                          <img
+                                            src={`/api/admin/template-assets/${encodeURIComponent(
+                                              String(ni.image_path).split('/').pop() || '',
+                                            )}`}
+                                            alt={ni.file_name || '数据图片'}
+                                            className="w-12 h-12 rounded-lg object-cover border border-slate-200"
+                                          />
+                                          <span className="text-[11px] text-indigo-700 font-medium group-hover:underline">
+                                            点击查看图片
+                                          </span>
+                                        </a>
                                       ) : (
-                                        <div className="space-y-1">
-                                          {ni.file_name && (
-                                            <div className="inline-flex items-center gap-1 text-indigo-700 font-mono font-medium text-[11px]">
-                                              <Paperclip className="w-3.5 h-3.5 shrink-0" />
-                                              <span className="truncate max-w-md">
-                                                {ni.file_name}
-                                              </span>
-                                            </div>
-                                          )}
-                                          {ni.file_caption && (
-                                            <div
-                                              className={`text-slate-600 leading-relaxed ${
-                                                isExpanded ? 'whitespace-pre-line' : 'line-clamp-1'
-                                              }`}
-                                            >
-                                              {ni.file_caption}
-                                            </div>
-                                          )}
+                                        <div className="text-[11px] text-rose-600 font-semibold">
+                                          未上传图片（编辑模板后可上传）
                                         </div>
                                       )}
                                     </div>
@@ -1333,7 +1342,7 @@ export const TemplatesView: React.FC = () => {
                         }}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:opacity-65 disabled:cursor-not-allowed font-semibold"
                       >
-                        <option value="notice">纯通知提醒</option>
+                        <option value="notice">通知提醒</option>
                         <option value="upload">上传任务（提醒文本 + H5链接上传）</option>
                       </select>
                     </div>

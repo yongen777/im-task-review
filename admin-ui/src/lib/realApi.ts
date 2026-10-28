@@ -135,14 +135,20 @@ function tplToMock(t: any): TemplateItem {
   dataKeysCache.set(t.template_id, t.data_keys || []);
   const spec: any = {};
   if ((t.kind || '') === 'notice') {
-    spec.notice_items = [];
-    spec.notice_items.push({ id: 'n_text', format: 'text', text_content: t.text_tpl || '' });
-    if (t.attach_image) {
+    /* 2026-10-28 修复：以前这里凭空造一条「数据看板.png + 当日数据看板（到点自动生成并推送）」，
+       既不是真实上传的文件、也没有任何链接，纯假数据。现在只按真实配置还原：
+       文本项来自 spec_json（没有就退回 text_tpl），图片项只在真的上传过 attach_image_path 时才出现。 */
+    const savedItems = Array.isArray(t.spec_json?.notice_items) ? t.spec_json.notice_items : [];
+    const textItems = savedItems.filter((it: any) => it && it.format === 'text');
+    spec.notice_items = textItems.length
+      ? textItems.map((it: any) => ({ id: it.id || 'n_text', format: 'text', text_content: it.text_content || '' }))
+      : [{ id: 'n_text', format: 'text', text_content: t.text_tpl || '' }];
+    if (t.attach_image_path) {
       spec.notice_items.push({
         id: 'n_file',
         format: 'file',
-        file_name: '数据看板.png',
-        file_caption: '当日数据看板（到点自动生成并推送）',
+        file_name: String(t.attach_image_path).split('/').pop() || '数据图片',
+        image_path: t.attach_image_path,
       });
     }
   } else {
@@ -228,6 +234,7 @@ function tplFromMock(t: any, partial = false) {
     if (t.enabled !== undefined) out.enabled = t.enabled !== false;
     if (t.attach_image !== undefined) out.attach_image = !!t.attach_image;
     if (t.attach_image_path !== undefined) out.attach_image_path = t.attach_image_path || null;
+    if (t.need_review !== undefined) out.need_review = !!t.need_review;
     if (t.data_keys !== undefined) out.data_keys = t.data_keys;
     applySpec();
     return out;
@@ -247,6 +254,7 @@ function tplFromMock(t: any, partial = false) {
   out.period = t.period || 'day';
   out.attach_image = attach;
   out.attach_image_path = t.attach_image_path || null;
+  out.need_review = t.need_review !== undefined ? !!t.need_review : false;
   out.data_keys = t.data_keys || [];
   out.enabled = t.enabled !== false;
   applySpec();
@@ -471,7 +479,10 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
     return {
       ok: true,
       instance: d.instance ? instToMock(d.instance) : instToMock(d),
+      /* 2026-10-28：后端给的是归一化后的 submission（字段标签 + 附件清单），
+         之前这里读 d.submission 但后端只返回 submissions 数组，详情页永远显示「尚未产生提交」。 */
       submission: d.submission || null,
+      template: d.template || null,
       reminders: (d.reminders || d.items || []).map(remToMock),
     } as unknown as T;
   }

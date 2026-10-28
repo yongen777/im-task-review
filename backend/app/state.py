@@ -1285,11 +1285,17 @@ class StateStore:
                 f"UPDATE task_instance SET status = 'overdue' WHERE status = 'pending' AND deadline_at < ? AND {not_notice}",
                 (now_s,),
             )
+            # 通知类：当天 23:59 过了还没发出去的，标成 expired（未送达），避免永久 pending
+            c_n = self.conn.execute(
+                "UPDATE task_instance SET status = 'expired' WHERE status = 'pending' AND deadline_at < ? "
+                "AND template_id IN (SELECT template_id FROM task_template WHERE kind = 'notice')",
+                (now_s,),
+            )
             c2 = self.conn.execute(
                 f"UPDATE task_instance SET status = 'expired' WHERE status = 'overdue' AND deadline_at < ? AND {not_notice}",
                 (cutoff_72h,),
             )
-            to_expired = int(c2.rowcount or 0)
+            to_expired = int(c2.rowcount or 0) + int(c_n.rowcount or 0)
             for r in self.conn.execute("SELECT id, deadline_at, reviewed_at FROM task_instance WHERE status = 'rejected'").fetchall():
                 if calc_resubmit_deadline(r["deadline_at"], r["reviewed_at"]) < now_s:
                     c3 = self.conn.execute("UPDATE task_instance SET status = 'expired' WHERE id = ? AND status = 'rejected'", (int(r["id"]),))

@@ -277,18 +277,30 @@ def test_notice_creates_instance_and_marks_sent():
     assert len(notifier.sent_messages) == 1
 
 
-def test_notice_instance_not_created_before_trigger_and_disabled():
-    """未到点不产生实例；停用模板也不产生实例。"""
+def test_notice_instance_pending_before_trigger_and_disabled_skips():
+    """2026-10-28 调整：未到点也按天预生成实例（pending「待提醒」），停用模板则不生成。"""
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=False)
     store.upsert_delivery_target("13800000001", "ext_user_001")
 
     early = _scheduler_at(store, 7, 0)  # 07:00 早于 08:00
     early.run_once()
-    assert store.list_instances_for_period(tpl_id, PKEY) == []
+    instances = store.list_instances_for_period(tpl_id, PKEY)
+    assert len(instances) == 1
+    assert instances[0]["status"] == "pending"  # 待提醒，还没发
 
-    # 停用后再到点，也不应产生实例
+    # 停用后再调度，不再新增实例（原有那条保持不动）
     store.update_template(tpl_id, {"enabled": False}, actor="t3")
+    _scheduler_at(store, 8, 5).run_once()
+    assert len(store.list_instances_for_period(tpl_id, PKEY)) == 1
+
+
+def test_disabled_notice_template_creates_no_instance():
+    store = _mk_store()
+    tpl_id = _setup_notice_tpl(store, attach_image=False)
+    store.upsert_delivery_target("13800000001", "ext_user_001")
+    store.update_template(tpl_id, {"enabled": False}, actor="t3")
+
     _scheduler_at(store, 8, 5).run_once()
     assert store.list_instances_for_period(tpl_id, PKEY) == []
 

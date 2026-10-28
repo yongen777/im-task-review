@@ -147,16 +147,29 @@ export interface TaskInstanceItem {
   created_at: string;
 }
 
+export interface SubmissionAttachment {
+  ref: string;
+  file_name: string;
+  mime: string;
+  size: number;
+  is_image: boolean;
+  url: string;
+}
+
 export interface SubmissionData {
   id?: number;
   instance_id?: number;
   kind?: TemplateKind;
   form_values?: Record<string, string | number>;
+  /** 带中文标签的字段明细（后端按模板 schema 映射好） */
+  fields?: Array<{ key: string; label: string; value: string }>;
   note?: string;
+  attachments?: SubmissionAttachment[];
   attachment_ref?: string | null;
   attachment_name?: string | null;
   attachment_size?: number | null;
   submitted_at?: string;
+  status?: string;
 }
 
 export interface ReminderLogItem {
@@ -179,6 +192,13 @@ export interface TaskInstanceDetail {
   instance: TaskInstanceItem;
   submission: SubmissionData | null;
   reminders: ReminderLogItem[];
+  /** 模板快照（详情页用来把字段 key 还原成中文标签） */
+  template?: {
+    name?: string;
+    kind?: string;
+    schema_json?: Array<{ key: string; label: string }>;
+    [k: string]: unknown;
+  } | null;
 }
 
 export interface InstanceStats {

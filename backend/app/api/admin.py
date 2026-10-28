@@ -1025,11 +1025,65 @@ def create_admin_router(state: StateStore) -> APIRouter:
             if inst.get("status") == "rejected"
             else None
         )
+
+        # 2026-10-28：详情页要能直接看到「字段 / 文字说明 / 图片 / 文件」，
+        # 前端只需要一份归一化的 submission（含每个附件的文件名、类型、能否预览）。
+        latest = submissions[-1] if submissions else None
+        submission_view = None
+        if latest:
+            try:
+                form_values = json.loads(latest.get("fields_json") or "{}") or {}
+            except Exception:
+                form_values = {}
+            refs: List[str] = []
+            if latest.get("refs_json"):
+                try:
+                    refs = [str(r) for r in (json.loads(latest["refs_json"]) or [])]
+                except Exception:
+                    refs = []
+            if not refs and latest.get("file_ref"):
+                refs = [str(latest["file_ref"])]
+            attachments: List[Dict[str, Any]] = []
+            fields_meta: List[Dict[str, Any]] = []
+            for r in refs:
+                up = state.get_upload_ref(r)
+                if not up:
+                    continue
+                mime = str(up.get("mime") or "")
+                attachments.append({
+                    "ref": up["ref"],
+                    "file_name": up.get("file_name") or up["ref"],
+                    "mime": mime,
+                    "size": int(up.get("size") or 0),
+                    "is_image": mime.startswith("image/"),
+                    "url": f"/api/admin/uploads/{up['ref']}",
+                })
+            # 字段标签用模板 schema 映射回中文名，前端不用再自己去查
+            label_map = {}
+            for f in (tpl.get("schema_json") or []) if tpl else []:
+                if isinstance(f, dict) and f.get("key"):
+                    label_map[str(f["key"])] = str(f.get("label") or f["key"])
+            for k, v in (form_values or {}).items():
+                fields_meta.append({"key": str(k), "label": label_map.get(str(k), str(k)), "value": "" if v is None else str(v)})
+            submission_view = {
+                "id": latest.get("id"),
+                "instance_id": latest.get("instance_id"),
+                "form_values": form_values,
+                "fields": fields_meta,
+                "note": latest.get("note") or "",
+                "attachments": attachments,
+                "attachment_ref": latest.get("file_ref"),
+                "attachment_name": latest.get("file_name"),
+                "submitted_at": latest.get("created_at"),
+                "status": latest.get("status"),
+            }
+
         return {
             "ok": True,
             "instance": inst,
             "template": tpl,
             "submissions": submissions,
+            "submission": submission_view,
             "reminders": reminders,
         }
 
