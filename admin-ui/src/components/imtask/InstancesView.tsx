@@ -972,7 +972,7 @@ export const InstancesView: React.FC = () => {
                           </div>
                         )}
 
-                        {/* 2026-10-28：图片与文件分两行单独展示；图片优先在线查看，文件给「在线查看 + 下载」 */}
+                        {/* 2026-10-28：图片与文件分两行单独展示；图片可点开在线查看，文件只给「下载」 */}
                         {(() => {
                           const imgs = attachments.filter((a) => a.is_image);
                           const files = attachments.filter((a) => !a.is_image);
