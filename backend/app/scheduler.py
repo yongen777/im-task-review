@@ -221,6 +221,7 @@ class ZdxlzImageSender:
                 mime_type = "image/png" if str(file_path).lower().endswith(".png") else "image/jpeg"
             file_key = self.channel.upload_media(path_to_use, category=1)
             width, height = self.channel._read_image_size(path_to_use)
+            file_size = os.path.getsize(path_to_use)
         finally:
             if upload_path:
                 try:
@@ -231,7 +232,20 @@ class ZdxlzImageSender:
             from .channels.zdxlz import ChannelError
 
             raise ChannelError(f"读取图片宽高失败: {file_path}")
-        return {"file_key": file_key, "width": int(width), "height": int(height), "mime_type": mime_type}
+        # 2026-10-29 D/E/F 实测修复：name/size/ext 必须随 image 消息 content 一起发，
+        # 客户端凭它们识别图片（缺省时手机点击转圈、PC 走文件下载）。
+        # name 用原文件名主名 + 实际上传格式后缀，保证可读且扩展名与真实文件一致。
+        file_ext = "jpg" if upload_path else (Path(file_path).suffix.lstrip(".").lower() or "png")
+        file_name = f"{Path(file_path).stem or '数据看板'}.{file_ext}"
+        return {
+            "file_key": file_key,
+            "width": int(width),
+            "height": int(height),
+            "mime_type": mime_type,
+            "file_name": file_name,
+            "file_size": int(file_size),
+            "file_ext": file_ext,
+        }
 
     def send_image_prepared(self, receive_id: str, prepared: Dict[str, Any], idem_key: str) -> SendResult:
         return self.channel.send_image(
@@ -243,6 +257,9 @@ class ZdxlzImageSender:
             alt_text="数据看板",
             push_content="你收到一条数据看板",
             idem_key=idem_key,
+            file_name=prepared.get("file_name"),
+            file_size=prepared.get("file_size"),
+            file_ext=prepared.get("file_ext"),
         )
 
 
@@ -528,7 +545,7 @@ class Scheduler:
                 if data_keys:
                     snap_values = self.state.get_data_snapshot_values(tpl["template_id"], p_key)
 
-                # 2026-10-28 方案A（按业务方新要求调整）：通知类**当天一进来就按人生成实例**（pending），
+                # 2026-10-28 方案A（按郑工新要求调整）：通知类**当天一进来就按人生成实例**（pending），
                 # 到点发出后置 sent。这样「任务实例」页能看到今天所有通知归了谁，
                 # 不会只剩已完成的那几条。deadline 用当天 23:59 占位，不参与 overdue 流转；
                 # 到当天结束仍未发出的，由 advance_instance_statuses 标成 expired（未送达）。

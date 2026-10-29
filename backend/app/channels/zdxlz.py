@@ -411,8 +411,13 @@ class ZdxlzChannel:
 
         流程（官方《媒体文件上传与下载》）：
         1) POST /files/upload/init          -> parts[].uploadUrl（预签名）+ uploadId
-        2) PUT  uploadUrl（octet-stream，⛔ 不带 Authorization）-> 响应头 ETag
+        2) PUT  uploadUrl（Content-Type 传真实 mime，⛔ 不带 Authorization）-> 响应头 ETag
         3) POST /files/upload/{uploadId}/complete -> data.fileKey
+
+        2026-10-29 修复：预签名 PUT 的 Content-Type 会被 S3 存成对象元数据，
+        下载时原样返回 ——之前写死 octet-stream，手机端图片组件因
+        Content-Type=application/octet-stream 无法识别而转圈重试。
+        现在与 init 的 mimeType 保持一致（_MIME_BY_EXT）。
         注意：complete 提交的 etag 必须保留响应头中的引号。
         """
         if not self.configured:
@@ -442,7 +447,8 @@ class ZdxlzChannel:
         if not upload_id or not parts:
             raise ChannelError(f"upload init 响应缺失 uploadId/parts: {resp.text}")
 
-        # 2) 按分片上传（预签名地址，octet-stream，不带开放平台 Authorization）
+        # 2) 按分片上传（预签名地址，Content-Type=真实 mime，不带开放平台 Authorization）
+        #    实测：S3 会把这个头存为对象元数据，下载 Content-Type 由此决定（A/B 实验已验证）。
         completed: list = []
         for part in parts:
             part_no = int(part["partNumber"])
@@ -454,7 +460,7 @@ class ZdxlzChannel:
             put_resp = self._client.put(
                 upload_url,
                 content=chunk,
-                headers={"Content-Type": "application/octet-stream"},
+                headers={"Content-Type": mime},
                 timeout=120.0,
             )
             if put_resp.status_code not in (200, 201, 204):
@@ -492,12 +498,21 @@ class ZdxlzChannel:
         alt_text: str = "数据看板",
         push_content: str = "你收到一条数据看板",
         idem_key: str = "",
+        file_name: Optional[str] = None,
+        file_size: Optional[int] = None,
+        file_ext: Optional[str] = None,
     ) -> SendResult:
         """发送单聊图片消息（官方《机器人消息发送和接收类型》image 消息）。
 
-        - content: {"fileId": file_key, "width": w, "height": h, "mimeType": mime_type, "altText": alt_text}
+        - content: {"fileId", "width", "height", "mimeType", "altText", "name", "size", "ext"}
         - 成功判定与 send_text 一致（success==true || code==0 || code==200）
         - HTTP 500（无会话）同样置 need_activate=True
+
+        2026-10-29 实测修复（D/E/F 对照实验）：content 里显式携带的 name/size/ext
+        会被服务端原样透传给客户端，客户端凭 ext/size 识别图片；
+        只发 mimeType 时客户端收到 ext=""、size=0、name="fileId."，
+        手机端无法识别为图片（点击转圈），PC 端走「接收文件」下载流程。
+        因此 image 消息务必带全 name/size/ext 三个字段。
         """
         if not self.configured:
             return SendResult(False, "failed", None, False, False, error="CHANNEL_UNCONFIGURED")
@@ -517,13 +532,21 @@ class ZdxlzChannel:
                 "X-Client-Id": self.config.app_id,
                 "Content-Type": "application/json; charset=utf-8",
             }
-            content = {
+            content: Dict[str, Any] = {
                 "fileId": str(file_key),
                 "width": int(width),
                 "height": int(height),
                 "mimeType": str(mime_type),
                 "altText": str(alt_text),
             }
+            # D/E/F 实验结论：这三个字段是客户端识别图片的关键（服务端原样透传）。
+            # 未传时回退旧口径，保证兼容；生产链路 ZdxlzImageSender 总是会传齐。
+            if file_name is not None:
+                content["name"] = str(file_name)
+            if file_size is not None:
+                content["size"] = int(file_size)
+            if file_ext is not None and str(file_ext).strip():
+                content["ext"] = str(file_ext).strip().lstrip(".").lower()
             body = {
                 "receive_id": str(receive_id),
                 "msg_type": "image",
