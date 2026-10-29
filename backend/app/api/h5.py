@@ -343,9 +343,14 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
     # 且 32KB 的图要 5s+ 才下发完，手机端量子密信的图片消息一直转圈打不开（PC 端因有缓存才正常）。
     # 这里提供一条我们自己的直链：文件名是 uuid4（不可枚举），Content-Type 由扩展名推断，
     # 同域同端口，员工手机点开即看。仅供兜底，不影响原有图片消息。
+    #
+    # 2026-10-29 下午 H5 图文页改造（用户确认方案）：
+    # - 不带 ?raw=1 时返回 HTML 页面：标题 = 发布时写入的同名 .title 文件（管理员填的图片名称），
+    #   页面内 <img> 指向本 URL 的 ?raw=1 原图；无 .title 文件（旧直链）回退「数据图片」。
+    # - ?raw=1 时返回原始图片字节（保留给直接引图的场景）。
     @router.get("/h5/img/{name}")
-    async def h5_public_image(name: str):
-        if FileResponse is None:  # pragma: no cover
+    async def h5_public_image(name: str, raw: Optional[str] = None):
+        if FileResponse is None or HTMLResponse is None:  # pragma: no cover
             return JSONResponse(status_code=500, content={"code": "UNAVAILABLE", "message": "服务未就绪"})
         clean = (name or "").strip().lower()
         if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png)", clean):
@@ -354,7 +359,44 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
         target = (img_dir / clean).resolve()
         if not target.is_file() or not target.is_relative_to(img_dir):
             return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
-        return FileResponse(str(target), headers={"Cache-Control": "public, max-age=86400"})
+        if (raw or "").strip().lower() in ("1", "true", "yes"):
+            return FileResponse(str(target), headers={"Cache-Control": "public, max-age=86400"})
+        # H5 图文页：标题取发布时写入的同名 .title 文件（管理员填写的图片名称）
+        title = "数据图片"
+        try:
+            title_file = img_dir / f"{clean}.title"
+            if title_file.is_file():
+                t = title_file.read_text(encoding="utf-8").strip()
+                if t:
+                    title = t
+        except OSError:  # noqa: BLE001
+            pass
+        import html as _html
+        safe_title = _html.escape(title)
+        src_url = f"/h5/img/{clean}?raw=1"
+        page = (
+            "<!DOCTYPE html>\n"
+            "<html lang=\"zh-CN\">\n"
+            "<head>\n"
+            "<meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\">\n"
+            f"<title>{safe_title}</title>\n"
+            "<style>\n"
+            "html,body{margin:0;padding:0;background:#0f172a;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;}\n"
+            ".wrap{max-width:860px;margin:0 auto;padding:18px 14px 40px;box-sizing:border-box;}\n"
+            ".title{color:#e2e8f0;font-size:17px;font-weight:600;line-height:1.5;margin:2px 4px 14px;word-break:break-all;}\n"
+            "img{display:block;width:100%;height:auto;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.35);background:#fff;}\n"
+            "</style>\n"
+            "</head>\n"
+            "<body>\n"
+            "<div class=\"wrap\">\n"
+            f"<div class=\"title\">{safe_title}</div>\n"
+            f"<img src=\"{src_url}\" alt=\"{safe_title}\" loading=\"lazy\">\n"
+            "</div>\n"
+            "</body>\n"
+            "</html>\n"
+        )
+        return HTMLResponse(content=page)
 
     @router.post("/api/h5/bind")
     async def api_h5_bind(request: Request):

@@ -289,6 +289,8 @@ class Database:
             _ensure_column(self.conn, "submission", "refs_json", "TEXT")
             # 2026-10-28 通知类「数据图片提醒」：管理员上传图片，到点直接随消息推送
             _ensure_column(self.conn, "task_template", "attach_image_path", "TEXT")
+            # 2026-10-29 H5 图文页：管理员填写的图片名称（描述），用于直链文案与 H5 页面标题
+            _ensure_column(self.conn, "task_template", "attach_image_name", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
 

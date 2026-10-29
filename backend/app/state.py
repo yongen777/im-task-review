@@ -666,6 +666,7 @@ class StateStore:
             "deadline_offset": int(d.get("deadline_offset") or 0), "need_review": bool(d.get("need_review", 0)),
             "max_file_mb": d.get("max_file_mb"), "enabled": bool(d.get("enabled", 1)), "deleted": bool(d.get("deleted", 0)),
             "attach_image": bool(d.get("attach_image", 0)), "attach_image_path": d.get("attach_image_path"),
+            "attach_image_name": d.get("attach_image_name"),
             "data_keys": data_keys, "spec_json": spec_json,
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
@@ -808,6 +809,9 @@ class StateStore:
             data_keys_norm.append({"key": k, "label": label, "unit": str(item.get("unit") or "").strip()})
         # 2026-10-28 通知类「数据图片提醒」：管理员上传的图片/文件路径（相对 data 目录）
         attach_image_path = str(merged.get("attach_image_path") or "").strip() or None
+        # 2026-10-29 H5 图文页：图片名称（描述）——用于直链文案与 H5 页面标题。
+        # 前端已做必填校验；后端不强校非空，兼容老模板启停等不带名称的更新路径。
+        attach_image_name = str(merged.get("attach_image_name") or "").strip() or None
         if attach_image_path:
             # 2026-10-29 P2-1：附图路径必须落在 data 目录内，挡住 ../ 与绝对路径越界读取
             if ".." in attach_image_path.replace("\\", "/"):
@@ -862,6 +866,7 @@ class StateStore:
             "anchor_weekday": anchor_weekday, "anchor_dom": anchor_dom, "deadline_offset": deadline_offset,
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
+            "attach_image_name": attach_image_name,
             "data_keys": data_keys_str,
             "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
@@ -872,14 +877,14 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
-                    norm["data_keys"], norm["spec_json"],
+                    norm["attach_image_name"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], actor, now_s, now_s,
                 ),
             )
@@ -921,12 +926,12 @@ class StateStore:
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
                     norm["anchor_dom"], norm["deadline_offset"], norm["need_review"], norm["max_file_mb"],
-                    norm["attach_image"], norm["attach_image_path"], norm["data_keys"], norm["spec_json"],
+                    norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], now_s, clean_id,
                 ),
             )

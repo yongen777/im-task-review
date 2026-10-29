@@ -231,7 +231,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                   </span>
                 )}
               </div>
-              {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
+              {/* 2026-10-28：按郑工要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
               <div className="text-[11px] text-slate-500">
                 提交人：张三 · 周期：{new Date().toISOString().slice(0, 10)} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
               </div>
@@ -523,7 +523,18 @@ export const TemplatesView: React.FC = () => {
 
     if (tpl.kind === 'notice') {
       if (Array.isArray(tpl.spec?.notice_items) && tpl.spec.notice_items.length > 0) {
-        setNoticeItems(tpl.spec.notice_items.map((item) => ({ ...item })));
+        const items = tpl.spec.notice_items.map((item) => ({ ...item }));
+        /* 2026-10-29 H5.5：老模板可能只有顶层 attach_image_name（或只有 spec 里的 file_caption），
+           两处都回填到 file 项的 file_caption，保证编辑框能显示已存的图片名称 */
+        const savedName = String(tpl.attach_image_name ?? '').trim();
+        if (savedName) {
+          for (const it of items) {
+            if (it.format === 'file' && !String(it.file_caption ?? '').trim()) {
+              it.file_caption = savedName;
+            }
+          }
+        }
+        setNoticeItems(items);
       } else {
         setNoticeItems([
           {
@@ -629,6 +640,8 @@ export const TemplatesView: React.FC = () => {
            避免这条路径上把 need_review / 附图配置写丢。 */
         need_review: tpl.need_review,
         attach_image_path: tpl.attach_image_path ?? null,
+        /* 2026-10-29 H5.5：启停也带上图片名称，防写丢 */
+        attach_image_name: tpl.attach_image_name ?? null,
       });
       await refreshTemplates();
       toast.success(
@@ -675,6 +688,15 @@ export const TemplatesView: React.FC = () => {
           toast.warning(
             `第 ${i + 1} 条勾选了「数据图片提醒」，请先上传要推送的图片`,
             '缺少提醒图片',
+          );
+          return;
+        }
+        /* 2026-10-29 H5.5：上传了图片就必须填写图片名称（描述），
+           否则发送时直链文案与 H5 页面标题没有名字可用 */
+        if (item.format === 'file' && item.image_path && !item.file_caption?.trim()) {
+          toast.warning(
+            `第 ${i + 1} 条已上传图片，请填写「图片名称（描述）」才能保存`,
+            '缺少图片名称',
           );
           return;
         }
@@ -734,6 +756,9 @@ export const TemplatesView: React.FC = () => {
     /* 通知类：取第一条已上传的「数据图片提醒」图片，作为到点直接推送的附件 */
     const noticeImagePath =
       noticeItems.find((ni) => ni.format === 'file' && ni.image_path)?.image_path || '';
+    /* 2026-10-29 H5.5：图片名称（描述）——发送直链文案与 H5 页标题用 */
+    const noticeImageName =
+      noticeItems.find((ni) => ni.format === 'file' && ni.image_path)?.file_caption?.trim() || '';
 
     setSaving(true);
     try {
@@ -754,7 +779,7 @@ export const TemplatesView: React.FC = () => {
           /* 通知类模板的每个提醒时刻都存在 notice_times，界面上只有一个「执行时间」输入框，
              必须显式映射过去，否则改了时间不会真的改发送时刻（后端对该类模板忽略 remind_at）。 */
           ...(kind === 'notice'
-            ? { notice_times: [remindAt.trim()], attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null }
+            ? { notice_times: [remindAt.trim()], attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
             : {}),
         });
         await refreshTemplates();
@@ -777,7 +802,7 @@ export const TemplatesView: React.FC = () => {
           enabled,
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
-            ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null }
+            ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
             : {}),
         });
         await refreshTemplates();
@@ -1526,8 +1551,30 @@ export const TemplatesView: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="text-[11px] text-slate-500 leading-relaxed">
-                                  到点会把这张图直接推送给成员，不需要填写任何描述文字。
+                                  到点会把这张图直接推送给成员，请填写这张图的名称（如「上午上门情况统计图」），成员点开链接后页面标题即显示该名称。
                                 </div>
+                                {item.image_path ? (
+                                  <div className="space-y-1.5">
+                                    <label className="block text-[11px] font-semibold text-slate-600">
+                                      图片名称（描述）
+                                      <span className="text-rose-600 ml-0.5">*</span>
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={item.file_caption || ''}
+                                      onChange={(e) => updateNoticeItem(idx, { file_caption: e.target.value })}
+                                      placeholder="如：上午上门情况统计图"
+                                      className={`w-full bg-white border rounded-xl px-2.5 py-2 text-slate-800 outline-none focus:border-blue-500 text-sm ${
+                                        item.file_caption?.trim() ? 'border-slate-200' : 'border-rose-300'
+                                      }`}
+                                    />
+                                    {!item.file_caption?.trim() && (
+                                      <span className="text-rose-600 text-[11px] font-semibold">
+                                        必须填写图片名称后才能保存
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : null}
                               </div>
                             )}
                           </div>
