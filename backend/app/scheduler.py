@@ -5,6 +5,8 @@ from __future__ import annotations
 import calendar
 import hashlib
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -178,14 +180,55 @@ class ZdxlzImageSender:
     def __init__(self, channel) -> None:
         self.channel = channel
 
+    @staticmethod
+    def _flatten_to_jpeg(src_path: str) -> Optional[str]:
+        """把任意图片转成「RGB baseline JPEG」（压平 alpha、丢掉 ICC/EXIF/gamma 等 chunk）。
+
+        2026-10-29：附图多是 Pillow 生成的 **RGBA PNG**，PC 端浏览器能正常显示，
+        但手机端量子密信里是「看得到缩略图、点不开大图」。移动端解码器/缩略图管线
+        对 alpha 通道和异常 chunk 更严格，统一转 JPEG 是最稳的公共分母。
+        失败（无 Pillow / 源文件损坏）返回 None，调用方回退成原图上传。
+        """
+        try:
+            from PIL import Image  # noqa: PLC0415
+
+            with Image.open(src_path) as im:
+                im.load()
+                if im.mode in ("RGBA", "LA", "P"):
+                    src = im.convert("RGBA")
+                    canvas = Image.new("RGB", src.size, (255, 255, 255))
+                    canvas.paste(src, mask=src.split()[-1])
+                    out_img = canvas
+                else:
+                    out_img = im.convert("RGB")
+                fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="imtask_img_")
+                os.close(fd)
+                out_img.save(tmp_path, format="JPEG", quality=88, optimize=True, progressive=False)
+            return tmp_path
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("附流转 JPEG 失败，回退原图上传: %s (%s)", src_path, exc)
+            return None
+
     def prepare_image(self, file_path: str) -> Dict[str, Any]:
-        file_key = self.channel.upload_media(file_path, category=1)
-        width, height = self.channel._read_image_size(file_path)
+        upload_path = self._flatten_to_jpeg(file_path)
+        mime_type = "image/jpeg"
+        try:
+            path_to_use = upload_path or file_path
+            if not upload_path:
+                mime_type = "image/png" if str(file_path).lower().endswith(".png") else "image/jpeg"
+            file_key = self.channel.upload_media(path_to_use, category=1)
+            width, height = self.channel._read_image_size(path_to_use)
+        finally:
+            if upload_path:
+                try:
+                    os.unlink(upload_path)
+                except OSError:
+                    pass
         if not width or not height:
             from .channels.zdxlz import ChannelError
 
             raise ChannelError(f"读取图片宽高失败: {file_path}")
-        return {"file_key": file_key, "width": int(width), "height": int(height), "mime_type": "png"}
+        return {"file_key": file_key, "width": int(width), "height": int(height), "mime_type": mime_type}
 
     def send_image_prepared(self, receive_id: str, prepared: Dict[str, Any], idem_key: str) -> SendResult:
         return self.channel.send_image(
