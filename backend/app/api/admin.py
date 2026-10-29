@@ -311,7 +311,8 @@ def _query_instances(
         )
         rows = state.conn.execute(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
-            f"t.role_ids AS template_role_ids "
+            f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
+            f"t.notice_times AS template_notice_times "
             f"{from_sql} {where_sql} ORDER BY i.id DESC LIMIT ? OFFSET ?",
             tuple(params + [s, offset]),
         ).fetchall()

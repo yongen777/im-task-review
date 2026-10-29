@@ -249,12 +249,13 @@ class TestStage2A(unittest.TestCase):
         scheduler = Scheduler(state=self.store, public_base_url="https://task.example.com", notifier=notifier, now_fn=lambda: self.current_dt)
 
         self.current_dt = make_dt("2026-10-25 17:00:00")
-        self.assertEqual(scheduler.run_once()["generated_instances"], 0)
+        # 2026-10-29：上传任务也改为「当天一进来就按人预生成实例」，未到点只建行不发送
+        self.assertEqual(scheduler.run_once()["generated_instances"], 2)
         self.assertEqual(len(notifier.sent_messages), 0)
 
         self.current_dt = make_dt("2026-10-25 17:30:00")
         s2 = scheduler.run_once()
-        self.assertEqual((s2["generated_instances"], s2["sent"], s2["skipped"]), (2, 1, 1))
+        self.assertEqual((s2["generated_instances"], s2["sent"], s2["skipped"]), (0, 1, 1))
         self.assertEqual(len(notifier.sent_messages), 1)
         self.assertIn("陈一（研发部）", notifier.sent_messages[0].text)
         self.assertIn("今天 18:00", notifier.sent_messages[0].text)

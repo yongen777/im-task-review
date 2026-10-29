@@ -466,15 +466,17 @@ class Scheduler:
                         idem = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str)
 
                         def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
-                            # 2026-10-26 定档：notice 正文不加【模板名】前缀，文案原样发出。
-                            # 2026-10-28：补统一的尾部时间行，和上报类消息格式对齐。
+                            # 2026-10-29 用户定档：通知类消息固定为
+                            #   今日通知：
+                            #   <管理员配置的正文>
+                            # ⛔ 不加【模板名】、不加发送时间、不加任何其它内容。
                             body = render_text_tpl(
                                 template["text_tpl"], member_name=instance["name_snap"],
                                 member_dept=instance.get("dept_snap"),
                                 template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
                                 extra_vars=snap_values,
                             )
-                            return f"{body.rstrip()}\n\n发送时间：{format_deadline_display(format_dt(planned), ref_dt=cur_dt)}"
+                            return f"今日通知：\n{body.strip()}"
 
                         sent_ok = self._deliver_with_log(
                             template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
@@ -546,16 +548,20 @@ class Scheduler:
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])
+            p_key = period_key(tpl["period"], cur_dt)
+
+            # 2026-10-29：上传任务也改成「当天一进来就按人生成实例」，
+            # 不再等到提醒时刻才建行——否则后台「任务实例与审核」里看不到还没到点的任务
+            # （用户反馈：缺陷/上传类模板只有触发后才出现，通知类却是提前就有）。
+            before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
+            instances = self.ensure_instances_for_template(tpl, cur_dt)
+            stats["generated_instances"] += max(0, len(instances) - before_cnt)
+
             if cur_dt < planned_dt:
                 continue
 
             planned_str = format_dt(planned_dt)
             delay_sec = (cur_dt - planned_dt).total_seconds()
-            p_key = period_key(tpl["period"], cur_dt)
-
-            before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
-            instances = self.ensure_instances_for_template(tpl, cur_dt)
-            stats["generated_instances"] += max(0, len(instances) - before_cnt)
 
             for inst in instances:
                 if inst["status"] != "pending":

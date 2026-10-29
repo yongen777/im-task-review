@@ -695,9 +695,24 @@ export const InstancesView: React.FC = () => {
                         </div>
                       </td>
 
-                      {/* 5. 执行时间 */}
+                      {/* 5. 执行时间：取模板的计划时刻（通知类可能有多个时点），不再拿提交时间顶替 */}
                       <td className="py-4 px-3 font-mono text-xs text-slate-700 whitespace-nowrap">
-                        {inst.submitted_at || `${inst.period_key} 待执行`}
+                        {(() => {
+                          const slots =
+                            inst.kind === 'notice'
+                              ? (inst.template_notice_times && inst.template_notice_times.length > 0
+                                ? inst.template_notice_times
+                                : inst.template_remind_at
+                                  ? [inst.template_remind_at]
+                                  : [])
+                              : inst.template_remind_at
+                                ? [inst.template_remind_at]
+                                : [];
+                          if (slots.length === 0) return '—';
+                          const pk = inst.period_key || '';
+                          const datePart = /^\d{4}-\d{2}-\d{2}$/.test(pk) ? pk.slice(5) : pk;
+                          return slots.map((s) => `${datePart} ${s}`).join(' / ');
+                        })()}
                       </td>
 
                       {/* 6. 当前状态 */}

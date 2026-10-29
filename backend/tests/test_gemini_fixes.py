@@ -359,3 +359,88 @@ def test_notice_missed_logged_once_per_slot():
         assert int(rows["c"]) == 1, f"missed 应只记 1 条，实际 {rows['c']}"
     finally:
         store.close()
+
+
+# ── 2026-10-29 第二批反馈（执行时间 / 上传任务预生成 / 通知文案格式）──────
+
+
+def test_notice_message_format_is_title_plus_body_only():
+    """通知类消息固定为「今日通知：+ 正文」，不带发送时间、不带模板名前缀。"""
+    from app.scheduler import FakeNotifier, Scheduler
+
+    store = _mk_store()
+    try:
+        rid = store.create_role("通知格式组", actor="t")["role_id"]
+        store.add_role_member(rid, "13900005001", "甲", "一部", actor="t")
+        store.upsert_delivery_target("13900005001", "uid_fmt")
+        store.create_template(
+            {
+                "name": "晨会安排", "kind": "notice", "role_ids": [rid],
+                "text_tpl": "一、文字提醒：\\n1、过一遍昨天的账\\n2、定今天的目标",
+                "remind_at": "08:15", "notice_times": ["08:15"], "period": "day",
+            },
+            actor="t",
+        )
+        notifier = FakeNotifier()
+        sched = Scheduler(state=store, public_base_url="http://example.com", notifier=notifier,
+                          now_fn=lambda: _dt(8, 16))
+        sched.run_once()
+        assert notifier.sent_messages, "应发出一条通知"
+        text = notifier.sent_messages[0].text
+        assert text.startswith("今日通知：\n"), text[:30]
+        assert "发送时间" not in text
+        assert "【" not in text
+        # 字面量 \n 已归一为真实换行
+        assert "\\n" not in text
+        assert "1、过一遍昨天的账\n2、定今天的目标" in text
+    finally:
+        store.close()
+
+
+def test_upload_task_instances_created_before_remind_time():
+    """上传任务在提醒时刻之前也应出现在任务实例列表里（不再等到触发才建行）。"""
+    from app.scheduler import FakeNotifier, Scheduler
+
+    store = _mk_store()
+    try:
+        tpl = _form_tpl(store)
+        sched = Scheduler(state=store, public_base_url="http://example.com",
+                          notifier=FakeNotifier(), now_fn=lambda: _dt(9, 0))  # 提醒时刻 17:30 之前
+        stats = sched.run_once()
+        assert stats["generated_instances"] >= 1
+        rows = store.list_instances_for_period(tpl["template_id"], "2026-10-28")
+        assert len(rows) == 1
+        assert rows[0]["status"] == "pending"
+    finally:
+        store.close()
+
+
+def test_instance_list_exposes_template_time():
+    """列表接口要带出模板的计划时刻，供「执行时间」列展示。"""
+    from app.api.admin import _query_instances
+
+    store = _mk_store()
+    try:
+        tpl = _form_tpl(store)
+        store.ensure_template_instances(tpl["template_id"], "2026-10-28", "2026-10-28 18:00:00")
+        res = _query_instances(store, page=1, size=20)
+        item = res["items"][0]
+        assert item["template_remind_at"] == "17:30"
+        assert item["template_notice_times"] is None or item["template_notice_times"] == "[]"
+
+        # 通知类：带多个时点
+        rid = store.create_role("多时点组", actor="t")["role_id"]
+        store.add_role_member(rid, "13900006001", "乙", "二部", actor="t")
+        n_tpl = store.create_template(
+            {
+                "name": "双时段提醒", "kind": "notice", "role_ids": [rid],
+                "text_tpl": "提醒", "remind_at": "12:00",
+                "notice_times": ["12:00", "20:00"], "period": "day",
+            },
+            actor="t",
+        )
+        store.ensure_template_instances(n_tpl["template_id"], "2026-10-28", "2026-10-28 23:59:00")
+        res2 = _query_instances(store, template_id=n_tpl["template_id"], page=1, size=20)
+        assert res2["items"][0]["template_notice_times"] == '["12:00", "20:00"]'
+    finally:
+        store.close()

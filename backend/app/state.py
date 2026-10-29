@@ -687,6 +687,9 @@ class StateStore:
         text_tpl = str(merged.get("text_tpl") or "").strip()
         if not text_tpl:
             raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
+        # 2026-10-29：把字面量 \n / \r\n 归一成真实换行再入库，
+        # 避免后台编辑框和消息里一直夹着反斜杠 n 这种字符。
+        text_tpl = text_tpl.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
 
         if kind == "notice":
             if str(merged.get("period") or "day").strip() != "day":
