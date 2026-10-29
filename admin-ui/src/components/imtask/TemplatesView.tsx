@@ -85,7 +85,7 @@ function createDefaultNoticeItems(): NoticeMessageItem[] {
       id: `ni_${Date.now()}_2`,
       format: 'file',
       /* 2026-10-29：不再预填假文件名/假描述（「支局1+1155…截图.png」「二、数据提醒：…」）。
-         上传后自动带出真实原始文件名，描述留空 —— 不填就是空。 */
+         上传后自动带出真实原始文件名；描述是**必填**（保存时校验），所以这里留空等管理员填。 */
       file_name: '',
       file_caption: '',
     },
@@ -678,7 +678,6 @@ export const TemplatesView: React.FC = () => {
         toast.warning('请至少保留 1 条提醒内容');
         return;
       }
-      let missingCaption = false;
       for (let i = 0; i < noticeItems.length; i++) {
         const item = noticeItems[i];
         if (item.format === 'text' && !item.text_content?.trim()) {
@@ -692,14 +691,15 @@ export const TemplatesView: React.FC = () => {
           );
           return;
         }
-        /* 2026-10-29：图片名称（描述）改成**可空**——只提醒、不挡保存。
-           图片本身已经能推送，没有名称只是 H5 图文页不显示标题，不应该拦住整个模板。 */
+        /* 2026-10-29：图片名称是**必填**——没有名称，H5 图文页就没有标题可显示。
+           只在保存时用弹窗提醒（不写死在界面上的红字提示）。 */
         if (item.format === 'file' && item.image_path && !item.file_caption?.trim()) {
-          missingCaption = true;
+          toast.warning(
+            `第 ${i + 1} 条已上传图片，请填写「图片名称（描述）」`,
+            '缺少图片名称',
+          );
+          return;
         }
-      }
-      if (missingCaption) {
-        toast.warning('有图片未填写名称（描述），已照常保存；H5 图文页将不显示标题。', '图片名称未填写');
       }
       finalTextTpl = summarizeNoticeItemsToText(noticeItems);
       spec = {
@@ -1554,13 +1554,13 @@ export const TemplatesView: React.FC = () => {
                                   <div className="space-y-1.5">
                                     <label className="block text-[11px] font-semibold text-slate-600">
                                       图片名称（描述）
-                                      <span className="text-slate-400 font-normal ml-1.5">选填</span>
+                                      <span className="text-rose-600 ml-0.5">*</span>
                                     </label>
                                     <input
                                       type="text"
                                       value={item.file_caption || ''}
                                       onChange={(e) => updateNoticeItem(idx, { file_caption: e.target.value })}
-                                      placeholder="如：上午上门情况统计图（留空则 H5 页不显示标题）"
+                                      placeholder="如：上午上门情况统计图"
                                       className="w-full bg-white border border-slate-200 rounded-xl px-2.5 py-2 text-slate-800 outline-none focus:border-blue-500 text-sm"
                                     />
                                   </div>
