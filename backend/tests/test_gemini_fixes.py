@@ -366,7 +366,10 @@ def test_notice_missed_logged_once_per_slot():
 
 
 def test_notice_message_format_is_body_only():
-    """通知类消息固定为「今日通知：+ 正文」，不带发送时间、不带模板名前缀。"""
+    """通知类消息**只发正文**：不带「今日通知：」标题、不带发送时间、不带模板名前缀。
+
+    （原口径「今日通知：+ 正文」已于 2026-10-29 作废，改为管理员配什么就发什么。）
+    """
     from app.scheduler import FakeNotifier, Scheduler
 
     store = _mk_store()
@@ -621,17 +624,17 @@ def test_notice_spec_literal_backslash_n_normalized():
 def test_member_can_join_multiple_roles():
     """2026-10-29：同一手机号可同时属于多个角色（一人兼多角色），互不影响。
 
-    场景：张三已在「片长/分支局长」，需要同时加入「云中台软研队伍」。
+    场景：郑佳已在「片长/分支局长」，需要同时加入「云中台软研队伍」。
     """
     store = _mk_store()
     try:
         r1 = store.create_role("片长/分支局长", actor="t")["role_id"]
         r2 = store.create_role("云中台软研队伍", actor="t")["role_id"]
-        store.add_role_member(r1, "13900008001", "张三", "市场部", actor="t")
+        store.add_role_member(r1, "13900008001", "郑佳", "市场部", actor="t")
         store.upsert_delivery_target("13900008001", "uid_jia")
 
         # 加入第二个角色：不报错，且第一个角色的成员关系保持
-        store.add_role_member(r2, "13900008001", "张三", "市场部", actor="t")
+        store.add_role_member(r2, "13900008001", "郑佳", "市场部", actor="t")
         assert store.list_role_members(r1)["total"] == 1
         assert store.list_role_members(r2)["total"] == 1
 
@@ -640,7 +643,7 @@ def test_member_can_join_multiple_roles():
 
         # 同一角色内重复添加仍应被拦（避免一条角色两条记录）
         with pytest.raises(BizError) as err:
-            store.add_role_member(r2, "13900008001", "张三", actor="t")
+            store.add_role_member(r2, "13900008001", "郑佳", actor="t")
         assert err.value.code == "DUPLICATE"
 
         # 从其中一个角色移出：另一角色与推送绑定都必须保留
