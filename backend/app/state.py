@@ -829,6 +829,32 @@ class StateStore:
             )
         data_keys_str = json.dumps(data_keys_norm, ensure_ascii=False)
 
+        # 2026-10-29 修复：前端提交的键是 `spec`（notice_items 里带上传时的**原始文件名**
+        # 与管理员填的描述），后端一直只读 `spec_json` → 这些配置从来没落库，
+        # 每次重新打开模板都被前端按 attach_image_path 重建，于是名字/描述回到默认值。
+        # 这里两种键都接受，优先 payload 里的 spec。
+        _payload_spec = payload.get("spec")
+        _spec_payload = _payload_spec if isinstance(_payload_spec, dict) else merged.get("spec_json")
+        if isinstance(_spec_payload, str):
+            try:
+                _spec_payload = json.loads(_spec_payload)
+            except Exception:  # noqa: BLE001
+                _spec_payload = None
+
+        # 2026-10-29：spec 里的正文/描述同样要把**字面量** `\n`（反斜杠+n）归一成真换行。
+        # text_tpl 早就有这层归一，但 notice_items.text_content 一直漏了，
+        # 结果后台卡片和预览里显示成「一、文字提醒：\n1、开晨会前…」。
+        if isinstance(_spec_payload, dict):
+            _items = _spec_payload.get("notice_items")
+            if isinstance(_items, list):
+                for _it in _items:
+                    if not isinstance(_it, dict):
+                        continue
+                    for _k in ("text_content", "file_caption"):
+                        _v = _it.get(_k)
+                        if isinstance(_v, str) and "\\n" in _v:
+                            _it[_k] = _v.replace("\\r\\n", "\n").replace("\\n", "\n")
+
         return {
             "name": name, "kind": kind, "role_ids_json": json.dumps(role_ids, ensure_ascii=False),
             "schema_json": schema_json_str, "allow_note": 1 if allow_note else 0, "text_tpl": text_tpl,
@@ -837,7 +863,7 @@ class StateStore:
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "data_keys": data_keys_str,
-            "spec_json": json.dumps(merged.get("spec_json"), ensure_ascii=False) if merged.get("spec_json") not in (None, "") else None,
+            "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
 
     def create_template(self, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:

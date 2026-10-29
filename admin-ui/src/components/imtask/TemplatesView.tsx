@@ -84,8 +84,10 @@ function createDefaultNoticeItems(): NoticeMessageItem[] {
     {
       id: `ni_${Date.now()}_2`,
       format: 'file',
-      file_name: '支局1+1155重点指标及商机通报截图.png',
-      file_caption: '二、数据提醒：\n同步最新业务进展与差缺通报图表。',
+      /* 2026-10-29：不再预填假文件名/假描述（「支局1+1155…截图.png」「二、数据提醒：…」）。
+         上传后自动带出真实原始文件名，描述留空 —— 不填就是空。 */
+      file_name: '',
+      file_caption: '',
     },
   ];
 }
@@ -1022,26 +1024,35 @@ export const TemplatesView: React.FC = () => {
                                           {ni.text_content}
                                         </div>
                                       ) : ni.image_path ? (
-                                        <a
-                                          href={`/api/admin/template-assets/${encodeURIComponent(
-                                            String(ni.image_path).split('/').pop() || '',
-                                          )}`}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          className="inline-flex items-center gap-2 group"
-                                          title="点击查看原图"
-                                        >
-                                          <img
-                                            src={`/api/admin/template-assets/${encodeURIComponent(
+                                        /* 2026-10-29：显示上传时的**原始文件名**；描述只在真的填过时才显示。
+                                           以前这里固定写「点击查看图片」，和真实配置对不上。 */
+                                        <div className="space-y-0.5">
+                                          <a
+                                            href={`/api/admin/template-assets/${encodeURIComponent(
                                               String(ni.image_path).split('/').pop() || '',
                                             )}`}
-                                            alt={ni.file_name || '数据图片'}
-                                            className="w-12 h-12 rounded-lg object-cover border border-slate-200"
-                                          />
-                                          <span className="text-[11px] text-indigo-700 font-medium group-hover:underline">
-                                            点击查看图片
-                                          </span>
-                                        </a>
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-2 group"
+                                            title="点击查看原图"
+                                          >
+                                            <img
+                                              src={`/api/admin/template-assets/${encodeURIComponent(
+                                                String(ni.image_path).split('/').pop() || '',
+                                              )}`}
+                                              alt={ni.file_name || '数据图片'}
+                                              className="w-12 h-12 rounded-lg object-cover border border-slate-200"
+                                            />
+                                            <span className="text-[11px] text-indigo-700 font-medium group-hover:underline truncate max-w-[220px]">
+                                              {ni.file_name || '点击查看图片'}
+                                            </span>
+                                          </a>
+                                          {ni.file_caption ? (
+                                            <div className="text-[11px] text-slate-500 leading-relaxed whitespace-pre-line">
+                                              {ni.file_caption}
+                                            </div>
+                                          ) : null}
+                                        </div>
                                       ) : (
                                         <div className="text-[11px] text-rose-600 font-semibold">
                                           未上传图片（编辑模板后可上传）

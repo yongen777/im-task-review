@@ -528,3 +528,88 @@ def test_disabled_template_instances_hidden_from_list():
         assert _query_instances(store, page=1, size=20)["total"] == 1
     finally:
         store.close()
+
+
+def test_notice_spec_survives_save_and_reload():
+    """2026-10-29：通知类的 spec（上传时的原始文件名 + 管理员填的描述）必须落库并原样读回。
+
+    起因：前端提交的键是 `spec`，后端只读 `spec_json` → 从来没存过，
+    每次打开编辑都被前端按 attach_image_path 重建，名字/描述就回到默认值。
+    """
+    store = _mk_store()
+    try:
+        rid = store.create_role("通知规格组", actor="t")["role_id"]
+        spec = {
+            "notice_items": [
+                {"id": "n_text", "format": "text", "text_content": "看今日数据"},
+                {
+                    "id": "n_file", "format": "file",
+                    "file_name": "支局1重点指标.png",
+                    "file_caption": "当日数据看板（管理员填的）",
+                    "image_path": "notice_attach/x.png",
+                },
+            ]
+        }
+        tpl = store.create_template(
+            {
+                "name": "带图通知", "kind": "notice", "role_ids": [rid],
+                "text_tpl": "看今日数据", "remind_at": "09:00", "notice_times": ["09:00"],
+                "period": "day", "attach_image": True, "attach_image_path": "notice_attach/x.png",
+                "spec": spec,
+            },
+            actor="t",
+        )
+        got = store.get_template(tpl["template_id"])
+        items = got["spec_json"]["notice_items"]
+        assert items[1]["file_name"] == "支局1重点指标.png"
+        assert items[1]["file_caption"] == "当日数据看板（管理员填的）"
+
+        # 只改模板名，spec 里的名字/描述不能丢
+        store.update_template(tpl["template_id"], {"name": "改名后"}, actor="t")
+        got2 = store.get_template(tpl["template_id"])
+        assert got2["spec_json"]["notice_items"][1]["file_name"] == "支局1重点指标.png"
+        assert got2["spec_json"]["notice_items"][1]["file_caption"] == "当日数据看板（管理员填的）"
+
+        # 描述留空就存空，后端不得补任何默认值
+        spec2 = {
+            "notice_items": [
+                {"id": "n_file", "format": "file", "file_name": "a.png", "file_caption": "",
+                 "image_path": "notice_attach/x.png"},
+            ]
+        }
+        store.update_template(tpl["template_id"], {"spec": spec2}, actor="t")
+        got3 = store.get_template(tpl["template_id"])
+        assert got3["spec_json"]["notice_items"][0]["file_caption"] == ""
+        assert got3["spec_json"]["notice_items"][0]["file_name"] == "a.png"
+    finally:
+        store.close()
+
+
+def test_notice_spec_literal_backslash_n_normalized():
+    """2026-10-29：spec 里的字面量 \\n 要归一成真换行（text_tpl 早有这层，notice_items 漏了）。"""
+    store = _mk_store()
+    try:
+        rid = store.create_role("换行组", actor="t")["role_id"]
+        spec = {
+            "notice_items": [
+                {"id": "n_text", "format": "text", "text_content": "一、文字提醒：\\n1、过账\\n2、定目标"},
+                {"id": "n_file", "format": "file", "file_name": "a.png",
+                 "file_caption": "第一行\\n第二行", "image_path": "notice_attach/x.png"},
+            ]
+        }
+        tpl = store.create_template(
+            {
+                "name": "换行通知", "kind": "notice", "role_ids": [rid],
+                "text_tpl": "一、文字提醒：\n1、过账", "remind_at": "09:00", "notice_times": ["09:00"],
+                "period": "day", "attach_image": True, "attach_image_path": "notice_attach/x.png",
+                "spec": spec,
+            },
+            actor="t",
+        )
+        items = store.get_template(tpl["template_id"])["spec_json"]["notice_items"]
+        assert "\\n" not in items[0]["text_content"]
+        assert items[0]["text_content"].count("\n") == 2
+        assert "\\n" not in items[1]["file_caption"]
+        assert items[1]["file_caption"] == "第一行\n第二行"
+    finally:
+        store.close()

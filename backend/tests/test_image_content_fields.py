@@ -18,7 +18,7 @@ def _mk_cfg() -> Config:
     return Config(
         public_port=9020,
         admin_port=9013,
-        public_base_url="http://219.151.177.33:9020",
+        public_base_url="http://203.0.113.10:9020",
         app_id="test_app_id",
         app_secret="test_app_secret",
     )

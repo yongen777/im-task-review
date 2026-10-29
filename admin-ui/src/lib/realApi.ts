@@ -143,11 +143,27 @@ function tplToMock(t: any): TemplateItem {
     spec.notice_items = textItems.length
       ? textItems.map((it: any) => ({ id: it.id || 'n_text', format: 'text', text_content: it.text_content || '' }))
       : [{ id: 'n_text', format: 'text', text_content: t.text_tpl || '' }];
-    if (t.attach_image_path) {
+    /* 2026-10-29：file 项同样要从 spec_json 原样恢复 —— file_name 是上传时的**原始文件名**、
+       file_caption 是管理员填的描述。没填就留空，绝不再造「数据看板.png / 当日数据看板（…）」。
+       只有「存了 attach_image_path 但 spec 里没有 file 项」的老数据才兜底重建。 */
+    const fileItems = savedItems.filter((it: any) => it && it.format === 'file');
+    if (fileItems.length) {
+      fileItems.forEach((it: any, idx: number) => {
+        spec.notice_items.push({
+          id: it.id || `n_file_${idx + 1}`,
+          format: 'file',
+          file_name: it.file_name || (it.image_path ? String(it.image_path).split('/').pop() || '' : ''),
+          file_caption: it.file_caption || '',
+          file_size: it.file_size,
+          image_path: it.image_path || undefined,
+        });
+      });
+    } else if (t.attach_image_path) {
       spec.notice_items.push({
         id: 'n_file',
         format: 'file',
-        file_name: String(t.attach_image_path).split('/').pop() || '数据图片',
+        file_name: String(t.attach_image_path).split('/').pop() || '',
+        file_caption: '',
         image_path: t.attach_image_path,
       });
     }
