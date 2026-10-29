@@ -323,3 +323,39 @@ def test_csv_export_formula_injection_escaped():
     assert _csv_safe("正常文本") == "正常文本"
     assert _csv_safe(123) == 123
     assert _csv_row([1, "=x"]) == [1, "'=x"]
+
+
+def test_notice_missed_logged_once_per_slot():
+    """P1-4：通知时点超出补偿窗口后，每 30s 重扫不能反复记 missed。"""
+    from app.scheduler import FakeNotifier, Scheduler
+
+    store = _mk_store()
+    try:
+        rid = store.create_role("通知组", actor="t")["role_id"]
+        store.add_role_member(rid, "13900004001", "甲", "一部", actor="t")
+        store.upsert_delivery_target("13900004001", "uid_n1")
+        tpl = store.create_template(
+            {
+                "name": "晨会提醒", "kind": "notice", "role_ids": [rid],
+                "text_tpl": "八点开会", "remind_at": "08:00",
+                "notice_times": ["08:00"], "period": "day",
+            },
+            actor="t",
+        )
+        sched = Scheduler(
+            state=store, public_base_url="http://example.com",
+            notifier=FakeNotifier(), now_fn=lambda: _dt(10, 0),  # 比 08:00 晚 2 小时，超 30min 窗口
+        )
+        first = sched.run_once()
+        second = sched.run_once()
+        third = sched.run_once()
+        assert first["missed"] >= 1
+        assert second["missed"] == 0 and third["missed"] == 0, "重复扫描不应再记 missed"
+
+        rows = store.conn.execute(
+            "SELECT COUNT(*) AS c FROM reminder_log WHERE template_id = ? AND result = 'missed'",
+            (tpl["template_id"],),
+        ).fetchone()
+        assert int(rows["c"]) == 1, f"missed 应只记 1 条，实际 {rows['c']}"
+    finally:
+        store.close()
