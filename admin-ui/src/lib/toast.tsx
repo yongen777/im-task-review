@@ -50,7 +50,7 @@ const ERROR_CODE_DICT: Record<string, string> = {
   PHONE_INVALID: '手机号格式不正确，请输入 11 位中国大陆手机号码（1 开头）。',
   MEMBER_NAME_REQUIRED: '请填写成员姓名，姓名不能为空。',
   MEMBER_NOT_FOUND: '在该角色下未找到此手机号对应的成员，请刷新列表后再试。',
-  CSV_EMPTY: '导入内容为空，请粘贴或选择包含「手机号,姓名,部门」的 CSV 数据。',
+  CSV_EMPTY: '导入内容为空，请粘贴或选择包含「手机号,姓名」的 CSV 数据。',
   CSV_TOO_LARGE: '单次导入数据量过大，请分批导入（每次不超过 2000 行）。',
 
   // 任务实例与审核相关

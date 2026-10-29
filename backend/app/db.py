@@ -291,6 +291,9 @@ class Database:
             _ensure_column(self.conn, "task_template", "attach_image_path", "TEXT")
             # 2026-10-29 H5 图文页：管理员填写的图片名称（描述），用于直链文案与 H5 页面标题
             _ensure_column(self.conn, "task_template", "attach_image_name", "TEXT")
+            # 2026-10-29 执行日：day 周期模板可指定「只在周几执行」（JSON 数组，1=周一…7=周日）；
+            # 空/NULL = 全周执行（调度层 fail-open）。
+            _ensure_column(self.conn, "task_template", "exec_weekdays", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
             # 2026-10-29 逾期补交审核制：逾期后必须「申请补交 → 管理员审核 → 30 分钟新链接」，

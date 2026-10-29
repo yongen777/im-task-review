@@ -616,15 +616,6 @@ export const RolesMembersView: React.FC = () => {
                         <div className="font-bold text-slate-900 text-sm truncate">
                           {r.role_name}
                         </div>
-                        <div className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1.5 tabular-nums">
-                          <span>共 {r.member_count} 人</span>
-                          <span aria-hidden="true">·</span>
-                          <span>启用 {r.active_count}</span>
-                          <span aria-hidden="true">·</span>
-                          <span className="text-emerald-700 font-medium">
-                            已激活 {r.activated_count}/{r.member_count}
-                          </span>
-                        </div>
                       </div>
                     </div>
 
@@ -647,6 +638,17 @@ export const RolesMembersView: React.FC = () => {
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
+                  </div>
+
+                  {/* 2026-10-29：统计信息统一放到标题下方独立一行，避免卡片宽度不同时换行不一致 */}
+                  <div className="mt-1.5 text-[11px] text-slate-500 flex items-center gap-1.5 tabular-nums whitespace-nowrap">
+                    <span>共 {r.member_count} 人</span>
+                    <span aria-hidden="true" className="text-slate-300">·</span>
+                    <span>启用 {r.active_count}</span>
+                    <span aria-hidden="true" className="text-slate-300">·</span>
+                    <span className="text-emerald-700 font-medium">
+                      已激活 {r.activated_count}/{r.member_count}
+                    </span>
                   </div>
 
                   {/* 激活进度细线 */}

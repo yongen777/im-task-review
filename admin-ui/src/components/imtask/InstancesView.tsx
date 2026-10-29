@@ -554,9 +554,9 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
           </div>
 
           <div
-            onClick={() => setStatusFilter('approved')}
+            onClick={() => setStatusFilter('approved,sent')}
             className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'approved'
+              statusFilter === 'approved,sent'
                 ? 'bg-emerald-50/70 border-emerald-400 shadow-2xs'
                 : 'bg-white border-slate-200/90 hover:border-emerald-200'
             }`}
@@ -596,9 +596,9 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
           </div>
 
           <div
-            onClick={() => setStatusFilter('rejected')}
+            onClick={() => setStatusFilter('rejected,overdue')}
             className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'rejected'
+              statusFilter === 'rejected,overdue'
                 ? 'bg-rose-50/70 border-rose-400 shadow-2xs'
                 : 'bg-white border-slate-200/90 hover:border-rose-200'
             }`}
@@ -738,6 +738,8 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
             <option value="submitted">待人工审核</option>
             <option value="rejected">已驳回待重交</option>
             <option value="overdue">已逾期未交</option>
+            <option value="approved,sent">已提醒 / 已完成</option>
+            <option value="rejected,overdue">已驳回 / 已逾期</option>
             <option value="resubmit_pending">补交待审核</option>
           </select>
 

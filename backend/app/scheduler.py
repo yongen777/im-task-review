@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -95,6 +96,28 @@ def is_anchor_day(
 
 
 def is_template_anchor_day(template: Dict[str, Any], dt: DateLike) -> bool:
+    """模板「今天是否需要执行」。
+
+    2026-10-29 执行日：period=="day" 时按 exec_weekdays（1=周一…7=周日）判断；
+    未配置 / 解析失败 / 空数组 → **全周执行**（fail-open：宁可多催一天，⛔ 不许业务静默失联）。
+    ⛔ 这是唯一的执行日判定点：run_once 循环顶部已调用，非执行日 continue 后
+    实例生成、发送、missed、逾期流转全部天然跳过，禁止在别处再开第二个判定。
+    """
+    if (template.get("period") or "") == "day":
+        raw = template.get("exec_weekdays")
+        days: Optional[List[int]] = None
+        if isinstance(raw, list):
+            days = [int(x) for x in raw if str(x).strip().isdigit() and 1 <= int(x) <= 7]
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    days = [int(x) for x in parsed if str(x).strip().isdigit() and 1 <= int(x) <= 7]
+            except Exception:
+                days = None
+        if days:
+            return _to_date(dt).isoweekday() in set(days)
+        return True
     return is_anchor_day(template["period"], dt, template.get("anchor_weekday"), template.get("anchor_dom"))
 
 
@@ -624,17 +647,15 @@ class Scheduler:
                         idem = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str)
 
                         def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
-                            # 2026-10-29 用户定档：通知类消息固定为
-                            #   今日通知：
-                            #   <管理员配置的正文>
-                            # ⛔ 不加【模板名】、不加发送时间、不加任何其它内容。
+                            # 2026-10-29 用户定档：通知类消息**只发管理员配置的正文**。
+                            # ⛔ 不加「今日通知：」标题、不加【模板名】、不加发送时间、不加任何其它内容。
                             body = render_text_tpl(
                                 template["text_tpl"], member_name=instance["name_snap"],
                                 member_dept=instance.get("dept_snap"),
                                 template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
                                 extra_vars=snap_values,
                             )
-                            return f"今日通知：\n{body.strip()}"
+                            return body.strip()
 
                         sent_ok = self._deliver_with_log(
                             template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],

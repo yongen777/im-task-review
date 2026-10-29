@@ -192,6 +192,10 @@ function tplToMock(t: any): TemplateItem {
        否则编辑/快捷启停时前端拿不到真实值，回写就会把配置冲掉。 */
     need_review: !!t.need_review,
     attach_image_path: t.attach_image_path || null,
+    /* 2026-10-29 执行日：后端返回 list[int] 或 null；null/空 = 全周 */
+    exec_weekdays: Array.isArray(t.exec_weekdays) && t.exec_weekdays.length
+      ? t.exec_weekdays.map((n: unknown) => Number(n)).filter((n: number) => n >= 1 && n <= 7)
+      : null,
     created_at: t.created_at || '',
     updated_at: t.updated_at,
   } as unknown as TemplateItem;

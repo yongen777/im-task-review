@@ -180,10 +180,10 @@
             const label = document.createElement("label");
             if (previewImages) {
               label.className = "upload-tile";
-              label.innerHTML = '<span class="plus">＋</span><span>拍照 / 选图</span>';
+              label.innerHTML = '<span class="plus">＋</span><span>点击选择图片</span>';
             } else {
               label.className = "upload-file";
-              label.textContent = "⇧ 点击选择手机中的表格或文档上传";
+              label.textContent = "⇧ 点击选择文档并上传";
             }
             const fileInp = document.createElement("input");
             fileInp.type = "file";
@@ -273,14 +273,14 @@
               body.appendChild(ta);
             }
             if (modules.includes("image")) {
-              makeUploadBlock("图片上传（现场拍照 / 晒图）", "🖼", ["#eff6ff", "#2563eb"], "JPG / PNG / WEBP", "image/*", true, "image");
+              makeUploadBlock("图片上传", "🖼", ["#eff6ff", "#2563eb"], "JPG / PNG / WEBP", "image/*", true, "image");
             }
             if (modules.includes("file")) {
-              makeUploadBlock("文件附件上传", "📎", ["#f5f3ff", "#7c3aed"], "Excel / PDF / Word", "", false, "file");
+              makeUploadBlock("文件上传", "📎", ["#f5f3ff", "#7c3aed"], "Excel / PDF / Word", "", false, "file");
             }
           } else {
             makeUploadBlock(
-              data.template.kind === "image" ? "上传图片 *" : "上传文件 *",
+              data.template.kind === "image" ? "图片上传 *" : "文件上传 *",
               "📎", ["#f5f3ff", "#7c3aed"], "", data.template.kind === "image" ? "image/*" : "", data.template.kind === "image", "single",
             );
           }

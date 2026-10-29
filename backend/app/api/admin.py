@@ -242,8 +242,15 @@ def _instance_filter_sql(
         where.append("i.period_key = ?")
         params.append(period_key.strip())
     if status and status.strip():
-        where.append("i.status = ?")
-        params.append(status.strip())
+        # 2026-10-29：支持逗号分隔多状态（「已提醒 / 已完成」= approved,sent），
+        # 否则统计卡片上的数字与点进去的列表条数对不上。
+        _parts = [x.strip() for x in status.split(",") if x.strip()]
+        if len(_parts) == 1:
+            where.append("i.status = ?")
+            params.append(_parts[0])
+        elif _parts:
+            where.append("i.status IN (%s)" % ",".join("?" * len(_parts)))
+            params.extend(_parts)
     # 2026-10-29 逾期补交审核制：按「补交申请状态」单独筛选（pending/approved/rejected）
     if resubmit_status and resubmit_status.strip():
         where.append("i.resubmit_status = ?")

@@ -74,6 +74,18 @@ const UPLOAD_MODULE_META: Record<
   },
 };
 
+/* 2026-10-29 执行日：1=周一…7=周日 */
+const WEEKDAY_LABELS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+
+function describeExecWeekdays(days: number[]): string {
+  const s = [...new Set(days)].sort((a, b) => a - b);
+  if (s.length === 7) return '每天';
+  if (s.length === 0) return '未选择（不会执行）';
+  if (s.length === 5 && s.every((d, i) => d === i + 1)) return '仅工作日';
+  if (s.length === 2 && s[0] === 6 && s[1] === 7) return '仅周末';
+  return s.map((d) => WEEKDAY_LABELS[d - 1]).join('、');
+}
+
 function createDefaultNoticeItems(): NoticeMessageItem[] {
   return [
     {
@@ -140,7 +152,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   const displayTitle = taskName.trim() || '当日上门走访晒图与意向单报数';
   const displayRemindText =
     remindText.trim() ||
-    '请各片长/分支局长于今日截止时间前，点击下方专属 H5 链接完成今日上门走访报数及现场图片上传。';
+    '请各片长/分支局长于今日截止时间前，点击下方专属 H5 链接完成今日上门走访报数及图片上传。';
   /* 预览里的链接用占位形式，避免把真实域名/令牌暴露在截图里 */
   const linkPreviewUrl = 'https://<你的域名>/h5/task#t=****';
 
@@ -326,14 +338,14 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                     <div className="flex items-center justify-between">
                       <span className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
                         <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>图片上传（现场拍照 / 晒图）</span>
+                        <span>图片上传</span>
                       </span>
                       <span className="text-[10px] text-slate-400">JPG / PNG / WEBP</span>
                     </div>
                     <div className="grid grid-cols-3 gap-2">
                       <div className="h-16 w-full rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 flex flex-col items-center justify-center text-center gap-1 text-indigo-600">
                         <ImageIcon className="w-4 h-4 shrink-0" />
-                        <span className="text-[10px] font-medium leading-none whitespace-nowrap">+ 拍照/选图</span>
+                        <span className="text-[10px] font-medium leading-none whitespace-nowrap">+ 点击选择图片</span>
                       </div>
                       <div className="h-16 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-[10px] text-slate-400">
                         示例晒图1.jpg
@@ -348,13 +360,13 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                     <div className="flex items-center justify-between">
                       <span className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
                         <Paperclip className="w-3.5 h-3.5 text-violet-600" />
-                        <span>文件附件上传</span>
+                        <span>文件上传</span>
                       </span>
                       <span className="text-[10px] text-slate-400">Excel / PDF / Word</span>
                     </div>
                     <div className="p-2.5 rounded-lg border border-dashed border-violet-200 bg-violet-50/40 flex items-center justify-center gap-1.5 text-violet-700 text-[11px] font-medium">
                       <Upload className="w-3.5 h-3.5" />
-                      <span>点击选择手机中的表格或文档上传</span>
+                      <span>点击选择文档并上传</span>
                     </div>
                   </div>
                 )}
@@ -397,6 +409,8 @@ export const TemplatesView: React.FC = () => {
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'notice' | 'upload'>('notice');
   const [period, setPeriod] = useState<TemplatePeriod>('day');
+  /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null） */
+  const [execWeekdays, setExecWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
   const [roleIds, setRoleIds] = useState<string[]>([]);
   const [remindAt, setRemindAt] = useState('08:15');
   const [deadline, setDeadline] = useState('18:00');
@@ -487,6 +501,7 @@ export const TemplatesView: React.FC = () => {
     setName('');
     setKind(defaultKind);
     setPeriod('day');
+    setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
     const defaultRoleId = roleFilter || roles[0]?.role_id || 'role_branch_chief';
     setRoleIds(defaultRoleId ? [defaultRoleId] : []);
     setRemindAt(defaultKind === 'notice' ? '08:15' : '16:30');
@@ -494,7 +509,7 @@ export const TemplatesView: React.FC = () => {
     setRequireReview(true);
     setNoticeItems(createDefaultNoticeItems());
     setUploadRemindText(
-      '请按时点击下方 H5 链接，完成今日上门走访户数报数及现场晒图上传。',
+      '请按时点击下方 H5 链接，完成今日上门走访户数报数及图片上传。',
     );
     setUploadModules(['fields', 'image', 'text']);
     setFields([
@@ -512,6 +527,12 @@ export const TemplatesView: React.FC = () => {
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
     setPeriod(tpl.period);
+    /* 2026-10-29 执行日：null/空 = 每天 → 七天全上 */
+    setExecWeekdays(
+      Array.isArray(tpl.exec_weekdays) && tpl.exec_weekdays.length
+        ? tpl.exec_weekdays.map(Number)
+        : [1, 2, 3, 4, 5, 6, 7],
+    );
     const tplRoles = getTemplateRoleIds(tpl);
     setRoleIds(
       tplRoles.length > 0 ? tplRoles : [roles[0]?.role_id || 'role_branch_chief'],
@@ -559,6 +580,13 @@ export const TemplatesView: React.FC = () => {
     }
 
     setModalOpen(true);
+  };
+
+  /* 2026-10-29 执行日：点一下切换某天 */
+  const toggleExecWeekday = (d: number) => {
+    setExecWeekdays((prev) =>
+      prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b),
+    );
   };
 
   // 添加一条同时下发的提醒子任务
@@ -642,6 +670,8 @@ export const TemplatesView: React.FC = () => {
         attach_image_path: tpl.attach_image_path ?? null,
         /* 2026-10-29 H5.5：启停也带上图片名称，防写丢 */
         attach_image_name: tpl.attach_image_name ?? null,
+        /* 2026-10-29 执行日：启停路径同样带上，避免把执行日冲回全周 */
+        exec_weekdays: tpl.exec_weekdays ?? null,
       });
       await refreshTemplates();
       toast.success(
@@ -667,6 +697,11 @@ export const TemplatesView: React.FC = () => {
     }
     if (!remindAt.trim()) {
       toast.warning('请填写执行时间');
+      return;
+    }
+    /* 2026-10-29 执行日：day 模板必须至少选一天，否则永远不会执行 */
+    if (period === 'day' && execWeekdays.length === 0) {
+      toast.warning('请至少选择一天「执行日」', '缺少执行日');
       return;
     }
 
@@ -773,6 +808,10 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
+          /* 2026-10-29 执行日：七天全选等价「每天」，传 null 交给后端存 NULL */
+          ...(period === 'day'
+            ? { exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays }
+            : {}),
           /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
              导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
           need_review: kind === 'notice' ? false : requireReview,
@@ -800,6 +839,10 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
+          /* 2026-10-29 执行日：七天全选等价「每天」，传 null 交给后端存 NULL */
+          ...(period === 'day'
+            ? { exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays }
+            : {}),
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
@@ -1375,6 +1418,55 @@ export const TemplatesView: React.FC = () => {
                         {kind !== 'notice' && <option value="month">每月</option>}
                       </select>
                     </div>
+
+                    {/* 执行日（仅每日周期）：2026-10-29 新增，像群运维后台那样按周几执行 */}
+                    {period === 'day' && (
+                      <div>
+                        <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
+                          <span>执行日</span>
+                          <span className="text-[10px] text-slate-400 font-normal">
+                            只在这些星期生成任务；没选的日子不提醒、不产生逾期
+                          </span>
+                        </label>
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          {WEEKDAY_LABELS.map((label, i) => {
+                            const d = i + 1;
+                            const on = execWeekdays.includes(d);
+                            return (
+                              <button
+                                key={d}
+                                type="button"
+                                onClick={() => toggleExecWeekday(d)}
+                                className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
+                                  on
+                                    ? 'bg-blue-600 text-white border-blue-600'
+                                    : 'bg-slate-50 text-slate-600 border-slate-200 hover:border-blue-300'
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            );
+                          })}
+                          <button
+                            type="button"
+                            onClick={() => setExecWeekdays([1, 2, 3, 4, 5])}
+                            className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
+                          >
+                            工作日
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setExecWeekdays([1, 2, 3, 4, 5, 6, 7])}
+                            className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
+                          >
+                            每天
+                          </button>
+                          <span className="text-[11px] text-slate-500 ml-1">
+                            {describeExecWeekdays(execWeekdays)}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
                     {/* 执行时间 & 截止时间（2026-10-28 重排版：时间字段并列一行 + 原生时间选择器） */}
                     <div className={kind === 'notice' ? 'sm:col-span-2' : ''}>

@@ -64,6 +64,8 @@ export interface TemplateItem {
   attach_image_path?: string | null;
   /* 2026-10-29 H5 图文页：管理员填写的图片名称（描述），直链文案与 H5 页面标题用 */
   attach_image_name?: string | null;
+  /* 2026-10-29 执行日：day 周期模板只在选中的周几执行；null/空 = 每天（周一=1…周日=7） */
+  exec_weekdays?: number[] | null;
   created_at: string;
   updated_at?: string;
 }

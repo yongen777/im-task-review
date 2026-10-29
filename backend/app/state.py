@@ -674,6 +674,17 @@ class StateStore:
             spec_json = json.loads(d.get("spec_json") or "null")
         except Exception:
             spec_json = None
+        # 2026-10-29 执行日：JSON 数组 → list[int]；空/坏 → None（=全周，由调度层 fail-open）
+        try:
+            _ew_raw = d.get("exec_weekdays")
+            exec_weekdays = json.loads(_ew_raw) if _ew_raw else None
+            if isinstance(exec_weekdays, list):
+                exec_weekdays = [int(x) for x in exec_weekdays if str(x).strip().isdigit()]
+                exec_weekdays = sorted({w for w in exec_weekdays if 1 <= w <= 7}) or None
+            else:
+                exec_weekdays = None
+        except Exception:
+            exec_weekdays = None
         return {
             "template_id": d["template_id"], "name": d["name"], "kind": d["kind"], "role_ids": role_ids,
             "schema_json": schema_json, "allow_note": bool(d.get("allow_note", 0)), "text_tpl": d["text_tpl"],
@@ -683,6 +694,7 @@ class StateStore:
             "max_file_mb": d.get("max_file_mb"), "enabled": bool(d.get("enabled", 1)), "deleted": bool(d.get("deleted", 0)),
             "attach_image": bool(d.get("attach_image", 0)), "attach_image_path": d.get("attach_image_path"),
             "attach_image_name": d.get("attach_image_name"),
+            "exec_weekdays": exec_weekdays,
             "data_keys": data_keys, "spec_json": spec_json,
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
@@ -849,6 +861,33 @@ class StateStore:
             )
         data_keys_str = json.dumps(data_keys_norm, ensure_ascii=False)
 
+        # 2026-10-29 执行日（exeс_weekdays）：只有 day 周期可以配周几。
+        # 未提供 → 更新时保留原值（与 need_review 同款部分更新语义）；空/坏 → 全周（调度层 fail-open）。
+        if "exec_weekdays" in payload:
+            raw_ew = payload.get("exec_weekdays")
+            if raw_ew is None:
+                exec_weekdays_norm: Optional[List[int]] = None
+            else:
+                if not isinstance(raw_ew, list):
+                    raise BizError(400, "VALIDATION_FAILED", "exec_weekdays 必须是数组")
+                clean_ew: List[int] = []
+                for x in raw_ew:
+                    try:
+                        w = int(str(x).strip())
+                    except Exception:
+                        raise BizError(400, "VALIDATION_FAILED", "执行日只能是 1~7（1=周一，7=周日）")
+                    if not (1 <= w <= 7):
+                        raise BizError(400, "VALIDATION_FAILED", "执行日只能是 1~7（1=周一，7=周日）")
+                    clean_ew.append(w)
+                clean_ew = sorted(set(clean_ew))
+                if not clean_ew:
+                    raise BizError(400, "VALIDATION_FAILED", "至少选择一天执行日")
+                if period != "day":
+                    raise BizError(400, "VALIDATION_FAILED", "仅每日周期支持执行日")
+                exec_weekdays_norm = clean_ew
+        else:
+            exec_weekdays_norm = (existing or {}).get("exec_weekdays")
+
         # 2026-10-29 修复：前端提交的键是 `spec`（notice_items 里带上传时的**原始文件名**
         # 与管理员填的描述），后端一直只读 `spec_json` → 这些配置从来没落库，
         # 每次重新打开模板都被前端按 attach_image_path 重建，于是名字/描述回到默认值。
@@ -883,6 +922,7 @@ class StateStore:
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "attach_image_name": attach_image_name,
+            "exec_weekdays": json.dumps(exec_weekdays_norm, ensure_ascii=False) if exec_weekdays_norm else None,
             "data_keys": data_keys_str,
             "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
@@ -893,14 +933,14 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
-                    norm["attach_image_name"], norm["data_keys"], norm["spec_json"],
+                    norm["attach_image_name"], norm["exec_weekdays"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], actor, now_s, now_s,
                 ),
             )
@@ -942,12 +982,12 @@ class StateStore:
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
                     norm["anchor_dom"], norm["deadline_offset"], norm["need_review"], norm["max_file_mb"],
-                    norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["data_keys"], norm["spec_json"],
+                    norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], now_s, clean_id,
                 ),
             )

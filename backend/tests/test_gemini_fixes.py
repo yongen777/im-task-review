@@ -365,7 +365,7 @@ def test_notice_missed_logged_once_per_slot():
 # ── 2026-10-29 第二批反馈（执行时间 / 上传任务预生成 / 通知文案格式）──────
 
 
-def test_notice_message_format_is_title_plus_body_only():
+def test_notice_message_format_is_body_only():
     """通知类消息固定为「今日通知：+ 正文」，不带发送时间、不带模板名前缀。"""
     from app.scheduler import FakeNotifier, Scheduler
 
@@ -388,7 +388,9 @@ def test_notice_message_format_is_title_plus_body_only():
         sched.run_once()
         assert notifier.sent_messages, "应发出一条通知"
         text = notifier.sent_messages[0].text
-        assert text.startswith("今日通知：\n"), text[:30]
+        # 2026-10-29 用户定档：不再加「今日通知：」标题，管理员配什么就发什么
+        assert "今日通知" not in text
+        assert text.startswith("一、文字提醒："), text[:30]
         assert "发送时间" not in text
         assert "【" not in text
         # 字面量 \n 已归一为真实换行

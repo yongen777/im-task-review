@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -92,13 +93,28 @@ def build_tarball() -> tuple[Path, int, list[str]]:
 
 
 def assert_admin_assets(names: list[str]) -> None:
-    """workbuddy 问题 2：后台是 Vite 构建产物，缺 assets 会导致白屏——缺则中止。"""
-    has_index = any(n == "app/admin_static/index.html" for n in names)
-    has_asset_js = any(n.startswith("app/admin_static/assets/") and n.endswith(".js") for n in names)
-    if not has_index:
+    """后台是 Vite 构建产物：index.html 缺 → 白屏；CSS 缺 → 无样式裸页面（两次事故都出在这）。
+
+    2026-10-29 起不只查「有没有」，而是**按 index.html 里真实引用的 /assets/* 逐个对包**，
+    哈希对不上（只传了 JS 没传新 CSS）会直接中止，不用等到线上看到裸页面。
+    """
+    name_set = set(names)
+    if "app/admin_static/index.html" not in name_set:
         raise SystemExit("✗ 打包缺 app/admin_static/index.html（后台白屏风险），中止")
-    if not has_asset_js:
+    js = [n for n in names if n.startswith("app/admin_static/assets/") and n.endswith(".js")]
+    css = [n for n in names if n.startswith("app/admin_static/assets/") and n.endswith(".css")]
+    if not js:
         raise SystemExit("✗ 打包缺 app/admin_static/assets/*.js（Vite 产物），中止")
+    if not css:
+        raise SystemExit("✗ 打包缺 app/admin_static/assets/*.css（无样式裸页面风险），中止")
+
+    index_path = ROOT / "app" / "admin_static" / "index.html"
+    refs = sorted(set(re.findall(r"/assets/[A-Za-z0-9._-]+", index_path.read_text(encoding="utf-8"))))
+    if not refs:
+        raise SystemExit("✗ index.html 未引用任何 /assets/*，构建产物异常，中止")
+    missing = [r for r in refs if f"app/admin_static{r}" not in name_set]
+    if missing:
+        raise SystemExit(f"✗ index.html 引用的资源不在包内：{missing}（会白屏 / 裸页面），中止")
 
 
 def main() -> int:
@@ -183,6 +199,26 @@ def main() -> int:
     code, _ = ssh_run(H, P, U, K, 'curl -s -m 8 -o /dev/null -w "%{http_code}" http://127.0.0.1:9013/', timeout=30, show=2)
     if "200" not in _:
         print("    ✗ 后台非 200"); ok = False
+
+    # 2026-10-29：按 index.html 真实引用逐个 curl，挡住「页面能开但 JS/CSS 是 404」
+    code, refs_out = ssh_run(
+        H, P, U, K,
+        f"grep -o '/assets/[A-Za-z0-9._-]*' {REMOTE_DIR}/app/admin_static/index.html | sort -u",
+        timeout=30, show=2,
+    )
+    asset_refs = [x.strip() for x in refs_out.splitlines() if x.strip().startswith("/assets/")]
+    if not asset_refs:
+        print("    ✗ index.html 里没有 /assets/* 引用"); ok = False
+    for ref in asset_refs:
+        code, out = ssh_run(
+            H, P, U, K,
+            f'curl -s -m 8 -o /dev/null -w "%{{http_code}}" http://127.0.0.1:9013{ref}',
+            timeout=30, show=1,
+        )
+        if "200" not in out:
+            print(f"    ✗ 静态资源不可用：{ref} → {out.strip()}"); ok = False
+    if ok and asset_refs:
+        print(f"    静态资源 {len(asset_refs)} 个全部 200")
     if not args.skip_tests:
         print("⑧ 远程 pytest")
         code, _ = ssh_run(H, P, U, K, f"cd {REMOTE_DIR} && .venv/bin/python -m pytest -o addopts=\"\" -q 2>&1 | tail -3", timeout=600, show=4)
