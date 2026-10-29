@@ -507,3 +507,24 @@ def test_attach_image_path_sibling_dir_rejected():
                 store.create_template({**base, "attach_image_path": bad}, actor="t")
     finally:
         store.close()
+
+
+def test_disabled_template_instances_hidden_from_list():
+    """2026-10-29：模板停用后，其历史实例不再出现在任务实例列表与统计里。"""
+    from app.api.admin import _query_instances
+
+    store = _mk_store()
+    try:
+        tpl = _form_tpl(store)
+        store.ensure_template_instances(tpl["template_id"], "2026-10-28", "2026-10-28 18:00:00")
+        assert _query_instances(store, page=1, size=20)["total"] == 1
+
+        store.update_template(tpl["template_id"], {"enabled": False}, actor="t")
+        assert store.get_instance_by_key(tpl["template_id"], "13900001001", "2026-10-28") is not None
+        assert _query_instances(store, page=1, size=20)["total"] == 0, "停用模板的实例应被过滤"
+
+        # 重新启用后恢复显示
+        store.update_template(tpl["template_id"], {"enabled": True}, actor="t")
+        assert _query_instances(store, page=1, size=20)["total"] == 1
+    finally:
+        store.close()

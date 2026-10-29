@@ -107,8 +107,62 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
   }
 }
 
-export const InstancesView: React.FC = () => {
-  const { roles, refreshStats } = useAppStore();
+/* 2026-10-29：执行时间统一在这里算——列表和详情共用一份，避免两处再走偏。
+   规则：取模板计划时刻（通知类可能是多个）；已到达的加粗，未到达的置灰。 */
+function parseNoticeTimes(v: unknown): string[] {
+  if (Array.isArray(v)) return v.map(String).filter(Boolean);
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const arr = JSON.parse(v);
+      return Array.isArray(arr) ? arr.map(String).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function instancePlanSlots(inst: TaskInstanceItem): string[] {
+  if (inst.kind === 'notice') {
+    const list = parseNoticeTimes(inst.template_notice_times);
+    if (list.length > 0) return list;
+  }
+  return inst.template_remind_at ? [inst.template_remind_at] : [];
+}
+
+function slotReached(inst: TaskInstanceItem, hhmm: string): boolean {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(inst.period_key || '');
+  const t = /^(\d{1,2}):(\d{2})$/.exec(hhmm || '');
+  if (!d || !t) return true; // 解析不出来就按「已到达」显示，不要误导
+  const at = new Date(+d[1], +d[2] - 1, +d[3], +t[1], +t[2], 0, 0).getTime();
+  return at <= Date.now();
+}
+
+const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }> = ({ inst, className = '' }) => {
+  const slots = instancePlanSlots(inst);
+  if (slots.length === 0) return <span className="text-slate-400">—</span>;
+  const pk = inst.period_key || '';
+  const datePart = /^\d{4}-\d{2}-\d{2}$/.test(pk) ? pk.slice(5) : pk;
+  return (
+    <span className={`inline-flex flex-wrap items-baseline gap-x-1.5 ${className}`}>
+      {slots.map((s, i) => {
+        const reached = slotReached(inst, s);
+        return (
+          <span
+            key={`${s}-${i}`}
+            className={reached ? 'font-bold text-slate-900' : 'font-normal text-slate-400'}
+            title={reached ? '已到达执行时刻' : '尚未到达执行时刻'}
+          >
+            {datePart} {s}
+            {i < slots.length - 1 ? ' /' : ''}
+          </span>
+        );
+      })}
+    </span>
+  );
+};
+
+export const InstancesView: React.FC = () => {  const { roles, refreshStats } = useAppStore();
   const toast = useToast();
 
   // 筛选条件：按日期（默认今天）、按角色、按任务类型、按执行状态、按用户名/手机号
@@ -695,37 +749,9 @@ export const InstancesView: React.FC = () => {
                         </div>
                       </td>
 
-                      {/* 5. 执行时间：取模板的计划时刻（通知类可能有多个时点），不再拿提交时间顶替 */}
-                      <td className="py-4 px-3 font-mono text-xs text-slate-700 whitespace-nowrap">
-                        {(() => {
-                          /* 后端历史上可能给回 JSON 字符串，这里做一次兜底解析，避免整页崩 */
-                          const parseTimes = (v: unknown): string[] => {
-                            if (Array.isArray(v)) return v.map(String);
-                            if (typeof v === 'string' && v.trim()) {
-                              try {
-                                const arr = JSON.parse(v);
-                                return Array.isArray(arr) ? arr.map(String) : [];
-                              } catch {
-                                return [];
-                              }
-                            }
-                            return [];
-                          };
-                          const slots =
-                            inst.kind === 'notice'
-                              ? (parseTimes(inst.template_notice_times).length > 0
-                                ? parseTimes(inst.template_notice_times)
-                                : inst.template_remind_at
-                                  ? [inst.template_remind_at]
-                                  : [])
-                              : inst.template_remind_at
-                                ? [inst.template_remind_at]
-                                : [];
-                          if (slots.length === 0) return '—';
-                          const pk = inst.period_key || '';
-                          const datePart = /^\d{4}-\d{2}-\d{2}$/.test(pk) ? pk.slice(5) : pk;
-                          return slots.map((s) => `${datePart} ${s}`).join(' / ');
-                        })()}
+                      {/* 5. 执行时间：模板计划时刻，已到达加粗、未到达置灰 */}
+                      <td className="py-4 px-3 font-mono text-xs whitespace-nowrap">
+                        <InstancePlanTime inst={inst} />
                       </td>
 
                       {/* 6. 当前状态 */}
@@ -918,13 +944,19 @@ export const InstancesView: React.FC = () => {
                 </div>
               </div>
               <div>
-                <div className="text-[11px] text-slate-400">
-                  {detailData.instance.kind === 'notice' ? '执行时间' : '上传提交时间'}
-                </div>
+                <div className="text-[11px] text-slate-400">执行时间</div>
                 <div className="font-mono text-slate-700 mt-0.5">
-                  {detailData.instance.submitted_at || '待到达执行时刻'}
+                  <InstancePlanTime inst={detailData.instance} />
                 </div>
               </div>
+              {detailData.instance.submitted_at && (
+                <div>
+                  <div className="text-[11px] text-slate-400">提交时间</div>
+                  <div className="font-mono text-slate-700 mt-0.5">
+                    {detailData.instance.submitted_at}
+                  </div>
+                </div>
+              )}
               {detailData.instance.kind !== 'notice' && (
                 <div>
                   <div className="text-[11px] text-slate-400">截止时间</div>

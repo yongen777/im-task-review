@@ -224,6 +224,10 @@ def _instance_filter_sql(
     where: List[str] = []
     params: List[Any] = []
 
+    # 2026-10-29 用户口径：停用（enabled=0）或已删除的模板，其历史实例不再出现在
+    # 任务实例列表与统计里——否则「停用」了还挂在列表上，看起来像没生效。
+    where.append("t.enabled = 1 AND t.deleted = 0")
+
     if template_id and template_id.strip():
         where.append("i.template_id = ?")
         params.append(template_id.strip())
@@ -1103,6 +1107,10 @@ def create_admin_router(state: StateStore) -> APIRouter:
         submissions = state.list_submissions_for_instance(instance_id)
         reminders = state.list_reminder_logs(instance_id=instance_id)
         inst["late_submit"] = bool(inst.get("late_submit", 0))
+        # 2026-10-29：详情页的执行时间也要取模板计划时刻（原来拿 submitted_at 兜底，
+        # 没提交就显示「待到达执行时刻」），与列表列共用同一份数据。
+        inst["template_remind_at"] = (tpl or {}).get("remind_at")
+        inst["template_notice_times"] = (tpl or {}).get("notice_times")
         inst["resubmit_deadline"] = (
             calc_resubmit_deadline(inst["deadline_at"], inst.get("reviewed_at"))
             if inst.get("status") == "rejected"
