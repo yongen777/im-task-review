@@ -107,11 +107,21 @@ def _extract_token_from_request(request: Request, body_token: Optional[str] = No
     return ""
 
 
-def _check_submission_window(state: StateStore, inst: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
-    if state.is_instance_window_closed(inst):
-        return False, "提交窗口已关闭"
+def _check_submission_window(
+    state: StateStore, inst: Dict[str, Any], tok: Optional[Dict[str, Any]] = None
+) -> Tuple[bool, Optional[str]]:
     if inst["status"] == "approved":
         return False, "任务已审核通过，无需重复提交"
+    # 2026-10-29 逾期补交审核制：逾期后**只有**「补交申请已通过、且未过期」的 resubmit token 放行，
+    # 旧的普通提交链接一律不放行（取消原「overdue 72h 内免审可交」）。
+    is_resubmit = bool(tok) and tok.get("purpose") == "resubmit" and str(tok.get("expires_at") or "") >= state.now_str()
+    if is_resubmit:
+        return True, None
+    if state.is_instance_window_closed(inst):
+        if inst["status"] == "rejected":
+            # 驳回重交窗口：保持原有语义与文案，不掺入逾期补交
+            return False, "提交窗口已关闭"
+        return False, "任务已逾期，请回复【申请补交】由管理员审核后获取新链接"
     return True, None
 
 
@@ -155,6 +165,9 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
     if not tok:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
     if tok["expires_at"] < state.now_str():
+        if tok.get("purpose") == "resubmit":
+            return None, None, (401, {"code": "TOKEN_EXPIRED",
+                                      "message": "补交链接已过期（30 分钟有效），本次补交机会已使用"})
         return None, None, (401, {"code": "TOKEN_EXPIRED", "message": "H5 访问令牌已过期"})
 
     inst: Optional[Dict[str, Any]] = None
@@ -171,11 +184,11 @@ def _validate_upload_target_and_limits(
     state: StateStore, raw_token: str, filename: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str, int, int, Optional[Tuple[int, Dict[str, Any]]]]:
     """前置校验令牌、窗口、模板类型与扩展名，计算该模板允许的最大字节数（未通过前绝不读取或落盘文件体）。"""
-    _, inst, err = _resolve_token_and_instance(state, raw_token)
+    tok, inst, err = _resolve_token_and_instance(state, raw_token)
     if err:
         return None, None, "", "", 0, 0, err
 
-    window_open, window_reason = _check_submission_window(state, inst)
+    window_open, window_reason = _check_submission_window(state, inst, tok)
     if not window_open:
         return None, None, "", "", 0, 0, (400, {"code": "WINDOW_CLOSED", "message": window_reason or "提交窗口已关闭"})
 
@@ -222,14 +235,14 @@ async def read_upload_file_bounded(file: UploadFile, max_bytes: int) -> Tuple[Op
 
 def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dict[str, Any]]:
     """§9.8 H5 加载任务实例与模板详情。"""
-    _, inst, err = _resolve_token_and_instance(state, raw_token)
+    tok, inst, err = _resolve_token_and_instance(state, raw_token)
     if err:
         return err
     tpl = state.get_template(inst["template_id"], include_deleted=True)
     if not tpl or tpl.get("deleted"):
         return 404, {"code": "NOT_FOUND", "message": "任务模板不存在"}
 
-    window_open, window_reason = _check_submission_window(state, inst)
+    window_open, window_reason = _check_submission_window(state, inst, tok)
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":

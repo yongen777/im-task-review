@@ -152,6 +152,11 @@ export interface TaskInstanceItem {
   /* 2026-10-29：模板的计划执行时间（通知类可能有多个时点），列表「执行时间」列要用 */
   template_remind_at?: string | null;
   template_notice_times?: string[] | string | null;
+  /* 2026-10-29 逾期补交审核制：申请时间 / 审核状态 / 审核人 / 审核时间 */
+  resubmit_req_at?: string | null;
+  resubmit_status?: 'pending' | 'approved' | 'rejected' | null;
+  resubmit_decided_by?: string | null;
+  resubmit_decided_at?: string | null;
   created_at: string;
 }
 

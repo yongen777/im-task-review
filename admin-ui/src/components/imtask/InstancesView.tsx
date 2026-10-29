@@ -72,6 +72,29 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
     };
   }
 
+  // 2026-10-29 逾期补交审核制：补交审核状态优先展示（叠加在「已逾期」之上）
+  if (inst.resubmit_status === 'pending') {
+    return {
+      label: '补交审核中',
+      className: 'bg-violet-50 text-violet-700 border-violet-200',
+      icon: <Clock className="w-3.5 h-3.5 text-violet-600 shrink-0" />,
+    };
+  }
+  if (inst.resubmit_status === 'approved' && (inst.status === 'overdue' || inst.status === 'expired')) {
+    return {
+      label: '补交已通过',
+      className: 'bg-teal-50 text-teal-700 border-teal-200',
+      icon: <CheckCircle2 className="w-3.5 h-3.5 text-teal-600 shrink-0" />,
+    };
+  }
+  if (inst.resubmit_status === 'rejected' && inst.status === 'overdue') {
+    return {
+      label: '补交已拒绝',
+      className: 'bg-rose-50 text-rose-700 border-rose-200',
+      icon: <XCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />,
+    };
+  }
+
   // 上传任务（upload / form / image / file）
   switch (inst.status) {
     case 'submitted':
@@ -229,7 +252,13 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
         const qs = new URLSearchParams();
         qs.set('page', String(targetPage));
         qs.set('size', String(PAGE_SIZE));
-        if (st) qs.set('status', st);
+        // 2026-10-29：'resubmit_pending' 是前端虚拟筛选项，映射成 resubmit_status=pending
+        const applyStatus = (target: URLSearchParams) => {
+          if (!st) return;
+          if (st === 'resubmit_pending') target.set('resubmit_status', 'pending');
+          else target.set('status', st);
+        };
+        applyStatus(qs);
         if (kd) qs.set('kind', kd);
         if (rl) qs.set('role_id', rl);
         if (ph) qs.set('q', ph);
@@ -237,7 +266,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
         if (tid) qs.set('template_id', tid);
 
         const statsQs = new URLSearchParams();
-        if (st) statsQs.set('status', st);
+        applyStatus(statsQs);
         if (kd) statsQs.set('kind', kd);
         if (rl) statsQs.set('role_id', rl);
         if (ph) statsQs.set('q', ph);
@@ -366,6 +395,67 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
       );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '审核通过操作失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  /* 2026-10-29 逾期补交审核：通过 → 后端签发 30 分钟补交链接并推送；拒绝 → 推送拒绝文案 */
+  const reloadDetailIfOpen = async (id: number) => {
+    if (detailData && detailData.instance.id === id) {
+      const refreshed = await api.get<TaskInstanceDetail>(`/api/admin/instances/${id}`);
+      setDetailData(refreshed);
+    }
+  };
+
+  const handleResubmitApprove = async (inst: TaskInstanceItem) => {
+    setBusyId(inst.id);
+    try {
+      const res = await api.post<{ ok: boolean; sent: boolean; expires_at?: string }>(
+        `/api/admin/instances/${inst.id}/resubmit/approve`,
+        {},
+      );
+      await Promise.all([loadData(page), refreshStats()]);
+      await reloadDetailIfOpen(inst.id);
+      const until = String(res.expires_at || '').slice(11, 16);
+      if (res.sent) {
+        toast.success(`已通过，补交链接已发送（${until} 前有效，30 分钟）`, '补交申请已通过');
+      } else {
+        toast.warning(
+          '已通过，但链接没能推送出去（该成员可能未完成绑定），请人工通知。',
+          '已通过，推送失败',
+        );
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '补交审核操作失败');
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleResubmitReject = async (inst: TaskInstanceItem) => {
+    if (
+      !window.confirm(
+        `确定拒绝「${inst.member_name_snap}」的补交申请？\n拒绝后该实例不能再申请补交。`,
+      )
+    ) {
+      return;
+    }
+    setBusyId(inst.id);
+    try {
+      const res = await api.post<{ ok: boolean; sent: boolean }>(
+        `/api/admin/instances/${inst.id}/resubmit/reject`,
+        {},
+      );
+      await Promise.all([loadData(page), refreshStats()]);
+      await reloadDetailIfOpen(inst.id);
+      if (res.sent) {
+        toast.success('已拒绝该补交申请，并已通知成员。', '补交申请已拒绝');
+      } else {
+        toast.warning('已拒绝，但通知没能发出去（该成员可能未完成绑定）。', '已拒绝，推送失败');
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '补交审核操作失败');
     } finally {
       setBusyId(null);
     }
@@ -648,6 +738,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
             <option value="submitted">待人工审核</option>
             <option value="rejected">已驳回待重交</option>
             <option value="overdue">已逾期未交</option>
+            <option value="resubmit_pending">补交待审核</option>
           </select>
 
           <input
@@ -974,6 +1065,45 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
               </div>
             )}
 
+            {/* 2026-10-29 逾期补交申请记录（只读展示 + 底部审核按钮） */}
+            {detailData.instance.resubmit_status && (
+              <div
+                className={`p-3.5 rounded-xl border text-xs ${
+                  detailData.instance.resubmit_status === 'pending'
+                    ? 'bg-violet-50 border-violet-200 text-violet-800'
+                    : detailData.instance.resubmit_status === 'approved'
+                      ? 'bg-teal-50 border-teal-200 text-teal-800'
+                      : 'bg-rose-50 border-rose-200 text-rose-800'
+                }`}
+              >
+                <div className="font-bold mb-1">
+                  补交申请：
+                  {detailData.instance.resubmit_status === 'pending'
+                    ? '待审核'
+                    : detailData.instance.resubmit_status === 'approved'
+                      ? '已通过'
+                      : '已拒绝'}
+                </div>
+                <div className="space-y-0.5 text-[11px]">
+                  <div>申请时间：{detailData.instance.resubmit_req_at || '—'}</div>
+                  {detailData.instance.resubmit_decided_at && (
+                    <div>
+                      审核时间：{detailData.instance.resubmit_decided_at}
+                      {detailData.instance.resubmit_decided_by
+                        ? ` · 审核人：${detailData.instance.resubmit_decided_by}`
+                        : ''}
+                    </div>
+                  )}
+                  {detailData.instance.resubmit_status === 'pending' && (
+                    <div>通过后系统自动发送 30 分钟有效的补交链接；拒绝后该实例不能再申请。</div>
+                  )}
+                  {detailData.instance.resubmit_status === 'approved' && (
+                    <div>补交链接有效期 30 分钟；过期未提交则本次补交机会已使用，不能再申请。</div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* 2. 提交内容与附件下载 (/api/admin/uploads/{ref}) */}
             <div className="space-y-2.5">
               <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
@@ -1222,6 +1352,26 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                       </button>
                     </>
                   )}
+                {detailData.instance.resubmit_status === 'pending' && (
+                  <>
+                    <button
+                      onClick={() => handleResubmitApprove(detailData.instance)}
+                      disabled={busyId === detailData.instance.id}
+                      className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>{busyId === detailData.instance.id ? '处理中…' : '通过补交'}</span>
+                    </button>
+                    <button
+                      onClick={() => handleResubmitReject(detailData.instance)}
+                      disabled={busyId === detailData.instance.id}
+                      className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>拒绝补交</span>
+                    </button>
+                  </>
+                )}
               </div>
               <button
                 onClick={() => setDetailData(null)}

@@ -170,7 +170,9 @@ def create_apps(
 
     # 管理后台端口挂载：权限守卫 + /api/admin/* + 静态托管外壳 (/login 与 4 个管理页面)
     register_admin_guard(admin_app, store)
-    admin_app.include_router(create_admin_router(store))
+    admin_app.include_router(
+        create_admin_router(store, notifier=active_notifier, public_base_url=cfg.public_base_url)
+    )
     _register_admin_spa_pages(admin_app)
 
     return public_app, admin_app, store, chan

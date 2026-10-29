@@ -788,17 +788,13 @@ class Scheduler:
             ext_id = target["external_id"] if target else None
 
             def _make_overdue_msg(instance=inst, template=tpl, dl_dt=deadline_dt) -> str:
-                late_limit_str = format_dt(dl_dt + timedelta(hours=72))
                 dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                late_disp = format_deadline_display(late_limit_str, ref_dt=cur_dt)
-                h5_url, _ = self.build_h5_submit_url(
-                    phone=instance["phone"], template_id=template["template_id"],
-                    period_key_val=instance["period_key"], instance_id=int(instance["id"]),
-                )
+                # 2026-10-29 逾期补交审核制：逾期后旧链接不再放行，改引导用户回复「申请补交」。
+                # 任务名与截止时间照旧保留（原有内容不删）。
                 return (
                     f"【{template['name']}】已逾期\n"
-                    f"截止时间：{dl_disp}，你尚未提交，可在 {late_disp} 前补交。\n\n"
-                    f"提交入口（复制链接到浏览器打开）：\n{h5_url}"
+                    f"截止时间：{dl_disp}，你尚未提交。\n\n"
+                    f"如需提交请回复【申请补交】，待管理员审核通过后将发送新链接。"
                 )
 
             self._deliver_with_log(

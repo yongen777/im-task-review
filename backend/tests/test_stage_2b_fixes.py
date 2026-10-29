@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from app.api import h5 as h5_api
-from app.config import SHANGHAI_TZ
+from app.config import SHANGHAI_TZ, format_dt
 from app.scheduler import FakeNotifier, Scheduler
 from app.state import StateStore
 
@@ -187,8 +187,10 @@ def test_upload_oversize_leaves_no_file():
     state = _store()
     _setup_task(state, kind="file")
     tpl = state.list_active_templates()[0]
+    # 2026-10-29：逾期补交审核制后普通提交只在截止前放行，
+    # 本用例测的是「超限不落盘」，截止时间放未来避免被窗口先拦。
     inst = state.ensure_template_instances(
-        tpl["template_id"], "2026-10-26", "2026-10-26 19:00:00")[0]
+        tpl["template_id"], "2026-10-26", format_dt(state.now() + timedelta(hours=6)))[0]
     raw = state.issue_h5_token(phone=PHONE, template_id=tpl["template_id"],
                                period_key="2026-10-26", instance_id=int(inst["id"]))
 

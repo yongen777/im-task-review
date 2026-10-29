@@ -1230,15 +1230,152 @@ class StateStore:
         if instance["status"] == "expired":
             return True
         if instance["status"] == "rejected":
+            # ⛔ 驳回重交窗口（calc_resubmit_deadline）：与本需求的「逾期补交」无关，一行不动
             return now_s > calc_resubmit_deadline(instance["deadline_at"], instance.get("reviewed_at"))
-        return now_s > format_dt(parse_dt(instance["deadline_at"]) + timedelta(hours=72))
+        # 2026-10-29 逾期补交审核制：截止时刻一过就关闭**普通**提交窗口。
+        # 逾期后不再有「72 小时内免审可交」，只能走「回复【申请补交】→ 管理员审核 → 30 分钟新链接」，
+        # 由 h5._check_submission_window() 按 token purpose == "resubmit" 单独放行。
+        return now_s > instance["deadline_at"]
+
+    # ── 2026-10-29 逾期补交审核制 ────────────────────────────────────────
+    # 口径（用户已拍板）：逾期后旧链接一律不放行；截止后 24h 内可回复【申请补交】；
+    # 每实例只有一次申请机会；通过 → 30 分钟新链接，拒绝 → 通知用户。
+    RESUBMIT_APPLY_WINDOW_HOURS = 24
+    RESUBMIT_LINK_TTL_MINUTES = 30
+
+    @staticmethod
+    def _resubmit_scope_sql() -> str:
+        """只有需要提交的模板才谈补交；通知类实例只是发送记录。"""
+        return "t.kind IN ('form','image','file')"
+
+    def list_overdue_in_window(self, phone: str, now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """该手机号「已截止、仍逾期、且在 24h 申请窗口内」的实例。"""
+        clean_phone = (phone or "").strip()
+        if not clean_phone:
+            return []
+        cur_dt = now_dt or self.now()
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT i.*, t.name AS template_name FROM task_instance i "
+                "JOIN task_template t ON t.template_id = i.template_id "
+                f"WHERE i.phone = ? AND i.status = 'overdue' AND {self._resubmit_scope_sql()} "
+                "ORDER BY i.deadline_at",
+                (clean_phone,),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            deadline_dt = parse_dt(d["deadline_at"])
+            if deadline_dt <= cur_dt <= deadline_dt + timedelta(hours=self.RESUBMIT_APPLY_WINDOW_HOURS):
+                out.append(d)
+        return out
+
+    def request_resubmit(self, phone: str, actor: str = "user", now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """用户回复「申请补交」：把窗口内**所有**可申请实例一次性置为 pending 审核。
+
+        返回 result：
+        - applied        申请成功（items 为本次置为待审核的实例）
+        - already        窗口内实例都已申请过（一次机会已用）
+        - window_expired 有逾期实例但都超过 24h 申请窗口
+        - none           根本没有逾期实例
+        """
+        clean_phone = (phone or "").strip()
+        cur_dt = now_dt or self.now()
+        now_s = format_dt(cur_dt)
+        with self.lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT i.*, t.name AS template_name FROM task_instance i "
+                "JOIN task_template t ON t.template_id = i.template_id "
+                f"WHERE i.phone = ? AND i.status IN ('overdue','expired') AND {self._resubmit_scope_sql()} "
+                "ORDER BY i.deadline_at",
+                (clean_phone,),
+            ).fetchall()
+            inside: List[Dict[str, Any]] = []
+            outside = 0
+            for r in rows:
+                d = dict(r)
+                deadline_dt = parse_dt(d["deadline_at"])
+                if deadline_dt <= cur_dt <= deadline_dt + timedelta(hours=self.RESUBMIT_APPLY_WINDOW_HOURS):
+                    inside.append(d)
+                else:
+                    outside += 1
+
+            if not inside:
+                return {"result": "window_expired" if outside else "none", "items": []}
+
+            fresh = [d for d in inside if not str(d.get("resubmit_status") or "").strip()]
+            if not fresh:
+                return {"result": "already", "items": []}
+
+            for d in fresh:
+                self.conn.execute(
+                    "UPDATE task_instance SET resubmit_req_at = ?, resubmit_status = 'pending' WHERE id = ?",
+                    (now_s, int(d["id"])),
+                )
+            self._insert_audit_unlocked(
+                actor, "resubmit.apply", "task_instance", clean_phone,
+                {"instance_ids": [int(d["id"]) for d in fresh]}, now_s,
+            )
+            return {
+                "result": "applied",
+                "items": [{"id": int(d["id"]), "template_name": d.get("template_name"), "deadline_at": d["deadline_at"]} for d in fresh],
+            }
+
+    def _load_resubmit_pending(self, instance_id: int) -> Dict[str, Any]:
+        with self.lock:
+            row = self.conn.execute("SELECT * FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone()
+        if not row:
+            raise BizError(404, "NOT_FOUND", "任务实例不存在")
+        inst = dict(row)
+        if str(inst.get("resubmit_status") or "") != "pending":
+            raise BizError(400, "VALIDATION_FAILED", "该实例没有待审核的补交申请")
+        return inst
+
+    def approve_resubmit(self, instance_id: int, actor: str = "system", now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """通过补交申请：置 approved + 签发 30 分钟 resubmit token（复用 issue_h5_token）。"""
+        cur_dt = now_dt or self.now()
+        now_s = format_dt(cur_dt)
+        inst = self._load_resubmit_pending(instance_id)
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE task_instance SET resubmit_status = 'approved', resubmit_decided_by = ?, resubmit_decided_at = ? WHERE id = ?",
+                (actor, now_s, int(instance_id)),
+            )
+            self._insert_audit_unlocked(actor, "resubmit.approve", "task_instance", inst["phone"],
+                                        {"instance_id": int(instance_id)}, now_s)
+        raw_token = self.issue_h5_token(
+            phone=inst["phone"], template_id=inst["template_id"], period_key=inst["period_key"],
+            instance_id=int(instance_id), purpose="resubmit",
+            ttl_hours=self.RESUBMIT_LINK_TTL_MINUTES / 60.0,
+        )
+        return {
+            "instance": self.get_instance(int(instance_id)),
+            "raw_token": raw_token,
+            "expires_in_minutes": self.RESUBMIT_LINK_TTL_MINUTES,
+            "expires_at": format_dt(cur_dt + timedelta(minutes=self.RESUBMIT_LINK_TTL_MINUTES)),
+        }
+
+    def reject_resubmit(self, instance_id: int, actor: str = "system", reason: Optional[str] = None,
+                        now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """拒绝补交申请：实例保持 overdue，但 resubmit_status 已非空 → 不能再申请。"""
+        now_s = format_dt(now_dt or self.now())
+        inst = self._load_resubmit_pending(instance_id)
+        with self.lock, self.conn:
+            self.conn.execute(
+                "UPDATE task_instance SET resubmit_status = 'rejected', resubmit_decided_by = ?, resubmit_decided_at = ? WHERE id = ?",
+                (actor, now_s, int(instance_id)),
+            )
+            self._insert_audit_unlocked(actor, "resubmit.reject", "task_instance", inst["phone"],
+                                        {"instance_id": int(instance_id), "reason": reason}, now_s)
+        return {"instance": self.get_instance(int(instance_id))}
 
     def submit_h5_task(
         self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
         note: Optional[str] = None, refs: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         tok = self.get_h5_token(raw_token)
-        if not tok or tok.get("purpose") != "submit":
+        # 2026-10-29：补交链接复用同一套 token 机制，只是 purpose == "resubmit"
+        if not tok or tok.get("purpose") not in ("submit", "resubmit"):
             raise BizError(404, "NOT_FOUND", "提交链接无效或不存在")
         cur_dt = self.now()
         now_s = format_dt(cur_dt)
@@ -1255,8 +1392,16 @@ class StateStore:
         # 2026-10-28：已提交待审核的也不能再交一次（H5 页面已锁，这里做服务端兜底）
         if inst["status"] == "submitted":
             raise BizError(400, "VALIDATION_FAILED", "该任务已提交，正在等待审核，不能重复提交")
-        if inst["status"] == "expired" or tok["expires_at"] < now_s or self.is_instance_window_closed(inst, cur_dt):
-            raise BizError(400, "WINDOW_CLOSED", "该任务已超过补交期限（72 小时），无法提交")
+        is_resubmit = tok.get("purpose") == "resubmit"
+        if tok["expires_at"] < now_s:
+            if is_resubmit:
+                raise BizError(400, "WINDOW_CLOSED", "补交链接已过期（30 分钟有效），本次补交机会已使用")
+            raise BizError(400, "WINDOW_CLOSED", "该任务提交链接已过期，无法提交")
+        if not is_resubmit and inst["status"] == "expired":
+            raise BizError(400, "WINDOW_CLOSED", "任务已关闭，无法提交")
+        # 只有 purpose=resubmit 的未过期 token 能在逾期后放行；普通 token 一律不放行
+        if not is_resubmit and self.is_instance_window_closed(inst, cur_dt):
+            raise BizError(400, "WINDOW_CLOSED", "任务已逾期，请回复【申请补交】由管理员审核后获取新链接")
         if bool(tok["consumed"]):
             raise BizError(400, "VALIDATION_FAILED", "该链接已提交过，请勿重复使用")
 

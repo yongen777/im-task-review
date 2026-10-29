@@ -7,6 +7,7 @@ import csv
 import hmac
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -29,6 +30,8 @@ from ..state import (
 
 COOKIE_NAME = "sid"
 CSRF_HEADER = "X-CSRF-Token"
+
+logger = logging.getLogger(__name__)
 
 # §16 P2：must_change=1 时仅允许访问的白名单接口（其余 /api/admin/* 一律 403 MUST_CHANGE_PASSWORD）
 MUST_CHANGE_ALLOWED_ENDPOINTS = {
@@ -210,6 +213,7 @@ def _instance_filter_sql(
     q: Optional[str] = None,
     period_key: Optional[str] = None,
     status: Optional[str] = None,
+    resubmit_status: Optional[str] = None,
 ) -> tuple[str, str, List[Any]]:
     """「任务实例」统一筛选条件（列表 / 统计 / 导出共用）。
 
@@ -240,6 +244,10 @@ def _instance_filter_sql(
     if status and status.strip():
         where.append("i.status = ?")
         params.append(status.strip())
+    # 2026-10-29 逾期补交审核制：按「补交申请状态」单独筛选（pending/approved/rejected）
+    if resubmit_status and resubmit_status.strip():
+        where.append("i.resubmit_status = ?")
+        params.append(resubmit_status.strip())
 
     # 任务类型：notice=纯通知；upload=所有上传类（form/image/file）
     k = (kind or "").strip()
@@ -285,6 +293,7 @@ def _query_instances(
     template_name: Optional[str] = None,
     period_key: Optional[str] = None,
     status: Optional[str] = None,
+    resubmit_status: Optional[str] = None,
     kind: Optional[str] = None,
     role_id: Optional[str] = None,
     phone: Optional[str] = None,
@@ -300,6 +309,7 @@ def _query_instances(
         template_name=template_name,
         period_key=period_key,
         status=status,
+        resubmit_status=resubmit_status,
         kind=kind,
         role_id=role_id,
         phone=phone,
@@ -357,8 +367,11 @@ def _query_instances(
         return {"total": total, "items": items}
 
 
-def create_admin_router(state: StateStore) -> APIRouter:
+def create_admin_router(state: StateStore, notifier: Any = None, public_base_url: str = "") -> APIRouter:
     router = APIRouter(prefix="/api/admin")
+    # 2026-10-29 逾期补交审核：审核通过后要主动把新链接推给用户。
+    # notifier 由 main.py 按现有装配方式注入（⛔ 不造全局单例）；缺省时只记日志不发送。
+    _notifier = notifier
 
     # ==================================================================
     # §9.1 会话与认证接口（admin_session + HttpOnly Cookie）
@@ -1116,6 +1129,7 @@ def create_admin_router(state: StateStore) -> APIRouter:
         template_name: Optional[str] = None,
         period_key: Optional[str] = None,
         status: Optional[str] = None,
+        resubmit_status: Optional[str] = None,
         kind: Optional[str] = None,
         role_id: Optional[str] = None,
         phone: Optional[str] = None,
@@ -1131,6 +1145,7 @@ def create_admin_router(state: StateStore) -> APIRouter:
         res = _query_instances(
             state,
             template_id=template_id,
+            resubmit_status=resubmit_status,
             template_name=template_name,
             period_key=period_key,
             status=status,
@@ -1227,6 +1242,68 @@ def create_admin_router(state: StateStore) -> APIRouter:
             "submission": submission_view,
             "reminders": reminders,
         }
+
+    # ── 2026-10-29 逾期补交审核 ────────────────────────────────────────
+    # 通过：签发 30 分钟 resubmit token 并把新链接推给用户；拒绝：推拒绝文案。
+    # 幂等由 state 侧保证（只有 resubmit_status='pending' 才能审），重复点击第二次会 400。
+    def _push_resubmit_message(inst: Dict[str, Any], text: str, tag: str) -> bool:
+        target = state.get_delivery_target(inst["phone"])
+        ext_id = (target or {}).get("external_id")
+        if _notifier is None or not ext_id:
+            logger.warning("补交审核通知未发送（notifier 或 external_id 缺失） instance=%s", inst.get("id"))
+            return False
+        try:
+            res = _notifier.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}")
+            return bool(getattr(res, "ok", False))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("补交审核通知发送失败 instance=%s: %s", inst.get("id"), exc)
+            return False
+
+    @router.post("/instances/{instance_id}/resubmit/approve")
+    async def approve_instance_resubmit(instance_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        try:
+            res = state.approve_resubmit(int(instance_id), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+
+        inst = res["instance"] or {}
+        tpl = state.get_template(inst.get("template_id") or "", include_deleted=True) or {}
+        base = (public_base_url or "").rstrip("/")
+        h5_url = f"{base}/h5/task#t={res['raw_token']}"
+        # 30 分钟有效期，文案按用户口径：先任务名，再 HH:MM，再链接，最后标有效期
+        expires_disp = str(res.get("expires_at") or "")[11:16]
+        text = (
+            f"【{tpl.get('name') or '任务'}】补交链接已开通，请于 {expires_disp} 前提交：\n"
+            f"{h5_url}\n（30 分钟内有效）"
+        )
+        sent = _push_resubmit_message(inst, text, "resubmit_ok")
+        return {"ok": True, "instance": inst, "h5_url": h5_url,
+                "expires_at": res.get("expires_at"), "sent": sent}
+
+    @router.post("/instances/{instance_id}/resubmit/reject")
+    async def reject_instance_resubmit(instance_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        reason = str(body.get("reason") or "").strip() or None
+        try:
+            res = state.reject_resubmit(int(instance_id), actor=sess["username"], reason=reason)
+        except BizError as exc:
+            return biz_error_response(exc)
+
+        inst = res["instance"] or {}
+        tpl = state.get_template(inst.get("template_id") or "", include_deleted=True) or {}
+        text = f"【{tpl.get('name') or '任务'}】补交申请未通过，如有疑问请联系管理员。"
+        sent = _push_resubmit_message(inst, text, "resubmit_no")
+        return {"ok": True, "instance": inst, "sent": sent}
 
     @router.post("/instances/{instance_id}/review")
     async def review_instance(instance_id: int, request: Request):

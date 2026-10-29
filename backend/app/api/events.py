@@ -276,6 +276,31 @@ def process_app_event(
 
     bound_member = state.touch_delivery_target_by_external_id(user_id)
     if bound_member is not None:
+        # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
+        # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
+        apply_text = (msg_text or "").strip().strip("【】[]　 ")
+        if apply_text == "申请补交":
+            try:
+                res = state.request_resubmit(bound_member["phone"], actor=f"user:{user_id}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("补交申请处理异常 user=%s: %s", user_id, exc)
+                res = {"result": "none", "items": []}
+            result = res.get("result")
+            if result == "applied":
+                reply = "已收到补交申请，请等待管理员审核。"
+                names = [str(i.get("template_name") or "").strip() for i in (res.get("items") or [])]
+                names = [n for n in names if n]
+                if names:
+                    reply += "\n本次申请涉及：" + "、".join(names)
+            elif result == "already":
+                reply = "该任务已申请过补交，不可重复申请。"
+            elif result == "window_expired":
+                reply = "已超补交申请窗口（需在截止时间后 24 小时内申请），本次不受理。"
+            else:
+                reply = "当前没有可申请补交的逾期任务。"
+            _send_bot_reply(user_id, reply, f"resubmit_{result}")
+            return 200, {"ok": True, "path": "resubmit", "bound": True, "result": result}
+
         # 2026-10-27 用户需求：已绑定用户发送非手机号消息时，机器人固定回复确认
         # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
         ack_text = (

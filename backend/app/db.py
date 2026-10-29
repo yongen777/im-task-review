@@ -293,6 +293,12 @@ class Database:
             _ensure_column(self.conn, "task_template", "attach_image_name", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
+            # 2026-10-29 逾期补交审核制：逾期后必须「申请补交 → 管理员审核 → 30 分钟新链接」，
+            # 每实例只有一次申请机会（resubmit_status 一旦非空即视为已用过）。
+            _ensure_column(self.conn, "task_instance", "resubmit_req_at", "TEXT")
+            _ensure_column(self.conn, "task_instance", "resubmit_status", "TEXT")
+            _ensure_column(self.conn, "task_instance", "resubmit_decided_by", "TEXT")
+            _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
 
             now_str = self._now_str_fn()
             row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()

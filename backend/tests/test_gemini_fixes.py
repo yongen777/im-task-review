@@ -14,14 +14,14 @@ from __future__ import annotations
 import asyncio
 import time
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.config import SHANGHAI_TZ
+from app.config import SHANGHAI_TZ, format_dt
 from app.state import BizError, StateStore
 
 
@@ -80,8 +80,11 @@ def test_csv_import_dict_format():
         store.close()
 
 
-def test_h5_overdue_window_can_submit():
-    """P0-1：逾期实例在 72 小时补交窗口内仍可提交（前端不再锁死页面）。"""
+def test_h5_overdue_old_link_rejected_requires_resubmit():
+    """2026-10-29 新口径：逾期后**旧链接一律不放行**，必须走申请补交 → 审核 → 30 分钟新链接。
+
+    （原用例断言「逾期 72h 内仍可提交」，随需求变更作废；rejected 的驳回重交窗口另有用例覆盖。）
+    """
     store = _mk_store()
     try:
         tpl = _form_tpl(store)
@@ -95,24 +98,19 @@ def test_h5_overdue_window_can_submit():
         assert adv["to_overdue"] >= 1
         assert store.get_instance(inst["id"])["status"] == "overdue"
 
-        # 逾期后 3 小时（仍在 72h 内）应允许提交
+        # 逾期后 3 小时：普通 token 不放行
         tok = store.issue_h5_token("13900001001", tpl["template_id"], pkey, inst["id"])
-        res = store.submit_h5_task(raw_token=tok, fields={"summary": "补交"})
+        with pytest.raises(BizError) as err:
+            store.submit_h5_task(raw_token=tok, fields={"summary": "补交"})
+        assert err.value.code == "WINDOW_CLOSED"
+        assert "申请补交" in err.value.message
+
+        # 申请 → 通过 → resubmit 链接放行
+        assert store.request_resubmit("13900001001")["result"] == "applied"
+        approved = store.approve_resubmit(int(inst["id"]), actor="admin")
+        res = store.submit_h5_task(raw_token=approved["raw_token"], fields={"summary": "补交"})
         assert res["ok"] is True
         assert res["late_submit"] is True
-
-        # 超过 72 小时则拒绝
-        store.conn.execute("UPDATE task_instance SET status='overdue' WHERE id=?", (inst["id"],))
-        store.conn.commit()
-        tok2 = store.issue_h5_token("13900001001", tpl["template_id"], pkey, inst["id"])
-        _orig_now = store._now_fn
-        store._now_fn = lambda: _dt(19, 0, day=31)  # 截止后 73 小时
-        try:
-            with pytest.raises(BizError) as err:
-                store.submit_h5_task(raw_token=tok2, fields={"summary": "超期"})
-        finally:
-            store._now_fn = _orig_now
-        assert err.value.code == "WINDOW_CLOSED"
     finally:
         store.close()
 
@@ -180,7 +178,10 @@ def test_review_instance_rejects_wrong_status():
     try:
         tpl = _form_tpl(store)
         pkey = "2026-10-28"
-        store.ensure_template_instances(tpl["template_id"], pkey, "2026-10-28 18:00:00")
+        # 2026-10-29：逾期补交审核制上线后，普通提交只在截止前放行；
+        # 本用例要测的是「审核状态机」，所以截止时间放在未来。
+        deadline = format_dt(store.now() + timedelta(hours=6))
+        store.ensure_template_instances(tpl["template_id"], pkey, deadline)
         inst = store.get_instance_by_key(tpl["template_id"], "13900001001", pkey)
         assert inst is not None and inst["status"] == "pending"
 
