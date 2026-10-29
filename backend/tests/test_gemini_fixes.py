@@ -444,3 +444,66 @@ def test_instance_list_exposes_template_time():
         assert res2["items"][0]["template_notice_times"] == ["12:00", "20:00"]
     finally:
         store.close()
+
+
+# ── 2026-10-29 补丁批（跨函数边界收口）─────────────────────────────
+
+
+def test_removed_member_is_not_revived_by_any_message():
+    """补丁1：被移出的成员发任意消息不能被静默复活，且能重新回到待归纳池。"""
+    store = _mk_store()
+    try:
+        tpl = _form_tpl(store)          # 建角色 + 成员 + delivery_target(usable=1)
+        rid = tpl["role_ids"][0]
+
+        store.delete_role_member(rid, "13900001001", actor="t")
+        assert store.get_pending_member("uid_jia") is not None, "移出后应在待归纳池"
+
+        # 关键断言：此时按 external_id「触碰」不应再识别为已绑定成员
+        assert store.touch_delivery_target_by_external_id("uid_jia") is None
+        # 也不该把 usable 复活
+        target = store.get_delivery_target("13900001001", include_unusable=True)
+        assert target is not None and int(target["usable"]) == 0
+    finally:
+        store.close()
+
+
+def test_multi_role_member_stays_bound_when_removed_from_one_role():
+    """补丁2：一人多角色时，从其中一个角色移出不能掐断另一个角色的推送绑定。"""
+    store = _mk_store()
+    try:
+        r1 = store.create_role("角色A", actor="t")["role_id"]
+        r2 = store.create_role("角色B", actor="t")["role_id"]
+        for r in (r1, r2):
+            store.add_role_member(r, "13900007001", "多岗甲", "一部", actor="t")
+        store.upsert_delivery_target("13900007001", "uid_multi")
+
+        store.delete_role_member(r1, "13900007001", actor="t")
+
+        # 仍留在角色 B：绑定必须还能用，且不能进待归纳池
+        assert store.get_delivery_target("13900007001") is not None
+        assert store.get_pending_member("uid_multi") is None
+        assert store.touch_delivery_target_by_external_id("uid_multi") is not None
+
+        # 从最后一个角色移出后才回收
+        store.delete_role_member(r2, "13900007001", actor="t")
+        assert store.get_delivery_target("13900007001") is None          # 默认只查 usable=1
+        assert store.get_pending_member("uid_multi") is not None
+    finally:
+        store.close()
+
+
+def test_attach_image_path_sibling_dir_rejected():
+    """补丁3：同级目录（data_other）不能被当成 data 目录内部路径。"""
+    store = _mk_store()
+    try:
+        rid = store.create_role("路径组", actor="t")["role_id"]
+        base = {
+            "name": "带图通知", "kind": "notice", "role_ids": [rid],
+            "text_tpl": "看看数据", "remind_at": "09:00", "notice_times": ["09:00"], "period": "day",
+        }
+        for bad in ("../data_other/a.png", "a/../../data_other/b.png", "/tmp/x.png"):
+            with pytest.raises(BizError):
+                store.create_template({**base, "attach_image_path": bad}, actor="t")
+    finally:
+        store.close()

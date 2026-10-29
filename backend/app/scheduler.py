@@ -498,7 +498,8 @@ class Scheduler:
                                 base_dir = Path(db_path).parent if db_path else Path("data").resolve()
                                 # 2026-10-29 P2-1：运行时再兜一道，越界路径直接跳过，不外读
                                 _target = (base_dir / attach_rel).resolve()
-                                if not str(_target).startswith(str(base_dir.resolve())):
+                                # 2026-10-29 补丁3：is_relative_to 比字符串前缀更可靠（data_other 不会被误判在 data 内）
+                                if not _target.is_relative_to(base_dir.resolve()):
                                     logger.warning("通知附图路径越界已拦截 template=%s path=%s", tpl["template_id"], attach_rel)
                                     raise ValueError("path_out_of_data_dir")
                                 prepared = self.image_sender.prepare_image(str(_target))

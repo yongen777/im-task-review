@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, Optional, Tuple
 
 try:
@@ -143,6 +144,25 @@ def process_app_event(
     """
     base_url = public_base_url.rstrip("/")
     active_notifier: NotifierProtocol = notifier if notifier is not None else channel
+    # 2026-10-29：不管防重放窗口开不开，每次回调都记一条时间戳样本，
+    # 用来核对平台下发的是秒还是毫秒、以及和服务器时钟差多少（窗口=0 时不会走到拒绝分支，
+    # 原来那条 warning 永远不会出现，等于观察不到）。
+    if timestamp:
+        try:
+            _ts_raw = str(timestamp).strip()
+            _ts_int = int(float(_ts_raw))
+            _ts_unit = "s" if _ts_int < 10 ** 12 else "ms"
+            _ts_ms = _ts_int * 1000 if _ts_unit == "s" else _ts_int
+            logger.info(
+                "[callback-ts] raw=%s digits=%d unit=%s skew=%+.1fs window=%ss",
+                _ts_raw, len(_ts_raw), _ts_unit, (int(time.time() * 1000) - _ts_ms) / 1000.0,
+                _event_ts_window_sec(),
+            )
+        except Exception:
+            logger.info("[callback-ts] raw=%s (无法解析为数字)", timestamp)
+    else:
+        logger.info("[callback-ts] 缺失 X-CTQ-Timestamp 头")
+
 
     def _send_bot_reply(receive_id: str, text: str, tag: str) -> None:
         if not receive_id or not text:

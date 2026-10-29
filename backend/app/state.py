@@ -389,10 +389,25 @@ class StateStore:
             return None
         now_s = self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM delivery_target WHERE platform = ? AND external_id = ?", (platform, clean_ext)).fetchone()
+            # 2026-10-29 补丁1：只有「usable=1 且手机号仍在有效名册中」才算已绑定成员。
+            # 之前这里不看 usable、也不看 member 表，被移出/移除的人发一句话就会被静默复活成
+            # usable=1，并且 return 掉绑分支，永远走不到「自动进待归纳池」那一步。
+            row = self.conn.execute(
+                "SELECT * FROM delivery_target WHERE platform = ? AND external_id = ? AND usable = 1",
+                (platform, clean_ext),
+            ).fetchone()
             if not row:
                 return None
-            self.conn.execute("UPDATE delivery_target SET usable = 1, last_event_at = ? WHERE platform = ? AND phone = ?", (now_s, platform, row["phone"]))
+            in_roster = self.conn.execute(
+                "SELECT 1 FROM member WHERE phone = ? LIMIT 1",
+                (row["phone"],),
+            ).fetchone()
+            if not in_roster:
+                return None
+            self.conn.execute(
+                "UPDATE delivery_target SET last_event_at = ? WHERE platform = ? AND phone = ?",
+                (now_s, platform, row["phone"]),
+            )
             return {"platform": row["platform"], "phone": row["phone"], "external_id": row["external_id"], "usable": 1, "activated_at": row["activated_at"], "last_event_at": now_s}
 
     def get_delivery_target(self, phone: str, platform: str = "zdxlz", include_unusable: bool = False) -> Optional[Dict[str, Any]]:
@@ -546,9 +561,14 @@ class StateStore:
             self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
             # 2026-10-29 P0-3：移出成员时把推送绑定一并收回到待归纳池，
             # 否则 delivery_target 仍指向该人，形成“已移出却还能收到任务”的幽灵绑定。
+            # 2026-10-29 补丁2：一人可同时属于多个角色（UNIQUE(role_id, phone)），
+            # 只是从 A 角色移出、但还留在 B 角色时，不能掐断他的推送绑定，也不该回待归纳池。
+            still_in_other_role = self.conn.execute(
+                "SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean_phone,)
+            ).fetchone() is not None
             dt = self.conn.execute("SELECT external_id FROM delivery_target WHERE phone = ?", (clean_phone,)).fetchone()
             back_to_pending = False
-            if dt and dt["external_id"]:
+            if (not still_in_other_role) and dt and dt["external_id"]:
                 ext_id = str(dt["external_id"])
                 existing_pending = self.conn.execute(
                     "SELECT id FROM pending_member WHERE external_id = ?", (ext_id,)
@@ -797,7 +817,9 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", "attach_image_path 必须是相对 data 目录的路径")
             _data_root = Path(self.db.db_path).parent.resolve()
             _resolved = (_data_root / attach_image_path).resolve()
-            if not str(_resolved).startswith(str(_data_root)):
+            # 2026-10-29 补丁3：用 is_relative_to 替代字符串前缀比较，
+            # 否则 /app/data_other 会命中 /app/data 前缀，越界判断失效。
+            if not _resolved.is_relative_to(_data_root):
                 raise BizError(400, "VALIDATION_FAILED", "attach_image_path 不允许指向数据目录以外的路径")
             attach_image = True  # 有图就等价于开启附图，避免前端只传了路径没传开关
         if attach_image and not data_keys_norm and not attach_image_path:
