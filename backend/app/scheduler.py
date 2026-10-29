@@ -6,7 +6,10 @@ import calendar
 import hashlib
 import logging
 import os
+import shutil
 import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -352,6 +355,62 @@ class Scheduler:
 
         return next_retry
 
+    def _publish_image_link(self, src_path: str) -> Optional[str]:
+        """把附图复制成公网可直链访问的副本，返回 URL（失败返回 None）。
+
+        2026-10-29 起因：平台媒体下载接口给出的是 **application/octet-stream** 的预签名
+        S3 链接，且 32KB 的图要 5s+ 才下载完 —— 手机端图片消息一直转圈点不开（PC 端有缓存才正常）。
+        这条链路完全在我们自己服务器上（同域、秒开、Content-Type 正确），作为移动端兜底。
+        文件名用 uuid4 hex，不可枚举；目录只放附图副本，不含任何业务数据。
+        """
+        try:
+            src = Path(src_path)
+            if not src.is_file():
+                return None
+            db_path = getattr(getattr(self.state, "db", None), "db_path", None)
+            data_dir = Path(db_path).parent if db_path else Path("data").resolve()
+            pub_dir = data_dir / "public_img"
+            pub_dir.mkdir(parents=True, exist_ok=True)
+            suffix = src.suffix.lower()
+            if suffix not in (".jpg", ".jpeg", ".png"):
+                suffix = ".jpg"
+            name = f"{uuid.uuid4().hex}{suffix}"
+            shutil.copyfile(src, pub_dir / name)
+            # 顺手清理 30 天前的副本，避免目录无界增长（清不动也不影响本次发布）
+            try:
+                cutoff = time.time() - 30 * 86400
+                for old in pub_dir.iterdir():
+                    if old.is_file() and old.stat().st_mtime < cutoff:
+                        old.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+            base = (self.public_base_url or "").rstrip("/")
+            if not base:
+                return None
+            return f"{base}/h5/img/{name}"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("附图公网副本发布失败 %s: %s", src_path, exc)
+            return None
+
+    def _send_image_link(self, external_id: str, image_url: str, base_idem: str,
+                         template_id: str, instance_id: Optional[int], phone: str,
+                         planned_str: str, now_s: str, stats: Dict[str, int]) -> None:
+        """图片消息之后补一条含直链的短文本；失败只记日志，绝不影响主链路。"""
+        try:
+            link_idem = hashlib.sha1(f"{base_idem}|link".encode("utf-8")).hexdigest()
+            text = f"数据图片（点击查看）：\n{image_url}"
+            res = self.notifier.send_text(external_id, text, link_idem)
+            self.state.record_reminder_log(
+                template_id=template_id, instance_id=instance_id, phone=phone, kind="notice_img_link",
+                planned_at=planned_str, attempted_at=now_s,
+                sent_at=now_s if res.ok else None, result="sent" if res.ok else "failed",
+                retry=0, error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=link_idem,
+            )
+            if not res.ok:
+                stats["failed"] = stats.get("failed", 0) + 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("附图直链文本发送异常 external=%s: %s", external_id, exc)
+
     def _deliver_with_log(
         self,
         *,
@@ -535,6 +594,7 @@ class Scheduler:
                     want_dash = bool(tpl.get("attach_image")) and bool(data_keys)
                     if self.image_sender is not None and (attach_rel or want_dash):
                         prepared = None
+                        img_src_path: Optional[str] = None
                         if attach_rel:
                             try:
                                 db_path = getattr(getattr(self.state, "db", None), "db_path", None)
@@ -546,6 +606,7 @@ class Scheduler:
                                     logger.warning("通知附图路径越界已拦截 template=%s path=%s", tpl["template_id"], attach_rel)
                                     raise ValueError("path_out_of_data_dir")
                                 prepared = self.image_sender.prepare_image(str(_target))
+                                img_src_path = str(_target)
                             except Exception as exc:
                                 logger.warning("通知附图加载失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
                         if prepared is None and want_dash:
@@ -570,9 +631,13 @@ class Scheduler:
                                         out_path=out_png,
                                     )
                                     prepared = self.image_sender.prepare_image(out_png)
+                                    img_src_path = out_png
                                 except Exception as exc:  # 看板渲染/上传失败不影响文本主链路
                                     logger.warning("看板渲染或上传失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
                         if prepared:
+                            # 2026-10-29：平台图片消息在手机端一直转圈（CDN 返回 octet-stream + 5s 延迟），
+                            # 因此图片之外再补一条「我们自己服务器」的直链，员工点开就能看。
+                            link_url = self._publish_image_link(img_src_path) if img_src_path else None
                             for inst in instances:
                                 idem_img = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice_img", seq_idx, planned_str)
                                 target = self.state.get_delivery_target(inst["phone"])
@@ -583,12 +648,18 @@ class Scheduler:
                                 def _noop_text() -> str:
                                     return ""
 
-                                self._deliver_with_log(
+                                sent_img = self._deliver_with_log(
                                     template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                                     external_id=ext_id, kind="notice_img", planned_str=planned_str, delay_sec=delay_sec,
                                     idem_key=idem_img, msg_text_fn=_noop_text, cur_dt=cur_dt, now_s=now_s, stats=stats,
                                     send_fn=lambda rid, _t, idem, _prep=prepared: self.image_sender.send_image_prepared(rid, _prep, idem),
                                 )
+                                if sent_img and link_url:
+                                    self._send_image_link(
+                                        external_id=ext_id, image_url=link_url, base_idem=idem_img,
+                                        template_id=tpl["template_id"], instance_id=int(inst["id"]),
+                                        phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
+                                    )
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])

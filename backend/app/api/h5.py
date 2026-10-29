@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import time
 import uuid
@@ -12,9 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from fastapi import APIRouter, File, Form, Request, UploadFile
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 except ImportError:  # pragma: no cover
     APIRouter = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
+    FileResponse = None  # type: ignore[assignment]
 
 from ..scheduler import NotifierProtocol
 from ..state import BizError, StateStore, calc_resubmit_deadline
@@ -336,6 +338,23 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
     @router.get("/h5/bind", response_class=HTMLResponse)
     async def h5_bind_page():
         return HTMLResponse(content=load_h5_html("bind.html"))
+
+    # 2026-10-29：通知附图的「公网直链」。平台 CDN 返回 application/octet-stream、
+    # 且 32KB 的图要 5s+ 才下发完，手机端量子密信的图片消息一直转圈打不开（PC 端因有缓存才正常）。
+    # 这里提供一条我们自己的直链：文件名是 uuid4（不可枚举），Content-Type 由扩展名推断，
+    # 同域同端口，员工手机点开即看。仅供兜底，不影响原有图片消息。
+    @router.get("/h5/img/{name}")
+    async def h5_public_image(name: str):
+        if FileResponse is None:  # pragma: no cover
+            return JSONResponse(status_code=500, content={"code": "UNAVAILABLE", "message": "服务未就绪"})
+        clean = (name or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png)", clean):
+            return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
+        img_dir = (uploads_dir.parent / "public_img").resolve()
+        target = (img_dir / clean).resolve()
+        if not target.is_file() or not target.is_relative_to(img_dir):
+            return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
+        return FileResponse(str(target), headers={"Cache-Control": "public, max-age=86400"})
 
     @router.post("/api/h5/bind")
     async def api_h5_bind(request: Request):

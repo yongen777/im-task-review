@@ -179,14 +179,16 @@ def test_notice_with_image_delivers_text_and_image():
     scheduler = _mk_scheduler(store, notifier=notifier, image_sender=img_sender)
     stats = scheduler.run_once()
 
-    assert stats["sent"] == 2  # 1 条文本 + 1 条图片
-    assert len(notifier.sent_messages) == 1
+    assert stats["sent"] == 2  # 1 条文本 + 1 条图片（直链文本不计入 sent）
+    assert len(img_sender.sent) == 1  # 图片发给 1 名成员
+    # 2026-10-29：图片之后再补一条「自己服务器的公网直链」——平台图片消息在手机端点不开
+    assert len(notifier.sent_messages) == 2
     assert "86.5%" in notifier.sent_messages[0].text
     assert "45" in notifier.sent_messages[0].text
-    assert len(img_sender.sent) == 1  # 图片发给 1 名成员
+    assert "/h5/img/" in notifier.sent_messages[1].text
 
     kinds = [r["kind"] for r in store.list_reminder_logs(tpl_id)]
-    assert "notice" in kinds and "notice_img" in kinds
+    assert "notice" in kinds and "notice_img" in kinds and "notice_img_link" in kinds
 
 
 def test_notice_without_snapshot_skips_image():
