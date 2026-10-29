@@ -441,6 +441,6 @@ def test_instance_list_exposes_template_time():
         )
         store.ensure_template_instances(n_tpl["template_id"], "2026-10-28", "2026-10-28 23:59:00")
         res2 = _query_instances(store, template_id=n_tpl["template_id"], page=1, size=20)
-        assert res2["items"][0]["template_notice_times"] == '["12:00", "20:00"]'
+        assert res2["items"][0]["template_notice_times"] == ["12:00", "20:00"]
     finally:
         store.close()

@@ -698,10 +698,23 @@ export const InstancesView: React.FC = () => {
                       {/* 5. 执行时间：取模板的计划时刻（通知类可能有多个时点），不再拿提交时间顶替 */}
                       <td className="py-4 px-3 font-mono text-xs text-slate-700 whitespace-nowrap">
                         {(() => {
+                          /* 后端历史上可能给回 JSON 字符串，这里做一次兜底解析，避免整页崩 */
+                          const parseTimes = (v: unknown): string[] => {
+                            if (Array.isArray(v)) return v.map(String);
+                            if (typeof v === 'string' && v.trim()) {
+                              try {
+                                const arr = JSON.parse(v);
+                                return Array.isArray(arr) ? arr.map(String) : [];
+                              } catch {
+                                return [];
+                              }
+                            }
+                            return [];
+                          };
                           const slots =
                             inst.kind === 'notice'
-                              ? (inst.template_notice_times && inst.template_notice_times.length > 0
-                                ? inst.template_notice_times
+                              ? (parseTimes(inst.template_notice_times).length > 0
+                                ? parseTimes(inst.template_notice_times)
                                 : inst.template_remind_at
                                   ? [inst.template_remind_at]
                                   : [])

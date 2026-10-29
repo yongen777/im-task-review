@@ -322,6 +322,13 @@ def _query_instances(
             d = dict(r)
             d["late_submit"] = bool(d.get("late_submit", 0))
             d["need_review"] = bool(d.get("need_review", 0))
+            # 2026-10-29：notice_times 在库里是 JSON 字符串，前端要按数组渲染执行时间，这里先解析
+            _nt = d.get("template_notice_times")
+            if isinstance(_nt, str):
+                try:
+                    d["template_notice_times"] = json.loads(_nt)
+                except Exception:
+                    d["template_notice_times"] = None
             # 前端表格按 inst.kind / inst.role_id 渲染任务类型与所属角色，这里直接补齐，
             # 免得每一行都退化成「上传任务 / 业务角色」的兜底文案。
             d["kind"] = d.get("template_kind") or "form"

@@ -149,7 +149,7 @@ export interface TaskInstanceItem {
   deadline_at: string | null;
   /* 2026-10-29：模板的计划执行时间（通知类可能有多个时点），列表「执行时间」列要用 */
   template_remind_at?: string | null;
-  template_notice_times?: string[] | null;
+  template_notice_times?: string[] | string | null;
   created_at: string;
 }
 
