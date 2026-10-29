@@ -231,7 +231,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                   </span>
                 )}
               </div>
-              {/* 2026-10-28：按郑工要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
+              {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
               <div className="text-[11px] text-slate-500">
                 提交人：张三 · 周期：{new Date().toISOString().slice(0, 10)} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
               </div>
@@ -678,6 +678,7 @@ export const TemplatesView: React.FC = () => {
         toast.warning('请至少保留 1 条提醒内容');
         return;
       }
+      let missingCaption = false;
       for (let i = 0; i < noticeItems.length; i++) {
         const item = noticeItems[i];
         if (item.format === 'text' && !item.text_content?.trim()) {
@@ -691,15 +692,14 @@ export const TemplatesView: React.FC = () => {
           );
           return;
         }
-        /* 2026-10-29 H5.5：上传了图片就必须填写图片名称（描述），
-           否则发送时直链文案与 H5 页面标题没有名字可用 */
+        /* 2026-10-29：图片名称（描述）改成**可空**——只提醒、不挡保存。
+           图片本身已经能推送，没有名称只是 H5 图文页不显示标题，不应该拦住整个模板。 */
         if (item.format === 'file' && item.image_path && !item.file_caption?.trim()) {
-          toast.warning(
-            `第 ${i + 1} 条已上传图片，请填写「图片名称（描述）」才能保存`,
-            '缺少图片名称',
-          );
-          return;
+          missingCaption = true;
         }
+      }
+      if (missingCaption) {
+        toast.warning('有图片未填写名称（描述），已照常保存；H5 图文页将不显示标题。', '图片名称未填写');
       }
       finalTextTpl = summarizeNoticeItemsToText(noticeItems);
       spec = {
@@ -1049,31 +1049,28 @@ export const TemplatesView: React.FC = () => {
                                           {ni.text_content}
                                         </div>
                                       ) : ni.image_path ? (
-                                        /* 2026-10-29：显示上传时的**原始文件名**；描述只在真的填过时才显示。
-                                           以前这里固定写「点击查看图片」，和真实配置对不上。 */
-                                        <div className="space-y-0.5">
+                                        /* 2026-10-29：按业务口径改成**上下结构**——上面是图片预览，下面是这张图的名称（描述）。
+                                           不再显示服务器上的文件名（notice_xxxx.png 是内部随机名，对业务没意义）。 */
+                                        <div className="space-y-1">
                                           <a
                                             href={`/api/admin/template-assets/${encodeURIComponent(
                                               String(ni.image_path).split('/').pop() || '',
                                             )}`}
                                             target="_blank"
                                             rel="noopener noreferrer"
-                                            className="inline-flex items-center gap-2 group"
+                                            className="inline-block group"
                                             title="点击查看原图"
                                           >
                                             <img
                                               src={`/api/admin/template-assets/${encodeURIComponent(
                                                 String(ni.image_path).split('/').pop() || '',
                                               )}`}
-                                              alt={ni.file_name || '数据图片'}
-                                              className="w-12 h-12 rounded-lg object-cover border border-slate-200"
+                                              alt={ni.file_caption || '数据图片'}
+                                              className="w-12 h-12 rounded-lg object-cover border border-slate-200 group-hover:border-indigo-300"
                                             />
-                                            <span className="text-[11px] text-indigo-700 font-medium group-hover:underline truncate max-w-[220px]">
-                                              {ni.file_name || '点击查看图片'}
-                                            </span>
                                           </a>
                                           {ni.file_caption ? (
-                                            <div className="text-[11px] text-slate-500 leading-relaxed whitespace-pre-line">
+                                            <div className="text-[11px] text-slate-600 leading-relaxed whitespace-pre-line max-w-[190px]">
                                               {ni.file_caption}
                                             </div>
                                           ) : null}
@@ -1557,22 +1554,15 @@ export const TemplatesView: React.FC = () => {
                                   <div className="space-y-1.5">
                                     <label className="block text-[11px] font-semibold text-slate-600">
                                       图片名称（描述）
-                                      <span className="text-rose-600 ml-0.5">*</span>
+                                      <span className="text-slate-400 font-normal ml-1.5">选填</span>
                                     </label>
                                     <input
                                       type="text"
                                       value={item.file_caption || ''}
                                       onChange={(e) => updateNoticeItem(idx, { file_caption: e.target.value })}
-                                      placeholder="如：上午上门情况统计图"
-                                      className={`w-full bg-white border rounded-xl px-2.5 py-2 text-slate-800 outline-none focus:border-blue-500 text-sm ${
-                                        item.file_caption?.trim() ? 'border-slate-200' : 'border-rose-300'
-                                      }`}
+                                      placeholder="如：上午上门情况统计图（留空则 H5 页不显示标题）"
+                                      className="w-full bg-white border border-slate-200 rounded-xl px-2.5 py-2 text-slate-800 outline-none focus:border-blue-500 text-sm"
                                     />
-                                    {!item.file_caption?.trim() && (
-                                      <span className="text-rose-600 text-[11px] font-semibold">
-                                        必须填写图片名称后才能保存
-                                      </span>
-                                    )}
                                   </div>
                                 ) : null}
                               </div>

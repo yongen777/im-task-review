@@ -67,6 +67,11 @@ export const RolesMembersView: React.FC = () => {
   const [editingMember, setEditingMember] = useState<RoleMemberItem | null>(null);
   const [editMemberName, setEditMemberName] = useState('');
   const [editMemberStatus, setEditMemberStatus] = useState<'active' | 'disabled'>('active');
+  /* 2026-10-29：一人多角色 —— 把已在某角色的成员同时加入其他角色 */
+  const [assignMember, setAssignMember] = useState<RoleMemberItem | null>(null);
+  const [assignRoleIds, setAssignRoleIds] = useState<string[]>([]);
+  const [assigningRoles, setAssigningRoles] = useState(false);
+  const [memberRoleIds, setMemberRoleIds] = useState<string[]>([]);
   const [savingMember, setSavingMember] = useState(false);
 
   // CSV 批量导入弹窗（仅手机号与用户名）
@@ -355,6 +360,71 @@ export const RolesMembersView: React.FC = () => {
       toast.error(err instanceof Error ? plainError(err.message) : '添加成员未成功');
     } finally {
       setAddingMember(false);
+    }
+  };
+
+  /* 2026-10-29：一人多角色 —— 打开「加入其他角色」弹窗，先拉该人当前所在角色用于置灰 */
+  const openAssignRolesModal = async (m: RoleMemberItem) => {
+    setAssignMember(m);
+    setAssignRoleIds([]);
+    setMemberRoleIds([]);
+    try {
+      const res = await api.get<{ ok: boolean; items: { role_id: string }[] }>(
+        `/api/admin/members/${encodeURIComponent(m.phone)}/roles`,
+      );
+      setMemberRoleIds((res.items || []).map((r) => String(r.role_id)));
+    } catch {
+      /* 拉不到就不置灰；提交时后端按 DUPLICATE 跳��，不会重复插入 */
+    }
+  };
+
+  const toggleAssignRole = (roleId: string) => {
+    setAssignRoleIds((prev) =>
+      prev.includes(roleId) ? prev.filter((x) => x !== roleId) : [...prev, roleId],
+    );
+  };
+
+  const handleAssignRoles = async () => {
+    if (!assignMember) return;
+    const targets = assignRoleIds.filter((rid) => !memberRoleIds.includes(rid));
+    if (targets.length === 0) {
+      toast.warning('请至少勾选 1 个「尚未加入」的角色');
+      return;
+    }
+    setAssigningRoles(true);
+    try {
+      const res = await api.post<{
+        ok: boolean;
+        added: string[];
+        skipped: string[];
+        failed: { role_id: string; message: string }[];
+      }>(`/api/admin/members/${encodeURIComponent(assignMember.phone)}/roles`, {
+        role_ids: targets,
+        name: assignMember.name,
+        dept: assignMember.dept || '',
+      });
+      const nameOf = (rid: string) => roles.find((r) => r.role_id === rid)?.role_name || rid;
+      const addedNames = (res.added || []).map(nameOf);
+      const memberName = assignMember.name;
+      await Promise.all([refreshRoles(), loadMembers(selectedRoleId), loadUnactivated()]);
+      setAssignMember(null);
+      setAssignRoleIds([]);
+      if (addedNames.length > 0) {
+        toast.success(
+          `「${memberName}」已同时加入：${addedNames.join('、')}。原有角色保留不变，两个角色都会收到各自的任务。`,
+          '已加入其他角色',
+        );
+      }
+      if ((res.skipped || []).length > 0) {
+        toast.info(`已跳过 ${res.skipped.length} 个角色：该成员本来就在里面`);
+      }
+      if ((res.failed || []).length > 0) {
+        toast.error(res.failed.map((f) => `${nameOf(f.role_id)}：${f.message}`).join('；'), '部分角色添加失败');
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '加入其他角色失败');
+    } finally {
+      setAssigningRoles(false);
     }
   };
 
@@ -771,6 +841,14 @@ export const RolesMembersView: React.FC = () => {
                           </td>
                           <td className="py-3.5 pl-3 pr-5 text-right">
                             <div className="inline-flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => void openAssignRolesModal(m)}
+                                title="把该成员同时加入其他业务角色（一人可兼多角色，原角色保留）"
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                              >
+                                <Users className="w-3 h-3" />
+                                <span>加入其他角色</span>
+                              </button>
                               <button
                                 onClick={() => openEditMemberModal(m)}
                                 className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
@@ -1208,6 +1286,97 @@ export const RolesMembersView: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-10-29：一人多角色 —— 把成员同时加入其他业务角色（原角色保留） */}
+      {assignMember && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900 text-base">加入其他业务角色</h3>
+                <p className="text-[11px] text-slate-400">
+                  一人可同时属于多个角色；原角色成员关系保留，各角色任务独立派发。
+                </p>
+              </div>
+              <button
+                onClick={() => setAssignMember(null)}
+                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="text-xs bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+              <div className="font-semibold text-slate-800">{assignMember.name}</div>
+              <div className="font-mono text-slate-500 tabular-nums">{assignMember.phone}</div>
+              <div className="text-[11px] text-slate-500 leading-relaxed">
+                当前已在：
+                {memberRoleIds.length === 0
+                  ? '（读取中…）'
+                  : memberRoleIds
+                      .map((rid) => roles.find((r) => r.role_id === rid)?.role_name || rid)
+                      .join('、')}
+              </div>
+            </div>
+
+            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+              {roles.map((r) => {
+                const already = memberRoleIds.includes(r.role_id);
+                const checked = assignRoleIds.includes(r.role_id);
+                return (
+                  <label
+                    key={r.role_id}
+                    className={`flex items-center gap-2.5 px-3 py-2 rounded-xl border text-xs ${
+                      already
+                        ? 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
+                        : checked
+                          ? 'bg-emerald-50 border-emerald-300 text-emerald-800 cursor-pointer'
+                          : 'bg-white border-slate-200 text-slate-700 hover:border-emerald-200 cursor-pointer'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={already}
+                      checked={already || checked}
+                      onChange={() => toggleAssignRole(r.role_id)}
+                      className="w-3.5 h-3.5 accent-emerald-600"
+                    />
+                    <span className="font-semibold flex-1 truncate">{r.role_name}</span>
+                    {already ? (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 text-slate-500">
+                        已在其中
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-slate-400">{r.member_count} 人</span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="pt-2 flex justify-end gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => setAssignMember(null)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={
+                  assigningRoles ||
+                  assignRoleIds.filter((rid) => !memberRoleIds.includes(rid)).length === 0
+                }
+                onClick={() => void handleAssignRoles()}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-50"
+              >
+                {assigningRoles ? '正在加入…' : '确认加入'}
+              </button>
+            </div>
           </div>
         </div>
       )}

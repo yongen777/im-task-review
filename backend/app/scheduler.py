@@ -584,7 +584,7 @@ class Scheduler:
                 if data_keys:
                     snap_values = self.state.get_data_snapshot_values(tpl["template_id"], p_key)
 
-                # 2026-10-28 方案A（按郑工新要求调整）：通知类**当天一进来就按人生成实例**（pending），
+                # 2026-10-28 方案A（按业务方新要求调整）：通知类**当天一进来就按人生成实例**（pending），
                 # 到点发出后置 sent。这样「任务实例」页能看到今天所有通知归了谁，
                 # 不会只剩已完成的那几条。deadline 用当天 23:59 占位，不参与 overdue 流转；
                 # 到当天结束仍未发出的，由 advance_instance_statuses 标成 expired（未送达）。

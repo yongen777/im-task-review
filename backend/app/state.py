@@ -518,6 +518,22 @@ class StateStore:
             items = [_fmt_member(r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"], r["source"], r["created_at"], r["external_id"]) for r in rows]
             return {"total": total, "items": items}
 
+    def list_roles_of_phone(self, phone: str) -> List[Dict[str, Any]]:
+        """2026-10-29：某手机号当前所在的所有角色（一人多角色场景，前端用来置灰「已加入」的角色）。"""
+        clean_phone = (phone or "").strip()
+        if not clean_phone:
+            return []
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT m.role_id, r.name AS role_name, m.enabled FROM member m "
+                "JOIN role r ON r.role_id = m.role_id WHERE m.phone = ? ORDER BY r.name",
+                (clean_phone,),
+            ).fetchall()
+        return [
+            {"role_id": r["role_id"], "role_name": r["role_name"], "enabled": bool(r["enabled"])}
+            for r in rows
+        ]
+
     def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system") -> Dict[str, Any]:
         clean_role_id, clean_phone, clean_name = (role_id or "").strip(), (phone or "").strip(), (name or "").strip()
         clean_dept = str(dept).strip() if dept is not None and str(dept).strip() else None

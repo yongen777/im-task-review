@@ -935,6 +935,56 @@ def create_admin_router(state: StateStore) -> APIRouter:
             return biz_error_response(exc)
         return {"ok": True, "member": member}
 
+    @router.get("/members/{phone}/roles")
+    async def list_member_roles(phone: str, request: Request):
+        """某人当前所在的全部角色（一人多角色：前端弹窗把已加入的角色置灰）。"""
+        # GET 只读：与其它查询接口一致，不校验 CSRF（否则前端 api.get 不带 token 会 403）
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        return {"ok": True, "items": state.list_roles_of_phone(phone)}
+
+    @router.post("/members/{phone}/roles")
+    async def assign_member_to_roles(phone: str, request: Request):
+        """2026-10-29：把**已有成员**一次加入多个其他角色（一人多角色）。
+
+        场景：张三已在「片长/分支局长」，还需要同时在「云中台软研队伍」。
+        成员表的唯一约束是 UNIQUE(role_id, phone)，本来就允许同一手机号出现在多个角色；
+        缺的只是一个显式入口（否则只能在目标角色里重新手填姓名+手机号）。
+        这里逐角色调用 add_role_member，已在该角色的记为 skipped，不影响其他角色。
+        """
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        raw_role_ids = body.get("role_ids")
+        if not isinstance(raw_role_ids, list) or not raw_role_ids:
+            return error_response(400, "VALIDATION_FAILED", "请至少选择 1 个目标角色")
+        name = str(body.get("name") or "").strip()
+        if not name:
+            return error_response(400, "VALIDATION_FAILED", "成员姓名不能为空")
+        dept = body.get("dept")
+
+        added: List[str] = []
+        skipped: List[str] = []
+        failed: List[Dict[str, Any]] = []
+        for rid in [str(x).strip() for x in raw_role_ids if str(x).strip()]:
+            try:
+                state.add_role_member(
+                    role_id=rid, phone=phone, name=name, dept=dept,
+                    source="manual", actor=sess["username"],
+                )
+                added.append(rid)
+            except BizError as exc:
+                if exc.code == "DUPLICATE":
+                    skipped.append(rid)
+                else:
+                    failed.append({"role_id": rid, "message": exc.message})
+        return {"ok": True, "added": added, "skipped": skipped, "failed": failed}
+
     @router.put("/roles/{role_id}/members/{phone}")
     async def update_role_member(role_id: str, phone: str, request: Request):
         sess, err = require_session(request, state, check_csrf=True)

@@ -24,7 +24,7 @@ class H5ImgPageTest(unittest.TestCase):
         self.cfg = Config(
             public_port=9020,
             admin_port=9013,
-            public_base_url="http://219.151.177.33:9020",
+            public_base_url="http://203.0.113.10:9020",
             data_dir=root / "data",
         )
         self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
@@ -71,7 +71,7 @@ class H5ImgPageTest(unittest.TestCase):
         src = self._make_img()
         url = self.scheduler._publish_image_link(str(src), "上午上门情况统计图")
         assert url, "直链发布失败"
-        assert url.startswith("http://219.151.177.33:9020/h5/img/")
+        assert url.startswith("http://203.0.113.10:9020/h5/img/")
         name = url.rsplit("/", 1)[-1]
 
         # 1) 默认：HTML 图文页，标题 = 图片名称

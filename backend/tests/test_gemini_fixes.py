@@ -613,3 +613,37 @@ def test_notice_spec_literal_backslash_n_normalized():
         assert items[1]["file_caption"] == "第一行\n第二行"
     finally:
         store.close()
+
+
+def test_member_can_join_multiple_roles():
+    """2026-10-29：同一手机号可同时属于多个角色（一人兼多角色），互不影响。
+
+    场景：张三已在「片长/分支局长」，需要同时加入「云中台软研队伍」。
+    """
+    store = _mk_store()
+    try:
+        r1 = store.create_role("片长/分支局长", actor="t")["role_id"]
+        r2 = store.create_role("云中台软研队伍", actor="t")["role_id"]
+        store.add_role_member(r1, "13900008001", "张三", "市场部", actor="t")
+        store.upsert_delivery_target("13900008001", "uid_jia")
+
+        # 加入第二个角色：不报错，且第一个角色的成员关系保持
+        store.add_role_member(r2, "13900008001", "张三", "市场部", actor="t")
+        assert store.list_role_members(r1)["total"] == 1
+        assert store.list_role_members(r2)["total"] == 1
+
+        roles = store.list_roles_of_phone("13900008001")
+        assert {r["role_id"] for r in roles} == {r1, r2}
+
+        # 同一角色内重复添加仍应被拦（避免一条角色两条记录）
+        with pytest.raises(BizError) as err:
+            store.add_role_member(r2, "13900008001", "张三", actor="t")
+        assert err.value.code == "DUPLICATE"
+
+        # 从其中一个角色移出：另一角色与推送绑定都必须保留
+        store.delete_role_member(r1, "13900008001", actor="t")
+        assert store.list_role_members(r2)["total"] == 1
+        assert store.get_delivery_target("13900008001") is not None
+        assert {r["role_id"] for r in store.list_roles_of_phone("13900008001")} == {r2}
+    finally:
+        store.close()
