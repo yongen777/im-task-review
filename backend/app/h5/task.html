@@ -290,23 +290,29 @@
           /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
              只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。 */
           const __status = data.instance.status;
-          const __canResubmit = __status === "rejected" && !!data.window_open;
+          /* 2026-10-29 P0-1：逾期（overdue）在 72 小时补交窗口内仍允许提交——
+             后端 is_instance_window_closed 放行，前端却锁死页面，导致补交链接不可用。 */
+          const __canResubmit = (__status === "rejected" || __status === "overdue") && !!data.window_open;
           if (__canResubmit) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
             tip.style.background = "#fff7ed";
             tip.style.borderColor = "#fed7aa";
             tip.style.color = "#c2410c";
-            tip.textContent = data.instance.resubmit_deadline
-              ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
-              : "该提交已被驳回，请按审核意见修改后重新提交。";
+            if (__status === "rejected") {
+              tip.textContent = data.instance.resubmit_deadline
+                ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
+                : "该提交已被驳回，请按审核意见修改后重新提交。";
+            } else {
+              tip.textContent = "已超过截止时间。补交窗口内仍可提交，请尽快完成。";
+            }
             content.insertBefore(tip, submitBtn);
           } else if (__status !== "pending") {
             const LOCKED_TEXT = {
               submitted: "已提交，等待管理员审核。如需修改请联系管理员驳回后重新提交。",
               approved: "已审核通过，本条任务已完成。",
               rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
-              overdue: "已超过截止时间，无法再提交。",
+              overdue: "已超过补交期限（截止后 72 小时），无法再提交。",
               expired: "该任务已过期，无法提交。",
             };
             const tip = document.createElement("div");

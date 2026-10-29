@@ -59,6 +59,9 @@ export interface TemplateItem {
   text_tpl: string;
   spec: TemplateSpec;
   enabled: boolean;
+  /* 2026-10-29 P1-5：模板列表回显需要这两个字段，否则快捷启停/编辑会把配置写丢 */
+  need_review?: boolean;
+  attach_image_path?: string | null;
   created_at: string;
   updated_at?: string;
 }

@@ -172,6 +172,10 @@ function tplToMock(t: any): TemplateItem {
     text_tpl: t.text_tpl || '',
     spec,
     enabled: t.enabled !== false,
+    /* 2026-10-29 P1-5：审核开关与附图路径要随列表下发，
+       否则编辑/快捷启停时前端拿不到真实值，回写就会把配置冲掉。 */
+    need_review: !!t.need_review,
+    attach_image_path: t.attach_image_path || null,
     created_at: t.created_at || '',
     updated_at: t.updated_at,
   } as unknown as TemplateItem;
@@ -243,7 +247,12 @@ function tplFromMock(t: any, partial = false) {
   /* 新建：给出后端必填项的完整默认值 */
   const kind = t.kind === 'upload' || t.kind === 'form' ? 'form' : t.kind || 'notice';
   const isNotice = kind === 'notice';
-  const times = isNotice ? [t.remind_at].filter((x: string) => /^\d{1,2}:\d{2}$/.test(x || '')) : [];
+  /* 2026-10-29 P1-7：多时点模板（notice_times 有多个）保存时不能被压成单时点 */
+  const times = isNotice
+    ? (Array.isArray(t.notice_times) && t.notice_times.length > 0
+      ? t.notice_times.filter((x: string) => /^\d{1,2}:\d{2}$/.test(x || ''))
+      : [t.remind_at].filter((x: string) => /^\d{1,2}:\d{2}$/.test(x || '')))
+    : [];
   out.name = t.name;
   out.kind = kind;
   out.role_ids = roleIds;
@@ -427,15 +436,26 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
         delete reqBody.activation;
       }
     } else if (rawPath.endsWith('/members/import')) {
-      /* 前端 csv_text → 后端 csv_rows */
+      /* 前端 csv_text → 后端 csv_rows
+         2026-10-29 P0-2：后端 import_role_members 要求 dict 行（row/phone/name/dept），
+         原来发的是二维字符串数组，每一行都被判成“行数据格式错误” → 导入 100% 失败。 */
       reqBody = { ...(body || {}) };
       const text = String(reqBody.csv_text || '');
       delete reqBody.csv_text;
+      const HEADER_WORDS = /^(手机号?|电话|号码|phone|mobile|tel|姓名|名字|name|部门|dept|department)$/i;
       reqBody.csv_rows = text
         .split(/\r?\n/)
         .map((l: string) => l.trim())
         .filter(Boolean)
-        .map((line: string) => line.split(/[,，\t]/).map((c: string) => c.trim()));
+        .map((line: string, idx: number) => {
+          const parts = line.split(/[,，\t]/).map((c: string) => c.trim());
+          return { row: idx + 1, phone: parts[0] || '', name: parts[1] || '', dept: parts[2] || '' };
+        })
+        /* 顺手跳过表头行，避免把“手机号,姓名,部门”当成一条错行 */
+        .filter((r: { row: number; phone: string; name: string; dept: string }) => {
+          const isHeader = HEADER_WORDS.test(r.phone) || HEADER_WORDS.test(r.name);
+          return !isHeader && (r.phone || r.name);
+        });
       if (reqBody.dry_run === undefined) reqBody.dry_run = false;
     }
   }
@@ -443,6 +463,20 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   const d = await rawFetch<any>(method, url, reqBody);
 
   /* 响应映射（后端结构 → 前端结构） */
+  /* 2026-10-29 P0-2：导入接口字段名对齐（will_add/already_exists/invalid → added/updated/skipped/errors） */
+  if (rawPath.endsWith('/members/import')) {
+    const invalid = Array.isArray(d?.invalid) ? d.invalid : [];
+    return {
+      ok: true,
+      added: Number(d?.will_add || 0),
+      updated: 0,
+      skipped: Number(d?.already_exists || 0),
+      errors: invalid.map((x: any) => ({
+        line: Number(x?.row || 0),
+        reason: String(x?.reason || '格式不符'),
+      })),
+    } as unknown as T;
+  }
   if (rawPath === '/api/admin/me') {
     /* 会话恢复：boot 探测时从响应同步 csrf（修复旧 Cookie 直接进站后写操作 403） */
     if (d && d.csrf_token) setCsrfToken(d.csrf_token);

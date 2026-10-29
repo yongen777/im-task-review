@@ -158,8 +158,13 @@ export const RolesMembersView: React.FC = () => {
     );
   }, [unactivatedList, unactivatedKeyword]);
 
-  const getRowTargetRole = (phone: string): string => {
-    const chosen = rowTargetRoleMap[phone];
+  /* 2026-10-29 P0-5：待归纳人员可能还没报手机号（phone=""），用 phone 做 key/行标识会撞车。
+     统一用 external_id 优先、phone 兜底的稳定标识。 */
+  const rowKeyOf = (p: { external_id?: string; phone?: string }): string =>
+    String(p.external_id || p.phone || '');
+
+  const getRowTargetRole = (rowKey: string): string => {
+    const chosen = rowTargetRoleMap[rowKey];
     if (chosen && roles.some((r) => r.role_id === chosen)) {
       return chosen;
     }
@@ -168,12 +173,13 @@ export const RolesMembersView: React.FC = () => {
 
   // 一键将单个已激活待归纳人员归入指定角色分组
   const handleMoveSingleUnactivated = async (person: UnactivatedMemberItem) => {
-    const targetRoleId = getRowTargetRole(person.phone);
+    const rowKey = rowKeyOf(person);
+    const targetRoleId = getRowTargetRole(rowKey);
     if (!targetRoleId) {
       toast.warning('请先选择目标角色分组');
       return;
     }
-    setMovingPhone(person.phone);
+    setMovingPhone(rowKey);
     try {
       // 2026-10-28 修：改用后端正式路径 pending-members/move，按 external_id 定位
       // （原 unactivated-members + phone 的组合是历史 mock 契约，后端只有兼容别名）
@@ -895,11 +901,12 @@ export const RolesMembersView: React.FC = () => {
               </div>
             ) : (
               filteredUnactivatedList.map((person) => {
-                const targetRole = getRowTargetRole(person.phone);
-                const isMoving = movingPhone === person.phone;
+                const rowKey = rowKeyOf(person);
+                const targetRole = getRowTargetRole(rowKey);
+                const isMoving = movingPhone === rowKey;
                 return (
                   <div
-                    key={person.phone}
+                    key={rowKey}
                     className="px-4 sm:px-5 py-3.5 hover:bg-slate-50/70 transition-colors space-y-2.5 text-xs"
                   >
                     {/* 第一行：完整展示用户全名 + 手机号 + 激活及会话状态标签（无 truncate 遮挡） */}
@@ -937,7 +944,7 @@ export const RolesMembersView: React.FC = () => {
                           onChange={(e) =>
                             setRowTargetRoleMap((prev) => ({
                               ...prev,
-                              [person.phone]: e.target.value,
+                              [rowKey]: e.target.value,
                             }))
                           }
                           aria-label={`选择 ${person.name} 的目标角色分组`}

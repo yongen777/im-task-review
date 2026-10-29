@@ -8,6 +8,8 @@ import hmac
 import io
 import json
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -77,6 +79,69 @@ def _clamp_page_size(page: int, size: int) -> tuple[int, int]:
     except Exception:
         s = 20
     return p, s
+
+
+# ── 2026-10-29 P2-3：登录失败锁定（内存计数，单进程生效；默认 5 次锁 15 分钟）──
+_LOGIN_FAIL_LOCK = threading.Lock()
+_LOGIN_FAILURES: Dict[str, Dict[str, float]] = {}
+
+
+def _csv_safe(val: Any) -> Any:
+    """2026-10-29 P2-4：CSV 公式注入防护——以 = + - @ 制表符开头的单元格前置单引号。
+
+    只处理字符串；数字原样返回，避免把实例 ID 变成文本。
+    """
+    if not isinstance(val, str):
+        return val
+    if val[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + val
+    return val
+
+
+def _csv_row(cells: List[Any]) -> List[Any]:
+    return [_csv_safe(c) for c in cells]
+
+
+def _login_max_fails() -> int:
+    raw = os.environ.get("IMT_LOGIN_MAX_FAILS", "").strip()
+    if not raw:
+        return 5
+    try:
+        return max(0, int(raw))  # 0 = 关闭锁定
+    except ValueError:
+        return 5
+
+
+def _login_locked_for(key: str) -> int:
+    """返回剩余锁定秒数，0 表示未锁定。"""
+    if _login_max_fails() <= 0:
+        return 0
+    now = time.time()
+    with _LOGIN_FAIL_LOCK:
+        info = _LOGIN_FAILURES.get(key)
+        if not info:
+            return 0
+        left = int(info.get("locked_until", 0) - now)
+        return max(0, left)
+
+
+def _login_note_failure(key: str) -> None:
+    max_fails = _login_max_fails()
+    if max_fails <= 0:
+        return
+    now = time.time()
+    with _LOGIN_FAIL_LOCK:
+        info = _LOGIN_FAILURES.setdefault(key, {"count": 0.0, "locked_until": 0.0})
+        info["count"] = float(info.get("count", 0)) + 1
+        if info["count"] >= max_fails:
+            info["locked_until"] = now + 900.0
+            info["count"] = 0.0
+        _LOGIN_FAILURES[key] = info
+
+
+def _login_clear(key: str) -> None:
+    with _LOGIN_FAIL_LOCK:
+        _LOGIN_FAILURES.pop(key, None)
 
 
 async def _read_json_body(request: Request) -> Dict[str, Any]:
@@ -294,9 +359,18 @@ def create_admin_router(state: StateStore) -> APIRouter:
         if not username or not password:
             return error_response(401, "BAD_CREDENTIALS", "用户名或密码错误")
 
+        # 2026-10-29 P2-3：连续失败锁定，挡在线爆破
+        client_ip = request.client.host if getattr(request, "client", None) else "unknown"
+        fail_key = f"login:{username}:{client_ip}"
+        left = _login_locked_for(fail_key)
+        if left > 0:
+            return error_response(429, "RATE_LIMITED", f"账号已锁定，请 {max(1, left // 60)} 分钟后再试")
+
         user = state.verify_admin_credentials(username, password)
         if not user:
+            _login_note_failure(fail_key)
             return error_response(401, "BAD_CREDENTIALS", "用户名或密码错误")
+        _login_clear(fail_key)
 
         sess = state.create_admin_session(int(user["id"]))
         state.write_audit(
@@ -943,7 +1017,7 @@ def create_admin_router(state: StateStore) -> APIRouter:
                 sub_summary = str(sub["fields_json"])
             elif sub.get("file_name"):
                 sub_summary = str(sub["file_name"])
-            writer.writerow([
+            writer.writerow(_csv_row([
                 item["id"],
                 item["template_id"],
                 item.get("template_name") or "",
@@ -958,7 +1032,7 @@ def create_admin_router(state: StateStore) -> APIRouter:
                 item.get("reviewer") or "",
                 item.get("reject_reason") or "",
                 sub_summary,
-            ])
+            ]))
 
         state.write_audit(
             username=sess["username"],

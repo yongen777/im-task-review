@@ -165,17 +165,23 @@ async function createTarGzBlobFromBundle(bundle: AgentBundleResponse): Promise<B
     { path: 'AGENT_1TO1_REPLICATION.md', content: bundle.fullMarkdown },
   ];
   const tarBytes = buildClientUstarTarBytes(entries);
+  /* 2026-10-29：TS 5.7 起 Uint8Array<ArrayBufferLike> 不再直接兼容 BlobPart / BufferSource，
+     这里取一份独立 ArrayBuffer 再传，行为不变。 */
+  const tarBuffer = tarBytes.buffer.slice(
+    tarBytes.byteOffset,
+    tarBytes.byteOffset + tarBytes.byteLength,
+  ) as ArrayBuffer;
 
   if (typeof CompressionStream !== 'undefined') {
     const cs = new CompressionStream('gzip');
     const writer = cs.writable.getWriter();
-    await writer.write(tarBytes);
+    await writer.write(tarBuffer);
     await writer.close();
     const compressedBuffer = await new Response(cs.readable).arrayBuffer();
     return new Blob([compressedBuffer], { type: 'application/gzip' });
   }
 
-  return new Blob([tarBytes], { type: 'application/x-tar' });
+  return new Blob([tarBuffer], { type: 'application/x-tar' });
 }
 
 function buildClientFallbackBundle(): AgentBundleResponse {

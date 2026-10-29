@@ -623,6 +623,10 @@ export const TemplatesView: React.FC = () => {
         text_tpl: tpl.text_tpl,
         spec: tpl.spec,
         enabled: nextEnabled,
+        /* 2026-10-29 P1-5：快捷启停也要把审核开关与附图路径带上，
+           避免这条路径上把 need_review / 附图配置写丢。 */
+        need_review: tpl.need_review,
+        attach_image_path: tpl.attach_image_path ?? null,
       });
       await refreshTemplates();
       toast.success(

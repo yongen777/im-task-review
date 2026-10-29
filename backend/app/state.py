@@ -544,7 +544,26 @@ class StateStore:
             if not row:
                 raise BizError(404, "NOT_FOUND", "成员不存在")
             self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
-            self._insert_audit_unlocked(actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}", {"name": row["name"], "dept": row["dept"]}, now_s)
+            # 2026-10-29 P0-3：移出成员时把推送绑定一并收回到待归纳池，
+            # 否则 delivery_target 仍指向该人，形成“已移出却还能收到任务”的幽灵绑定。
+            dt = self.conn.execute("SELECT external_id FROM delivery_target WHERE phone = ?", (clean_phone,)).fetchone()
+            back_to_pending = False
+            if dt and dt["external_id"]:
+                ext_id = str(dt["external_id"])
+                existing_pending = self.conn.execute(
+                    "SELECT id FROM pending_member WHERE external_id = ?", (ext_id,)
+                ).fetchone()
+                if not existing_pending:
+                    self.conn.execute(
+                        "INSERT INTO pending_member(external_id, phone, name, activated_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (ext_id, clean_phone, row["name"], now_s, now_s),
+                    )
+                    back_to_pending = True
+                self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE external_id = ?", (ext_id,))
+            self._insert_audit_unlocked(
+                actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
+                {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending}, now_s,
+            )
 
     def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system") -> Dict[str, Any]:
         """R43 + §9.3：批量导入成员（行解析加 try 保护，非法行进 invalid 列表而不抛 500）。"""
@@ -767,6 +786,16 @@ class StateStore:
         # 2026-10-28 通知类「数据图片提醒」：管理员上传的图片/文件路径（相对 data 目录）
         attach_image_path = str(merged.get("attach_image_path") or "").strip() or None
         if attach_image_path:
+            # 2026-10-29 P2-1：附图路径必须落在 data 目录内，挡住 ../ 与绝对路径越界读取
+            if ".." in attach_image_path.replace("\\", "/"):
+                raise BizError(400, "VALIDATION_FAILED", "attach_image_path 不允许包含 ..")
+            _p = Path(attach_image_path)
+            if _p.is_absolute():
+                raise BizError(400, "VALIDATION_FAILED", "attach_image_path 必须是相对 data 目录的路径")
+            _data_root = Path(self.db.db_path).parent.resolve()
+            _resolved = (_data_root / attach_image_path).resolve()
+            if not str(_resolved).startswith(str(_data_root)):
+                raise BizError(400, "VALIDATION_FAILED", "attach_image_path 不允许指向数据目录以外的路径")
             attach_image = True  # 有图就等价于开启附图，避免前端只传了路径没传开关
         if attach_image and not data_keys_norm and not attach_image_path:
             raise BizError(
@@ -860,7 +889,17 @@ class StateStore:
             if not row:
                 raise BizError(404, "NOT_FOUND", "任务模板不存在")
             self.conn.execute("UPDATE task_template SET deleted = 1, enabled = 0, updated_at = ? WHERE template_id = ?", (now_s, clean_id))
-            self._insert_audit_unlocked(actor, "template.delete", "task_template", clean_id, {"name": row["name"]}, now_s)
+            # 2026-10-29 P1-6：模板删了，未完成的实例不该继续挂在列表里等提交/审核，
+            # 统一置 expired；已完成的实例保留，便于追溯历史。
+            expired_cnt = self.conn.execute(
+                "UPDATE task_instance SET status = 'expired' "
+                "WHERE template_id = ? AND status IN ('pending', 'submitted', 'overdue')",
+                (clean_id,),
+            ).rowcount
+            self._insert_audit_unlocked(
+                actor, "template.delete", "task_template", clean_id,
+                {"name": row["name"], "expired_instances": int(expired_cnt or 0)}, now_s,
+            )
 
     def get_dedup_enabled_members_for_roles(self, role_ids: List[str]) -> List[Dict[str, Any]]:
         clean_ids = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
@@ -979,6 +1018,9 @@ class StateStore:
             if not row:
                 raise BizError(404, "NOT_FOUND", "待归纳人员不存在")
             self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
+            # 2026-10-29 P0-4：移除待归纳的人，其推送绑定也要置为不可用，
+            # 否则绑定仍在，调度器照样往一个“已被移除”的人发任务。
+            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE external_id = ?", (clean_id,))
             self._insert_audit_unlocked(actor, "pending_member.remove", "pending_member", clean_id, None, now_s)
 
     # ── 数据快照（2026-10-27 春促数据看板：人工填数本期主通道，后续可替换为自动取数）──
@@ -1208,8 +1250,18 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "驳回原因不少于 2 个字")
         now_s = self.now_str()
         with self.lock, self.conn:
-            if not self.conn.execute("SELECT 1 FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone():
+            inst_row = self.conn.execute(
+                "SELECT status FROM task_instance WHERE id = ?", (int(instance_id),)
+            ).fetchone()
+            if not inst_row:
                 raise BizError(404, "NOT_FOUND", "任务实例不存在")
+            # 2026-10-29 P1-2：只有「已提交、待审核」的实例可以审核。
+            # 之前对 pending/approved/expired 也能调，会把已完成的实例改回 approved 或覆盖结论。
+            if inst_row["status"] != "submitted":
+                raise BizError(
+                    400, "VALIDATION_FAILED",
+                    f"当前状态为 {inst_row['status']}，仅已提交（submitted）的实例可审核",
+                )
             latest_sub = self.conn.execute("SELECT id FROM submission WHERE instance_id = ? ORDER BY id DESC LIMIT 1", (int(instance_id),)).fetchone()
             if act == "approve":
                 self.conn.execute("UPDATE task_instance SET status = 'approved', reviewed_at = ?, reviewer = ? WHERE id = ?", (now_s, reviewer, int(instance_id)))

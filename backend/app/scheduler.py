@@ -442,11 +442,15 @@ class Scheduler:
                     planned_str = format_dt(planned_dt)
                     delay_sec = (cur_dt - planned_dt).total_seconds()
 
-                    # 整跳已超出补偿窗口：按原语义记 missed，但**不建实例**——
-                    # 通知没有补交概念，建了只会留下永远 pending 的僵尸行。
+                    # 整跳已超出补偿窗口：按原语义记 missed（实例已在上面按天建好，
+                    # 到当天结束由 advance_instance_statuses 置 expired=未送达）。
+                    # 2026-10-29 P1-4：这里每 30s 会被重扫一次，必须按 idem_key 去重，
+                    # 否则同一时点会反复写 missed，日志与 stats["missed"] 一路膨胀。
                     if delay_sec > self.COMPENSATION_WINDOW_SECONDS:
                         for m in members:
                             idem = make_idem_key(tpl["template_id"], m["phone"], p_key, "notice", seq_idx, planned_str)
+                            if self.state.list_reminder_attempts(idem):
+                                continue  # 该时点已记过（无论 missed/sent/failed），不重复记
                             self.state.record_reminder_log(
                                 template_id=tpl["template_id"], instance_id=None, phone=m["phone"], kind="notice",
                                 planned_at=planned_str, attempted_at=now_s, sent_at=None, result="missed", retry=0,
@@ -490,7 +494,12 @@ class Scheduler:
                             try:
                                 db_path = getattr(getattr(self.state, "db", None), "db_path", None)
                                 base_dir = Path(db_path).parent if db_path else Path("data").resolve()
-                                prepared = self.image_sender.prepare_image(str(base_dir / attach_rel))
+                                # 2026-10-29 P2-1：运行时再兜一道，越界路径直接跳过，不外读
+                                _target = (base_dir / attach_rel).resolve()
+                                if not str(_target).startswith(str(base_dir.resolve())):
+                                    logger.warning("通知附图路径越界已拦截 template=%s path=%s", tpl["template_id"], attach_rel)
+                                    raise ValueError("path_out_of_data_dir")
+                                prepared = self.image_sender.prepare_image(str(_target))
                             except Exception as exc:
                                 logger.warning("通知附图加载失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
                         if prepared is None and want_dash:

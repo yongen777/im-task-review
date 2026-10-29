@@ -66,6 +66,26 @@ def verify_event_signature(
     return hmac.compare_digest(expected.lower(), signature.strip().lower())
 
 
+def is_event_timestamp_fresh(timestamp: str, window_sec: int = 300, now_ms: Optional[int] = None) -> bool:
+    """2026-10-29 P2-2：回调时间戳新鲜度校验，挡住重放旧报文。
+
+    - 平台可能下发秒级或毫秒级时间戳，这里按量级归一（小于 1e12 视为秒）；
+    - window_sec <= 0 表示关闭校验（联调/排障时可临时放宽）。
+    """
+    if window_sec is None or window_sec <= 0:
+        return True
+    raw = str(timestamp or "").strip()
+    if not raw:
+        return False
+    try:
+        ts = int(float(raw))
+    except (TypeError, ValueError):
+        return False
+    ts_ms = ts * 1000 if ts < 10 ** 12 else ts
+    current_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    return abs(current_ms - ts_ms) <= int(window_sec) * 1000
+
+
 def _aes256_cbc_crypt(key: bytes, iv: bytes, data: bytes, encrypt: bool) -> bytes:
     """当环境未安装 pycryptodome 时使用 OpenSSL EVP_Cipher 执行 AES-256-CBC + PKCS7。"""
     import ctypes

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import os
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from datetime import datetime
@@ -311,7 +312,7 @@ class TestStage2B(unittest.TestCase):
         self.store.add_role_member(rid, "13800008001", "张A", "研发", actor="admin")
         self.store.add_role_member(rid, "13800008002", "李B", "产品", actor="admin")
         self.store.add_role_member(rid, "13800008003", "王C", "设计", actor="admin")
-        ts, nonce = "1730000000", "nonce_abc"
+        ts, nonce = str(int(time.time())), "nonce_abc"
 
         body_b64, _ = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_hacker", "phone": "13800008001"})
         resp_401 = self.pub_client.post(
@@ -364,7 +365,7 @@ class TestStage2B(unittest.TestCase):
         rid = self.store.create_role("重复绑定角色", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800007001", "重复测", "研发", actor="admin")
 
-        ts1, nonce1 = "1730000001", "nonce_repeat_1"
+        ts1, nonce1 = str(int(time.time())), "nonce_repeat_1"
         body1, sig1 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts1, nonce1,
                                             {"userId": "uid_repeat", "text": "13800007001"})
         first = self.pub_client.post("/api/app-events", content=body1,
@@ -373,7 +374,7 @@ class TestStage2B(unittest.TestCase):
         self.assertTrue(first.json()["bound"])
         self.assertFalse(first.json().get("already_same", False))
 
-        ts2, nonce2 = "1730000002", "nonce_repeat_2"
+        ts2, nonce2 = str(int(time.time()) + 1), "nonce_repeat_2"
         body2, sig2 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts2, nonce2,
                                             {"userId": "uid_repeat", "text": "13800007001"})
         second = self.pub_client.post("/api/app-events", content=body2,
@@ -388,7 +389,7 @@ class TestStage2B(unittest.TestCase):
             ("中文逗号", "张三，13800009002", "张三"),
             ("号码在前", "13800009003 李四", "李四"),
         ):
-            ts, nonce = "1730000020", "nonce_np_" + str(abs(hash(label)) % 10 ** 6)
+            ts, nonce = str(int(time.time()) + 20), "nonce_np_" + str(abs(hash(label)) % 10 ** 6)
             body, sig = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce,
                                               {"userId": "uid_np_" + want_name, "text": text})
             resp = self.pub_client.post("/api/app-events", content=body,

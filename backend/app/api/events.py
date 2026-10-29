@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover
     Request = None  # type: ignore[assignment,misc]
     JSONResponse = None  # type: ignore[assignment,misc]
 
-from ..channels.zdxlz import SignatureVerificationError, ZdxlzChannel
+from ..channels.zdxlz import SignatureVerificationError, ZdxlzChannel, is_event_timestamp_fresh
 from ..scheduler import NotifierProtocol
 from ..state import BizError, StateStore, is_valid_phone, mask_phone
 
@@ -34,6 +34,17 @@ def _plain_event_allowed() -> bool:
     """联调开关：是否允许处理**未加密**的事件报文（默认关闭）。"""
     return (os.environ.get("IMT_ALLOW_PLAIN_EVENT", "").strip().lower()
             in ("1", "true", "yes"))
+
+
+def _event_ts_window_sec() -> int:
+    """2026-10-29 P2-2：回调时间戳允许的偏移秒数，默认 300 秒；设 0 可临时关闭。"""
+    raw = os.environ.get("IMT_EVENT_TS_WINDOW_SEC", "").strip()
+    if not raw:
+        return 300
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 300
 
 
 def _looks_like_plain_json(body_text: str) -> bool:
@@ -159,6 +170,12 @@ def process_app_event(
             return 401, {"code": "UNAUTHORIZED", "message": "回调事件签名校验失败"}
     except Exception as exc:
         return 400, {"code": "BAD_PAYLOAD", "message": f"回调事件解密失败: {exc}"}
+
+    # 2026-10-29 P2-2：时间戳新鲜度（防重放）。只在校验了签名/有 timestamp 时生效，
+    # 联调明文模式可省略时间戳，不受影响。
+    if timestamp and not is_event_timestamp_fresh(timestamp, window_sec=_event_ts_window_sec()):
+        logger.warning("回调时间戳超出窗口，按重放拒绝 timestamp=%s", timestamp)
+        return 401, {"code": "UNAUTHORIZED", "message": "回调事件时间戳已过期（疑似重放）"}
 
     user_id = _extract_user_id(event_payload)
     if not user_id:

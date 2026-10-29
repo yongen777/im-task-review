@@ -266,7 +266,9 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._now_str_fn = now_str_fn
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None)
+        # 2026-10-29 P1-1：改为 DEFERRED 隔离级别，使 `with self.conn:` 真正开事务、
+        # 中途异常能整体回滚；原来 isolation_level=None 是自动提交，多条写操作没有原子性。
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level="DEFERRED")
         self.conn.row_factory = sqlite3.Row
         self.init_schema()
 
@@ -299,6 +301,9 @@ class Database:
 
             if self.conn.execute("SELECT scope_id FROM scope WHERE scope_id = 'root'").fetchone() is None:
                 self.conn.execute("INSERT INTO scope(scope_id, name, type, parent_id, created_at) VALUES ('root', '默认组织', 'dept', NULL, ?)", (now_str,))
+
+            # 2026-10-29 P1-1：DEFERRED 模式下迁移语句会挂在未提交事务里，这里显式落盘
+            self.conn.commit()
 
     def get_schema_version(self) -> int:
         with self.lock:

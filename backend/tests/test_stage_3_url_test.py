@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -84,7 +85,7 @@ class TestPlatformUrlTest(unittest.TestCase):
             self._tmp.cleanup()
 
     def _post_event(self, payload: dict) -> tuple[int, dict]:
-        ts, nonce = "1792722877666", "xFWXh8zvUcRDJmm5"
+        ts, nonce = str(int(time.time() * 1000)), "xFWXh8zvUcRDJmm5"
         body_b64 = encrypt_event_payload(self.cfg.encrypt_key, ts, nonce, payload)
         sig = hmac.new(self.cfg.verify_token.encode(), (ts + nonce + body_b64).encode(), hashlib.sha256).hexdigest()
         return process_app_event(

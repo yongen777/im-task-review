@@ -180,7 +180,9 @@ async def _scheduler_loop(scheduler: Scheduler, stop_event: asyncio.Event) -> No
     """§6.1 后台每 30 秒执行一轮调度扫描。"""
     while not stop_event.is_set():
         try:
-            scheduler.run_once()
+            # 2026-10-29 P1-3：run_once 内含同步 HTTP 投递，直接在事件循环里跑会把
+            # H5 / 后台接口一起卡住（最长数十秒）。丢到线程池，保持事件循环可响应。
+            await asyncio.to_thread(scheduler.run_once)
         except Exception as exc:
             logger.exception("调度循环执行异常: %s", exc)
         try:

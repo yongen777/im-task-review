@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -22,6 +24,36 @@ ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip",
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 MAX_HARD_UPLOAD_MB = 20
+
+# 2026-10-29 P2-2：绑定接口按 IP 限流（内存计数，单进程生效；默认 5 次/分钟，设 0 关闭）
+_BIND_RATE_LOCK = threading.Lock()
+_BIND_RATE: Dict[str, List[float]] = {}
+
+
+def _bind_rate_per_min() -> int:
+    raw = os.environ.get("IMT_BIND_RATE_PER_MIN", "").strip()
+    if not raw:
+        return 5
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 5
+
+
+def _bind_rate_limited(client_ip: str) -> bool:
+    limit = _bind_rate_per_min()
+    if limit <= 0:
+        return False
+    now = time.time()
+    key = client_ip or "unknown"
+    with _BIND_RATE_LOCK:
+        hits = [t for t in _BIND_RATE.get(key, []) if now - t < 60.0]
+        if len(hits) >= limit:
+            _BIND_RATE[key] = hits
+            return True
+        hits.append(now)
+        _BIND_RATE[key] = hits
+    return False
 
 ZIP_BASED_MIMES = {
     "zip": "application/zip",
@@ -307,6 +339,10 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
 
     @router.post("/api/h5/bind")
     async def api_h5_bind(request: Request):
+        # 2026-10-29 P2-2：绑定接口无令牌、只有手机号，按 IP 限流，挡批量撞号
+        client_ip = request.client.host if getattr(request, "client", None) else "unknown"
+        if _bind_rate_limited(client_ip):
+            return JSONResponse(status_code=429, content={"code": "RATE_LIMITED", "message": "操作过于频繁，请稍后重试"})
         try:
             data = await request.json()
         except Exception:
