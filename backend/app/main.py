@@ -114,7 +114,15 @@ def create_apps(
 
     store = state or StateStore(cfg.db_path, now_fn=now_fn)
     chan = channel or ZdxlzChannel(cfg)
-    active_notifier: NotifierProtocol = notifier if notifier is not None else chan
+    # 2026-10-30 通道可切：IMT_CHANNEL=wecom 时走企业微信自建应用（迁移目标），
+    # 默认仍是 zdxlz（量子密信），保证现有生产行为一个字都不变。
+    default_notifier: NotifierProtocol = chan
+    if str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower() == "wecom":
+        from .channels.wecom import WecomNotifier
+
+        default_notifier = WecomNotifier(cfg)
+        logger.info("通道已切换为 企业微信自建应用（agentid=%s）", getattr(cfg, "wecom_agentid", ""))
+    active_notifier: NotifierProtocol = notifier if notifier is not None else default_notifier
 
     # §16 P7：IMT_PUBLIC_BASE_URL 仍为 127.0.0.1/localhost 且通道已配置时，启动打 WARN
     if chan.configured and cfg.is_loopback_public_url:

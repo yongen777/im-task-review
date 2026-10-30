@@ -108,6 +108,12 @@ class Config:
     verify_token: str = ""
     api_base: str = "https://imtwo.zdxlz.com"
     data_dir: Path = Path("data")
+    # 2026-10-30 通道可切：zdxlz（量子密信，现状）| wecom（企业微信自建应用，迁移目标）
+    channel: str = "zdxlz"
+    # 企业微信自建应用三件套（由企业管理员创建应用后提供；缺任意一项则通道不可用）
+    wecom_corpid: str = ""
+    wecom_agentid: str = ""
+    wecom_secret: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -199,6 +205,10 @@ class Config:
             verify_token=os.environ.get("IMT_VERIFY_TOKEN", "").strip(),
             api_base=api_base_raw,
             data_dir=Path(data_dir_raw),
+            channel=(os.environ.get("IMT_CHANNEL", "").strip().lower() or "zdxlz"),
+            wecom_corpid=os.environ.get("IMT_WECOM_CORPID", "").strip(),
+            wecom_agentid=os.environ.get("IMT_WECOM_AGENTID", "").strip(),
+            wecom_secret=os.environ.get("IMT_WECOM_SECRET", "").strip(),
         )
 
 
