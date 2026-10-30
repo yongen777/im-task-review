@@ -202,6 +202,26 @@ class WecomClient:
             json=body,
         )
 
+    # ── 网页授权（P3 预留）─────────────────────────────────────────
+    def get_userid_by_code(self, code: str) -> Optional[str]:
+        """用 OAuth2 的 code 换成员 userid（静默授权，不弹窗）。
+
+        ⚠️ 本轮只提供能力，不接前端；返回 None 表示凭证无效或成员不在可见范围。
+        """
+        clean = (code or "").strip()
+        if not clean:
+            return None
+        data = self._request(
+            "GET",
+            "/cgi-bin/auth/getuserinfo",
+            params={"access_token": self.get_token(), "code": clean},
+        )
+        if int(data.get("errcode") or 0) != 0:
+            logger.warning("code 换 userid 失败: %s %s", data.get("errcode"), data.get("errmsg"))
+            return None
+        userid = str(data.get("userid") or "").strip()
+        return userid or None
+
     # ── 图片素材 ───────────────────────────────────────────────────
     def upload_image(self, file_path: str) -> str:
         """上传图片拿 media_id。⚠️ media_id 只有 3 天有效，必须现发现传，不能存库复用。"""
@@ -264,6 +284,36 @@ class WecomNotifier:
         except Exception as exc:  # noqa: BLE001
             logger.warning("企业微信发送异常 to=%s: %s", receive_id, exc)
             return SendResult(ok=False, result="failed", retryable=True, error=f"EXCEPTION: {exc}")
+
+
+def build_oauth_url(config: Any, *, state: str = "") -> Optional[str]:
+    """构造网页授权链接（snsapi_base 静默授权，直接拿 userid）。
+
+    ⚠️ P3 阶段才启用，本轮只预留构造器，不接前端：
+       前置条件是管理后台「网页授权及 JS-SDK」里配置了**可信域名**（需域名归属验证），
+       没配之前跳转会直接被拦，且报错信息不直观。
+
+    授权回调 `redirect_uri?code=CODE` 后，用 code 换 userid：
+       GET https://qyapi.weixin.qq.com/cgi-bin/auth/getuserinfo?access_token=xx&code=CODE
+    （见 WecomClient.get_userid_by_code）
+    """
+    corpid = str(getattr(config, "wecom_corpid", "") or "").strip()
+    agentid = str(getattr(config, "wecom_agentid", "") or "").strip()
+    redirect = str(getattr(config, "wecom_oauth_redirect", "") or "").strip()
+    if not (corpid and agentid and redirect):
+        return None
+    from urllib.parse import quote
+
+    return (
+        "https://open.weixin.qq.com/connect/oauth2/authorize"
+        f"?appid={quote(corpid, safe='')}"
+        f"&redirect_uri={quote(redirect, safe='')}"
+        "&response_type=code"
+        "&scope=snsapi_base"
+        f"&state={quote(state or '', safe='')}"
+        f"&agentid={quote(agentid, safe='')}"
+        "#wechat_redirect"
+    )
 
 
 def _split_ids(raw: Any) -> set:

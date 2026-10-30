@@ -14,7 +14,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 try:
     from fastapi import APIRouter, Request
@@ -125,6 +125,140 @@ def _extract_message_text(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def handle_inbound_text(
+    *,
+    state: StateStore,
+    user_id: str,
+    msg_text: str,
+    event_phone: str = "",
+    send: Callable[[str, str], None],
+) -> Tuple[int, Dict[str, Any]]:
+    """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
+
+    2026-10-30 企微自建应用接入时抽出：
+      · 量子密信：process_app_event 验签+解密后调用本函数；
+      · 企业微信：/api/wecom/callback 解出 XML 明文后调用本函数。
+    ⛔ 业务规则（绑定 / 待归纳 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
+    """
+
+    # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
+    if event_phone:
+        try:
+            res = state.bind_member_with_guardrails(phone=event_phone, external_id=user_id, path="A")
+            send(res["receipt"], f"bind_A_{event_phone}")
+            return 200, {
+                "ok": True, "path": "A", "bound": True, "already_same": res.get("already_same", False),
+                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
+            }
+        except BizError as exc:
+            send(exc.message, f"bind_A_err_{event_phone}")
+            return exc.status_code, {"ok": False, "path": "A", "bound": False, "code": exc.code, "message": exc.message}
+
+    # 路径 B（主导路径）：用户私聊发送「姓名 + 手机号」或仅手机号
+    # ⭐ 2026-10-28 用户口径①：手机号**不再拦截**——不在名单的先落「已激活待归纳」池，
+    #    由管理员归纳角色；只有「该号已被别人绑定」才拒绝（防冒绑）。
+    # ⭐ 2026-10-28 用户口径②：平台不下发姓名，因此允许用户在手机号前/后带上姓名，
+    #    例如「张三 13900000000」「张三，13900000000」「13900000000 张三」。
+    phone_hit = re.search(r"1[3-9]\d{9}", msg_text or "")
+    if phone_hit:
+        msg_phone = phone_hit.group(0)
+        rest = (msg_text or "")[:phone_hit.start()] + (msg_text or "")[phone_hit.end():]
+        msg_name = re.sub(r"[\s,，、;；:：+＋|/\\-]+", "", rest).strip()[:20]
+        masked = mask_phone(msg_phone)
+        existing = state.get_delivery_target(msg_phone)
+        owner = str((existing or {}).get("external_id") or "") if existing else ""
+        if existing and owner and owner != user_id:
+            dup_text = "该手机号已被其他账号绑定，禁止覆盖；如非本人操作请联系管理员申诉。"
+            send(dup_text, f"bind_dup_{msg_phone}")
+            return 409, {"ok": False, "path": "B", "bound": False,
+                         "code": "DUPLICATE", "message": dup_text}
+        if existing and owner == user_id:
+            same_text = f"当前账号已关联手机号 {masked}，无需重复绑定。"
+            send(same_text, f"bind_same_{msg_phone}")
+            return 200, {"ok": True, "path": "B", "bound": True, "already_same": True,
+                         "masked_phone": masked, "message": same_text}
+        if not state.phone_in_roster(msg_phone):
+            rec = state.upsert_pending_member(user_id, last_message=msg_text,
+                                              phone=msg_phone, name=msg_name or None)
+            who = (f"{msg_name}（{masked}）" if msg_name else f"手机号 {masked}")
+            pending_text = (f"已登记{who}，已进入「已激活待归纳」名单。\n"
+                            f"管理员为你分配业务角色后，即可接收任务提醒。")
+            send(pending_text, f"bind_pending_{msg_phone}")
+            return 200, {"ok": True, "path": "B", "bound": False, "pending": True,
+                         "masked_phone": masked, "name": msg_name, "pending_id": rec.get("id"),
+                         "message": pending_text}
+        try:
+            res = state.bind_member_with_guardrails(phone=msg_phone, external_id=user_id, path="B")
+            send(res["receipt"], f"bind_B_{msg_phone}")
+            return 200, {
+                "ok": True, "path": "B", "bound": True,
+                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
+            }
+        except BizError as exc:
+            send(exc.message, f"bind_B_err_{msg_phone}")
+            return exc.status_code, {"ok": False, "path": "B", "bound": False, "code": exc.code, "message": exc.message}
+
+    bound_member = state.touch_delivery_target_by_external_id(user_id)
+    if bound_member is not None:
+        # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
+        # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
+        apply_text = (msg_text or "").strip().strip("【】[]　 ")
+        if apply_text == "申请补交":
+            try:
+                res = state.request_resubmit(bound_member["phone"], actor=f"user:{user_id}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("补交申请处理异常 user=%s: %s", user_id, exc)
+                res = {"result": "none", "items": []}
+            result = res.get("result")
+            if result == "applied":
+                reply = "已收到补交申请，请等待管理员审核。"
+                names = [str(i.get("template_name") or "").strip() for i in (res.get("items") or [])]
+                names = [n for n in names if n]
+                if names:
+                    reply += "\n本次申请涉及：" + "、".join(names)
+            elif result == "already":
+                reply = "该任务已申请过补交，不可重复申请。"
+            elif result == "window_expired":
+                reply = "已超补交申请窗口（需在截止时间后 24 小时内申请），本次不受理。"
+            else:
+                reply = "当前没有可申请补交的逾期任务。"
+            send(reply, f"resubmit_{result}")
+            return 200, {"ok": True, "path": "resubmit", "bound": True, "result": result}
+
+        # 2026-10-27 用户需求：已绑定用户发送非手机号消息时，机器人固定回复确认
+        # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
+        ack_text = (
+            "【OPS任务调度助手】\n"
+            "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容，\n"
+            "暂时看不懂聊天和其他文字指令，这里不需要你回复文字。\n"
+            "任务提醒会按时自动送达，届时按提醒里的链接或表单提交即可；业务问题请联系对应管理员。"
+        )
+        send(ack_text, "ack_nonphone")
+        return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
+
+    # ── 2026-10-28 方案B：未绑定用户发任意消息 → 自动录入「已激活待归纳人员」──
+    # 用户无需发送手机号——发任意消息即被后台自动登记，管理员在「已激活待归纳角色人员」
+    # 专栏中看到该用户后，手动将其移入对应角色分组（分配时填写手机号完成推送绑定）。
+    try:
+        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100])
+        pending_ack = (
+            "【OPS任务调度助手】\n"
+            "你好，会话已激活，但尚未完成身份绑定。\n"
+            "我不支持聊天和文字指令，请回复「姓名 手机号」（例：张三 13900000000）完成绑定；\n"
+            "绑定后由管理员分配业务角色，即可接收任务提醒。"
+        )
+        send(pending_ack, "pending_auto")
+        return 200, {"ok": True, "bound": False, "pending": True, "message": pending_ack}
+    except Exception as exc:
+        logger.warning("pending_member 自动登记失败 external_id=%s: %s", user_id, exc)
+        # 登记失败时 fallback 到原有绑定指引
+        bind_url = f"{base_url}/h5/bind#uid={user_id}"
+        guide_text = (f"您尚未完成身份绑定。请回复「姓名 手机号」（例：张三 13900000000），"
+                      f"或点击以下链接绑定：\n👉 {bind_url}")
+        send(guide_text, "bind_guide")
+        return 200, {"ok": True, "bound": False, "bind_url": bind_url, "message": guide_text}
+
+
 def process_app_event(
     *,
     state: StateStore,
@@ -217,122 +351,12 @@ def process_app_event(
     event_phone = _extract_event_phone(event_payload)
     msg_text = _extract_message_text(event_payload).strip()
 
-    # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
-    if event_phone:
-        try:
-            res = state.bind_member_with_guardrails(phone=event_phone, external_id=user_id, path="A")
-            _send_bot_reply(user_id, res["receipt"], f"bind_A_{event_phone}")
-            return 200, {
-                "ok": True, "path": "A", "bound": True, "already_same": res.get("already_same", False),
-                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
-            }
-        except BizError as exc:
-            _send_bot_reply(user_id, exc.message, f"bind_A_err_{event_phone}")
-            return exc.status_code, {"ok": False, "path": "A", "bound": False, "code": exc.code, "message": exc.message}
 
-    # 路径 B（主导路径）：用户私聊发送「姓名 + 手机号」或仅手机号
-    # ⭐ 2026-10-28 用户口径①：手机号**不再拦截**——不在名单的先落「已激活待归纳」池，
-    #    由管理员归纳角色；只有「该号已被别人绑定」才拒绝（防冒绑）。
-    # ⭐ 2026-10-28 用户口径②：平台不下发姓名，因此允许用户在手机号前/后带上姓名，
-    #    例如「张三 13900000000」「张三，13900000000」「13900000000 张三」。
-    phone_hit = re.search(r"1[3-9]\d{9}", msg_text or "")
-    if phone_hit:
-        msg_phone = phone_hit.group(0)
-        rest = (msg_text or "")[:phone_hit.start()] + (msg_text or "")[phone_hit.end():]
-        msg_name = re.sub(r"[\s,，、;；:：+＋|/\\-]+", "", rest).strip()[:20]
-        masked = mask_phone(msg_phone)
-        existing = state.get_delivery_target(msg_phone)
-        owner = str((existing or {}).get("external_id") or "") if existing else ""
-        if existing and owner and owner != user_id:
-            dup_text = "该手机号已被其他账号绑定，禁止覆盖；如非本人操作请联系管理员申诉。"
-            _send_bot_reply(user_id, dup_text, f"bind_dup_{msg_phone}")
-            return 409, {"ok": False, "path": "B", "bound": False,
-                         "code": "DUPLICATE", "message": dup_text}
-        if existing and owner == user_id:
-            same_text = f"当前账号已关联手机号 {masked}，无需重复绑定。"
-            _send_bot_reply(user_id, same_text, f"bind_same_{msg_phone}")
-            return 200, {"ok": True, "path": "B", "bound": True, "already_same": True,
-                         "masked_phone": masked, "message": same_text}
-        if not state.phone_in_roster(msg_phone):
-            rec = state.upsert_pending_member(user_id, last_message=msg_text,
-                                              phone=msg_phone, name=msg_name or None)
-            who = (f"{msg_name}（{masked}）" if msg_name else f"手机号 {masked}")
-            pending_text = (f"已登记{who}，已进入「已激活待归纳」名单。\n"
-                            f"管理员为你分配业务角色后，即可接收任务提醒。")
-            _send_bot_reply(user_id, pending_text, f"bind_pending_{msg_phone}")
-            return 200, {"ok": True, "path": "B", "bound": False, "pending": True,
-                         "masked_phone": masked, "name": msg_name, "pending_id": rec.get("id"),
-                         "message": pending_text}
-        try:
-            res = state.bind_member_with_guardrails(phone=msg_phone, external_id=user_id, path="B")
-            _send_bot_reply(user_id, res["receipt"], f"bind_B_{msg_phone}")
-            return 200, {
-                "ok": True, "path": "B", "bound": True,
-                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
-            }
-        except BizError as exc:
-            _send_bot_reply(user_id, exc.message, f"bind_B_err_{msg_phone}")
-            return exc.status_code, {"ok": False, "path": "B", "bound": False, "code": exc.code, "message": exc.message}
-
-    bound_member = state.touch_delivery_target_by_external_id(user_id)
-    if bound_member is not None:
-        # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
-        # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
-        apply_text = (msg_text or "").strip().strip("【】[]　 ")
-        if apply_text == "申请补交":
-            try:
-                res = state.request_resubmit(bound_member["phone"], actor=f"user:{user_id}")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("补交申请处理异常 user=%s: %s", user_id, exc)
-                res = {"result": "none", "items": []}
-            result = res.get("result")
-            if result == "applied":
-                reply = "已收到补交申请，请等待管理员审核。"
-                names = [str(i.get("template_name") or "").strip() for i in (res.get("items") or [])]
-                names = [n for n in names if n]
-                if names:
-                    reply += "\n本次申请涉及：" + "、".join(names)
-            elif result == "already":
-                reply = "该任务已申请过补交，不可重复申请。"
-            elif result == "window_expired":
-                reply = "已超补交申请窗口（需在截止时间后 24 小时内申请），本次不受理。"
-            else:
-                reply = "当前没有可申请补交的逾期任务。"
-            _send_bot_reply(user_id, reply, f"resubmit_{result}")
-            return 200, {"ok": True, "path": "resubmit", "bound": True, "result": result}
-
-        # 2026-10-27 用户需求：已绑定用户发送非手机号消息时，机器人固定回复确认
-        # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
-        ack_text = (
-            "【OPS任务调度助手】\n"
-            "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容，\n"
-            "暂时看不懂聊天和其他文字指令，这里不需要你回复文字。\n"
-            "任务提醒会按时自动送达，届时按提醒里的链接或表单提交即可；业务问题请联系对应管理员。"
-        )
-        _send_bot_reply(user_id, ack_text, "ack_nonphone")
-        return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
-
-    # ── 2026-10-28 方案B：未绑定用户发任意消息 → 自动录入「已激活待归纳人员」──
-    # 用户无需发送手机号——发任意消息即被后台自动登记，管理员在「已激活待归纳角色人员」
-    # 专栏中看到该用户后，手动将其移入对应角色分组（分配时填写手机号完成推送绑定）。
-    try:
-        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100])
-        pending_ack = (
-            "【OPS任务调度助手】\n"
-            "你好，会话已激活，但尚未完成身份绑定。\n"
-            "我不支持聊天和文字指令，请回复「姓名 手机号」（例：张三 13900000000）完成绑定；\n"
-            "绑定后由管理员分配业务角色，即可接收任务提醒。"
-        )
-        _send_bot_reply(user_id, pending_ack, "pending_auto")
-        return 200, {"ok": True, "bound": False, "pending": True, "message": pending_ack}
-    except Exception as exc:
-        logger.warning("pending_member 自动登记失败 external_id=%s: %s", user_id, exc)
-        # 登记失败时 fallback 到原有绑定指引
-        bind_url = f"{base_url}/h5/bind#uid={user_id}"
-        guide_text = (f"您尚未完成身份绑定。请回复「姓名 手机号」（例：张三 13900000000），"
-                      f"或点击以下链接绑定：\n👉 {bind_url}")
-        _send_bot_reply(user_id, guide_text, "bind_guide")
-        return 200, {"ok": True, "bound": False, "bind_url": bind_url, "message": guide_text}
+    # 业务分支统一走 handle_inbound_text（两通道共用，见函数注释）
+    return handle_inbound_text(
+        state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
+        send=lambda text, tag: _send_bot_reply(user_id, text, tag),
+    )
 
 
 def create_events_router(

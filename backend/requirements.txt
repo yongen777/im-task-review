@@ -10,5 +10,3 @@ tzdata>=2024.1
 matplotlib>=3.10.0,<4.0.0
 pillow>=11.0.0
 pytest>=8.0.0,<9.0.0
-# 2026-10-30 企业微信智能机器人长连接通道（官方 SDK；未切通道时不会被导入）
-wecom-aibot-python-sdk>=1.0.2

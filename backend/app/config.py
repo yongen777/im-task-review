@@ -114,9 +114,11 @@ class Config:
     wecom_corpid: str = ""
     wecom_agentid: str = ""
     wecom_secret: str = ""
-    # 2026-10-30 选定方案：智能机器人（API 模式 → 长连接），凭证是 BotID + Secret
-    wecom_bot_id: str = ""
-    wecom_bot_secret: str = ""
+    # 2026-10-30 回调接收：管理后台「接收消息」里填的 Token / EncodingAESKey（43 位）
+    wecom_token: str = ""
+    wecom_aes_key: str = ""
+    # OAuth2 网页授权回跳地址（P3 阶段用；可信域名未配前不启用）
+    wecom_oauth_redirect: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -212,8 +214,9 @@ class Config:
             wecom_corpid=os.environ.get("IMT_WECOM_CORPID", "").strip(),
             wecom_agentid=os.environ.get("IMT_WECOM_AGENTID", "").strip(),
             wecom_secret=os.environ.get("IMT_WECOM_SECRET", "").strip(),
-            wecom_bot_id=os.environ.get("IMT_WECOM_BOT_ID", "").strip(),
-            wecom_bot_secret=os.environ.get("IMT_WECOM_BOT_SECRET", "").strip(),
+            wecom_token=os.environ.get("IMT_WECOM_TOKEN", "").strip(),
+            wecom_aes_key=os.environ.get("IMT_WECOM_AES_KEY", "").strip(),
+            wecom_oauth_redirect=os.environ.get("IMT_WECOM_OAUTH_REDIRECT", "").strip(),
         )
 
 

@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api.admin import create_admin_router, register_admin_guard
 from .api.events import create_events_router
+from .api.wecom_callback import create_wecom_router
 from .api.h5 import create_h5_router
 from .channels.zdxlz import ZdxlzChannel
 from .config import Config, NowFn, default_now
@@ -119,17 +120,11 @@ def create_apps(
     default_notifier: NotifierProtocol = chan
     _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
     if _channel == "wecom":
-        # 旧方案（自建应用 + HTTP 主动推送）：保留但不推荐，见 wecom.py 头注释
+        # 2026-10-30 最终路线：企业微信自建应用（HTTP 主动推送 + 回调接收）
         from .channels.wecom import WecomNotifier
 
         default_notifier = WecomNotifier(cfg)
         logger.info("通道已切换为 企业微信自建应用（agentid=%s）", getattr(cfg, "wecom_agentid", ""))
-    elif _channel in ("wecom_aibot", "aibot"):
-        # 2026-10-30 选定方案：智能机器人 + 长连接（与量子密信对话形态一致，迁移成本最低）
-        from .channels.wecom_aibot import WecomAibotNotifier
-
-        default_notifier = WecomAibotNotifier(cfg)
-        logger.info("通道已切换为 企业微信智能机器人（长连接，bot_id=%s）", getattr(cfg, "wecom_bot_id", ""))
     active_notifier: NotifierProtocol = notifier if notifier is not None else default_notifier
 
     # §16 P7：IMT_PUBLIC_BASE_URL 仍为 127.0.0.1/localhost 且通道已配置时，启动打 WARN
@@ -181,6 +176,17 @@ def create_apps(
             state=store,
             uploads_dir=cfg.uploads_dir,
             notifier=active_notifier,
+        )
+    )
+    # 2026-10-30 企业微信自建应用接收回调（独立于量子密信的 /api/app-events）：
+    # 未配置 Token/AESKey 时路由仍在，但一律 503，便于部署后一眼看出「路由在、配置没填」。
+    public_app.include_router(
+        create_wecom_router(
+            store,
+            active_notifier,
+            token=getattr(cfg, "wecom_token", ""),
+            aes_key=getattr(cfg, "wecom_aes_key", ""),
+            corpid=getattr(cfg, "wecom_corpid", ""),
         )
     )
 
