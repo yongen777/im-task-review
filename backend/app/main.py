@@ -19,6 +19,7 @@ from .api.events import create_events_router
 from .api.wecom_callback import create_wecom_router
 from .api.h5 import create_h5_router
 from .channels.zdxlz import ZdxlzChannel
+from .channel_config import apply_db_channel_config
 from .config import Config, NowFn, default_now
 from .scheduler import NotifierProtocol, Scheduler, ZdxlzImageSender
 from .state import StateStore
@@ -114,6 +115,10 @@ def create_apps(
     setup_logging(cfg)
 
     store = state or StateStore(cfg.db_path, now_fn=now_fn)
+    # 2026-10-30 通道配置向导：DB 里配过就用 DB（加密存储），没配过照样用 env —— 现网零变化。
+    # ⛔ 只在这里合并一次：配置改动重启后生效，不做热更新（避免运行中换凭证导致半截状态）。
+    if channel is None and state is None:
+        cfg = apply_db_channel_config(cfg, store)
     chan = channel or ZdxlzChannel(cfg)
     # 2026-10-30 通道可切：IMT_CHANNEL=wecom 时走企业微信自建应用（迁移目标），
     # 默认仍是 zdxlz（量子密信），保证现有生产行为一个字都不变。

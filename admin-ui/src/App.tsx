@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ClipboardCheck,
   FileSpreadsheet,
+  Settings2,
   Users,
   CalendarCheck2,
 } from 'lucide-react';
@@ -10,8 +11,9 @@ import { AdminMe, AdminUserCard } from './components/system/AdminUserCard';
 import { TemplatesView } from './components/imtask/TemplatesView';
 import { RolesMembersView } from './components/imtask/RolesMembersView';
 import { InstancesView } from './components/imtask/InstancesView';
+import ChannelSettingsView from './components/imtask/ChannelSettingsView';
 
-type TabKey = 'instances' | 'templates' | 'roles';
+type TabKey = 'instances' | 'templates' | 'roles' | 'channels';
 
 interface MainAppProps {
   me: AdminMe;
@@ -21,6 +23,25 @@ interface MainAppProps {
 const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
   const { loading, templates, roles, stats } = useAppStore();
   const [activeTab, setActiveTab] = useState<TabKey>('instances');
+
+  /* 2026-10-30 首次安装引导：全部通道都未配置时，打开后台直接进「通道配置」——
+     否则管理员看到的是一个永远发不出消息的空系统，不知道该先干什么。 */
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const res = await fetch('/api/admin/channel-config', { credentials: 'same-origin' });
+        if (!res.ok) return;
+        const data = (await res.json()) as { any_configured?: boolean };
+        if (alive && data?.any_configured === false) setActiveTab('channels');
+      } catch {
+        /* 读不到就保持默认页，不影响正常使用 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const submittedCount = stats?.by_status?.submitted || 0;
   const enabledTemplatesCount = templates.filter((t) => t.enabled).length;
@@ -117,6 +138,28 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               );
             })}
           </nav>
+
+          {/* 2026-10-30 系统设置：新增分组，⛔ 不动上面既有导航与布局 */}
+          <nav className="space-y-1">
+            <div className="px-2.5 pb-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+              系统设置
+            </div>
+            <button
+              onClick={() => setActiveTab('channels')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-medium transition-all cursor-pointer ${
+                activeTab === 'channels'
+                  ? 'bg-blue-600 text-white shadow-xs font-semibold'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <Settings2
+                  className={`w-4 h-4 ${activeTab === 'channels' ? 'text-white' : 'text-slate-400'}`}
+                />
+                <span>通道配置</span>
+              </div>
+            </button>
+          </nav>
         </div>
 
         {/* 底部：管理员卡片（2026-10-28 用户指令：移除获取代码入口） */}
@@ -139,6 +182,7 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               {activeTab === 'instances' && <InstancesView />}
               {activeTab === 'templates' && <TemplatesView />}
               {activeTab === 'roles' && <RolesMembersView />}
+              {activeTab === 'channels' && <ChannelSettingsView />}
             </>
           )}
         </div>

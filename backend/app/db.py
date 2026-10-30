@@ -183,6 +183,15 @@ CREATE TABLE IF NOT EXISTS admin_session (
   expires_at TEXT NOT NULL
 );
 
+-- 2026-10-30 通道配置向导：凭证加密存库（AES-GCM），换一家公司部署只填表单、不改代码。
+-- payload 是密文（v1:base64(nonce+ct)），⛔ 任何情况下都不落明文；channel 只有 zdxlz / wecom。
+CREATE TABLE IF NOT EXISTS channel_config (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel    TEXT NOT NULL UNIQUE,
+  payload    TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS admin_audit (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   username    TEXT NOT NULL,

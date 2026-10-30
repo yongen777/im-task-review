@@ -20,6 +20,18 @@ from urllib.parse import quote
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from ..channel_config import (
+    CHANNEL_SCHEMA,
+    ChannelConfigStore,
+    build_callback_url,
+    channel_configured,
+    field_map,
+    key_source,
+    mask_value,
+    masked_view,
+    normalize_payload,
+    validate_payload,
+)
 from ..config import format_dt
 from ..state import (
     SESSION_TTL_HOURS,
@@ -379,6 +391,78 @@ def _query_instances(
             items.append(d)
 
         return {"total": total, "items": items}
+
+
+def _probe_channel(channel: str, payload: Dict[str, str]) -> tuple[bool, str]:
+    """用**临时凭证**做一次真实连通性自检：能换到 access_token 就算通。
+
+    ⛔ 不写库、不改任何状态、不碰服务里正在用的通道实例 —— 纯粹探活。
+    返回值 (ok, 人话说明)：错误文案要能直接给填表的人看，不能甩 Python 异常栈。
+    """
+    from types import SimpleNamespace
+
+    if channel == "zdxlz":
+        from ..channels.zdxlz import ZdxlzChannel
+
+        base = payload.get("api_base") or "https://imtwo.zdxlz.com"
+        shim = SimpleNamespace(
+            api_base=base.rstrip("/"),
+            app_id=payload.get("app_id", ""),
+            app_secret=payload.get("app_secret", ""),
+            verify_token=payload.get("verify_token", ""),
+            encrypt_key=payload.get("encrypt_key", ""),
+            channel_configured=True,
+        )
+        chan = ZdxlzChannel(shim)  # type: ignore[arg-type]
+        try:
+            token = chan.get_access_token(force_refresh=True)
+            return True, f"连接成功，已换到 access_token（{mask_value(token)}）"
+        except Exception as exc:  # noqa: BLE001 - 一律翻成人话
+            text = str(exc)
+            low = text.lower()
+            if "401" in text or "403" in text:
+                return False, "AppID 或 AppSecret 无效（服务端返回 401/403），请核对后重填"
+            if "timeout" in low or "timed out" in low or "connect" in low:
+                return False, f"网络不通或超时：{text[:120]}"
+            return False, f"连接失败：{text[:160]}"
+        finally:
+            try:
+                chan.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if channel == "wecom":
+        from ..channels.wecom import WecomClient
+
+        client = WecomClient(
+            payload.get("corpid", ""), payload.get("agentid", ""), payload.get("secret", "")
+        )
+        try:
+            token = client.get_token(force=True)
+            return True, f"连接成功，已换到 access_token（{mask_value(token)}）"
+        except Exception as exc:  # noqa: BLE001
+            errcode = getattr(exc, "errcode", None)
+            hint = {
+                40001: "Secret 无效（40001），请到应用详情页重新复制",
+                40013: "corpid 无效（40013），请核对企业 ID",
+                40056: "agentid 无效（40056），必须是该企业下的应用 ID（整数）",
+                60020: "服务器出口 IP 不在可信 IP 白名单里（60020），请让管理员添加",
+                41004: "缺少 secret 参数（41004）",
+            }.get(errcode) if errcode is not None else None
+            if hint:
+                return False, hint
+            text = str(exc)
+            low = text.lower()
+            if "timeout" in low or "timed out" in low or "connect" in low:
+                return False, f"网络不通或超时（服务器需能访问 qyapi.weixin.qq.com）：{text[:120]}"
+            return False, f"连接失败：{text[:160]}"
+        finally:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return False, f"不支持的通道：{channel}"
 
 
 def create_admin_router(state: StateStore, notifier: Any = None, public_base_url: str = "") -> APIRouter:
@@ -1610,5 +1694,170 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                     counts[st] = cnt
 
         return {"ok": True, "stats": counts}
+
+    # ==================================================================
+    # 2026-10-30 通道配置向导（首次安装填表即用，⛔ 不写 .env）
+    # ==================================================================
+    def _channel_store():
+        """按当前 state 拼一个配置读写门面；data_dir 取数据库同级的父目录。"""
+        data_dir = Path(state.db.db_path).parent
+        return ChannelConfigStore(state.conn, state.lock, data_dir)
+
+    def _env_fallback(cfg: Any, channel: str) -> Dict[str, str]:
+        """库里没配时，把 env 里的现状当作「已配置」返回（掩码可见，证明当前在跑）。
+
+        cfg 取 request.app.state.config；单测里单独组 router 时可能没有，直接当空处理。
+        """
+        if cfg is None:
+            return {}
+        out: Dict[str, str] = {}
+        for src, dst in field_map(channel).items():
+            val = str(getattr(cfg, dst, "") or "").strip()
+            if val:
+                out[src] = val
+        return out
+
+    @router.get("/channel-config")
+    async def get_channel_config(request: Request):
+        """返回每个通道的配置状态 + 掩码 + 回调地址（⛔ 永不回完整凭证）。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        cc = _channel_store()
+        cfg_now = getattr(request.app.state, "config", None)
+        db_all = cc.read_all()
+        active = cc.read_active_channel() or (os.environ.get("IMT_CHANNEL", "").strip().lower() or "zdxlz")
+        source_kind, source_desc = key_source()
+
+        channels = []
+        any_configured = False
+        for name, meta in CHANNEL_SCHEMA.items():
+            db_payload = db_all.get(name) or {}
+            env_payload = _env_fallback(cfg_now, name)
+            if db_payload:
+                effective, source = db_payload, "db"
+            elif env_payload:
+                effective, source = env_payload, "env"
+            else:
+                effective, source = {}, "none"
+            configured = channel_configured(name, effective)
+            any_configured = any_configured or configured
+            channels.append({
+                "channel": name,
+                "label": meta["label"],
+                "configured": configured,
+                "source": source,
+                "masked": masked_view(name, effective),
+                "fields": meta["fields"],
+                "callback_url": build_callback_url(public_base_url, name),
+                "callback_path": meta["callback_path"],
+                "is_active": name == active,
+            })
+
+        return {
+            "ok": True,
+            "channels": channels,
+            "active_channel": active,
+            "any_configured": any_configured,
+            "public_base_url": public_base_url,
+            "enc_key_source": source_kind,
+            "enc_key_desc": source_desc,
+        }
+
+    @router.post("/channel-config")
+    async def save_channel_config(request: Request):
+        """保存凭证：校验必填 → AES-GCM 加密入库 → 回掩码。生效需重启服务。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return error_response(400, "VALIDATION_FAILED", "请求体不是合法 JSON")
+        if not isinstance(body, dict):
+            return error_response(400, "VALIDATION_FAILED", "请求体格式错误")
+
+        channel = str(body.get("channel") or "").strip().lower()
+        payload = body.get("payload")
+        if channel not in CHANNEL_SCHEMA:
+            return error_response(400, "VALIDATION_FAILED", "请选择要配置的通道（zdxlz / wecom）")
+        if not isinstance(payload, dict):
+            return error_response(400, "VALIDATION_FAILED", "payload 必须是对象")
+
+        cc = _channel_store()
+        try:
+            merged = cc.save(channel, payload, now_str=state.now_str())
+        except ValueError as exc:
+            return error_response(400, "VALIDATION_FAILED", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("保存通道配置失败")
+            return error_response(500, "SAVE_FAILED", f"保存失败：{exc}")
+
+        want_active = bool(body.get("set_active"))
+        if want_active:
+            try:
+                cc.save_active_channel(channel, now_str=state.now_str())
+            except Exception:  # noqa: BLE001
+                logger.exception("记录启用通道失败")
+
+        logger.info(
+            "通道配置已更新：channel=%s actor=%s set_active=%s",
+            channel, sess.get("username"), want_active,
+        )
+        try:
+            # 审计只记字段名，⛔ 不记任何凭证值
+            state.write_audit(
+                str(sess.get("username") or "admin"),
+                "channel_config_save",
+                "channel",
+                channel,
+                {"fields": sorted(merged.keys()), "set_active": want_active},
+            )
+        except Exception:  # noqa: BLE001 - 审计失败不影响保存
+            logger.warning("写审计日志失败（通道配置）")
+
+        return {
+            "ok": True,
+            "channel": channel,
+            "masked": masked_view(channel, merged),
+            "is_active": want_active,
+            "restart_required": True,
+            "message": "重启服务后生效：systemctl restart imtask",
+        }
+
+    @router.post("/channel-config/test")
+    async def test_channel_config(request: Request):
+        """用提交的临时凭证做连通性自检（⛔ 不入库），错误信息要人话。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001
+            return error_response(400, "VALIDATION_FAILED", "请求体不是合法 JSON")
+        if not isinstance(body, dict):
+            return error_response(400, "VALIDATION_FAILED", "请求体格式错误")
+
+        channel = str(body.get("channel") or "").strip().lower()
+        payload = body.get("payload") if isinstance(body.get("payload"), dict) else {}
+        if channel not in CHANNEL_SCHEMA:
+            return error_response(400, "VALIDATION_FAILED", "请选择要测试的通道（zdxlz / wecom）")
+
+        # 允许「只测改动过的字段」：没填的项用库里已有值补全（与保存的合并语义一致）
+        cfg_now = getattr(request.app.state, "config", None)
+        existing = _channel_store().read(channel) or _env_fallback(cfg_now, channel)
+        probe = {**existing, **normalize_payload(channel, payload)}
+        verr = validate_payload(channel, probe)
+        if verr:
+            return {"ok": False, "detail": verr, "channel": channel}
+
+        ok, detail = _probe_channel(channel, probe)
+        return {"ok": ok, "detail": detail, "channel": channel}
 
     return router
