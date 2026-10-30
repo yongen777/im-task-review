@@ -89,6 +89,11 @@
       const submitBtn = document.getElementById("submitBtn");
       let taskInfo = null;
       let uploadedRefs = [];
+      /* 2026-10-30：管理员勾了哪些模块，用户就必须完成哪些。
+         模块清单与各模块已上传的 ref 需要给「提交」按钮那层用，所以在外面留一份。 */
+      let h5Modules = [];
+      let refsByModule = {};
+      let h5Schema = [];
 
       function showMsg(text, type) {
         msgBox.textContent = text;
@@ -130,6 +135,8 @@
           const modules = Array.isArray(spec.upload_modules) && spec.upload_modules.length
             ? spec.upload_modules
             : (data.template.kind === "form" ? ["fields"] : []);
+          h5Modules = modules.slice();
+          h5Schema = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
           let textModuleOn = false;
 
           /* 统一的模块卡片：图标 + 标题 + 右侧提示 + 内容区 */
@@ -169,6 +176,7 @@
           function syncRefs() {
             uploadedRefs = [];
             Object.keys(moduleRefs).forEach((k) => { uploadedRefs = uploadedRefs.concat(moduleRefs[k]); });
+            refsByModule = moduleRefs;
           }
           function makeUploadBlock(title, icon, iconColor, hint, accept, previewImages, moduleKey) {
             const body = makeBlock(title, icon, iconColor, hint);
@@ -344,6 +352,24 @@
         payload = { fields: fieldsObj, refs: uploadedRefs, file_ref: uploadedRefs[0] || "" };
         const noteEl = document.getElementById("noteInput");
         const note = noteEl ? noteEl.value : "";
+        /* 2026-10-30 用户口径：管理员选了什么，用户就必须完成什么 —— 缺什么先在这里提示，
+           不要让用户点完提交才看到服务端报错（服务端同样有硬校验兜底）。 */
+        for (const f of h5Schema) {
+          if (!f || !f.required) continue;
+          const el = document.querySelector('[data-field-key="' + f.key + '"]');
+          if (el && !String(el.value || "").trim()) {
+            return showMsg("请填写「" + (f.label || f.key) + "」后再提交", "error");
+          }
+        }
+        if (h5Modules.indexOf("text") >= 0 && !String(note || "").trim()) {
+          return showMsg("请填写文字说明后再提交", "error");
+        }
+        if (h5Modules.indexOf("image") >= 0 && !((refsByModule["image"] || []).length)) {
+          return showMsg("请上传图片后再提交", "error");
+        }
+        if (h5Modules.indexOf("file") >= 0 && !((refsByModule["file"] || []).length)) {
+          return showMsg("请上传文件后再提交", "error");
+        }
         submitBtn.disabled = true;
         fetch("/api/h5/task/submit", {
           method: "POST",

@@ -38,6 +38,7 @@ from ..state import (
     BizError,
     StateStore,
     calc_resubmit_deadline,
+    effective_h5_modules,
     validate_new_password,
     verify_password,
 )
@@ -1326,6 +1327,17 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if not inst:
             return error_response(404, "NOT_FOUND", "任务实例不存在")
         tpl = state.get_template(inst["template_id"], include_deleted=True)
+        # 2026-10-30 详情补齐模板侧字段：
+        # · kind / role_id：列表早就用模板补了，详情漏了，前端只能退化成「业务角色」
+        # · need_review：决定状态文案是「已完成」还是「审核通过」
+        # · modules：决定详情里显示哪些上传区块（管理员没勾文件就不该出现文件栏）
+        _tpl = tpl or {}
+        _role_ids = _tpl.get("role_ids") or []
+        inst["kind"] = _tpl.get("kind") or "form"
+        inst["need_review"] = bool(_tpl.get("need_review"))
+        inst["role_id"] = _role_ids[0] if _role_ids else ""
+        inst["role_ids"] = list(_role_ids)
+        inst["modules"] = effective_h5_modules(_tpl)
         submissions = state.list_submissions_for_instance(instance_id)
         reminders = state.list_reminder_logs(instance_id=instance_id)
         inst["late_submit"] = bool(inst.get("late_submit", 0))

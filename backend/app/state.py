@@ -150,6 +150,45 @@ def _validate_form_schema(schema_raw: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
+def required_h5_modules(template: Dict[str, Any]) -> set:
+    """模板**显式勾选**的 H5 上传模块（spec.upload_modules）。
+
+    2026-10-30 用户口径：管理员在模板里选了什么，用户就必须完成什么 ——
+    选了「图片」就必须传图、选了「文件」就必须传文件、选了「文字说明」就必须填，
+    否则提交时直接拦下来并提示，不允许"空着交上去"。
+
+    ⚠️ 只在**显式勾选**时生效：老模板 spec 里没有 upload_modules 字段，
+    保持原来行为（不额外新增拦截），避免存量任务突然交不了。
+    """
+    spec = template.get("spec_json") or {}
+    mods = spec.get("upload_modules") if isinstance(spec, dict) else None
+    if not isinstance(mods, list):
+        return set()
+    return {str(m).strip() for m in mods if str(m or "").strip()}
+
+
+def effective_h5_modules(template: Dict[str, Any]) -> List[str]:
+    """H5 页面**实际渲染**的模块清单（显式勾选优先，否则按任务类型给默认值）。
+
+    后台详情弹窗按这份清单决定显示哪些区块 —— 管理员没勾「文件」，就不该出现文件那一栏。
+    与前端预览 `resolveUploadModules` / H5 `modules` 三段推导保持一致。
+    """
+    mods = required_h5_modules(template)
+    if mods:
+        # 保持用户勾选顺序，便于前后端展示一致
+        spec = template.get("spec_json") or {}
+        order = [str(m) for m in (spec.get("upload_modules") or [])]
+        return [m for m in order if m in mods]
+    kind = str(template.get("kind") or "")
+    if kind == "form":
+        return ["fields", "text"]
+    if kind == "image":
+        return ["image", "text"]
+    if kind == "file":
+        return ["file", "text"]
+    return ["fields", "image", "text"]
+
+
 def validate_form_submission_fields(schema: List[Dict[str, Any]], fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     input_fields = fields if isinstance(fields, dict) else {}
     cleaned: Dict[str, Any] = {}
@@ -1446,7 +1485,9 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "该链接已提交过，请勿重复使用")
 
         fields_json_str, up_row = None, None
-        clean_note = str(note).strip()[:500] if ((tpl.get("allow_note") or tpl["kind"] == "form") and note is not None and str(note).strip()) else None
+        # 勾了「文字说明」模块就必须把 note 存下来（否则下面校验必填时会永远判空）
+        _note_allowed = bool(tpl.get("allow_note")) or tpl["kind"] == "form" or "text" in required_h5_modules(tpl)
+        clean_note = str(note).strip()[:500] if (_note_allowed and note is not None and str(note).strip()) else None
 
         # 上报类（form）可以同时带多个附件：文字说明走 note，图片/文件走 refs
         clean_refs = [str(r).strip() for r in (refs or []) if str(r or "").strip()] if isinstance(refs, list) else []
@@ -1475,6 +1516,17 @@ class StateStore:
             ref_rows = [up_row]
 
         refs_json_str = json.dumps([r["ref"] for r in ref_rows], ensure_ascii=False) if ref_rows else None
+        # 2026-10-30：管理员勾选的模块，用户必须真的完成（服务端硬校验，H5 前端只是先提示一遍）
+        _mods = required_h5_modules(tpl)
+        if _mods:
+            _imgs = [r for r in ref_rows if str(r.get("mime") or "").startswith("image/")]
+            _others = [r for r in ref_rows if not str(r.get("mime") or "").startswith("image/")]
+            if "image" in _mods and not _imgs:
+                raise BizError(400, "VALIDATION_FAILED", "请上传图片后再提交")
+            if "file" in _mods and not _others:
+                raise BizError(400, "VALIDATION_FAILED", "请上传文件后再提交")
+            if "text" in _mods and not clean_note:
+                raise BizError(400, "VALIDATION_FAILED", "请填写文字说明后再提交")
         new_status = "submitted" if tpl["need_review"] else "approved"
         late_submit = 1 if (now_s > inst["deadline_at"] or int(inst.get("late_submit") or 0) == 1) else 0
 

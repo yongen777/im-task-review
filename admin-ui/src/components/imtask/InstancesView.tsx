@@ -106,7 +106,11 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
       };
     case 'approved':
       return {
-        label: inst.require_review === false ? '已上传' : '审核通过',
+        /* 2026-10-30 用户口径：不需要审核的任务，提交成功即「已完成」；
+           需要审核的，审核通过后才是「审核通过」。
+           注意判据是 need_review（后端下发），原来判的 require_review 前端从未被赋值，
+           导致所有免审任务都错误显示成「审核通过」。 */
+        label: inst.need_review ? '审核通过' : '已完成',
         className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
         icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />,
       };
@@ -228,6 +232,22 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
     }
     return map;
   }, [roles]);
+
+  /* 2026-10-30 用户反馈：详情里角色一直显示成固定的「业务角色」。
+     根因是详情接口没带 role_id（已补），同时这里的兜底也不该编一个假名字 ——
+     多角色逐个查名，查不到就显示「—」，让人一眼看出是角色被删了而不是"叫业务角色"。 */
+  const roleLabel = useCallback(
+    (inst: { role_id?: string; role_ids?: string[] }) => {
+      const ids = (
+        Array.isArray(inst.role_ids) && inst.role_ids.length
+          ? inst.role_ids
+          : [inst.role_id || '']
+      ).filter(Boolean) as string[];
+      const names = ids.map((id) => roleMap[id]).filter(Boolean);
+      return names.length ? names.join('、') : '—';
+    },
+    [roleMap],
+  );
 
   const loadData = useCallback(
     async (
@@ -816,7 +836,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
               ) : (
                 items.map((inst) => {
                   const statusMeta = getInstanceStatusMeta(inst);
-                  const roleName = roleMap[inst.role_id] || '业务角色';
+                  const roleName = roleLabel(inst);
                   const isNotice = inst.kind === 'notice';
 
                   return (
@@ -1016,7 +1036,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                 <p className="text-[11px] text-slate-400 mt-0.5">
                   执行日期：{detailData.instance.period_key} · 接收人：
                   {detailData.instance.member_name_snap} ({detailData.instance.phone}) ·{' '}
-                  {roleMap[detailData.instance.role_id] || '业务角色'}
+                  {roleLabel(detailData.instance)}
                 </p>
               </div>
               <button
@@ -1041,7 +1061,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                   </span>
                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200/70 text-[11px] font-semibold">
                     <Users className="w-3 h-3 shrink-0" />
-                    <span>{roleMap[detailData.instance.role_id] || '业务角色'}</span>
+                    <span>{roleLabel(detailData.instance)}</span>
                   </span>
                 </div>
               </div>
@@ -1149,9 +1169,17 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                             value: String(v ?? ''),
                           }));
                     const attachments = sub.attachments || [];
+                    /* 2026-10-30：只渲染模板**实际启用**的模块 —— 管理员只勾了字段+图片，
+                       就不该出现「文件（0） 本次未上传文件」这种空区块。
+                       例外：真有数据就照常显示（历史模板/脏数据不隐藏证据）。 */
+                    const mods: string[] = Array.isArray(detailData.instance.modules)
+                      ? detailData.instance.modules
+                      : [];
+                    const hasModule = (m: string, hasData = false) =>
+                      hasData || mods.length === 0 || mods.indexOf(m) >= 0;
                     return (
                       <>
-                        {fieldRows.length > 0 && (
+                        {fieldRows.length > 0 && hasModule('fields', true) && (
                           <div className="space-y-1.5">
                             <div className="text-[11px] font-semibold text-slate-500">报数字段</div>
                             <div className="divide-y divide-slate-100 border border-slate-200/80 rounded-xl overflow-hidden">
@@ -1185,6 +1213,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                           const files = attachments.filter((a) => !a.is_image);
                           return (
                             <>
+                              {hasModule('image', imgs.length > 0) && (
                               <div>
                                 <div className="text-[11px] font-semibold text-slate-500 mb-1">
                                   图片（{imgs.length}）
@@ -1221,7 +1250,9 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                                   </div>
                                 )}
                               </div>
+                              )}
 
+                              {hasModule('file', files.length > 0) && (
                               <div>
                                 <div className="text-[11px] font-semibold text-slate-500 mb-1">
                                   文件（{files.length}）
@@ -1265,6 +1296,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
                                   </div>
                                 )}
                               </div>
+                              )}
                             </>
                           );
                         })()}
@@ -1346,7 +1378,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 {detailData.instance.kind !== 'notice' &&
-                  detailData.instance.require_review !== false &&
+                  detailData.instance.need_review === true &&
                   detailData.instance.status === 'submitted' && (
                     <>
                       <button

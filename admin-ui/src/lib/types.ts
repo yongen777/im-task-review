@@ -145,6 +145,10 @@ export interface TaskInstanceItem {
   member_name_snap: string;
   dept_snap?: string;
   require_review?: boolean;
+  /* 2026-10-30：是否为需人工审核的模板（后端下发）。决定状态文案「已完成」/「审核通过」 */
+  need_review?: boolean;
+  /* 2026-10-30：模板实际启用的 H5 上传模块（fields/text/image/file），详情按它决定显示哪些区块 */
+  modules?: string[];
   status: InstanceStatus;
   submitted_at: string | null;
   reviewed_by: string | null;
