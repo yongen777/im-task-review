@@ -394,7 +394,7 @@ def _query_instances(
         return {"total": total, "items": items}
 
 
-def _probe_channel(channel: str, payload: Dict[str, str]) -> tuple[bool, str]:
+def _probe_channel(channel: str, payload: Dict[str, str], *, notifier: Any = None) -> tuple[bool, str]:
     """用**临时凭证**做一次真实连通性自检：能换到 access_token 就算通。
 
     ⛔ 不写库、不改任何状态、不碰服务里正在用的通道实例 —— 纯粹探活。
@@ -462,6 +462,41 @@ def _probe_channel(channel: str, payload: Dict[str, str]) -> tuple[bool, str]:
                 client.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    if channel == "wecom_aibot":
+        from ..channels.wecom_aibot import AibotBridge
+
+        bot_id = str(payload.get("bot_id") or "").strip()
+        secret = str(payload.get("bot_secret") or "").strip()
+        live = getattr(notifier, "bridge", None)
+        # ⚠️ 同一机器人只能维持一条长连接，新连接会把旧连接踢下线。
+        #    所以当探测的正是「当前正在跑的那一个」时，直接回报已就绪，绝不再建第二条。
+        if isinstance(live, AibotBridge) and live.is_ready() and live.bot_id == bot_id:
+            return True, "当前通道正在使用该机器人，长连接已就绪（为避免把线上连接踢掉，本次未重复建连）"
+
+        probe = AibotBridge(bot_id, secret, connect_timeout=8.0)
+        if not probe.start():
+            return False, probe.last_error or "无法启动长连接（SDK 未安装或凭证为空）"
+        try:
+            ready = probe.wait_ready(8.0)
+            err = probe.last_error or ""
+        finally:
+            try:
+                probe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        if ready:
+            return True, "连接成功：长连接已完成鉴权（BotID / Secret 有效）"
+        if "SDK 未安装" in err:
+            return False, "服务器未安装 wecom-aibot-python-sdk，无法建立长连接（需要 pip install）"
+        low = err.lower()
+        if "timeout" in low or "timed out" in low or "connect" in low:
+            return False, (
+                "8 秒内未能完成长连接鉴权，常见原因：① BotID / Secret 不正确；"
+                "② 服务器出网 443 被拦，访问不了 openws.work.weixin.qq.com；③ 该机器人已在别处连接"
+            )
+        detail = f"（{err[:100]}）" if err else ""
+        return False, f"长连接建立失败{detail}：请核对 BotID / Secret，并确认服务器可访问 openws.work.weixin.qq.com"
 
     return False, f"不支持的通道：{channel}"
 
@@ -1869,7 +1904,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if verr:
             return {"ok": False, "detail": verr, "channel": channel}
 
-        ok, detail = _probe_channel(channel, probe)
+        ok, detail = _probe_channel(channel, probe, notifier=_notifier)
         return {"ok": ok, "detail": detail, "channel": channel}
 
     return router

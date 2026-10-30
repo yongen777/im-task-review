@@ -69,6 +69,18 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
              "hint": "43 位，应用「接收消息」里随机生成"},
         ],
     },
+    "wecom_aibot": {
+        "label": "企业微信（智能机器人）",
+        # 长连接模式没有回调地址：官方原文「无需域名或 IP 即可接收消息并返回结果」，
+        # 所以 callback_path 留空，前端据此不渲染「回调地址」那一栏。
+        "callback_path": "",
+        "fields": [
+            {"key": "bot_id", "label": "Bot ID", "required": True, "secret": True,
+             "hint": "智能机器人详情页的 Bot ID（aib 开头）"},
+            {"key": "bot_secret", "label": "Bot Secret", "required": True, "secret": True,
+             "hint": "点「点击获取」生成后复制；同一机器人只能建立一条长连接"},
+        ],
+    },
 }
 
 # DB payload 字段 → Config 字段（None 表示需要特殊处理）
@@ -85,6 +97,10 @@ _FIELD_MAP: Dict[str, Dict[str, str]] = {
         "secret": "wecom_secret",
         "token": "wecom_token",
         "aes_key": "wecom_aes_key",
+    },
+    "wecom_aibot": {
+        "bot_id": "wecom_bot_id",
+        "bot_secret": "wecom_bot_secret",
     },
 }
 

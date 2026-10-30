@@ -310,28 +310,35 @@ const ChannelSettingsView: React.FC = () => {
               )}
             </div>
 
-            <div className="mt-3 pt-2.5 border-t border-slate-100">
-              <div className="text-[10px] font-semibold text-slate-400 mb-1">回调地址</div>
-              <div className="flex items-center gap-1.5">
-                {/* 用 readonly input 而不是 code：复制失败时还能点一下全选手动复制 */}
-                <input
-                  readOnly
-                  value={c.callback_url || ''}
-                  placeholder="（未配置 public_base_url）"
-                  onFocus={(e) => e.currentTarget.select()}
-                  onClick={(e) => e.currentTarget.select()}
-                  title={c.callback_url || ''}
-                  className="flex-1 min-w-0 text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50 cursor-text"
-                />
-                <button
-                  onClick={() => void copy(c.callback_url, '回调地址')}
-                  className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 border border-slate-200 cursor-pointer shrink-0"
-                  title="复制回调地址"
-                >
-                  <Copy className="w-3 h-3" />
-                </button>
+            {/* 长连接通道（智能机器人）没有回调地址：callback_path 为空时整块不渲染 */}
+            {c.callback_path ? (
+              <div className="mt-3 pt-2.5 border-t border-slate-100">
+                <div className="text-[10px] font-semibold text-slate-400 mb-1">回调地址</div>
+                <div className="flex items-center gap-1.5">
+                  {/* 用 readonly input 而不是 code：复制失败时还能点一下全选手动复制 */}
+                  <input
+                    readOnly
+                    value={c.callback_url || ''}
+                    placeholder="（未配置 public_base_url）"
+                    onFocus={(e) => e.currentTarget.select()}
+                    onClick={(e) => e.currentTarget.select()}
+                    title={c.callback_url || ''}
+                    className="flex-1 min-w-0 text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50 cursor-text"
+                  />
+                  <button
+                    onClick={() => void copy(c.callback_url, '回调地址')}
+                    className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 border border-slate-200 cursor-pointer shrink-0"
+                    title="复制回调地址"
+                  >
+                    <Copy className="w-3 h-3" />
+                  </button>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="mt-3 pt-2.5 border-t border-slate-100 text-[11px] text-slate-500">
+                长连接模式：无需回调地址、无需域名或可信 IP，保存后重启即自动建连。
+              </div>
+            )}
           </div>
         ))}
       </div>

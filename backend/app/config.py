@@ -119,6 +119,10 @@ class Config:
     wecom_aes_key: str = ""
     # OAuth2 网页授权回跳地址（P3 阶段用；可信域名未配前不启用）
     wecom_oauth_redirect: str = ""
+    # 2026-10-30 企业微信「智能机器人」长连接（微信侧无域名/可信 IP 要求，绕开自建应用的回调域名死锁）：
+    # 凭证只有 BotID + Secret 两样；同一机器人只能有一条长连接。
+    wecom_bot_id: str = ""
+    wecom_bot_secret: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -217,6 +221,8 @@ class Config:
             wecom_token=os.environ.get("IMT_WECOM_TOKEN", "").strip(),
             wecom_aes_key=os.environ.get("IMT_WECOM_AES_KEY", "").strip(),
             wecom_oauth_redirect=os.environ.get("IMT_WECOM_OAUTH_REDIRECT", "").strip(),
+            wecom_bot_id=os.environ.get("IMT_WECOM_BOT_ID", "").strip(),
+            wecom_bot_secret=os.environ.get("IMT_WECOM_BOT_SECRET", "").strip(),
         )
 
 

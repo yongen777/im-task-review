@@ -126,13 +126,32 @@ def create_apps(
     _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
     # 2026-10-30 通道隔离：投递绑定（谁用什么 ID 能收到）按通道分开存，
     # store 读写默认跟着当前通道走；默认 zdxlz 时与历史行为完全一致。
-    store.platform = _channel
+    #
+    # ⚠️ platform 映射（不是漏改）：企业微信**两条路线**——自建应用（wecom）与智能机器人（wecom_aibot）——
+    #    用的是同一套成员 userid 体系，所以绑定统一记在 'wecom' 下。
+    #    好处：先激活智能机器人，将来域名到位切自建应用时，绑定直接复用，员工不用重新激活。
+    store.platform = "wecom" if _channel in ("wecom", "wecom_aibot") else _channel
     if _channel == "wecom":
-        # 2026-10-30 最终路线：企业微信自建应用（HTTP 主动推送 + 回调接收）
+        # 企业微信自建应用（HTTP 主动推送 + 回调接收）：暂缓，等回调域名可用
         from .channels.wecom import WecomNotifier
 
         default_notifier = WecomNotifier(cfg)
         logger.info("通道已切换为 企业微信自建应用（agentid=%s）", getattr(cfg, "wecom_agentid", ""))
+    elif _channel in ("wecom_aibot", "aibot"):
+        # 2026-10-30 当前路线：企业微信智能机器人（长连接）。
+        # 官方原文：长连接「无需域名或 IP 即可接收消息并返回结果」→ 绕开自建应用的回调域名+可信 IP 死锁。
+        # 收消息复用 handle_inbound_text（绑定/待归纳/申请补交/ack 同一套规则，⛔ 这里只做格式转换）。
+        from .api.events import handle_inbound_text
+        from .channels.wecom_aibot import WecomAibotNotifier
+
+        def _aibot_inbound(user_id: str, msg_text: str, send) -> None:
+            handle_inbound_text(state=store, user_id=user_id, msg_text=msg_text, send=send)
+
+        default_notifier = WecomAibotNotifier(cfg, on_text=_aibot_inbound)
+        logger.info(
+            "通道已切换为 企业微信智能机器人（长连接 bot_id=%s；同一机器人只能一条连接）",
+            getattr(cfg, "wecom_bot_id", "")[:12],
+        )
     active_notifier: NotifierProtocol = notifier if notifier is not None else default_notifier
 
     # §16 P7：IMT_PUBLIC_BASE_URL 仍为 127.0.0.1/localhost 且通道已配置时，启动打 WARN
