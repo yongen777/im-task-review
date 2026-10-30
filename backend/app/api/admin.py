@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from ..config import format_dt
 from ..state import (
     SESSION_TTL_HOURS,
     BizError,
@@ -334,7 +336,12 @@ def _query_instances(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
             f"t.notice_times AS template_notice_times "
-            f"{from_sql} {where_sql} ORDER BY i.id DESC LIMIT ? OFFSET ?",
+            # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），
+            # 管理员顺着看一天的排期；日期维度仍是最近的在上面（period_key DESC）。
+            # 通知类 remind_at 可能为空，用 COALESCE 兜底到末尾，最后再用 id 保证稳定顺序。
+            f"{from_sql} {where_sql} "
+            "ORDER BY i.period_key DESC, COALESCE(NULLIF(t.remind_at, ''), '99:99') ASC, i.id ASC "
+            "LIMIT ? OFFSET ?",
             tuple(params + [s, offset]),
         ).fetchall()
 
@@ -1164,6 +1171,65 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             size=size,
         )
         return {"ok": True, "total": res["total"], "page": page, "size": size, "items": res["items"]}
+
+    @router.get("/instances/pending-reviews")
+    async def pending_reviews(request: Request, days: int = 7):
+        """跨日期的「待我处理」聚合：用户提交待审 + 补交申请待审。
+
+        为什么需要单开一个接口：实例列表的 period_key 是**单日精确匹配**，而补交待审的实例
+        必然是往日的（逾期才可能补交），默认「今天」筛选下永远查不到，管理员必须先手改日期。
+        这里按「提交/申请时刻」跨日聚合，不看任务日期；只读，不改任何状态。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        try:
+            d = max(1, min(int(days or 7), 90))
+        except Exception:  # noqa: BLE001
+            d = 7
+        # 用户口径：自然日口径（今天往前数 d 天，含今天），不是滚动 7×24h
+        start_dt = (state.now() - timedelta(days=d - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_s = format_dt(start_dt)
+        limit = 100
+        base = (
+            # name_snap 是实例表列名，前端统一叫 member_name_snap，这里直接给别名省一层换算
+            "SELECT i.*, i.name_snap AS member_name_snap, t.name AS template_name, t.kind AS template_kind "
+            "FROM task_instance i JOIN task_template t ON t.template_id = i.template_id "
+            "WHERE t.enabled = 1 AND t.deleted = 0 "
+        )
+        with state.lock:
+            sub_rows = state.conn.execute(
+                base + "AND i.status = 'submitted' AND COALESCE(i.submitted_at, i.created_at) >= ? "
+                       "ORDER BY COALESCE(i.submitted_at, i.created_at) DESC, i.id DESC LIMIT ?",
+                (start_s, limit + 1),
+            ).fetchall()
+            rq_rows = state.conn.execute(
+                base + "AND i.resubmit_status = 'pending' AND COALESCE(i.resubmit_req_at, i.created_at) >= ? "
+                       "ORDER BY COALESCE(i.resubmit_req_at, i.created_at) DESC, i.id DESC LIMIT ?",
+                (start_s, limit + 1),
+            ).fetchall()
+
+        def _row(r):
+            d0 = dict(r)
+            d0["kind"] = d0.get("template_kind") or "form"
+            d0["late_submit"] = bool(d0.get("late_submit", 0))
+            d0["need_review"] = bool(d0.get("need_review", 0))
+            return d0
+
+        subs = [_row(r) for r in sub_rows]
+        rqs = [_row(r) for r in rq_rows]
+        return {
+            "ok": True,
+            "days": d,
+            "since": start_s,
+            "limit": limit,
+            "truncated": {"submitted": len(subs) > limit, "resubmit": len(rqs) > limit},
+            "submitted": subs[:limit],
+            "resubmit": rqs[:limit],
+            "total": min(len(subs), limit) + min(len(rqs), limit),
+        }
 
     @router.get("/instances/{instance_id}")
     async def get_instance_detail(instance_id: int, request: Request):

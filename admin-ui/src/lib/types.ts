@@ -162,6 +162,25 @@ export interface TaskInstanceItem {
   created_at: string;
 }
 
+/* 2026-10-30 审核待办（跨日期聚合）：用户提交待审 / 补交申请待审 */
+export interface PendingReviewItem {
+  id: number;
+  template_id: string;
+  template_name: string;
+  kind: TemplateKind;
+  role_id?: string;
+  phone: string;
+  member_name_snap: string;
+  dept_snap?: string | null;
+  status: string;
+  need_review?: boolean;
+  late_submit?: boolean;
+  deadline_at: string | null;
+  submitted_at?: string | null;
+  resubmit_req_at?: string | null;
+  resubmit_status?: string | null;
+}
+
 export interface SubmissionAttachment {
   ref: string;
   file_name: string;

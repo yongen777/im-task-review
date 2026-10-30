@@ -20,6 +20,7 @@ import {
   Search,
   ListFilter,
 } from 'lucide-react';
+import PendingReviewPanel from './PendingReviewPanel';
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
@@ -519,6 +520,13 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
     }
   };
 
+  /* 2026-10-30 审核待办：动作完成后同时刷新待办卡片、主列表与统计卡片 */
+  const [pendingRefresh, setPendingRefresh] = useState(0);
+  const handlePendingChanged = useCallback(() => {
+    setPendingRefresh((n) => n + 1);
+    void Promise.all([loadData(page), refreshStats()]);
+  }, [loadData, page, refreshStats]);
+
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
@@ -610,6 +618,13 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
           </div>
         </div>
       )}
+
+      {/* 2026-10-30 审核待办：跨日期聚合「用户提交待审 + 补交申请待审」，无待办时整卡不渲染 */}
+      <PendingReviewPanel
+        refreshToken={pendingRefresh}
+        onOpenDetail={handleOpenDetail}
+        onChanged={handlePendingChanged}
+      />
 
       {/* 筛选工具栏 + 表格 + 分页 */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
