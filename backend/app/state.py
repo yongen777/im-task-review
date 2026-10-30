@@ -237,9 +237,19 @@ def _fmt_member(mid: int, role_id: str, phone: str, name: str, dept: Optional[st
 
 
 class StateStore:
-    def __init__(self, db_path: Path, now_fn: NowFn = default_now) -> None:
+    def __init__(self, db_path: Path, now_fn: NowFn = default_now, platform: str = "zdxlz") -> None:
         self._now_fn = now_fn
+        # 当前通道（zdxlz / wecom）：投递绑定按通道分开存，读写默认都走它。
+        self.platform = (platform or "zdxlz").strip().lower()
         self.db = Database(db_path, self.now_str)
+
+    def _plat(self, platform: Optional[str] = None) -> str:
+        """显式传了就用传的，否则用当前通道（store.platform）。
+
+        2026-10-30 通道隔离：delivery_target 主键是 (platform, phone)，
+        绑定关系必须跟着通道走，否则切到企业微信会把量子密信的 uid 当企微 userid 发。
+        """
+        return ((platform or "").strip().lower() or self.platform)
 
     @property
     def conn(self):
@@ -360,7 +370,8 @@ class StateStore:
         with self.lock:
             return self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", ((phone or "").strip(),)).fetchone() is not None
 
-    def upsert_delivery_target(self, phone: str, external_id: str, platform: str = "zdxlz") -> Dict[str, Any]:
+    def upsert_delivery_target(self, phone: str, external_id: str, platform: Optional[str] = None) -> Dict[str, Any]:
+        platform = self._plat(platform)
         clean_phone, clean_ext = (phone or "").strip(), (external_id or "").strip()
         if not is_valid_phone(clean_phone):
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
@@ -383,10 +394,11 @@ class StateStore:
                 )
             return {"platform": platform, "phone": clean_phone, "external_id": clean_ext, "usable": 1, "activated_at": activated_at, "last_event_at": now_s}
 
-    def bind_member_with_guardrails(self, phone: str, external_id: str, path: str, platform: str = "zdxlz") -> Dict[str, Any]:
+    def bind_member_with_guardrails(self, phone: str, external_id: str, path: str, platform: Optional[str] = None) -> Dict[str, Any]:
         """v1.1 激活绑定（路径 A/B/C）与三条护栏：在册校验 + 防覆盖校验 + 脱敏回执与审计。
         若原记录因 500 无会话被置为 usable=0，重新绑定成功时恢复 usable=1 并保留原 activated_at。
         """
+        platform = self._plat(platform)
         clean_phone, clean_ext, path_code = (phone or "").strip(), (external_id or "").strip(), (path or "B").strip().upper()
         if not is_valid_phone(clean_phone):
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
@@ -422,7 +434,8 @@ class StateStore:
             self._insert_audit_unlocked("system", f"target.bind_{path_code.lower()}", "delivery_target", clean_phone, {"masked_phone": masked, "external_id": clean_ext, "path": path_code}, now_s)
             return {"ok": True, "already_same": False, "phone": clean_phone, "masked_phone": masked, "external_id": clean_ext, "receipt": receipt}
 
-    def touch_delivery_target_by_external_id(self, external_id: str, platform: str = "zdxlz") -> Optional[Dict[str, Any]]:
+    def touch_delivery_target_by_external_id(self, external_id: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        platform = self._plat(platform)
         clean_ext = (external_id or "").strip()
         if not clean_ext:
             return None
@@ -449,24 +462,27 @@ class StateStore:
             )
             return {"platform": row["platform"], "phone": row["phone"], "external_id": row["external_id"], "usable": 1, "activated_at": row["activated_at"], "last_event_at": now_s}
 
-    def get_delivery_target(self, phone: str, platform: str = "zdxlz", include_unusable: bool = False) -> Optional[Dict[str, Any]]:
+    def get_delivery_target(self, phone: str, platform: Optional[str] = None, include_unusable: bool = False) -> Optional[Dict[str, Any]]:
+        platform = self._plat(platform)
         with self.lock:
             sql = "SELECT * FROM delivery_target WHERE platform = ? AND phone = ?" + ("" if include_unusable else " AND usable = 1")
             row = self.conn.execute(sql, (platform, (phone or "").strip())).fetchone()
             return dict(row) if row else None
 
-    def get_delivery_target_by_external_id(self, external_id: str, platform: str = "zdxlz", include_unusable: bool = False) -> Optional[Dict[str, Any]]:
+    def get_delivery_target_by_external_id(self, external_id: str, platform: Optional[str] = None, include_unusable: bool = False) -> Optional[Dict[str, Any]]:
+        platform = self._plat(platform)
         with self.lock:
             sql = "SELECT * FROM delivery_target WHERE platform = ? AND external_id = ?" + ("" if include_unusable else " AND usable = 1")
             row = self.conn.execute(sql, (platform, (external_id or "").strip())).fetchone()
             return dict(row) if row else None
 
-    def mark_delivery_target_unusable(self, phone: str, platform: str = "zdxlz") -> None:
+    def mark_delivery_target_unusable(self, phone: str, platform: Optional[str] = None) -> None:
         """发送返回 500 无会话时标记 usable=0，保留 external_id 与 activated_at 供排障。"""
+        platform = self._plat(platform)
         with self.lock, self.conn:
             self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND phone = ?", (platform, (phone or "").strip()))
 
-    def delete_delivery_target(self, phone: str, platform: str = "zdxlz") -> None:
+    def delete_delivery_target(self, phone: str, platform: Optional[str] = None) -> None:
         """兼容性别名：将绑定标记为不可用 (usable=0)，不物理抹除 external_id 与 activated_at。"""
         self.mark_delivery_target_unusable(phone, platform=platform)
 
@@ -550,9 +566,10 @@ class StateStore:
             total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM member m {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
             rows = self.conn.execute(
                 f"SELECT m.*, dt.external_id FROM member m "
-                f"LEFT JOIN delivery_target dt ON dt.platform = 'zdxlz' AND dt.phone = m.phone AND dt.usable = 1 "
+                f"LEFT JOIN delivery_target dt ON dt.platform = ? AND dt.phone = m.phone AND dt.usable = 1 "
                 f"{where_sql} ORDER BY m.id ASC LIMIT ? OFFSET ?",
-                tuple(params + [s, offset]),
+                # JOIN 里的 platform 占位符在最前，别漏
+                tuple([self.platform] + params + [s, offset]),
             ).fetchall()
             items = [_fmt_member(r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"], r["source"], r["created_at"], r["external_id"]) for r in rows]
             return {"total": total, "items": items}
@@ -634,7 +651,7 @@ class StateStore:
                         (ext_id, clean_phone, row["name"], now_s, now_s),
                     )
                     back_to_pending = True
-                self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE external_id = ?", (ext_id,))
+                self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (self.platform, ext_id))
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
                 {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending}, now_s,
@@ -1060,9 +1077,9 @@ class StateStore:
         with self.lock:
             rows = self.conn.execute(
                 f"SELECT m.phone, m.name, m.dept, dt.external_id FROM member m "
-                f"LEFT JOIN delivery_target dt ON dt.platform = 'zdxlz' AND dt.phone = m.phone AND dt.usable = 1 "
+                f"LEFT JOIN delivery_target dt ON dt.platform = ? AND dt.phone = m.phone AND dt.usable = 1 "
                 f"WHERE m.role_id IN ({placeholders}) AND m.enabled = 1 ORDER BY m.id ASC",
-                tuple(clean_ids),
+                tuple([self.platform] + clean_ids),
             ).fetchall()
             seen: set[str] = set()
             deduped: List[Dict[str, Any]] = []
@@ -1171,7 +1188,7 @@ class StateStore:
             self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
             # 2026-10-29 P0-4：移除待归纳的人，其推送绑定也要置为不可用，
             # 否则绑定仍在，调度器照样往一个“已被移除”的人发任务。
-            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE external_id = ?", (clean_id,))
+            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (self.platform, clean_id))
             self._insert_audit_unlocked(actor, "pending_member.remove", "pending_member", clean_id, None, now_s)
 
     # ── 数据快照（2026-10-27 春促数据看板：人工填数本期主通道，后续可替换为自动取数）──

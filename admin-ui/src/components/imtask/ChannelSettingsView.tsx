@@ -11,6 +11,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { getCsrfToken } from '../../lib/api';
+import { copyText } from '../../lib/clipboard';
 import { useToast } from '../../lib/toast';
 
 /* ================================================================== */
@@ -180,14 +181,16 @@ const ChannelSettingsView: React.FC = () => {
     }
   };
 
+  /* 2026-10-30：后台是 http://内网IP 访问，非安全上下文下 navigator.clipboard 是 undefined，
+     原来直接用它 → 点一下就报「浏览器不允许自动复制」。改走 copyText 的两级降级。 */
   const copy = async (text: string, label: string) => {
-    if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      toast.success(`已复制${label}`);
-    } catch {
-      toast.error('浏览器不允许自动复制，请手动选中复制');
+    if (!text) {
+      toast.warning('该通道还没有回调地址，请先配置 public_base_url');
+      return;
     }
+    const ok = await copyText(text);
+    if (ok) toast.success(`已复制${label}`);
+    else toast.error('复制失败，请点一下地址框全选后手动复制（Ctrl+C）');
   };
 
   if (loading) {
@@ -304,9 +307,16 @@ const ChannelSettingsView: React.FC = () => {
             <div className="mt-3 pt-2.5 border-t border-slate-100">
               <div className="text-[10px] font-semibold text-slate-400 mb-1">回调地址</div>
               <div className="flex items-center gap-1.5">
-                <code className="flex-1 min-w-0 truncate text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1">
-                  {c.callback_url || '（未配置 public_base_url）'}
-                </code>
+                {/* 用 readonly input 而不是 code：复制失败时还能点一下全选手动复制 */}
+                <input
+                  readOnly
+                  value={c.callback_url || ''}
+                  placeholder="（未配置 public_base_url）"
+                  onFocus={(e) => e.currentTarget.select()}
+                  onClick={(e) => e.currentTarget.select()}
+                  title={c.callback_url || ''}
+                  className="flex-1 min-w-0 text-[11px] font-mono text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50 cursor-text"
+                />
                 <button
                   onClick={() => void copy(c.callback_url, '回调地址')}
                   className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 border border-slate-200 cursor-pointer shrink-0"

@@ -124,6 +124,9 @@ def create_apps(
     # 默认仍是 zdxlz（量子密信），保证现有生产行为一个字都不变。
     default_notifier: NotifierProtocol = chan
     _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
+    # 2026-10-30 通道隔离：投递绑定（谁用什么 ID 能收到）按通道分开存，
+    # store 读写默认跟着当前通道走；默认 zdxlz 时与历史行为完全一致。
+    store.platform = _channel
     if _channel == "wecom":
         # 2026-10-30 最终路线：企业微信自建应用（HTTP 主动推送 + 回调接收）
         from .channels.wecom import WecomNotifier
