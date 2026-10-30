@@ -387,25 +387,38 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
         import html as _html
         safe_title = _html.escape(title)
         src_url = f"/h5/img/{clean}?raw=1"
+        # 2026-10-30 用户口径：
+        # 1) **不再渲染页面内的白色标题**——顶部浏览器/聊天窗已经显示 <title>，两个标题重复；
+        # 2) **允许缩放**——原 viewport 写了 maximum-scale=1，把双指缩放彻底禁掉了；
+        #    同时支持「点一下放大到原始尺寸、再点还原」，方便看报表细节。
         page = (
             "<!DOCTYPE html>\n"
             "<html lang=\"zh-CN\">\n"
             "<head>\n"
             "<meta charset=\"utf-8\">\n"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
             f"<title>{safe_title}</title>\n"
             "<style>\n"
-            "html,body{margin:0;padding:0;background:#0f172a;min-height:100vh;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;}\n"
-            ".wrap{max-width:860px;margin:0 auto;padding:18px 14px 40px;box-sizing:border-box;}\n"
-            ".title{color:#e2e8f0;font-size:17px;font-weight:600;line-height:1.5;margin:2px 4px 14px;word-break:break-all;}\n"
-            "img{display:block;width:100%;height:auto;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.35);background:#fff;}\n"
+            "html,body{margin:0;padding:0;background:#0f172a;min-height:100vh;"
+            "font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;"
+            "-webkit-text-size-adjust:100%;}\n"
+            ".wrap{max-width:860px;margin:0 auto;padding:12px 12px 32px;box-sizing:border-box;"
+            "overflow-x:auto;-webkit-overflow-scrolling:touch;}\n"
+            "img{display:block;width:100%;max-width:100%;height:auto;border-radius:10px;"
+            "box-shadow:0 6px 24px rgba(0,0,0,.35);background:#fff;touch-action:pinch-zoom;cursor:zoom-in;}\n"
             "</style>\n"
             "</head>\n"
             "<body>\n"
             "<div class=\"wrap\">\n"
-            f"<div class=\"title\">{safe_title}</div>\n"
-            f"<img src=\"{src_url}\" alt=\"{safe_title}\" loading=\"lazy\">\n"
+            f"<img id=\"img\" src=\"{src_url}\" alt=\"{safe_title}\" loading=\"lazy\">\n"
             "</div>\n"
+            "<script>\n"
+            "(function(){var img=document.getElementById('img');var big=false;\n"
+            "img.addEventListener('click',function(){big=!big;\n"
+            "img.style.width=big?'auto':'100%';img.style.maxWidth=big?'none':'100%';\n"
+            "img.style.cursor=big?'zoom-out':'zoom-in';\n"
+            "if(!big){window.scrollTo(0,0);}});})();\n"
+            "</script>\n"
             "</body>\n"
             "</html>\n"
         )

@@ -168,7 +168,8 @@ def test_template_data_keys_dedup_and_format():
 
 # ── 4. 调度端到端：notice 文本 + notice_img 图片 ────────────────────────────────
 
-def test_notice_with_image_delivers_text_and_image():
+def test_notice_with_image_sends_text_and_link_only():
+    """2026-10-30 用户口径：**不再发送图片消息**（手机端图片消息打不开），只发文本 + 一条自有直链。"""
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=True)
     store.upsert_delivery_target("13800000001", "ext_user_001")  # 激活成员（模拟已发过消息建立会话）
@@ -179,17 +180,16 @@ def test_notice_with_image_delivers_text_and_image():
     scheduler = _mk_scheduler(store, notifier=notifier, image_sender=img_sender)
     stats = scheduler.run_once()
 
-    assert stats["sent"] == 2  # 1 条文本 + 1 条图片（直链文本不计入 sent）
-    assert len(img_sender.sent) == 1  # 图片发给 1 名成员
-    # 2026-10-29：图片之后再补一条「自己服务器的公网直链」——平台图片消息在手机端点不开
-    assert len(notifier.sent_messages) == 2
+    assert stats["sent"] == 1  # 只有文本计入 sent（直链文本不计）
+    assert len(img_sender.sent) == 0, "⛔ 不再调用平台图片消息"
+    assert len(notifier.sent_messages) == 2  # 文本 + 直链
     assert "86.5%" in notifier.sent_messages[0].text
     assert "45" in notifier.sent_messages[0].text
     assert "/h5/img/" in notifier.sent_messages[1].text
 
     kinds = [r["kind"] for r in store.list_reminder_logs(tpl_id)]
-    assert "notice" in kinds and "notice_img" in kinds and "notice_img_link" in kinds
-
+    assert "notice" in kinds and "notice_img_link" in kinds
+    assert "notice_img" not in kinds, "⛔ 不应再产生图片消息的发送记录"
 
 def test_notice_without_snapshot_skips_image():
     store = _mk_store()
@@ -207,7 +207,8 @@ def test_notice_without_snapshot_skips_image():
     assert "notice_img" not in kinds
 
 
-def test_notice_image_sender_none_text_only():
+def test_notice_image_sender_none_still_sends_link():
+    """不再依赖平台图床上传：即使没注入 image_sender，自有直链照常发。"""
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=True)
     store.upsert_delivery_target("13800000001", "ext_user_001")
@@ -218,9 +219,9 @@ def test_notice_image_sender_none_text_only():
     stats = scheduler.run_once()
 
     assert stats["sent"] == 1  # 仅文本
+    assert len(notifier.sent_messages) == 2  # 文本 + 直链，不依赖 image_sender
     kinds = [r["kind"] for r in store.list_reminder_logs(tpl_id)]
-    assert kinds == ["notice"]
-
+    assert kinds == ["notice", "notice_img_link"]
 
 def test_notice_unactivated_member_skipped_and_image_skipped():
     store = _mk_store()
@@ -307,8 +308,8 @@ def test_disabled_notice_template_creates_no_instance():
     assert store.list_instances_for_period(tpl_id, PKEY) == []
 
 
-def test_notice_instance_sent_with_image():
-    """带数据看板图片的 notice：文本 + 图片都发出，实例仍然标记 sent。"""
+def test_notice_instance_sent_with_image_link_only():
+    """带数据看板图片的 notice：只发文本 + 直链，实例仍然标记 sent。"""
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=True)
     store.upsert_delivery_target("13800000001", "ext_user_001")
@@ -319,12 +320,11 @@ def test_notice_instance_sent_with_image():
     scheduler = _mk_scheduler(store, notifier=notifier, image_sender=img_sender)
     stats = scheduler.run_once()
 
-    assert stats["sent"] == 2  # 文本 + 图片
+    assert stats["sent"] == 1  # 文本（直链不计入 sent）
     instances = store.list_instances_for_period(tpl_id, PKEY)
     assert len(instances) == 1
     assert instances[0]["status"] == "sent"
-    assert len(img_sender.sent) == 1
-
+    assert len(img_sender.sent) == 0, "⛔ 不再发送图片消息"
 
 def test_notice_instance_stays_pending_for_unactivated_member():
     """未绑定成员的实例要建出来，但状态保持 pending（发送记录为 skipped）。"""

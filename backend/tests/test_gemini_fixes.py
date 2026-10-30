@@ -87,6 +87,8 @@ def test_h5_overdue_old_link_rejected_requires_resubmit():
     """
     store = _mk_store()
     try:
+        # 固定"现在"：这条用例的申请窗口是「截止后 24h」，用真实日期跑会在第二天变成超窗。
+        store._now_fn = lambda: _dt(19, 0)
         tpl = _form_tpl(store)
         pkey = "2026-10-28"
         store.ensure_template_instances(tpl["template_id"], pkey, "2026-10-28 18:00:00")
@@ -624,17 +626,17 @@ def test_notice_spec_literal_backslash_n_normalized():
 def test_member_can_join_multiple_roles():
     """2026-10-29：同一手机号可同时属于多个角色（一人兼多角色），互不影响。
 
-    场景：郑佳已在「片长/分支局长」，需要同时加入「云中台软研队伍」。
+    场景：张三已在「片长/分支局长」，需要同时加入「云中台软研队伍」。
     """
     store = _mk_store()
     try:
         r1 = store.create_role("片长/分支局长", actor="t")["role_id"]
         r2 = store.create_role("云中台软研队伍", actor="t")["role_id"]
-        store.add_role_member(r1, "13900008001", "郑佳", "市场部", actor="t")
+        store.add_role_member(r1, "13900008001", "张三", "市场部", actor="t")
         store.upsert_delivery_target("13900008001", "uid_jia")
 
         # 加入第二个角色：不报错，且第一个角色的成员关系保持
-        store.add_role_member(r2, "13900008001", "郑佳", "市场部", actor="t")
+        store.add_role_member(r2, "13900008001", "张三", "市场部", actor="t")
         assert store.list_role_members(r1)["total"] == 1
         assert store.list_role_members(r2)["total"] == 1
 
@@ -643,7 +645,7 @@ def test_member_can_join_multiple_roles():
 
         # 同一角色内重复添加仍应被拦（避免一条角色两条记录）
         with pytest.raises(BizError) as err:
-            store.add_role_member(r2, "13900008001", "郑佳", actor="t")
+            store.add_role_member(r2, "13900008001", "张三", actor="t")
         assert err.value.code == "DUPLICATE"
 
         # 从其中一个角色移出：另一角色与推送绑定都必须保留

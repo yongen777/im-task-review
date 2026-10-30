@@ -1640,7 +1640,7 @@ export const TemplatesView: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="text-[11px] text-slate-500 leading-relaxed">
-                                  到点会把这张图直接推送给成员，请填写这张图的名称（如「上午上门情况统计图」），成员点开链接后页面标题即显示该名称。
+                                  到点会给成员发一条图片链接（不再发图片消息，手机端图片消息打不开），请填写这张图的名称（如「上午上门情况统计图」），成员点开链接后看到的页面就是这张图。
                                 </div>
                                 {item.image_path ? (
                                   <div className="space-y-1.5">
