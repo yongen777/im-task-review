@@ -45,12 +45,12 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
              "hint": "量子密信开放平台分配的应用 ID"},
             {"key": "app_secret", "label": "AppSecret", "required": True, "secret": True,
              "hint": "应用密钥，仅首次可复制"},
-            {"key": "verify_token", "label": "回调 Token", "required": False, "secret": True,
+            # 2026-10-30 用户口径：必填 = 能保证「发送 + 回调接收」全链路的参数全集。
+            # 这两个缺了，验签/解密直接失败 → 用户发来的「姓名 手机号」「申请补交」机器人收不到。
+            {"key": "verify_token", "label": "回调 Token", "required": True, "secret": True,
              "hint": "与平台「事件订阅」里配置的 Token 一致，用于事件验签"},
-            {"key": "encrypt_key", "label": "回调 EncryptKey", "required": False, "secret": True,
+            {"key": "encrypt_key", "label": "回调 EncryptKey", "required": True, "secret": True,
              "hint": "事件加密密钥（原样填写，不做 base64 解码）"},
-            {"key": "api_base", "label": "API 基础地址", "required": False, "secret": False,
-             "hint": "留空用默认 https://imtwo.zdxlz.com"},
         ],
     },
     "wecom": {
@@ -63,9 +63,9 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
              "hint": "必须是整数，例如 1000002"},
             {"key": "secret", "label": "应用 Secret", "required": True, "secret": True,
              "hint": "应用详情页的 Secret"},
-            {"key": "token", "label": "回调 Token", "required": False, "secret": True,
+            {"key": "token", "label": "回调 Token", "required": True, "secret": True,
              "hint": "应用「接收消息」里自己填的 Token"},
-            {"key": "aes_key", "label": "回调 EncodingAESKey", "required": False, "secret": True,
+            {"key": "aes_key", "label": "回调 EncodingAESKey", "required": True, "secret": True,
              "hint": "43 位，应用「接收消息」里随机生成"},
         ],
     },
@@ -78,7 +78,6 @@ _FIELD_MAP: Dict[str, Dict[str, str]] = {
         "app_secret": "app_secret",
         "verify_token": "verify_token",
         "encrypt_key": "encrypt_key",
-        "api_base": "api_base",
     },
     "wecom": {
         "corpid": "wecom_corpid",
@@ -227,10 +226,6 @@ def validate_payload(channel: str, payload: Dict[str, str]) -> Optional[str]:
         aes_key = payload.get("aes_key", "")
         if aes_key and len(aes_key) != 43:
             return f"EncodingAESKey 必须是 43 位（当前 {len(aes_key)} 位）"
-    if channel == "zdxlz":
-        api_base = payload.get("api_base", "")
-        if api_base and not api_base.startswith(("http://", "https://")):
-            return "API 基础地址必须以 http:// 或 https:// 开头"
     return None
 
 

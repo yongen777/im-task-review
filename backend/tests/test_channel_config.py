@@ -42,6 +42,31 @@ from app.state import StateStore
 SECRET = "SuperSecretValue_9f2c1d"  # 明文特征串，用于断言"库里查不到"
 
 
+def _zdx(**over: Any) -> Dict[str, str]:
+    """量子密信完整凭证（4 项必填：AppID / AppSecret / 回调 Token / EncryptKey）。"""
+    base = {
+        "app_id": "appid_143e4c0b",
+        "app_secret": SECRET,
+        "verify_token": "vt_001",
+        "encrypt_key": "ek_001",
+    }
+    base.update(over)
+    return base
+
+
+def _wec(**over: Any) -> Dict[str, str]:
+    """企业微信完整凭证（5 项必填：corpid / agentid / secret / Token / EncodingAESKey）。"""
+    base = {
+        "corpid": "corp_demo",
+        "agentid": "1000002",
+        "secret": SECRET,
+        "token": "tok_001",
+        "aes_key": "A" * 43,
+    }
+    base.update(over)
+    return base
+
+
 # ── 夹具 ────────────────────────────────────────────────────────────
 def _mk_store(tmp: Path) -> StateStore:
     return StateStore(tmp / "im_task.db")
@@ -76,11 +101,7 @@ def test_encrypt_roundtrip_and_no_plaintext_in_db() -> None:
     store = _mk_store(tmp)
     try:
         cc = _cc(store, tmp)
-        merged = cc.save(
-            "zdxlz",
-            {"app_id": "appid_143e4c0b", "app_secret": SECRET, "verify_token": "vt_001"},
-            now_str=store.now_str(),
-        )
+        merged = cc.save("zdxlz", _zdx(), now_str=store.now_str())
         assert merged["app_secret"] == SECRET
 
         # 回读解密一致
@@ -108,7 +129,7 @@ def test_wrong_key_cannot_decrypt() -> None:
     store = _mk_store(tmp)
     try:
         cc = _cc(store, tmp)
-        cc.save("zdxlz", {"app_id": "a1", "app_secret": SECRET}, now_str=store.now_str())
+        cc.save("zdxlz", _zdx(app_id="a1"), now_str=store.now_str())
         assert cc.read("zdxlz") is not None
 
         other = ChannelConfigStore(store.conn, store.lock, tmp)
@@ -147,11 +168,7 @@ def test_db_overrides_env(tmp_path: Path) -> None:
     cfg = _mk_config(tmp_path, app_id="ENV_APP", app_secret="ENV_SECRET", wecom_corpid="ENV_CORP")
     store = _mk_store(tmp_path)
     try:
-        _cc(store, tmp_path).save(
-            "wecom",
-            {"corpid": "DB_CORP", "agentid": "1000002", "secret": "DB_SECRET"},
-            now_str=store.now_str(),
-        )
+        _cc(store, tmp_path).save("wecom", _wec(corpid="DB_CORP", secret="DB_SECRET"), now_str=store.now_str())
         got = apply_db_channel_config(cfg, store)
         assert got.wecom_corpid == "DB_CORP"
         assert got.wecom_secret == "DB_SECRET"
@@ -167,7 +184,7 @@ def test_db_active_channel_used_only_when_env_silent(tmp_path: Path, monkeypatch
     store = _mk_store(tmp_path)
     try:
         cc = _cc(store, tmp_path)
-        cc.save("wecom", {"corpid": "c", "agentid": "1000002", "secret": SECRET}, now_str=store.now_str())
+        cc.save("wecom", _wec(), now_str=store.now_str())
         cc.save_active_channel("wecom", now_str=store.now_str())
         assert apply_db_channel_config(cfg, store).channel == "wecom"
 
@@ -188,17 +205,43 @@ def test_mask_value_never_leaks_full_secret() -> None:
     assert view["app_secret"].startswith("Supe") and view["app_secret"].endswith("2c1d")
 
 
+def test_required_fields_cover_full_chain() -> None:
+    """必填 = 全链路（发送 + 回调接收）：密信 4 项、企微 5 项，缺任一项都不算已配置。
+
+    回调 Token / 加密密钥必须必填：缺了验签、解密直接失败，
+    用户发来的「姓名 手机号」「申请补交」机器人收不到 —— 发得出去、收不回来，等于半条链路。
+    api_base 已按用户口径从表单移除（默认值代码兜底），schema 里也不该再有它。
+    """
+    from app.channel_config import CHANNEL_SCHEMA
+
+    zdx_keys = [f["key"] for f in CHANNEL_SCHEMA["zdxlz"]["fields"]]
+    wec_keys = [f["key"] for f in CHANNEL_SCHEMA["wecom"]["fields"]]
+    assert zdx_keys == ["app_id", "app_secret", "verify_token", "encrypt_key"]
+    assert wec_keys == ["corpid", "agentid", "secret", "token", "aes_key"]
+    assert all(f["required"] for f in CHANNEL_SCHEMA["zdxlz"]["fields"])
+    assert all(f["required"] for f in CHANNEL_SCHEMA["wecom"]["fields"])
+
+    # 每少一项都不算配置完成，且报错能指名道姓
+    for key in zdx_keys:
+        partial = {k: v for k, v in _zdx().items() if k != key}
+        assert channel_configured("zdxlz", partial) is False, key
+        assert "缺少必填项" in (validate_payload("zdxlz", partial) or ""), key
+    for key in wec_keys:
+        partial = {k: v for k, v in _wec().items() if k != key}
+        assert channel_configured("wecom", partial) is False, key
+
+    assert channel_configured("zdxlz", _zdx()) is True
+    assert channel_configured("wecom", _wec()) is True
+
+
 def test_validate_payload_readable_errors() -> None:
-    assert validate_payload("wecom", {"corpid": "c", "agentid": "1000002", "secret": "s"}) is None
+    assert validate_payload("wecom", _wec()) is None
     assert "缺少必填项" in (validate_payload("wecom", {"corpid": "c"}) or "")
-    err = validate_payload("wecom", {"corpid": "c", "agentid": "abc", "secret": "s"}) or ""
+    err = validate_payload("wecom", _wec(agentid="abc")) or ""
     assert "agentid 必须是整数" in err
-    err2 = validate_payload("wecom", {"corpid": "c", "agentid": "1", "secret": "s", "aes_key": "tooShort"}) or ""
+    err2 = validate_payload("wecom", _wec(aes_key="tooShort")) or ""
     assert "43 位" in err2
     assert "不支持" in (validate_payload("nope", {}) or "")
-    # channel_configured 与必填口径一致
-    assert channel_configured("zdxlz", {"app_id": "a", "app_secret": "b"}) is True
-    assert channel_configured("zdxlz", {"app_id": "a"}) is False
 
 
 def test_callback_url_built_from_public_base() -> None:
@@ -269,7 +312,7 @@ def test_save_requires_csrf_and_encrypts() -> None:
     try:
         sess = _login(store)
         client = _client(store)
-        payload = {"channel": "zdxlz", "payload": {"app_id": "appid_143e4c0b", "app_secret": SECRET}}
+        payload = {"channel": "zdxlz", "payload": _zdx()}
 
         # 缺 CSRF
         r0 = client.post("/api/admin/channel-config", json=payload, cookies={"sid": sess["sid"]})
@@ -321,7 +364,7 @@ def test_second_save_keeps_untouched_fields() -> None:
     store = _mk_store(tmp)
     try:
         cc = _cc(store, tmp)
-        cc.save("zdxlz", {"app_id": "old_id", "app_secret": SECRET}, now_str=store.now_str())
+        cc.save("zdxlz", _zdx(app_id="old_id"), now_str=store.now_str())
         cc.save("zdxlz", {"app_id": "new_id"}, now_str=store.now_str())
         back = cc.read("zdxlz") or {}
         assert back["app_id"] == "new_id"
@@ -386,7 +429,7 @@ def test_probe_wecom_errcode_translated(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr("app.channels.wecom.WecomClient", _FakeWecom)
     ok, detail = admin_mod._probe_channel(
-        "wecom", {"corpid": "c", "agentid": "1000002", "secret": "bad"}
+        "wecom", _wec(secret="bad")
     )
     assert ok is False
     assert "40001" in detail and "Secret 无效" in detail
@@ -413,7 +456,7 @@ def test_test_endpoint_returns_detail_and_never_persists(monkeypatch: pytest.Mon
         client = _client(store)
         r = client.post(
             "/api/admin/channel-config/test",
-            json={"channel": "wecom", "payload": {"corpid": "c", "agentid": "1000002", "secret": SECRET}},
+            json={"channel": "wecom", "payload": _wec()},
             cookies={"sid": sess["sid"]}, headers={"X-CSRF-Token": sess["csrf"]},
         )
         assert r.status_code == 200, r.text
@@ -436,7 +479,7 @@ def test_test_endpoint_rejects_bad_agentid_before_calling_api() -> None:
         client = _client(store)
         r = client.post(
             "/api/admin/channel-config/test",
-            json={"channel": "wecom", "payload": {"corpid": "c", "agentid": "not-int", "secret": "s"}},
+            json={"channel": "wecom", "payload": _wec(agentid="not-int")},
             cookies={"sid": sess["sid"]}, headers={"X-CSRF-Token": sess["csrf"]},
         )
         assert r.status_code == 200

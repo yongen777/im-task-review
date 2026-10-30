@@ -234,6 +234,12 @@ const ChannelSettingsView: React.FC = () => {
               首次安装只需在此填写凭证并保存，<span className="font-semibold text-slate-700">无需修改代码或 .env</span>。
               凭证以 AES-GCM 加密后存库，密钥与数据库分开保存。
             </p>
+            {/* 2026-10-30 用户口径：必填 = 全链路（发送 + 回调接收），缺一项都拦住 */}
+            <p className="mt-1.5 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 leading-relaxed">
+              以上必填项（<span className="font-semibold">标 * 的</span>）缺任一项，保存会被拦截；
+              其中<span className="font-semibold">回调 Token / 加密密钥</span>缺失会导致回调验签失败，
+              用户消息（绑定、申请补交）机器人收不到。
+            </p>
           </div>
           <button
             onClick={() => void load()}
@@ -365,10 +371,12 @@ const ChannelSettingsView: React.FC = () => {
                 type={f.secret ? 'password' : 'text'}
                 value={form[f.key] || ''}
                 onChange={(e) => setField(f.key, e.target.value)}
+                /* 2026-10-30：原来 placeholder 和下方说明都用 hint，两行一模一样的字；
+                   现在 placeholder 只负责「留空沿用」，字段说明统一放下面一行。 */
                 placeholder={
                   current?.configured && f.secret
                     ? `留空则沿用已保存的值（${current.masked[f.key] || '****'}）`
-                    : f.hint || ''
+                    : ''
                 }
                 autoComplete="off"
                 className="w-full px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono focus:outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-50"

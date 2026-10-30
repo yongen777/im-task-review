@@ -3,7 +3,6 @@ import {
   User,
   UserCog,
   Key,
-  Link2,
   Copy,
   Check,
   LogOut,
@@ -226,178 +225,6 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
 /* 事件回调地址查看                                                    */
 /* ------------------------------------------------------------------ */
 
-interface CallbackUrlModalProps {
-  isOpen: boolean;
-  onClose: () => void;
-}
-
-export const CallbackUrlModal: React.FC<CallbackUrlModalProps> = ({ isOpen, onClose }) => {
-  const toast = useToast();
-  const [password, setPassword] = useState('');
-  const [url, setUrl] = useState('');
-  const [note, setNote] = useState('');
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    setPassword('');
-    setUrl('');
-    setNote('');
-    setErrorMsg(null);
-    setCopied(false);
-  }, [isOpen]);
-
-  if (!isOpen) return null;
-
-  const verify = async () => {
-    setErrorMsg(null);
-    if (!password) {
-      setErrorMsg('请输入登录密码以查看回调地址');
-      return;
-    }
-    setBusy(true);
-    try {
-      const data = await api.post<{ ok: boolean; url: string; note?: string }>(
-        '/api/admin/callback-url',
-        { password },
-      );
-      setUrl(data.url || '');
-      setNote(data.note || '');
-    } catch (err) {
-      const msg = err instanceof Error ? plainError(err.message) : '验证未通过';
-      setErrorMsg(msg);
-      toast.error(msg);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const copy = async () => {
-    if (!url) return;
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(url);
-      } else {
-        const el = document.createElement('textarea');
-        el.value = url;
-        document.body.appendChild(el);
-        el.select();
-        document.execCommand('copy');
-        document.body.removeChild(el);
-      }
-      setCopied(true);
-      toast.success('回调地址已复制到剪贴板');
-      window.setTimeout(() => setCopied(false), 1800);
-    } catch {
-      toast.error('复制失败，请手动选中地址复制');
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-xs">
-              <Link2 className="w-4 h-4" />
-            </div>
-            <div>
-              <h3 className="font-bold text-slate-900 text-base">量子密信事件回调地址</h3>
-              <span className="text-[11px] text-slate-400">IMTask 通道接入配置 · 只读</span>
-            </div>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 hover:text-slate-600 cursor-pointer"
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        {errorMsg && (
-          <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-700 text-xs flex items-center gap-1.5">
-            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-            <span>{errorMsg}</span>
-          </div>
-        )}
-
-        {!url ? (
-          <div className="space-y-3 text-xs">
-            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 leading-relaxed">
-              回调地址属于部署级配置，<span className="font-bold">查看前需再次验证登录密码</span>。
-              验证通过后可复制填入量子密信开发者后台。
-            </div>
-            <div>
-              <label className="font-semibold text-slate-700 block mb-1">登录密码</label>
-              <input
-                type="text"
-                autoComplete="off"
-                spellCheck={false}
-                style={MASKED_INPUT_STYLE}
-                placeholder="请输入当前登录密码"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') verify();
-                }}
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 outline-none focus:border-blue-500 focus:bg-white"
-              />
-            </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={onClose}
-                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
-              >
-                取消
-              </button>
-              <button
-                onClick={verify}
-                disabled={busy}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
-              >
-                {busy ? '正在验证…' : '验证并查看'}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-3 text-xs">
-            <div>
-              <label className="font-semibold text-slate-700 block mb-1">回调地址（POST JSON）</label>
-              <div className="flex items-center gap-2">
-                <input
-                  readOnly
-                  value={url}
-                  onFocus={(e) => e.currentTarget.select()}
-                  className="flex-1 bg-slate-50 border border-slate-200 rounded-xl p-2.5 font-mono text-[12px] text-slate-800 outline-none"
-                />
-                <button
-                  onClick={copy}
-                  className="px-3 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold flex items-center gap-1.5 shrink-0 cursor-pointer transition-colors"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied ? '已复制' : '复制'}</span>
-                </button>
-              </div>
-            </div>
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-600 leading-relaxed">
-              {note || '该地址由服务器部署配置决定，后台只能查看与复制，不能修改。'}
-            </div>
-            <div className="flex justify-end">
-              <button
-                onClick={onClose}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-medium cursor-pointer transition-colors"
-              >
-                关闭
-              </button>
-            </div>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
 
 /* ------------------------------------------------------------------ */
 /* 修改管理员账号名                                                     */
@@ -563,7 +390,7 @@ interface AdminUserCardProps {
 export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut }) => {
   const [open, setOpen] = useState(false);
   const [modal, setModal] = useState<
-    'none' | 'password' | 'callback' | 'username' | 'logout'
+    'none' | 'password' | 'username' | 'logout'
   >('none');
   const [busy, setBusy] = useState(false);
   const [displayName, setDisplayName] = useState(me.username || '');
@@ -628,17 +455,6 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <button
               onClick={() => {
                 setOpen(false);
-                setModal('callback');
-              }}
-              className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 font-medium flex items-center gap-2 cursor-pointer transition-colors"
-            >
-              <Link2 className="w-3.5 h-3.5 text-slate-500" />
-              <span>查看密信回调地址</span>
-            </button>
-
-            <button
-              onClick={() => {
-                setOpen(false);
                 setModal('username');
               }}
               className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 font-medium flex items-center gap-2 cursor-pointer transition-colors"
@@ -672,7 +488,6 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
         }}
       />
 
-      <CallbackUrlModal isOpen={modal === 'callback'} onClose={() => setModal('none')} />
 
       <ChangeUsernameModal
         isOpen={modal === 'username'}
