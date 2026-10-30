@@ -117,11 +117,19 @@ def create_apps(
     # 2026-10-30 通道可切：IMT_CHANNEL=wecom 时走企业微信自建应用（迁移目标），
     # 默认仍是 zdxlz（量子密信），保证现有生产行为一个字都不变。
     default_notifier: NotifierProtocol = chan
-    if str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower() == "wecom":
+    _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
+    if _channel == "wecom":
+        # 旧方案（自建应用 + HTTP 主动推送）：保留但不推荐，见 wecom.py 头注释
         from .channels.wecom import WecomNotifier
 
         default_notifier = WecomNotifier(cfg)
         logger.info("通道已切换为 企业微信自建应用（agentid=%s）", getattr(cfg, "wecom_agentid", ""))
+    elif _channel in ("wecom_aibot", "aibot"):
+        # 2026-10-30 选定方案：智能机器人 + 长连接（与量子密信对话形态一致，迁移成本最低）
+        from .channels.wecom_aibot import WecomAibotNotifier
+
+        default_notifier = WecomAibotNotifier(cfg)
+        logger.info("通道已切换为 企业微信智能机器人（长连接，bot_id=%s）", getattr(cfg, "wecom_bot_id", ""))
     active_notifier: NotifierProtocol = notifier if notifier is not None else default_notifier
 
     # §16 P7：IMT_PUBLIC_BASE_URL 仍为 127.0.0.1/localhost 且通道已配置时，启动打 WARN

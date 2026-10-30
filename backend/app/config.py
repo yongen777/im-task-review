@@ -114,6 +114,9 @@ class Config:
     wecom_corpid: str = ""
     wecom_agentid: str = ""
     wecom_secret: str = ""
+    # 2026-10-30 选定方案：智能机器人（API 模式 → 长连接），凭证是 BotID + Secret
+    wecom_bot_id: str = ""
+    wecom_bot_secret: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -209,6 +212,8 @@ class Config:
             wecom_corpid=os.environ.get("IMT_WECOM_CORPID", "").strip(),
             wecom_agentid=os.environ.get("IMT_WECOM_AGENTID", "").strip(),
             wecom_secret=os.environ.get("IMT_WECOM_SECRET", "").strip(),
+            wecom_bot_id=os.environ.get("IMT_WECOM_BOT_ID", "").strip(),
+            wecom_bot_secret=os.environ.get("IMT_WECOM_BOT_SECRET", "").strip(),
         )
 
 
