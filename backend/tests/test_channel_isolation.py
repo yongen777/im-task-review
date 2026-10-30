@@ -173,3 +173,36 @@ def test_create_apps_sets_store_platform_from_config() -> None:
     finally:
         store.close()
         chan.close()
+
+
+def test_member_create_and_update_read_current_channel() -> None:
+    """add_role_member / update_role_member 返回的「已激活」也要跟当前通道走。
+
+    管理端新增/编辑成员时，接口会把该成员在当前通道下是否有可用绑定一起返回，
+    前端据此显示「已激活 / 未激活」。这两处原来写死 platform='zdxlz'，
+    切到企业微信后会把量子密信的绑定当成企微已激活（或反之）。
+    """
+    store = _mk("wecom")
+    try:
+        rid = store.create_role("云中台软研队伍", actor="t")["role_id"]
+        store.upsert_delivery_target(PHONE, "wecom_userid_006")
+
+        # 企微下已有绑定 → 新增成员返回已激活
+        created = store.add_role_member(rid, PHONE, "张三", "市场部", actor="t")
+        assert created["activated"] is True
+
+        # 切回量子密信：这边还没绑定 → 编辑成员不能显示成已激活
+        store.platform = "zdxlz"
+        updated = store.update_role_member(rid, PHONE, name="张三")
+        assert updated["activated"] is False
+
+        # 密信侧也绑上 → 已激活
+        store.upsert_delivery_target(PHONE, "zdxlz_uid_006")
+        updated2 = store.update_role_member(rid, PHONE, name="张三")
+        assert updated2["activated"] is True
+
+        # 再切回企微：仍然看企微的绑定，不受密信影响
+        store.platform = "wecom"
+        assert store.update_role_member(rid, PHONE, name="张三")["activated"] is True
+    finally:
+        store.close()

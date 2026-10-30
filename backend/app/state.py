@@ -604,7 +604,9 @@ class StateStore:
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
             cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, source, now_s))
-            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = 'zdxlz' AND phone = ? AND usable = 1", (clean_phone,)).fetchone()
+            # 2026-10-30：这里原来写死 'zdxlz'，切企微后返回的 external_id 取错通道，
+            # 管理员新增/编辑成员时看到的「激活状态」会串。与其它读写一致，跟随当前通道。
+            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1", (self.platform, clean_phone)).fetchone()
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "source": source}, now_s)
             return _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, dt_row and dt_row["external_id"])
 
@@ -620,7 +622,9 @@ class StateStore:
             new_dept = row["dept"] if dept is None else (str(dept).strip() or None)
             new_enabled = (1 if bool(enabled) else 0) if enabled is not None else int(row["enabled"])
             self.conn.execute("UPDATE member SET name = ?, dept = ?, enabled = ? WHERE id = ?", (new_name, new_dept, new_enabled, int(row["id"])))
-            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = 'zdxlz' AND phone = ? AND usable = 1", (clean_phone,)).fetchone()
+            # 2026-10-30：这里原来写死 'zdxlz'，切企微后返回的 external_id 取错通道，
+            # 管理员新增/编辑成员时看到的「激活状态」会串。与其它读写一致，跟随当前通道。
+            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1", (self.platform, clean_phone)).fetchone()
             self._insert_audit_unlocked(actor, "member.update", "member", f"{clean_role_id}:{clean_phone}", {"name": new_name, "dept": new_dept, "enabled": bool(new_enabled)}, now_s)
             return _fmt_member(int(row["id"]), clean_role_id, clean_phone, new_name, new_dept, new_enabled, row["source"], row["created_at"], dt_row and dt_row["external_id"])
 
