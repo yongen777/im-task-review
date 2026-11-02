@@ -26,8 +26,20 @@ import threading
 import time
 from typing import Any, Dict, List, Tuple
 
+import pytest
+
 from app.channels.wecom_aibot import AibotBridge, WecomAibotNotifier
 from app.scheduler import FakeNotifier, SendResult
+
+# 2026-11-02 环境守卫（验收纠正）：本文件依赖官方 SDK 的 `aibot` 模块
+# （来自 wecom-aibot-python-sdk）。新机器只 clone 没装依赖时，以前表现为
+# 9 条「莫名其妙的 assert 失败」——真实原因（ModuleNotFoundError）被上传失败兜底吞进了
+# WARNING 日志，外面只剩一句 `assert False is True`，极难定位。
+# 缺失依赖属于环境问题，不该伪装成代码缺陷，所以直接 skip 并说清怎么装。
+pytest.importorskip(
+    "aibot",
+    reason="缺 wecom-aibot-python-sdk（企微智能机器人通道）。先执行 pip install -r requirements.txt",
+)
 
 # 测试里所有同步调用都用这个超时：环境有问题 2 秒内红，绝不挂 60 秒
 T = 2.0

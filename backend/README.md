@@ -5,14 +5,21 @@
 管理员在后台定义任务模板（谁、几点、提交什么、要不要审核），系统按时单聊推送到人，
 用户在 H5 里提交，后台出完成率。
 
-> **实现现状**：服务端在 `app/` 包内，按《后台开发规格书 v1.2》实现，测试 35 条通过 / 11 条跳过。
-> 旧的 P0 实现（`src/imtask/`）已归档，不在本仓库内。
+> **2026-10-26 换轨**：服务端实现从 `src/imtask/`（旧 P0）换成项目根的 **`app/`** 包
+> （按《后台开发规格书 v1.2》由 AI Studio 产出，阶段 2A~2C 已全部落盘、测试 28 条全绿）。
+> 旧实现连同它的 4 个测试文件整体归档到 **`_legacy/`**，不要再改、不要再跑。
+> 两套的表结构 / 环境变量名都不一样，详见 `_legacy/README.md` 的对照表。
 
 ## 从这里开始
 
-- **业务口径真源**：[`docs/交接包-20261023.md`](docs/交接包-20261023.md) —— 数据模型、触发链路、通道结论。
-- **实现口径真源**：[`docs/后台开发规格书-20261023.md`](docs/后台开发规格书-20261023.md) —— 表结构、接口约定、状态机。
-- **接口契约快照**：[`docs/api-openapi-20261026.json`](docs/api-openapi-20261026.json)。
+- **业务口径真源**：**[`docs/交接包-20261023.md`](docs/交接包-20261023.md)** —— 数据模型、触发链路、通道结论。
+- **实现口径真源**：**[`docs/AI-STUDIO-提示词-换轨补齐-20261026.md`]** —— 本套 `app/` 的交付顺序、
+  符号契约、9 项页面补缺与实测记录（含 P0 的 XSS 运行时验证）。
+
+新会话开场白：
+
+> 读 `D:\im-task\docs\交接包-20261023.md` 与 `docs\AI-STUDIO-提示词-换轨补齐-20261026.md`，
+> 代码在项目根 `app/`（⛔ 不要去改 `_legacy/`），按里面已验证过的口径继续，不要重新推导。
 
 ## 边界
 
@@ -34,14 +41,14 @@ app/                 服务端（当前实现）
   api/events.py        回调入口（三条激活路径 + 三条防冒绑护栏）
   api/h5.py            H5 绑定与三类任务提交（魔数嗅探、流式限长、零残留）
   api/admin.py         后台 REST（会话 / 模板 / 角色成员 / 实例审核 / 日志 / 统计导出）
-  admin_static/        后台 SPA 运行期产物（由 admin-ui/ 构建后拷入，不随仓库提供）
+  admin_static/        后台单文件 SPA（登录、改密、模板、角色、实例、日志）
   h5/                  H5 页面（task / bind）
 scripts/
   check_app.py         9 个模块的 import 探针 + 配置体检（每批落盘后先跑它）
   create_admin.py      管理员建号 / 重置密码
 tests/                pytest（2A/2B/2C + 修正包 + XSS 运行时）
   tools/              Node 版渲染检查脚本
-_legacy/              旧 src/imtask 实现与其测试（已归档，不在本仓库内）
+_legacy/              旧 src/imtask 实现与其测试（⛔ 已归档，勿用）
 data/                 本地库与上传文件（不入库）
 ```
 
@@ -50,10 +57,10 @@ data/                 本地库与上传文件（不入库）
 两个监听口：**业务 9012**（平台回调 + H5）、**后台 9013**（管理界面），同进程两个监听。
 
 ```bash
-cd backend
-cp .env.example .env                                # 首次：填三个必填项（见下）
-python scripts/check_app.py                         # 先确认各模块都能 import
-python -m app.main
+cd D:\im-task
+copy .env.example .env      # 首次：填三个必填项（见下）
+.\.venv\Scripts\python.exe scripts\check_app.py     # 先确认 9 个模块都能 import
+.\.venv\Scripts\python.exe -m app.main
 #   业务服务  http://<IMT_PUBLIC_BASE_URL>/healthz
 #   后台管理  http://127.0.0.1:9013/login
 ```
@@ -86,10 +93,23 @@ python -m app.main
 
 ### 测试
 
+**前置：先把依赖装全**，否则会出现「一堆看不懂的失败」而不是「缺依赖」：
+
 ```bash
-python -m pytest -o addopts="" -q
-# 35 passed, 11 skipped（2A / 2B / 修正包 / 2C 分页与安全 / XSS 运行时；11 条为旧 HTML 结构断言，已跳过）
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+然后：
+
+```bash
+.\.venv\Scripts\python.exe -m pytest -o addopts="" -q
+# 206 passed / 11 skipped（2026-11-02 基线）
+```
+
+⚠️ **新机器最容易踩的坑**：`requirements.txt` 里的 `wecom-aibot-python-sdk`（`aibot` 模块）
+是企微智能机器人通道的依赖。**没装时，两个机器人测试文件会整文件 skip**（会打印
+「缺 wecom-aibot-python-sdk…先执行 pip install -r requirements.txt」）。
+这不是测试坏了，是依赖没装 —— 装上即恢复。
 
 ⚠️ Windows 上必须装 `tzdata`（`zoneinfo` 没有它直接 `ZoneInfoNotFoundError`），
 `requirements.txt` 已包含；`TEMP/TMP` 建议指到 D 盘，C 盘满会出假故障。

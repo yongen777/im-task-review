@@ -20,6 +20,14 @@ import pytest
 
 from app.channels.wecom_aibot import AibotBridge, WecomAibotNotifier
 
+# 2026-11-02 环境守卫（验收纠正）：本文件依赖官方 SDK 的 `aibot` 模块。
+# 未装 wecom-aibot-python-sdk 时以前会以「assert 失败 / 超时」的形式红掉，
+# 真实原因被兜底逻辑吞进日志，极难定位。缺依赖是环境问题，直接 skip 并说明装法。
+pytest.importorskip(
+    "aibot",
+    reason="缺 wecom-aibot-python-sdk（企微智能机器人通道）。先执行 pip install -r requirements.txt",
+)
+
 
 class FakeAibotClient:
     """最小替身：记录 on/run/send_message 的调用。"""
