@@ -248,3 +248,89 @@ def test_notice_image_retryable_failure_does_not_send_link_immediately() -> None
         assert not [m for m in notifier.sent_messages if "/h5/img/" in m.text]
     finally:
         store.close()
+
+
+# ── 3. media_id 缓存：同图只传一次，别踩 30 次/分钟 ────────────────
+class ScriptedClient(FakeClientWithWs):
+    """send_message 按脚本依次返回，用来模拟「缓存 media_id 失效」。"""
+
+    def __init__(self, ws: FakeWsManager, replies: List[Dict[str, Any]]) -> None:
+        super().__init__(ws)
+        self._replies = list(replies)
+
+    async def send_message(self, chatid: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append((chatid, body))
+        return self._replies.pop(0) if self._replies else {"errcode": 0, "errmsg": "ok"}
+
+
+def _inits(ws: FakeWsManager) -> int:
+    return len([c for c, _ in ws.sent if c == "aibot_upload_media_init"])
+
+
+def test_same_image_uploaded_once_for_many_recipients(tmp_path) -> None:
+    """一个模板 20 个收件人：上传只能 1 次，消息发 20 条。
+
+    官方上传限流 30 次/分钟；按人各传一次会在两个模板同时到点时直接打满。
+    """
+    ws = FakeWsManager()
+    client = FakeClientWithWs(ws)
+    bridge = _ready_bridge(client)
+    path = _write_png(tmp_path)
+
+    for i in range(20):
+        res = bridge.send_image(f"user_{i}", path)
+        assert res.ok is True, (i, res)
+
+    assert _inits(ws) == 1, _inits(ws)
+    assert len(client.calls) == 20
+    assert all(b["image"]["media_id"] == "MEDIA_ABC" for _, b in client.calls)
+
+
+def test_changed_image_triggers_reupload(tmp_path) -> None:
+    ws = FakeWsManager()
+    bridge = _ready_bridge(FakeClientWithWs(ws))
+    path = _write_png(tmp_path, 1024)
+
+    bridge.send_image("u1", path)
+    # 同名文件内容变了（mtime/大小任一变化都必须重传，否则会发旧图）
+    import os as _os
+    with open(path, "ab") as fh:
+        fh.write(b"\x00" * 4096)
+    _os.utime(path, (time.time() + 5, time.time() + 5))
+
+    bridge.send_image("u2", path)
+    assert _inits(ws) == 2, _inits(ws)
+
+
+def test_stale_cached_media_id_is_reuploaded_once(tmp_path) -> None:
+    """缓存里的 media_id 被服务端判失效（过期/清理）时，必须丢掉缓存重传一次，而不是直接失败。"""
+    ws = FakeWsManager()
+    client = ScriptedClient(ws, [
+        {"errcode": 0, "errmsg": "ok"},                      # 首次真上传，缓存写入
+        {"errcode": 40007, "errmsg": "invalid media_id"},  # 第二次命中缓存 → 被判失效
+        {"errcode": 0, "errmsg": "ok"},                      # 丢掉缓存重传后成功
+    ])
+    bridge = _ready_bridge(client)
+    path = _write_png(tmp_path)
+
+    assert bridge.send_image("u1", path).ok is True      # 首次真上传，缓存写入
+    assert _inits(ws) == 1
+
+    res = bridge.send_image("u2", path)                  # 命中缓存 → 被判失效 → 重传
+    assert res.ok is True, res
+    assert _inits(ws) == 2, _inits(ws)
+    assert len(client.calls) == 3
+
+
+def test_cache_expires_after_ttl(tmp_path, monkeypatch) -> None:
+    ws = FakeWsManager()
+    bridge = _ready_bridge(FakeClientWithWs(ws))
+    path = _write_png(tmp_path)
+
+    bridge.send_image("u1", path)
+    assert _inits(ws) == 1
+    # 把缓存 TTL 拨到 0，模拟过期
+    monkeypatch.setattr(AibotBridge, "MEDIA_CACHE_TTL_SECONDS", -1, raising=False)
+    bridge._media_cache.clear()  # noqa: SLF001
+    bridge.send_image("u2", path)
+    assert _inits(ws) == 2

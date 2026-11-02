@@ -27,6 +27,7 @@ import logging
 import math
 import os
 import threading
+import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Dict, Optional, Tuple
 
@@ -63,6 +64,9 @@ class AibotBridge:
         # 2026-10-30 收消息：on_text(userid, text, send) —— 由 main 注入
         # handle_inbound_text，业务规则一条不复制，这里只做格式转换。
         self._on_text = on_text
+        # path -> (media_id, expire_ts, mtime, size)：同图复用，别按人重复上传
+        self._media_cache: Dict[str, Tuple[str, float, float, int]] = {}
+        self._media_lock = threading.Lock()
 
     # ── 生命周期 ────────────────────────────────────────────────────
     def is_available(self) -> bool:
@@ -251,6 +255,10 @@ class AibotBridge:
     # 再用 msgtype=image 发出去。约束：单分片 ≤512KB、≤100 片、图片 ≤10MB、
     # 仅 png/jpg/jpeg/gif、media_id 有效期 3 天、上传频率 30 次/分钟。
     UPLOAD_CHUNK_SIZE = 512 * 1024
+    # 官方限制：上传 30 次/分钟。一个模板有 20 个收件人时，若每人各传一次，
+    # 一个时点就 20 次；两个模板同时到点直接触发限流。所以同一张图只传一次。
+    # media_id 官方有效期 3 天，缓存留 2 天余量。
+    MEDIA_CACHE_TTL_SECONDS = 2 * 24 * 3600
 
     @staticmethod
     def _frame_error(frame: Dict[str, Any]) -> Tuple[int, str]:
@@ -321,8 +329,52 @@ class AibotBridge:
             return None, "FINISH_FAILED %s:%s" % (code, msg)
         return media_id, ""
 
+    def _cache_get(self, file_path: str) -> Optional[str]:
+        """命中且未过期（且文件没变）就复用 media_id。"""
+        try:
+            st = os.stat(file_path)
+        except OSError:
+            return None
+        with self._media_lock:
+            item = self._media_cache.get(file_path)
+            if not item:
+                return None
+            media_id, expire_ts, mtime, size = item
+            if time.time() >= expire_ts or st.st_mtime != mtime or st.st_size != size:
+                self._media_cache.pop(file_path, None)
+                return None
+            return media_id
+
+    def _cache_put(self, file_path: str, media_id: str) -> None:
+        try:
+            st = os.stat(file_path)
+        except OSError:
+            return
+        with self._media_lock:
+            self._media_cache[file_path] = (
+                media_id, time.time() + self.MEDIA_CACHE_TTL_SECONDS, st.st_mtime, st.st_size
+            )
+
+    def _cache_drop(self, file_path: str) -> None:
+        with self._media_lock:
+            self._media_cache.pop(file_path, None)
+
     def upload_image(self, file_path: str, *, timeout: float = 45.0) -> Optional[str]:
-        """上传本地图片，返回 media_id；失败返回 None（原因见日志）。"""
+        """上传本地图片，返回 media_id；失败返回 None（原因见日志）。
+
+        2026-11-02：加 media_id 缓存 —— 同一张图（路径+mtime+大小不变）2 天内只上传一次。
+        否则 20 个收件人就是 20 次上传，踩官方 30 次/分钟的限流。
+        """
+        cached = self._cache_get(file_path)
+        if cached:
+            return cached
+        media_id = self._upload_fresh(file_path, timeout=timeout)
+        if media_id:
+            self._cache_put(file_path, media_id)
+        return media_id
+
+    def _upload_fresh(self, file_path: str, *, timeout: float = 45.0) -> Optional[str]:
+        """强制真上传一次（不走缓存）。"""
         loop = self._loop
         if self._client is None or loop is None or not loop.is_running():
             logger.warning("上传图片失败：长连接未就绪")
@@ -360,25 +412,33 @@ class AibotBridge:
         if not self._ready.is_set() or loop is None or not loop.is_running():
             return SendResult(ok=False, result="failed", retryable=True, error="NOT_CONNECTED")
 
-        media_id = self.upload_image(file_path, timeout=timeout)
-        if not media_id:
-            # 上传失败按可重试处理：可能是长连接抖动或频率限制（30 次/分钟）
-            return SendResult(ok=False, result="failed", retryable=True, error="UPLOAD_FAILED")
+        body: Dict[str, Any] = {"msgtype": "image", "image": {"media_id": ""}}
+        for attempt in (0, 1):
+            used_cache = self._cache_get(file_path) is not None
+            media_id = self.upload_image(file_path, timeout=timeout)
+            if not media_id:
+                # 上传失败按可重试处理：可能是长连接抖动或频率限制（30 次/分钟）
+                return SendResult(ok=False, result="failed", retryable=True, error="UPLOAD_FAILED")
+            body["image"]["media_id"] = media_id
+            try:
+                fut = asyncio.run_coroutine_threadsafe(self._client.send_message(target, body), loop)
+                frame = fut.result(timeout=timeout)
+            except (asyncio.TimeoutError, FutureTimeoutError):
+                return SendResult(ok=False, result="failed", retryable=True, error="SEND_TIMEOUT")
+            except Exception as exc:  # noqa: BLE001
+                return SendResult(ok=False, result="failed", retryable=True, error="EXCEPTION: %s" % exc)
 
-        body: Dict[str, Any] = {"msgtype": "image", "image": {"media_id": media_id}}
-        try:
-            fut = asyncio.run_coroutine_threadsafe(self._client.send_message(target, body), loop)
-            frame = fut.result(timeout=timeout)
-        except (asyncio.TimeoutError, FutureTimeoutError):
-            return SendResult(ok=False, result="failed", retryable=True, error="SEND_TIMEOUT")
-        except Exception as exc:  # noqa: BLE001
-            return SendResult(ok=False, result="failed", retryable=True, error="EXCEPTION: %s" % exc)
-
-        errcode, errmsg = self._frame_error(frame if isinstance(frame, dict) else {})
-        if errcode != 0:
+            errcode, errmsg = self._frame_error(frame if isinstance(frame, dict) else {})
+            if errcode == 0:
+                return SendResult(ok=True, result="sent", status_code=200)
+            # 用的是缓存、且被判失效（media_id 过期/被清理）：丢掉缓存重传一次
+            if attempt == 0 and used_cache:
+                logger.warning("缓存 media_id 被判失效（%s: %s），重传一次", errcode, errmsg)
+                self._cache_drop(file_path)
+                continue
             return SendResult(ok=False, result="failed", status_code=200,
                               retryable=False, error="%s: %s" % (errcode, errmsg))
-        return SendResult(ok=True, result="sent", status_code=200)
+        return SendResult(ok=False, result="failed", retryable=False, error="SEND_FAILED")
 
 
 class WecomAibotNotifier:
