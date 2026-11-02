@@ -21,10 +21,14 @@ SDK 是 asyncio 原生（`client.run()` 阻塞）。我们的调度器是同步�
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
+import math
+import os
 import threading
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from .zdxlz import SendResult
 
@@ -240,6 +244,143 @@ class AibotBridge:
         return SendResult(ok=True, result="sent", status_code=200)
 
 
+    # ── 图片消息（三步分片上传 → 图片消息）──────────────────────────
+    # 2026-11-02 纠正我下过的一个错误结论：此前说「智能机器人发不了图片」。
+    # 错在只看官方 Python SDK 的封装（只有 download，没有 upload），没去看协议本身。
+    # 协议是支持的（官方文档 101970）：aibot_upload_media_init → _chunk × N → _finish 拿 media_id，
+    # 再用 msgtype=image 发出去。约束：单分片 ≤512KB、≤100 片、图片 ≤10MB、
+    # 仅 png/jpg/jpeg/gif、media_id 有效期 3 天、上传频率 30 次/分钟。
+    UPLOAD_CHUNK_SIZE = 512 * 1024
+
+    @staticmethod
+    def _frame_error(frame: Dict[str, Any]) -> Tuple[int, str]:
+        """errcode 可能在顶层，也可能在 headers 里（线上两种都出现过）。"""
+        if not isinstance(frame, dict):
+            return 0, ""
+        errcode = int(frame.get("errcode") or 0)
+        errmsg = str(frame.get("errmsg") or "")
+        headers = frame.get("headers")
+        if isinstance(headers, dict) and not errcode:
+            errcode = int(headers.get("errcode") or 0)
+            errmsg = errmsg or str(headers.get("errmsg") or "")
+        return errcode, errmsg
+
+    async def _cmd(self, cmd: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """发一条通用长连接命令并等回执（上传三步复用；与 send_message 走同一个 WS 队列）。"""
+        from aibot.utils import generate_req_id
+
+        frame = await self._client._ws_manager.send_reply(  # noqa: SLF001 - SDK 未暴露泛用命令入口
+            generate_req_id(cmd), body, cmd
+        )
+        return frame if isinstance(frame, dict) else {}
+
+    async def _upload_image_async(self, data: bytes, filename: str) -> Tuple[Optional[str], str]:
+        total = len(data)
+        chunks = max(1, math.ceil(total / self.UPLOAD_CHUNK_SIZE))
+        if chunks > 100:
+            return None, "TOO_MANY_CHUNKS(%d>100)" % chunks
+
+        init = await self._cmd(
+            "aibot_upload_media_init",
+            {
+                "type": "image",
+                "filename": filename,
+                "total_size": total,
+                "total_chunks": chunks,
+                "md5": hashlib.md5(data).hexdigest(),
+            },
+        )
+        code, msg = self._frame_error(init)
+        upload_id = str((init.get("body") or {}).get("upload_id") or "").strip()
+        if code or not upload_id:
+            return None, "INIT_FAILED %s:%s" % (code, msg)
+
+        for idx in range(chunks):
+            seg = data[idx * self.UPLOAD_CHUNK_SIZE:(idx + 1) * self.UPLOAD_CHUNK_SIZE]
+            b64 = base64.b64encode(seg).decode("ascii")
+            frame = await self._cmd(
+                "aibot_upload_media_chunk",
+                {"upload_id": upload_id, "chunk_index": idx, "base64_data": b64},
+            )
+            code, msg = self._frame_error(frame)
+            if code:
+                # 官方文档与不同 SDK 对分片字段名有分歧（data / base64_data），
+                # 换另一个再试一次 —— 分片上传本身幂等，重复不会出错。
+                frame2 = await self._cmd(
+                    "aibot_upload_media_chunk",
+                    {"upload_id": upload_id, "chunk_index": idx, "data": b64},
+                )
+                code2, msg2 = self._frame_error(frame2)
+                if code2:
+                    return None, "CHUNK_FAILED[%d] %s:%s / %s:%s" % (idx, code, msg, code2, msg2)
+
+        finish = await self._cmd("aibot_upload_media_finish", {"upload_id": upload_id})
+        code, msg = self._frame_error(finish)
+        media_id = str((finish.get("body") or {}).get("media_id") or "").strip()
+        if code or not media_id:
+            return None, "FINISH_FAILED %s:%s" % (code, msg)
+        return media_id, ""
+
+    def upload_image(self, file_path: str, *, timeout: float = 45.0) -> Optional[str]:
+        """上传本地图片，返回 media_id；失败返回 None（原因见日志）。"""
+        loop = self._loop
+        if self._client is None or loop is None or not loop.is_running():
+            logger.warning("上传图片失败：长连接未就绪")
+            return None
+        try:
+            with open(file_path, "rb") as fh:
+                data = fh.read()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("上传图片读取失败 %s: %s", file_path, exc)
+            return None
+        fname = os.path.basename(file_path)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._upload_image_async(data, fname), loop)
+            media_id, err = fut.result(timeout=timeout)
+        except (asyncio.TimeoutError, FutureTimeoutError):
+            logger.warning("上传图片超时 %s", file_path)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("上传图片异常 %s: %s", file_path, exc)
+            return None
+        if not media_id:
+            logger.warning("上传图片失败 %s: %s", file_path, err)
+        return media_id
+
+    def send_image(self, chatid: str, file_path: str, *, timeout: float = 60.0) -> SendResult:
+        """发一条真正的图片消息：先三步上传拿 media_id，再 msgtype=image 发出去。
+
+        ⚠️ 与 send_markdown 同样的约束：**不能**在 SDK 事件循环线程里同步调用本方法
+           （内部会 run_coroutine_threadsafe 再等结果 → 自己等自己死锁）。
+        """
+        target = (chatid or "").strip()
+        if not target:
+            return SendResult(ok=False, result="failed", retryable=False, error="EMPTY_CHATID")
+        loop = self._loop
+        if not self._ready.is_set() or loop is None or not loop.is_running():
+            return SendResult(ok=False, result="failed", retryable=True, error="NOT_CONNECTED")
+
+        media_id = self.upload_image(file_path, timeout=timeout)
+        if not media_id:
+            # 上传失败按可重试处理：可能是长连接抖动或频率限制（30 次/分钟）
+            return SendResult(ok=False, result="failed", retryable=True, error="UPLOAD_FAILED")
+
+        body: Dict[str, Any] = {"msgtype": "image", "image": {"media_id": media_id}}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._client.send_message(target, body), loop)
+            frame = fut.result(timeout=timeout)
+        except (asyncio.TimeoutError, FutureTimeoutError):
+            return SendResult(ok=False, result="failed", retryable=True, error="SEND_TIMEOUT")
+        except Exception as exc:  # noqa: BLE001
+            return SendResult(ok=False, result="failed", retryable=True, error="EXCEPTION: %s" % exc)
+
+        errcode, errmsg = self._frame_error(frame if isinstance(frame, dict) else {})
+        if errcode != 0:
+            return SendResult(ok=False, result="failed", status_code=200,
+                              retryable=False, error="%s: %s" % (errcode, errmsg))
+        return SendResult(ok=True, result="sent", status_code=200)
+
+
 class WecomAibotNotifier:
     """把 AibotBridge 适配成 scheduler 需要的 NotifierProtocol。
 
@@ -272,6 +413,14 @@ class WecomAibotNotifier:
             return self.bridge.send_markdown(receive_id, text)
         except Exception as exc:  # noqa: BLE001
             logger.warning("企业微信智能机器人发送异常 to=%s: %s", receive_id, exc)
+            return SendResult(ok=False, result="failed", retryable=True, error=f"EXCEPTION: {exc}")
+
+    def send_image(self, receive_id: str, file_path: str, idem_key: str) -> SendResult:
+        """发原生图片消息：调度器检测到通道有这个方法，就用图片替代 H5 链接。"""
+        try:
+            return self.bridge.send_image(receive_id, file_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("企业微信智能机器人发图异常 to=%s: %s", receive_id, exc)
             return SendResult(ok=False, result="failed", retryable=True, error=f"EXCEPTION: {exc}")
 
     def close(self) -> None:

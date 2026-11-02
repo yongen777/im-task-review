@@ -1463,6 +1463,69 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             logger.warning("补交审核通知发送失败 instance=%s: %s", inst.get("id"), exc)
             return False
 
+    @router.post("/channel-config/test-send")
+    async def channel_test_send(request: Request):
+        """给指定成员发一条测试消息（text / image），用于联调取证。
+
+        为什么必须有这个端点：机器人**同一时间只能有一条长连接**，
+        想在外面写脚本验证发图，一连接就会把线上连接踢掉。
+        所以验证只能在**进程内**做 —— 复用 scheduler 正在用的那个 notifier。
+        """
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        kind = str(body.get("kind") or "text").strip().lower()
+        text = str(body.get("text") or "这是一条测试消息").strip()
+        userid = str(body.get("userid") or "").strip()
+        phone = str(body.get("phone") or "").strip()
+
+        if not userid and phone:
+            target = state.get_delivery_target(phone)
+            userid = str((target or {}).get("external_id") or "").strip()
+        if not userid:
+            with state.lock:
+                row = state.conn.execute(
+                    "SELECT external_id FROM delivery_target WHERE platform = ? AND usable = 1 "
+                    "ORDER BY activated_at DESC LIMIT 1",
+                    (state.platform,),
+                ).fetchone()
+            userid = str(row["external_id"] if row else "")
+        if not userid:
+            return error_response(400, "NO_TARGET", "没有可用的投递绑定：请先在机器人里发送「姓名 手机号」完成激活")
+
+        if _notifier is None or not hasattr(_notifier, "send_text"):
+            return error_response(400, "NO_NOTIFIER", "当前没有可用的消息通道（notifier 未注入）")
+
+        if kind == "image":
+            if not hasattr(_notifier, "send_image"):
+                return error_response(
+                    400, "NO_IMAGE_SUPPORT",
+                    f"当前通道（{state.platform}）不支持图片消息；只有企业微信智能机器人支持",
+                )
+            # 找一张现成的图：优先今天刚发的附图副本，其次看板图
+            data_dir = Path(state.db.db_path).parent
+            candidates = []
+            for sub in ("public_img", "dashboards"):
+                d = data_dir / sub
+                if d.is_dir():
+                    candidates.extend(sorted(d.glob("*.png"), key=lambda x: x.stat().st_mtime, reverse=True)[:5])
+            candidates = [c for c in candidates if c.is_file()]
+            if not candidates:
+                return error_response(404, "NO_IMAGE", "data 目录下没有可用的 png（public_img / dashboards 都是空的）")
+            img_path = candidates[0]
+            res = _notifier.send_image(userid, str(img_path), "test_send_image")
+            detail = f"图片消息已发送（{img_path.name}，{img_path.stat().st_size} 字节）" if res.ok else f"发送失败：{res.error}"
+            return {"ok": bool(res.ok), "kind": "image", "to": userid, "file": img_path.name, "detail": detail}
+
+        res = _notifier.send_text(userid, text, "test_send_text")
+        return {
+            "ok": bool(res.ok), "kind": "text", "to": userid,
+            "detail": "文本已发送" if res.ok else f"发送失败：{res.error}",
+        }
+
     @router.post("/instances/{instance_id}/resubmit/approve")
     async def approve_instance_resubmit(instance_id: int, request: Request):
         sess, err = require_session(request, state, check_csrf=True)

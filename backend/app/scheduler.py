@@ -447,6 +447,39 @@ class Scheduler:
         """附图直链文本的幂等键：由基础 idem 派生，发送侧与门控侧必须用同一份。"""
         return hashlib.sha1(f"{base_idem}|link".encode("utf-8")).hexdigest()
 
+    def _send_image_media(
+        self, *, external_id: str, image_path: str, idem: str,
+        template_id: str, instance_id: int, phone: str,
+        planned_str: str, now_s: str, stats: Dict[str, int],
+    ) -> bool:
+        """发一条**原生图片消息**（企微智能机器人，2026-11-02 起支持）。
+
+        返回 True = 这一轮不用再走链接兜底（已发出，或失败但可重试、留给下一轮）；
+        返回 False = 永久失败，调用方应降级发 H5 链接，别让用户什么都收不到。
+
+        ⚠️ 幂等门控必须在**发送之前**（2026-11-02 刷屏事故的根因就是这个顺序错了）。
+        """
+        try:
+            if self.state.has_sent_reminder(idem):
+                return True
+            res = self.notifier.send_image(external_id, image_path, idem)
+            self.state.record_reminder_log(
+                template_id=template_id, instance_id=instance_id, phone=phone, kind="notice_img",
+                planned_at=planned_str, attempted_at=now_s,
+                sent_at=now_s if res.ok else None, result="sent" if res.ok else "failed",
+                retry=0, error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=idem,
+            )
+            if res.ok:
+                return True
+            if getattr(res, "retryable", False):
+                # 长连接抖动 / 上传频率限制：交给下一个 tick 重试，此时别补发链接（会重复）
+                return True
+            stats["failed"] = stats.get("failed", 0) + 1
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("附图图片消息发送异常 external=%s: %s", external_id, exc)
+            return False
+
     def _send_image_link(self, external_id: str, image_url: str, image_name: Optional[str], base_idem: str,
                          template_id: str, instance_id: Optional[int], phone: str,
                          planned_str: str, now_s: str, stats: Dict[str, int]) -> None:
@@ -659,9 +692,10 @@ class Scheduler:
                     # 没上传图时才退回「数据看板自动出图」的旧路径（依赖当天人工填报的快照值）。
                     attach_rel = str(tpl.get("attach_image_path") or "").strip()
                     want_dash = bool(tpl.get("attach_image")) and bool(data_keys)
-                    # 2026-10-30 用户口径：不再发送图片消息（移动端图片消息打不开），
-                    # 改为只发我们自己的 H5 图文链接。因此这里只需要本地图片路径，
-                    # 不再走平台的 prepare_image 上传（平台 CDN 本身也慢 5s+）。
+                    # 2026-11-02 订正：量子密信那条「图片消息手机端点不开」的结论，
+                    # **不适用于企业微信** —— 企微机器人发的是原生图片消息，实测点开正常，
+                    # 所以企微通道优先发图片（_send_image_media），失败再降级 H5 链接。
+                    # 量子密信没有 send_image，仍然走链接，行为不变。
                     if attach_rel or want_dash:
                         img_src_path: Optional[str] = None
                         if attach_rel:
@@ -711,21 +745,42 @@ class Scheduler:
                             # 原实现无条件「先发布副本 → 再逐人发送」，而发送是「先发后记账」，
                             # 于是调度器每 30 秒一轮时：每轮发一条 + 每轮复制一个新副本
                             #（线上实测 15 分钟新增 30 个副本、收件人被刷 50+ 条）。
+                            # 2026-11-02：企微机器人支持原生图片消息了（三步上传 → msgtype=image），
+                            # 通道有 send_image 就用图片；没有（或发送永久失败）再降级回 H5 链接。
+                            native_image = callable(getattr(self.notifier, "send_image", None))
                             pending: List[tuple] = []
                             for inst in instances:
                                 idem_link = make_idem_key(
                                     tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str
                                 )
-                                if self.state.has_sent_reminder(self._link_idem(idem_link)):
+                                idem_media = make_idem_key(
+                                    tpl["template_id"], inst["phone"], p_key, "notice_img", seq_idx, planned_str
+                                )
+                                # 两种形态都要查：换成图片之后，历史链接记录也得认，
+                                # 否则切换当天会再补发一条（用户刚被刷过屏，不能再来一次）。
+                                if (self.state.has_sent_reminder(self._link_idem(idem_link))
+                                        or self.state.has_sent_reminder(idem_media)):
                                     continue  # 这一轮已经发过了，连副本都不用再生成
                                 target = self.state.get_delivery_target(inst["phone"])
                                 ext_id = (target or {}).get("external_id") if target else None
                                 if not ext_id:
-                                    continue  # 未激活成员文本链路已记 skipped，附图链接同样跳过，避免重复记一条
-                                pending.append((inst, ext_id, idem_link))
+                                    continue  # 未激活成员文本链路已记 skipped，附图同样跳过，避免重复记一条
+                                pending.append((inst, ext_id, idem_link, idem_media))
                             if pending:
-                                link_url = self._publish_image_link(img_src_path, img_title)
-                                for inst, ext_id, idem_link in pending:
+                                link_url: Optional[str] = None
+                                for inst, ext_id, idem_link, idem_media in pending:
+                                    handled = False
+                                    if native_image:
+                                        handled = self._send_image_media(
+                                            external_id=ext_id, image_path=img_src_path, idem=idem_media,
+                                            template_id=tpl["template_id"], instance_id=int(inst["id"]),
+                                            phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
+                                        )
+                                    if handled:
+                                        continue
+                                    # 降级：H5 链接（发布副本按需做，只做一次）
+                                    if link_url is None:
+                                        link_url = self._publish_image_link(img_src_path, img_title) or ""
                                     if not link_url:
                                         break
                                     self._send_image_link(
