@@ -356,3 +356,42 @@ def test_notice_instance_not_advanced_to_overdue():
 
 
 
+
+
+# ── 2026-11-02 P0 刷屏回归 ────────────────────────────────────────────
+def test_notice_image_link_only_once_across_multiple_ticks() -> None:
+    """到点后连续跑多轮调度，附图直链只能发 1 条、副本也只能生成 1 个。
+
+    事故（2026-10-30 ~ 11-02）：`_send_image_link` 是「先发送、后记账」，
+    reminder_log 的 UNIQUE 只拦住记录，拦不住已经发出去的消息；调度器每 30 秒一轮，
+    于是到点后每轮都发一条链接，并且每轮还复制一个新副本 —— 收件人被刷 50+ 条、
+    public_img 15 分钟多出 30 个文件。
+
+    这条用例故意跑 **3 轮**：单轮能过不算过，multi-tick 只发一条才算过。
+    """
+    store = _mk_store()
+    try:
+        tpl_id = _setup_notice_tpl(store, attach_image=True)
+        store.upsert_delivery_target("13800000001", "ext_user_001")
+        store.upsert_data_snapshot(tpl_id, PKEY, {"completion_rate": "86.5", "intent_count": "45"})
+
+        notifier = FakeNotifier()
+        scheduler = _mk_scheduler(store, notifier=notifier)
+        for _ in range(3):  # 三个 tick，模拟 30 秒一轮
+            scheduler.run_once()
+
+        links = [m for m in notifier.sent_messages if "/h5/img/" in m.text]
+        assert len(links) == 1, f"附图链接应只发 1 条，实际 {len(links)} 条"
+        # 文本也只能 1 条（正文另有自己的幂等门控）
+        assert len(notifier.sent_messages) == 2, [m.text[:20] for m in notifier.sent_messages]
+
+        kinds = [r["kind"] for r in store.list_reminder_logs(tpl_id)]
+        assert kinds.count("notice") == 1
+        assert kinds.count("notice_img_link") == 1, kinds
+
+        # 副本目录只应有 1 个 png + 1 个 .title（每 tick 复制一次是刷屏的另一半）
+        pub_dir = Path(store.db.db_path).parent / "public_img"
+        pngs = list(pub_dir.glob("*.png"))
+        assert len(pngs) == 1, f"副本应只生成 1 个，实际 {len(pngs)} 个"
+    finally:
+        store.close()

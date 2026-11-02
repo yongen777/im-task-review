@@ -442,6 +442,11 @@ class Scheduler:
             logger.warning("附图公网副本发布失败 %s: %s", src_path, exc)
             return None
 
+    @staticmethod
+    def _link_idem(base_idem: str) -> str:
+        """附图直链文本的幂等键：由基础 idem 派生，发送侧与门控侧必须用同一份。"""
+        return hashlib.sha1(f"{base_idem}|link".encode("utf-8")).hexdigest()
+
     def _send_image_link(self, external_id: str, image_url: str, image_name: Optional[str], base_idem: str,
                          template_id: str, instance_id: Optional[int], phone: str,
                          planned_str: str, now_s: str, stats: Dict[str, int]) -> None:
@@ -451,7 +456,12 @@ class Scheduler:
         名称由管理员在模板编辑时填写（attach_image_name），无名称时回退「数据图片」。
         """
         try:
-            link_idem = hashlib.sha1(f"{base_idem}|link".encode("utf-8")).hexdigest()
+            link_idem = self._link_idem(base_idem)
+            # 2026-11-02 P0 刷屏修复：**发送动作之前**先查重。
+            # 原实现是「先发、后记账」，reminder_log 的 UNIQUE 只拦住记录，
+            # 消息在 30 秒一轮的调度里已经被发出去了 —— 到点后每轮都发一条。
+            if self.state.has_sent_reminder(link_idem):
+                return
             display = (image_name or "").strip() or "数据图片"
             text = f"{display}（点击查看）：\n{image_url}"
             res = self.notifier.send_text(external_id, text, link_idem)
@@ -553,6 +563,10 @@ class Scheduler:
         )
         resubmit_disp = format_deadline_display(instance["resubmit_deadline"], ref_dt=cur_dt)
         msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n请在 {resubmit_disp} 前重新提交。\n👉 重新提交：{h5_url}"
+        # 2026-11-02：同一类「先发后记账」隐患一并收掉 —— 发送前先查重，
+        # 重复触发（重复点驳回、重放）不会二次打扰提交人。
+        if self.state.has_sent_reminder(idem):
+            return None
         send_res = self.notifier.send_text(target["external_id"], msg_text, idem)
         self.state.record_reminder_log(
             template_id=instance["template_id"], instance_id=int(instance["id"]), phone=instance["phone"],
@@ -692,21 +706,34 @@ class Scheduler:
                             # 图片消息在手机端一律打不开（平台 CDN 返回 octet-stream + 5s 延迟），
                             # 发出去只会让员工反复点、看起来像故障，所以整条删掉。
                             img_title = str(tpl.get("attach_image_name") or "").strip() or None
-                            link_url = self._publish_image_link(img_src_path, img_title)
+                            # 2026-11-02 P0 刷屏修复：先按幂等键筛出「本轮真正还需要发的人」，
+                            # 一个人都不需要就既不发布副本、也不发消息。
+                            # 原实现无条件「先发布副本 → 再逐人发送」，而发送是「先发后记账」，
+                            # 于是调度器每 30 秒一轮时：每轮发一条 + 每轮复制一个新副本
+                            #（线上实测 15 分钟新增 30 个副本、收件人被刷 50+ 条）。
+                            pending: List[tuple] = []
                             for inst in instances:
-                                if not link_url:
-                                    break
-                                idem_link = make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str)
+                                idem_link = make_idem_key(
+                                    tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str
+                                )
+                                if self.state.has_sent_reminder(self._link_idem(idem_link)):
+                                    continue  # 这一轮已经发过了，连副本都不用再生成
                                 target = self.state.get_delivery_target(inst["phone"])
                                 ext_id = (target or {}).get("external_id") if target else None
                                 if not ext_id:
                                     continue  # 未激活成员文本链路已记 skipped，附图链接同样跳过，避免重复记一条
-                                self._send_image_link(
-                                    external_id=ext_id, image_url=link_url, image_name=img_title or "",
-                                    base_idem=idem_link,
-                                    template_id=tpl["template_id"], instance_id=int(inst["id"]),
-                                    phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
-                                )
+                                pending.append((inst, ext_id, idem_link))
+                            if pending:
+                                link_url = self._publish_image_link(img_src_path, img_title)
+                                for inst, ext_id, idem_link in pending:
+                                    if not link_url:
+                                        break
+                                    self._send_image_link(
+                                        external_id=ext_id, image_url=link_url, image_name=img_title or "",
+                                        base_idem=idem_link,
+                                        template_id=tpl["template_id"], instance_id=int(inst["id"]),
+                                        phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
+                                    )
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])
