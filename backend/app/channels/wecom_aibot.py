@@ -206,6 +206,24 @@ class AibotBridge:
             pass
 
     # ── 发送 ────────────────────────────────────────────────────────
+    # ── 传输层封装（可注入，便于测试脱离跨线程时序）────────────────
+    def _transport_ready(self) -> bool:
+        """长连接是否可发（就绪标志 + 事件循环确实在跑）。
+
+        抽成方法是为了测试：单测里把这个方法替掉，就不必真的起一条事件循环线程，
+        避免「靠线程调度时序」的脆弱用例（2026-11-02 验收反馈：另一台机器 6 条超时）。
+        ⛔ 不要在这里加操作系统判断，环境差异属于测试的事。
+        """
+        loop = self._loop
+        return bool(self._ready.is_set() and loop is not None and loop.is_running())
+
+    def _run_sync(self, coro: Any, timeout: float) -> Any:
+        """在后台事件循环里跑协程并同步等结果。"""
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("loop_not_running")
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+
     def send_markdown(self, chatid: str, content: str, *, timeout: float = 10.0) -> SendResult:
         """主动推送一条 markdown 消息（单聊 chatid 传 userid）。
 
@@ -214,18 +232,14 @@ class AibotBridge:
         target = (chatid or "").strip()
         if not target:
             return SendResult(ok=False, result="failed", retryable=False, error="EMPTY_CHATID")
-        loop = self._loop
-        if not self._ready.is_set() or loop is None or not loop.is_running():
+        if not self._transport_ready():
             return SendResult(ok=False, result="failed", retryable=True, error="NOT_CONNECTED")
         if self._client is None:
             return SendResult(ok=False, result="failed", retryable=True, error="NO_CLIENT")
 
         body: Dict[str, Any] = {"msgtype": "markdown", "markdown": {"content": content}}
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._client.send_message(target, body), loop
-            )
-            frame = fut.result(timeout=timeout)
+            frame = self._run_sync(self._client.send_message(target, body), timeout)
         except (asyncio.TimeoutError, FutureTimeoutError):
             # Python 3.10 里 concurrent.futures.TimeoutError 与 asyncio.TimeoutError 是两个类，
             # 3.11 才合并；生产是 3.10，所以两个都要捕获，否则超时会被记成未知异常。
@@ -375,8 +389,7 @@ class AibotBridge:
 
     def _upload_fresh(self, file_path: str, *, timeout: float = 45.0) -> Optional[str]:
         """强制真上传一次（不走缓存）。"""
-        loop = self._loop
-        if self._client is None or loop is None or not loop.is_running():
+        if self._client is None or not self._transport_ready():
             logger.warning("上传图片失败：长连接未就绪")
             return None
         try:
@@ -387,8 +400,7 @@ class AibotBridge:
             return None
         fname = os.path.basename(file_path)
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._upload_image_async(data, fname), loop)
-            media_id, err = fut.result(timeout=timeout)
+            media_id, err = self._run_sync(self._upload_image_async(data, fname), timeout)
         except (asyncio.TimeoutError, FutureTimeoutError):
             logger.warning("上传图片超时 %s", file_path)
             return None
@@ -408,8 +420,7 @@ class AibotBridge:
         target = (chatid or "").strip()
         if not target:
             return SendResult(ok=False, result="failed", retryable=False, error="EMPTY_CHATID")
-        loop = self._loop
-        if not self._ready.is_set() or loop is None or not loop.is_running():
+        if not self._transport_ready():
             return SendResult(ok=False, result="failed", retryable=True, error="NOT_CONNECTED")
 
         body: Dict[str, Any] = {"msgtype": "image", "image": {"media_id": ""}}
@@ -421,8 +432,7 @@ class AibotBridge:
                 return SendResult(ok=False, result="failed", retryable=True, error="UPLOAD_FAILED")
             body["image"]["media_id"] = media_id
             try:
-                fut = asyncio.run_coroutine_threadsafe(self._client.send_message(target, body), loop)
-                frame = fut.result(timeout=timeout)
+                frame = self._run_sync(self._client.send_message(target, body), timeout)
             except (asyncio.TimeoutError, FutureTimeoutError):
                 return SendResult(ok=False, result="failed", retryable=True, error="SEND_TIMEOUT")
             except Exception as exc:  # noqa: BLE001
