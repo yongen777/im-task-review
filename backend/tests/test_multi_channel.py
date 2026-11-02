@@ -169,3 +169,29 @@ def test_member_list_returns_per_platform_activations() -> None:
         assert m2["activated"] is True
     finally:
         store.close()
+
+
+def test_instance_filter_sql_platform_condition() -> None:
+    """后台所选办公软件 -> 只显示该平台有可用绑定的人员实例。"""
+    from app.api.admin import _instance_filter_sql
+
+    store = _mk_store()
+    try:
+        _from, where, params = _instance_filter_sql(store, platform="wecom")
+        assert "EXISTS" in where and "dt.platform" in where
+        assert "wecom" in params
+    finally:
+        store.close()
+
+
+def test_pending_list_filters_by_platform() -> None:
+    store = _mk_store()
+    try:
+        store.upsert_pending_member("zdx_uid", last_message="a", platform="zdxlz")
+        store.upsert_pending_member("wo_uid", last_message="b", platform="wecom")
+        z = store.list_pending_members(platform="zdxlz")
+        w = store.list_pending_members(platform="wecom")
+        assert [x["external_id"] for x in z] == ["zdx_uid"]
+        assert [x["external_id"] for x in w] == ["wo_uid"]
+    finally:
+        store.close()

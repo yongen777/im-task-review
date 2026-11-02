@@ -229,6 +229,7 @@ def _instance_filter_sql(
     period_key: Optional[str] = None,
     status: Optional[str] = None,
     resubmit_status: Optional[str] = None,
+    platform: Optional[str] = None,
 ) -> tuple[str, str, List[Any]]:
     """「任务实例」统一筛选条件（列表 / 统计 / 导出共用）。
 
@@ -304,6 +305,14 @@ def _instance_filter_sql(
         where.append("(i.name_snap LIKE ? OR i.phone LIKE ? OR COALESCE(i.dept_snap, '') LIKE ?)")
         params.extend([kw, kw, kw])
 
+    # 2026-11-02 多通道面板：按所选办公软件过滤——只保留在该平台有可用绑定的人员实例。
+    plat = (platform or "").strip().lower()
+    if plat:
+        where.append(
+            "EXISTS (SELECT 1 FROM delivery_target dt WHERE dt.platform = ? AND dt.phone = i.phone AND dt.usable = 1)"
+        )
+        params.append(plat)
+
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     return from_sql, where_sql, params
 
@@ -320,6 +329,7 @@ def _query_instances(
     role_id: Optional[str] = None,
     phone: Optional[str] = None,
     q: Optional[str] = None,
+    platform: Optional[str] = None,
     page: int = 1,
     size: int = 20,
 ) -> Dict[str, Any]:
@@ -336,6 +346,7 @@ def _query_instances(
         role_id=role_id,
         phone=phone,
         q=q,
+        platform=platform,
     )
     with state.lock:
         total = int(
@@ -812,11 +823,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # ── 已激活待归纳人员（2026-10-28 方案B：用户发任意消息自动登记，管理员后续移入角色）──
 
     @router.get("/pending-members")
-    async def list_pending_members(request: Request, limit: int = 200):
+    async def list_pending_members(request: Request, limit: int = 200, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
-        items = state.list_pending_members(limit=limit)
+        items = state.list_pending_members(limit=limit, platform=platform)
         return {"ok": True, "total": len(items), "items": items}
 
     @router.post("/pending-members/move")
@@ -884,11 +895,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return None
 
     @router.get("/unactivated-members")
-    async def list_unactivated_alias(request: Request, limit: int = 200):
+    async def list_unactivated_alias(request: Request, limit: int = 200, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
-        items = state.list_pending_members(limit=limit)
+        items = state.list_pending_members(limit=limit, platform=platform)
         return {"ok": True, "total": len(items), "items": items}
 
     @router.post("/unactivated-members/move")
@@ -1197,6 +1208,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         period_key: Optional[str] = None,
         status: Optional[str] = None,
         q: Optional[str] = None,
+        platform: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -1209,6 +1221,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             period_key=period_key,
             status=status,
             q=q,
+            platform=platform,
             page=1,
             size=200,
         )
@@ -1268,6 +1281,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         role_id: Optional[str] = None,
         phone: Optional[str] = None,
         q: Optional[str] = None,
+        platform: Optional[str] = None,
         page: int = 1,
         size: int = 20,
     ):
@@ -1287,13 +1301,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             role_id=role_id,
             phone=phone,
             q=q,
+            platform=platform,
             page=page,
             size=size,
         )
         return {"ok": True, "total": res["total"], "page": page, "size": size, "items": res["items"]}
 
     @router.get("/instances/pending-reviews")
-    async def pending_reviews(request: Request, days: int = 7):
+    async def pending_reviews(request: Request, days: int = 7, platform: Optional[str] = None):
         """跨日期的「待我处理」聚合：用户提交待审 + 补交申请待审。
 
         为什么需要单开一个接口：实例列表的 period_key 是**单日精确匹配**，而补交待审的实例
@@ -1313,6 +1328,12 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         start_dt = (state.now() - timedelta(days=d - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
         start_s = format_dt(start_dt)
         limit = 100
+        plat_sql = ""
+        plat_params: List[Any] = []
+        if (platform or "").strip():
+            plat_sql = ("AND EXISTS (SELECT 1 FROM delivery_target dt WHERE dt.platform = ? "
+                        "AND dt.phone = i.phone AND dt.usable = 1) ")
+            plat_params = [platform.strip().lower()]
         base = (
             # name_snap 是实例表列名，前端统一叫 member_name_snap，这里直接给别名省一层换算
             "SELECT i.*, i.name_snap AS member_name_snap, t.name AS template_name, t.kind AS template_kind "
@@ -1322,13 +1343,15 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         with state.lock:
             sub_rows = state.conn.execute(
                 base + "AND i.status = 'submitted' AND COALESCE(i.submitted_at, i.created_at) >= ? "
+                       + plat_sql +
                        "ORDER BY COALESCE(i.submitted_at, i.created_at) DESC, i.id DESC LIMIT ?",
-                (start_s, limit + 1),
+                (start_s, *plat_params, limit + 1),
             ).fetchall()
             rq_rows = state.conn.execute(
                 base + "AND i.resubmit_status = 'pending' AND COALESCE(i.resubmit_req_at, i.created_at) >= ? "
+                       + plat_sql +
                        "ORDER BY COALESCE(i.resubmit_req_at, i.created_at) DESC, i.id DESC LIMIT ?",
-                (start_s, limit + 1),
+                (start_s, *plat_params, limit + 1),
             ).fetchall()
 
         def _row(r):
@@ -1758,6 +1781,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         role_id: Optional[str] = None,
         phone: Optional[str] = None,
         q: Optional[str] = None,
+        platform: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -1775,6 +1799,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             role_id=role_id,
             phone=phone,
             q=q,
+            platform=platform,
         )
         counts = {
             "total": 0,

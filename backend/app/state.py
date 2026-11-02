@@ -1171,9 +1171,17 @@ class StateStore:
             row = self.conn.execute("SELECT * FROM pending_member WHERE external_id = ?", ((external_id or "").strip(),)).fetchone()
             return dict(row) if row else None
 
-    def list_pending_members(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def list_pending_members(self, limit: int = 200, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        plat = (platform or "").strip().lower()
+        sql = "SELECT * FROM pending_member"
+        params: List[Any] = []
+        if plat:
+            sql += " WHERE platform = ?"
+            params.append(plat)
+        sql += " ORDER BY activated_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 500)))
         with self.lock:
-            rows = self.conn.execute("SELECT * FROM pending_member ORDER BY activated_at DESC LIMIT ?", (max(1, min(int(limit), 500)),)).fetchall()
+            rows = self.conn.execute(sql, tuple(params)).fetchall()
             return [dict(r) for r in rows]
 
     def assign_pending_member(self, external_id: str, phone: str, name: str, role_id: str, dept: Optional[str] = None, actor: str = "system") -> Dict[str, Any]:
