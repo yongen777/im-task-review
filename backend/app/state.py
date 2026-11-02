@@ -229,11 +229,14 @@ def validate_form_submission_fields(schema: List[Dict[str, Any]], fields: Option
     return cleaned
 
 
-def _fmt_member(mid: int, role_id: str, phone: str, name: str, dept: Optional[str], enabled: Any, source: str, created_at: str, activated: Any) -> Dict[str, Any]:
-    return {
+def _fmt_member(mid: int, role_id: str, phone: str, name: str, dept: Optional[str], enabled: Any, source: str, created_at: str, activated: Any, activations: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+    item = {
         "id": int(mid), "role_id": role_id, "phone": phone, "name": name, "dept": dept,
         "enabled": bool(enabled), "source": source, "created_at": created_at, "activated": bool(activated),
     }
+    if activations is not None:
+        item["activations"] = {k: bool(v) for k, v in activations.items()}
+    return item
 
 
 class StateStore:
@@ -565,13 +568,25 @@ class StateStore:
                 params.extend([f"%{kw}%", f"%{kw}%", f"%{kw}%"])
             total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM member m {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
             rows = self.conn.execute(
-                f"SELECT m.*, dt.external_id FROM member m "
-                f"LEFT JOIN delivery_target dt ON dt.platform = ? AND dt.phone = m.phone AND dt.usable = 1 "
+                f"SELECT m.*, dtz.external_id AS ext_zdxlz, dtw.external_id AS ext_wecom FROM member m "
+                f"LEFT JOIN delivery_target dtz ON dtz.platform = 'zdxlz' AND dtz.phone = m.phone AND dtz.usable = 1 "
+                f"LEFT JOIN delivery_target dtw ON dtw.platform = 'wecom' AND dtw.phone = m.phone AND dtw.usable = 1 "
                 f"{where_sql} ORDER BY m.id ASC LIMIT ? OFFSET ?",
-                # JOIN 里的 platform 占位符在最前，别漏
-                tuple([self.platform] + params + [s, offset]),
+                tuple(params + [s, offset]),
             ).fetchall()
-            items = [_fmt_member(r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"], r["source"], r["created_at"], r["external_id"]) for r in rows]
+            items = []
+            for r in rows:
+                # activated 保持旧语义：跟随当前通道（兼容既有调用/测试）；
+                # activations 给多通道 UI 展示「密信/企微各自是否已激活」。
+                act = {
+                    "zdxlz": bool(r["ext_zdxlz"]),
+                    "wecom": bool(r["ext_wecom"]),
+                }
+                activated = act.get(self.platform, act["zdxlz"] or act["wecom"])
+                items.append(_fmt_member(
+                    r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"],
+                    r["source"], r["created_at"], activated, activations=act,
+                ))
             return {"total": total, "items": items}
 
     def list_roles_of_phone(self, phone: str) -> List[Dict[str, Any]]:
@@ -1118,32 +1133,36 @@ class StateStore:
 
     def upsert_pending_member(self, external_id: str, last_message: str = "",
                               phone: Optional[str] = None,
-                              name: Optional[str] = None) -> Dict[str, Any]:
+                              name: Optional[str] = None,
+                              platform: Optional[str] = None) -> Dict[str, Any]:
         """用户给机器人发任意消息时自动录入待归纳池（幂等，已存在则仅更新变化字段）。
 
         ⭐ 2026-10-28 用户口径：手机号**不再要求先在名单里**——
            提交的手机号直接落池（标记未核实），由管理员归纳角色时才决定归属。
+        ⭐ 2026-11-02 多通道：记录来源通道（zdxlz/wecom），后台显示「从哪个办公软件来」。
         """
         clean_id = (external_id or "").strip()
         if not clean_id:
             raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
         clean_phone = (phone or "").strip() or None
         clean_name = (name or "").strip() or None
+        clean_platform = self._plat(platform) if platform else None
         now_s = self.now_str()
         with self.lock, self.conn:
             existing = self.conn.execute("SELECT id FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
             if existing:
                 self.conn.execute(
                     "UPDATE pending_member SET last_message = ?,"
-                    " phone = COALESCE(?, phone), name = COALESCE(?, name), updated_at = ?"
+                    " phone = COALESCE(?, phone), name = COALESCE(?, name),"
+                    " platform = COALESCE(?, platform), updated_at = ?"
                     " WHERE external_id = ?",
-                    (last_message[:200], clean_phone, clean_name, now_s, clean_id),
+                    (last_message[:200], clean_phone, clean_name, clean_platform, now_s, clean_id),
                 )
             else:
                 self.conn.execute(
-                    "INSERT INTO pending_member(external_id, phone, name, last_message, activated_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (clean_id, clean_phone, clean_name, last_message[:200], now_s, now_s),
+                    "INSERT INTO pending_member(external_id, phone, name, last_message, platform, activated_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (clean_id, clean_phone, clean_name, last_message[:200], clean_platform, now_s, now_s),
                 )
         return self.get_pending_member(clean_id) or {"external_id": clean_id}
 
@@ -1174,8 +1193,9 @@ class StateStore:
             d = dict(row)
             # 添加到角色成员
             self.add_role_member(role_id=role_id, phone=clean_phone, name=name or d.get("name") or clean_phone[-4:], dept=dept or "", actor=actor)
-            # 绑定 delivery_target（使其可接收推送）
-            self.upsert_delivery_target(phone=clean_phone, external_id=clean_id)
+            # 绑定 delivery_target（使其可接收推送）：绑定到该人员来源通道，
+            # 多通道并行时不能默认写到当前通道，否则会把企微 userid 绑到密信上。
+            self.upsert_delivery_target(phone=clean_phone, external_id=clean_id, platform=d.get("platform"))
             # 从待归纳池移除
             self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
             self._insert_audit_unlocked(actor, "pending_member.assign", "pending_member", clean_id, {"phone": clean_phone, "role_id": role_id}, now_s)

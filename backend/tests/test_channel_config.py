@@ -288,9 +288,11 @@ def test_get_channel_config_reports_env_source_and_masks() -> None:
         assert zdx["callback_url"] == "https://task.example.com/api/app-events"
         # ⛔ 响应里绝不能出现完整 secret
         assert SECRET not in r.text
-        wecom = next(c for c in body["channels"] if c["channel"] == "wecom")
-        assert wecom["configured"] is False and wecom["source"] == "none"
-        assert wecom["callback_url"] == "https://task.example.com/api/wecom/callback"
+        # 2026-11-02：自建应用通道已隐藏，后台只展示量子密信 + 智能机器人
+        assert all(c["channel"] != "wecom" for c in body["channels"])
+        bot = next(c for c in body["channels"] if c["channel"] == "wecom_aibot")
+        assert bot["configured"] is False and bot["source"] == "none"
+        assert bot["callback_url"] == ""  # 长连接无回调地址
         assert body["enc_key_source"] in ("env", "file")
     finally:
         store.close()

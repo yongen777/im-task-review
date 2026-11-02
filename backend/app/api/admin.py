@@ -1839,11 +1839,16 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         cfg_now = getattr(request.app.state, "config", None)
         db_all = cc.read_all()
         active = cc.read_active_channel() or (os.environ.get("IMT_CHANNEL", "").strip().lower() or "zdxlz")
+        enabled = cc.read_enabled_channels()
+        if enabled is None:
+            enabled = [active] if active in CHANNEL_SCHEMA else ["zdxlz"]
         source_kind, source_desc = key_source()
 
         channels = []
         any_configured = False
         for name, meta in CHANNEL_SCHEMA.items():
+            if meta.get("hidden"):
+                continue  # 2026-11-02 用户口径：自建应用通道已停用，不在后台展示
             db_payload = db_all.get(name) or {}
             env_payload = _env_fallback(cfg_now, name)
             if db_payload:
@@ -1864,12 +1869,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 "callback_url": build_callback_url(public_base_url, name),
                 "callback_path": meta["callback_path"],
                 "is_active": name == active,
+                "enabled": name in enabled,
             })
 
         return {
             "ok": True,
             "channels": channels,
             "active_channel": active,
+            "enabled_channels": enabled,
             "any_configured": any_configured,
             "public_base_url": public_base_url,
             "enc_key_source": source_kind,
@@ -1894,7 +1901,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         channel = str(body.get("channel") or "").strip().lower()
         payload = body.get("payload")
         if channel not in CHANNEL_SCHEMA:
-            return error_response(400, "VALIDATION_FAILED", "请选择要配置的通道（zdxlz / wecom）")
+            return error_response(400, "VALIDATION_FAILED", "请选择要配置的通道")
         if not isinstance(payload, dict):
             return error_response(400, "VALIDATION_FAILED", "payload 必须是对象")
 
@@ -1911,6 +1918,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if want_active:
             try:
                 cc.save_active_channel(channel, now_str=state.now_str())
+                # 兼容旧前端：勾选启用 = 加入多通道启用列表（不再覆盖其他通道）
+                current_enabled = cc.read_enabled_channels() or []
+                if channel not in current_enabled:
+                    cc.save_enabled_channels(current_enabled + [channel], now_str=state.now_str())
             except Exception:  # noqa: BLE001
                 logger.exception("记录启用通道失败")
 
@@ -1935,6 +1946,44 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             "channel": channel,
             "masked": masked_view(channel, merged),
             "is_active": want_active,
+            "restart_required": True,
+            "message": "重启服务后生效：systemctl restart imtask",
+        }
+
+    @router.post("/channel-config/enabled")
+    async def set_enabled_channels(request: Request):
+        """多通道启用开关（可多选）。与凭证保存分离：切开关不必重填凭证。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            body = await _read_json_body(request)
+        except Exception:  # noqa: BLE001
+            return error_response(400, "VALIDATION_FAILED", "请求体不是合法 JSON")
+        raw = body.get("channels")
+        if not isinstance(raw, list):
+            return error_response(400, "VALIDATION_FAILED", "channels 必须是数组")
+        cc = _channel_store()
+        try:
+            saved = cc.save_enabled_channels(raw, now_str=state.now_str())
+            if saved:
+                active = cc.read_active_channel()
+                if active not in saved:
+                    cc.save_active_channel(saved[0], now_str=state.now_str())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("保存多通道启用列表失败")
+            return error_response(500, "SAVE_FAILED", f"保存失败：{exc}")
+        try:
+            state.write_audit(
+                str(sess.get("username") or "admin"), "channel_config_enabled",
+                "channel", ",".join(saved) or "none", {"enabled_channels": saved},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("写审计日志失败（多通道启用）")
+        return {
+            "ok": True,
+            "enabled_channels": saved,
             "restart_required": True,
             "message": "重启服务后生效：systemctl restart imtask",
         }

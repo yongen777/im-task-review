@@ -103,7 +103,7 @@ def _mk_overdue(store: StateStore, *, hours_late: float = 2.0) -> Dict[str, Any]
     """建一个已逾期实例（用于验证「申请补交」分支）。"""
     rid = store.create_role("执行组", actor="t")["role_id"]
     store.add_role_member(rid, PHONE, "张三", "市场部", actor="t")
-    store.upsert_delivery_target(PHONE, USERID)  # 企微 userid 作为推送 ID
+    store.upsert_delivery_target(PHONE, USERID, platform="wecom")  # 企微 userid 作为推送 ID（绑定在 wecom 平台）
     tpl = store.create_template(
         {
             "name": "每日上报", "kind": "form", "role_ids": [rid], "text_tpl": "上报今日数据",

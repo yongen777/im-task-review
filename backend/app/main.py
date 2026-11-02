@@ -15,11 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api.admin import create_admin_router, register_admin_guard
-from .api.events import create_events_router
+from .api.events import create_events_router, handle_inbound_text
 from .api.wecom_callback import create_wecom_router
 from .api.h5 import create_h5_router
 from .channels.zdxlz import ZdxlzChannel
-from .channel_config import apply_db_channel_config
+from .channel_config import ChannelConfigStore, apply_db_channel_config
 from .config import Config, NowFn, default_now
 from .scheduler import NotifierProtocol, Scheduler, ZdxlzImageSender
 from .state import StateStore
@@ -120,39 +120,65 @@ def create_apps(
     if channel is None and state is None:
         cfg = apply_db_channel_config(cfg, store)
     chan = channel or ZdxlzChannel(cfg)
-    # 2026-10-30 通道可切：IMT_CHANNEL=wecom 时走企业微信自建应用（迁移目标），
-    # 默认仍是 zdxlz（量子密信），保证现有生产行为一个字都不变。
-    default_notifier: NotifierProtocol = chan
     _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
-    # 2026-10-30 通道隔离：投递绑定（谁用什么 ID 能收到）按通道分开存，
-    # store 读写默认跟着当前通道走；默认 zdxlz 时与历史行为完全一致。
-    #
-    # ⚠️ platform 映射（不是漏改）：企业微信**两条路线**——自建应用（wecom）与智能机器人（wecom_aibot）——
-    #    用的是同一套成员 userid 体系，所以绑定统一记在 'wecom' 下。
-    #    好处：先激活智能机器人，将来域名到位切自建应用时，绑定直接复用，员工不用重新激活。
-    store.platform = "wecom" if _channel in ("wecom", "wecom_aibot") else _channel
-    if _channel == "wecom":
-        # 企业微信自建应用（HTTP 主动推送 + 回调接收）：暂缓，等回调域名可用
-        from .channels.wecom import WecomNotifier
 
-        default_notifier = WecomNotifier(cfg)
-        logger.info("通道已切换为 企业微信自建应用（agentid=%s）", getattr(cfg, "wecom_agentid", ""))
-    elif _channel in ("wecom_aibot", "aibot"):
-        # 2026-10-30 当前路线：企业微信智能机器人（长连接）。
-        # 官方原文：长连接「无需域名或 IP 即可接收消息并返回结果」→ 绕开自建应用的回调域名+可信 IP 死锁。
-        # 收消息复用 handle_inbound_text（绑定/待归纳/申请补交/ack 同一套规则，⛔ 这里只做格式转换）。
-        from .api.events import handle_inbound_text
-        from .channels.wecom_aibot import WecomAibotNotifier
+    # 2026-11-02 多通道并行（用户拍板 B：双绑定双发）：
+    # 构建 platform -> notifier 注册表；enabled_channels 决定实际投递哪些平台。
+    # 单通道测试注入 notifier 时 registry 为空，Scheduler 退回旧逻辑，历史用例不受影响。
+    notifiers: dict = {}
+    if notifier is not None:
+        active_notifier: NotifierProtocol = notifier
+    else:
+        if chan.configured:
+            notifiers["zdxlz"] = chan
+        if cfg.wecom_bot_id.strip() and cfg.wecom_bot_secret.strip():
+            from .channels.wecom_aibot import WecomAibotNotifier
 
-        def _aibot_inbound(user_id: str, msg_text: str, send) -> None:
-            handle_inbound_text(state=store, user_id=user_id, msg_text=msg_text, send=send)
+            def _aibot_inbound(user_id: str, msg_text: str, send) -> None:
+                handle_inbound_text(
+                    state=store, user_id=user_id, msg_text=msg_text, send=send, platform="wecom"
+                )
 
-        default_notifier = WecomAibotNotifier(cfg, on_text=_aibot_inbound)
+            notifiers["wecom"] = WecomAibotNotifier(cfg, on_text=_aibot_inbound)
+            logger.info(
+                "企业微信智能机器人已装配（长连接 bot_id=%s；同一机器人只能一条连接）",
+                cfg.wecom_bot_id[:12],
+            )
+        # 旧自建应用仅保留 env 显式选择且没有 aibot 时的兼容路径（向导已移除该通道）。
+        if _channel == "wecom" and "wecom" not in notifiers and cfg.wecom_corpid.strip() and cfg.wecom_secret.strip():
+            from .channels.wecom import WecomNotifier
+
+            notifiers["wecom"] = WecomNotifier(cfg)
+            logger.info("企业微信自建应用已装配（agentid=%s）", cfg.wecom_agentid)
+
+        enabled_channels = None
+        try:
+            enabled_channels = ChannelConfigStore(store.conn, store.lock, cfg.data_dir).read_enabled_channels()
+        except Exception as exc:  # noqa: BLE001 - 配置读失败不拖垮启动
+            logger.warning("读取多通道启用列表失败，回退当前通道：%s", exc)
+        if enabled_channels is None:
+            enabled_channels = [_channel]
+        enabled_platforms = []
+        for ch in enabled_channels:
+            platform = "wecom" if ch in ("wecom", "wecom_aibot") else ch
+            if platform in notifiers and platform not in enabled_platforms:
+                enabled_platforms.append(platform)
+        if not enabled_platforms:
+            fallback = ["wecom"] if _channel in ("wecom", "wecom_aibot") else ["zdxlz"]
+            enabled_platforms = [p for p in fallback if p in notifiers]
+        if not enabled_platforms and notifiers:
+            enabled_platforms = list(notifiers.keys())
+        notifiers = {p: notifiers[p] for p in enabled_platforms}
+        active_platform = "wecom" if _channel in ("wecom", "wecom_aibot") else _channel
+        active_notifier = notifiers.get(active_platform) or (next(iter(notifiers.values())) if notifiers else chan)
         logger.info(
-            "通道已切换为 企业微信智能机器人（长连接 bot_id=%s；同一机器人只能一条连接）",
-            getattr(cfg, "wecom_bot_id", "")[:12],
+            "多通道投递已启用：%s（用户口径 B：双绑定双发，各通道独立幂等）",
+            ", ".join(enabled_platforms) if enabled_platforms else "无（回退默认通道）",
         )
-    active_notifier: NotifierProtocol = notifier if notifier is not None else default_notifier
+
+    # 投递绑定默认平台：保持旧行为（跟随当前通道），仅影响成员增改等历史路径；
+    # 实际发送/回调全部显式按平台路由，多通道下不依赖这个默认值。
+    store.platform = "wecom" if _channel in ("wecom", "wecom_aibot") else _channel
 
     # §16 P7：IMT_PUBLIC_BASE_URL 仍为 127.0.0.1/localhost 且通道已配置时，启动打 WARN
     if chan.configured and cfg.is_loopback_public_url:
@@ -171,6 +197,7 @@ def create_apps(
         notifier=active_notifier,
         now_fn=now_fn,
         image_sender=image_sender,
+        notifiers=notifiers,
     )
 
     public_app = FastAPI(title="IMTask Public Service", version="1.2.0")

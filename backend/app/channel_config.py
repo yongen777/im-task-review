@@ -55,6 +55,7 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
     },
     "wecom": {
         "label": "企业微信（自建应用）",
+        "hidden": True,  # 2026-11-02 用户口径：后台不再展示，已改用智能机器人；保留 schema 兼容旧配置/测试
         "callback_path": "/api/wecom/callback",
         "fields": [
             {"key": "corpid", "label": "企业 ID（corpid）", "required": True, "secret": True,
@@ -330,22 +331,19 @@ class ChannelConfigStore:
             self.conn.commit()
         return merged
 
-    # ── 当前启用通道（元数据行，不含凭证） ─────────────────────────
-    def read_active_channel(self) -> Optional[str]:
+    # ── 元数据行（不含凭证）：当前启用通道 + 多通道启用列表 ────────
+    def _read_meta(self) -> Dict[str, Any]:
         row = self._row(META_CHANNEL)
         if row is None:
-            return None
+            return {}
         try:
             data = decrypt_json(self.key, row["payload"], aad=META_CHANNEL)
+            return data if isinstance(data, dict) else {}
         except Exception:  # noqa: BLE001
-            return None
-        val = str(data.get("active_channel") or "").strip().lower()
-        return val if val in CHANNEL_SCHEMA else None
+            return {}
 
-    def save_active_channel(self, channel: str, *, now_str: str) -> None:
-        if channel not in CHANNEL_SCHEMA:
-            raise ValueError(f"不支持的通道：{channel}")
-        blob = encrypt_json(self.key, {"active_channel": channel}, aad=META_CHANNEL)
+    def _write_meta(self, meta: Dict[str, Any], *, now_str: str) -> None:
+        blob = encrypt_json(self.key, meta, aad=META_CHANNEL)
         with self.lock:
             self.conn.execute(
                 "INSERT INTO channel_config(channel, payload, updated_at) VALUES (?, ?, ?) "
@@ -354,6 +352,36 @@ class ChannelConfigStore:
                 (META_CHANNEL, blob, now_str),
             )
             self.conn.commit()
+
+    def read_active_channel(self) -> Optional[str]:
+        val = str(self._read_meta().get("active_channel") or "").strip().lower()
+        return val if val in CHANNEL_SCHEMA else None
+
+    def save_active_channel(self, channel: str, *, now_str: str) -> None:
+        if channel not in CHANNEL_SCHEMA:
+            raise ValueError(f"不支持的通道：{channel}")
+        meta = self._read_meta()
+        meta["active_channel"] = channel
+        self._write_meta(meta, now_str=now_str)
+
+    def read_enabled_channels(self) -> Optional[List[str]]:
+        """多通道启用列表；None = 从未配置过（调用方按旧逻辑回落）。"""
+        raw = self._read_meta().get("enabled_channels")
+        if not isinstance(raw, list):
+            return None
+        clean = [str(x).strip().lower() for x in raw]
+        return [x for x in clean if x in CHANNEL_SCHEMA]
+
+    def save_enabled_channels(self, channels: List[str], *, now_str: str) -> List[str]:
+        clean: List[str] = []
+        for x in channels or []:
+            key = str(x or "").strip().lower()
+            if key in CHANNEL_SCHEMA and key not in clean:
+                clean.append(key)
+        meta = self._read_meta()
+        meta["enabled_channels"] = clean
+        self._write_meta(meta, now_str=now_str)
+        return clean
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -437,6 +465,7 @@ def schema_for_api() -> List[Dict[str, Any]]:
             "fields": meta["fields"],
         }
         for name, meta in CHANNEL_SCHEMA.items()
+        if not meta.get("hidden")
     ]
 
 

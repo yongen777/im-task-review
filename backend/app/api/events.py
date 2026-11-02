@@ -132,6 +132,7 @@ def handle_inbound_text(
     msg_text: str,
     event_phone: str = "",
     send: Callable[[str, str], None],
+    platform: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
     """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
 
@@ -144,7 +145,7 @@ def handle_inbound_text(
     # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
     if event_phone:
         try:
-            res = state.bind_member_with_guardrails(phone=event_phone, external_id=user_id, path="A")
+            res = state.bind_member_with_guardrails(phone=event_phone, external_id=user_id, path="A", platform=platform or None)
             send(res["receipt"], f"bind_A_{event_phone}")
             return 200, {
                 "ok": True, "path": "A", "bound": True, "already_same": res.get("already_same", False),
@@ -165,7 +166,7 @@ def handle_inbound_text(
         rest = (msg_text or "")[:phone_hit.start()] + (msg_text or "")[phone_hit.end():]
         msg_name = re.sub(r"[\s,，、;；:：+＋|/\\-]+", "", rest).strip()[:20]
         masked = mask_phone(msg_phone)
-        existing = state.get_delivery_target(msg_phone)
+        existing = state.get_delivery_target(msg_phone, platform=platform or None)
         owner = str((existing or {}).get("external_id") or "") if existing else ""
         if existing and owner and owner != user_id:
             dup_text = "该手机号已被其他账号绑定，禁止覆盖；如非本人操作请联系管理员申诉。"
@@ -179,7 +180,7 @@ def handle_inbound_text(
                          "masked_phone": masked, "message": same_text}
         if not state.phone_in_roster(msg_phone):
             rec = state.upsert_pending_member(user_id, last_message=msg_text,
-                                              phone=msg_phone, name=msg_name or None)
+                                              phone=msg_phone, name=msg_name or None, platform=platform or None)
             who = (f"{msg_name}（{masked}）" if msg_name else f"手机号 {masked}")
             pending_text = (f"已登记{who}，已进入「已激活待归纳」名单。\n"
                             f"管理员为你分配业务角色后，即可接收任务提醒。")
@@ -188,7 +189,7 @@ def handle_inbound_text(
                          "masked_phone": masked, "name": msg_name, "pending_id": rec.get("id"),
                          "message": pending_text}
         try:
-            res = state.bind_member_with_guardrails(phone=msg_phone, external_id=user_id, path="B")
+            res = state.bind_member_with_guardrails(phone=msg_phone, external_id=user_id, path="B", platform=platform or None)
             send(res["receipt"], f"bind_B_{msg_phone}")
             return 200, {
                 "ok": True, "path": "B", "bound": True,
@@ -198,7 +199,7 @@ def handle_inbound_text(
             send(exc.message, f"bind_B_err_{msg_phone}")
             return exc.status_code, {"ok": False, "path": "B", "bound": False, "code": exc.code, "message": exc.message}
 
-    bound_member = state.touch_delivery_target_by_external_id(user_id)
+    bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
     if bound_member is not None:
         # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
         # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
@@ -240,7 +241,7 @@ def handle_inbound_text(
     # 用户无需发送手机号——发任意消息即被后台自动登记，管理员在「已激活待归纳角色人员」
     # 专栏中看到该用户后，手动将其移入对应角色分组（分配时填写手机号完成推送绑定）。
     try:
-        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100])
+        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100], platform=platform or None)
         pending_ack = (
             "【OPS任务调度助手】\n"
             "你好，会话已激活，但尚未完成身份绑定。\n"
@@ -356,6 +357,7 @@ def process_app_event(
     return handle_inbound_text(
         state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
+        platform="zdxlz",
     )
 
 
