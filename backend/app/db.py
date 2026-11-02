@@ -37,9 +37,11 @@ CREATE TABLE IF NOT EXISTS scope (
 
 CREATE TABLE IF NOT EXISTS role (
   role_id    TEXT PRIMARY KEY,
-  name       TEXT NOT NULL UNIQUE,
+  name       TEXT NOT NULL,
   note       TEXT,
-  created_at TEXT NOT NULL
+  platform   TEXT NOT NULL DEFAULT 'zdxlz',
+  created_at TEXT NOT NULL,
+  UNIQUE(platform, name)
 );
 
 CREATE TABLE IF NOT EXISTS member (
@@ -267,6 +269,37 @@ def _migrate_reminder_log_unique(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_role_platform(conn: sqlite3.Connection) -> None:
+    """2026-11-02 角色按办公软件隔离：role 表补 platform 列，唯一键由 name 改为 (platform, name)。
+
+    旧库是 name 单列 UNIQUE，SQLite 不能直接改约束，只能重建表；
+    历史角色全部属于量子密信（当时只有这一条通道），因此统一回填 'zdxlz'。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(role)").fetchall()}
+    if "platform" in cols:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE IF EXISTS role_new")
+        conn.execute(
+            "CREATE TABLE role_new ("
+            "role_id TEXT PRIMARY KEY, name TEXT NOT NULL, note TEXT, "
+            "platform TEXT NOT NULL DEFAULT 'zdxlz', created_at TEXT NOT NULL, "
+            "UNIQUE(platform, name))"
+        )
+        conn.execute(
+            "INSERT INTO role_new(role_id, name, note, platform, created_at) "
+            "SELECT role_id, name, note, 'zdxlz', created_at FROM role"
+        )
+        conn.execute("DROP TABLE role")
+        conn.execute("ALTER TABLE role_new RENAME TO role")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 class Database:
     """单文件 SQLite 连接管理（开启 WAL，配合线程级可重入锁串行写入）。"""
 
@@ -314,6 +347,8 @@ class Database:
             _ensure_column(self.conn, "task_instance", "resubmit_status", "TEXT")
             _ensure_column(self.conn, "task_instance", "resubmit_decided_by", "TEXT")
             _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
+            # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
+            _migrate_role_platform(self.conn)
 
             now_str = self._now_str_fn()
             row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()

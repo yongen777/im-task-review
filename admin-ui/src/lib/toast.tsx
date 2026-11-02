@@ -72,10 +72,10 @@ const ERROR_CODE_DICT: Record<string, string> = {
   RATE_LIMITED: '连续输错密码次数过多，账号已被临时保护锁定，请稍后再试。',
 
   // 通道与催办结果相关
-  NO_TARGET: '该手机号尚未在量子密信中完成身份激活绑定，系统暂无法向其推送单聊消息。',
-  NEED_ACTIVATE: '员工尚未给机器人发送过消息激活会话（平台返回 500），需引导员工在密信中向机器人发任意消息完成激活。',
-  CHANNEL_NOT_CONFIGURED: '量子密信通道（AppID / AppSecret）尚未配置，当前处于本地演练模式，未实际发出外部消息。',
-  HTTP_TIMEOUT: '请求量子密信网关超时，系统将按退避策略（30秒 / 2分钟 / 5分钟）自动重试。',
+  NO_TARGET: '该手机号尚未在当前办公软件中完成身份激活绑定，系统暂无法向其推送单聊消息。',
+  NEED_ACTIVATE: '员工尚未给机器人发送过消息激活会话（平台返回 500），需引导员工在当前办公软件中向机器人发任意消息完成激活。',
+  CHANNEL_NOT_CONFIGURED: '当前办公软件通道尚未配置，当前处于本地演练模式，未实际发出外部消息。',
+  HTTP_TIMEOUT: '请求办公软件网关超时，系统将按退避策略（30秒 / 2分钟 / 5分钟）自动重试。',
 };
 
 export function humanizeMessage(raw: unknown, fallback = '操作未成功，请稍后重试'): string {
@@ -140,13 +140,13 @@ export function humanizeMessage(raw: unknown, fallback = '操作未成功，请�
  */
 export function humanizeReminderLogError(result: string, error: string | null): string {
   if (result === 'sent') {
-    return '已成功通过量子密信下发提醒消息';
+    return '已成功通过当前办公软件下发提醒消息';
   }
   if (result === 'no_target') {
-    return '未发送：该成员手机号尚未在密信中激活绑定（无 external_id）';
+    return '未发送：该成员手机号尚未在当前办公软件中激活绑定（无 external_id）';
   }
   if (result === 'need_activate') {
-    return '需重新激活：密信接口返回 500，员工需在密信向机器人发任意消息恢复会话';
+    return '需重新激活：办公软件接口返回 500，员工需在办公软件向机器人发任意消息恢复会话';
   }
   if (!error) {
     return result === 'failed' ? '发送失败：通道返回异常，系统将自动退避重试' : '—';

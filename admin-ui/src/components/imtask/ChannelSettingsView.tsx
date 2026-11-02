@@ -40,11 +40,13 @@ interface ChannelStatus {
   callback_url: string;
   callback_path: string;
   is_active: boolean;
+  enabled: boolean;
 }
 
 interface ChannelConfigResp {
   channels: ChannelStatus[];
   active_channel: string;
+  enabled_channels: string[];
   any_configured: boolean;
   public_base_url: string;
   enc_key_source: string;
@@ -87,9 +89,6 @@ const ChannelSettingsView: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; detail: string } | null>(null);
   const [savedHint, setSavedHint] = useState<string | null>(null);
-  /* 是否把这条通道设为「启用通道」。默认不勾 —— 否则「只是先存个备用的企微凭证」
-     会在重启后把在跑的通道换掉，等于静默改线上行为。 */
-  const [setActive, setSetActive] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -100,7 +99,12 @@ const ChannelSettingsView: React.FC = () => {
       const data = (await res.json()) as ChannelConfigResp & { ok?: boolean; message?: string };
       if (!res.ok || data?.ok === false) throw new Error(data?.message || `HTTP_${res.status}`);
       setState(data);
-      setPicked((prev) => prev || data.channels[0]?.channel || '');
+      // 多通道：默认选中「当前启用平台」（active_channel）；没有则选已启用列表第一个，再退第一个。
+      setPicked((prev) => prev
+        || (data.channels.some((c) => c.channel === data.active_channel) ? data.active_channel : '')
+        || data.enabled_channels?.[0]
+        || data.channels[0]?.channel
+        || '');
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : '读取通道配置失败');
     } finally {
@@ -164,7 +168,7 @@ const ChannelSettingsView: React.FC = () => {
     try {
       const { status, data } = await postJson<{ ok: boolean; message?: string; masked?: Record<string, string> }>(
         '/api/admin/channel-config',
-        { channel: current.channel, payload: form, set_active: setActive },
+        { channel: current.channel, payload: form },
       );
       if (status === 401) throw new Error('登录已过期，请重新登录');
       if (status >= 400 || data?.ok === false) {
@@ -178,6 +182,25 @@ const ChannelSettingsView: React.FC = () => {
       toast.error(err instanceof Error ? err.message : '保存失败');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const toggleEnabled = async (channel: string) => {
+    const currentEnabled = state?.enabled_channels || [];
+    const next = currentEnabled.includes(channel)
+      ? currentEnabled.filter((x) => x !== channel)
+      : [...currentEnabled, channel];
+    try {
+      const { status, data } = await postJson<{ ok: boolean; message?: string; enabled_channels?: string[] }>(
+        '/api/admin/channel-config/enabled',
+        { channels: next },
+      );
+      if (status === 401) throw new Error('登录已过期，请重新登录');
+      if (status >= 400 || data?.ok === false) throw new Error((data as any)?.message || `HTTP_${status}`);
+      toast.success('通道启用状态已更新，重启服务后生效', '已保存');
+      await load();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '切换通道启用状态失败');
     }
   };
 
@@ -271,23 +294,39 @@ const ChannelSettingsView: React.FC = () => {
             }`}
           >
             <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="font-bold text-sm text-slate-900 truncate">{c.label}</span>
-                {c.is_active && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-blue-50 text-blue-600 border border-blue-200/70 font-semibold">
-                    当前启用
-                  </span>
-                )}
+              <span className="font-bold text-sm text-slate-900 truncate min-w-0">{c.label}</span>
+              {/* 2026-11-02：多通道并行后不再有唯一「当前启用」，统一按通道自身状态展示 已配置/已启用 标签，两者对齐。 */}
+              <div className="flex items-center gap-1.5 shrink-0">
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded-md font-semibold ${
+                    c.enabled
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200/70'
+                      : 'bg-slate-100 text-slate-500 border border-slate-200'
+                  }`}
+                >
+                  {c.enabled ? '已启用' : '已停用'}
+                </span>
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-md font-semibold ${
+                    c.configured
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : 'bg-slate-100 text-slate-500 border border-slate-200'
+                  }`}
+                >
+                  {c.configured ? '已配置' : '未配置'}
+                </span>
+                <button
+                  onClick={() => void toggleEnabled(c.channel)}
+                  className={`text-[10px] px-2 py-0.5 rounded-md font-semibold border cursor-pointer ${
+                    c.enabled
+                      ? 'bg-rose-50 text-rose-600 border-rose-200 hover:bg-rose-100'
+                      : 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+                  }`}
+                  title={c.enabled ? '停用该通道（重启后生效）' : '启用该通道（重启后生效，可多选）'}
+                >
+                  {c.enabled ? '停用' : '启用'}
+                </button>
               </div>
-              <span
-                className={`text-[10px] px-2 py-0.5 rounded-md font-semibold ${
-                  c.configured
-                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                    : 'bg-slate-100 text-slate-500 border border-slate-200'
-                }`}
-              >
-                {c.configured ? '已配置' : '未配置'}
-              </span>
             </div>
 
             <div className="mt-1 text-[11px] text-slate-500">
@@ -443,15 +482,9 @@ const ChannelSettingsView: React.FC = () => {
           </span>
         </div>
 
-        <label className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-600 cursor-pointer select-none">
-          <input
-            type="checkbox"
-            checked={setActive}
-            onChange={(e) => setSetActive(e.target.checked)}
-            className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-0 cursor-pointer"
-          />
-          重启后使用该通道发送消息（不勾选则只保存凭证，不改变当前启用的通道）
-        </label>
+        <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500">
+          <span>多通道启用开关在每张通道卡上操作，可同时启用多个；重启服务后生效。</span>
+        </div>
       </div>
     </div>
   );

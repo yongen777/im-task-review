@@ -305,11 +305,12 @@ def _instance_filter_sql(
         where.append("(i.name_snap LIKE ? OR i.phone LIKE ? OR COALESCE(i.dept_snap, '') LIKE ?)")
         params.extend([kw, kw, kw])
 
-    # 2026-11-02 多通道面板：按所选办公软件过滤——只保留在该平台有可用绑定的人员实例。
+    # 2026-11-02 多通道面板：任务归属平台 = 模板所选角色所属平台（角色已按办公软件隔离）。
+    # 不再按「成员在该平台有绑定」判断——否则同一个人两边都绑定时，密信任务会串到企微面板。
     plat = (platform or "").strip().lower()
     if plat:
         where.append(
-            "EXISTS (SELECT 1 FROM delivery_target dt WHERE dt.platform = ? AND dt.phone = i.phone AND dt.usable = 1)"
+            "EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)"
         )
         params.append(plat)
 
@@ -644,6 +645,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         enabled: Optional[str] = None,
         page: int = 1,
         size: int = 20,
+        platform: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -652,7 +654,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
 
         enabled_bool = _parse_optional_bool(enabled)
         res = state.list_templates(
-            q=q, kind=kind, enabled=enabled_bool, page=page, size=size
+            q=q, kind=kind, enabled=enabled_bool, page=page, size=size, platform=platform
         )
         return {"ok": True, "total": res["total"], "items": res["items"]}
 
@@ -793,13 +795,13 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # §9.3 角色与成员接口
     # ==================================================================
     @router.get("/roles")
-    async def list_roles(request: Request):
+    async def list_roles(request: Request, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
         assert sess is not None
 
-        items = state.list_roles()
+        items = state.list_roles(platform=platform)
         return {"ok": True, "items": items}
 
     @router.post("/roles")
@@ -815,6 +817,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 name=str(body.get("name") or ""),
                 note=body.get("note"),
                 actor=sess["username"],
+                platform=str(body.get("platform") or "zdxlz"),
             )
         except BizError as exc:
             return biz_error_response(exc)
@@ -1060,6 +1063,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         q: Optional[str] = None,
         page: int = 1,
         size: int = 20,
+        platform: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -1067,7 +1071,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         try:
-            res = state.list_role_members(role_id=role_id, q=q, page=page, size=size)
+            res = state.list_role_members(role_id=role_id, q=q, page=page, size=size, platform=platform)
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "total": res["total"], "items": res["items"]}
@@ -1331,8 +1335,9 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         plat_sql = ""
         plat_params: List[Any] = []
         if (platform or "").strip():
-            plat_sql = ("AND EXISTS (SELECT 1 FROM delivery_target dt WHERE dt.platform = ? "
-                        "AND dt.phone = i.phone AND dt.usable = 1) ")
+            # 2026-11-02：审核待办按任务归属平台（模板角色平台）过滤，不再按成员绑定。
+            plat_sql = ("AND EXISTS (SELECT 1 FROM role r WHERE r.platform = ? "
+                        "AND instr(t.role_ids, r.role_id) > 0) ")
             plat_params = [platform.strip().lower()]
         base = (
             # name_snap 是实例表列名，前端统一叫 member_name_snap，这里直接给别名省一层换算

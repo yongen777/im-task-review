@@ -27,7 +27,7 @@ import { useToast } from '../../lib/toast';
 import { RoleItem, RoleMemberItem, UnactivatedMemberItem } from '../../lib/types';
 
 export const RolesMembersView: React.FC = () => {
-  const { roles, refreshRoles } = useAppStore();
+  const { roles, refreshRoles, platform } = useAppStore();
   const toast = useToast();
 
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
@@ -79,18 +79,13 @@ export const RolesMembersView: React.FC = () => {
   const [csvText, setCsvText] = useState('13900000000,张三');
   const [importing, setImporting] = useState(false);
 
+  // 2026-11-02：批量归纳目标跟随当前选中的角色分组（用户指令）。
+  // 手动改下拉时保持用户选择，直到切换到别的角色卡再重置。
   useEffect(() => {
-    if (!selectedRoleId && roles.length > 0) {
-      setSelectedRoleId(roles[0].role_id);
-    } else if (selectedRoleId && !roles.some((r) => r.role_id === selectedRoleId)) {
-      setSelectedRoleId(roles[0]?.role_id || '');
+    if (selectedRoleId && roles.some((r) => r.role_id === selectedRoleId)) {
+      setBatchTargetRoleId(selectedRoleId);
     }
-    if (!batchTargetRoleId && roles.length > 0) {
-      setBatchTargetRoleId(roles[0].role_id);
-    } else if (batchTargetRoleId && !roles.some((r) => r.role_id === batchTargetRoleId)) {
-      setBatchTargetRoleId(roles[0]?.role_id || '');
-    }
-  }, [roles, selectedRoleId, batchTargetRoleId]);
+  }, [selectedRoleId, roles]);
 
   const loadMembers = useCallback(
     async (roleId: string) => {
@@ -101,7 +96,7 @@ export const RolesMembersView: React.FC = () => {
       setLoadingMembers(true);
       try {
         const res = await api.get<{ ok: boolean; items: RoleMemberItem[] }>(
-          `/api/admin/roles/${encodeURIComponent(roleId)}/members`,
+          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}`,
         );
         setMembers(res.items || []);
       } catch (err) {
@@ -110,14 +105,14 @@ export const RolesMembersView: React.FC = () => {
         setLoadingMembers(false);
       }
     },
-    [toast],
+    [toast, platform],
   );
 
   const loadUnactivated = useCallback(async () => {
     setLoadingUnactivated(true);
     try {
       const res = await api.get<{ ok: boolean; items: UnactivatedMemberItem[] }>(
-        '/api/admin/unactivated-members',
+        `/api/admin/unactivated-members?platform=${encodeURIComponent(platform)}`,
       );
       setUnactivatedList(res.items || []);
     } catch (err) {
@@ -125,7 +120,7 @@ export const RolesMembersView: React.FC = () => {
     } finally {
       setLoadingUnactivated(false);
     }
-  }, [toast]);
+  }, [toast, platform]);
 
   useEffect(() => {
     loadUnactivated();
@@ -167,6 +162,17 @@ export const RolesMembersView: React.FC = () => {
      统一用 external_id 优先、phone 兜底的稳定标识。 */
   const rowKeyOf = (p: { external_id?: string; phone?: string }): string =>
     String(p.external_id || p.phone || '');
+
+  // 2026-11-02：平台事件通常只下发 userId，不下发姓名/手机号。
+  // 没有名字时给可辨识的占位（平台 + ID 尾号），手机号未知时明确标注，避免管理员分不清是谁。
+  const displayName = (p: { name?: string; external_id?: string; phone?: string }): string => {
+    const n = (p.name || '').trim();
+    if (n) return n;
+    const tail = (p.external_id || '').slice(-4) || (p.phone || '').slice(-4) || '-';
+    return `未命名用户（ID尾号 ${tail}）`;
+  };
+  const displayPhone = (p: { phone?: string }): string =>
+    (p.phone || '').trim() || '未知（待用户提供绑定）';
 
   const getRowTargetRole = (rowKey: string): string => {
     const chosen = rowTargetRoleMap[rowKey];
@@ -269,7 +275,7 @@ export const RolesMembersView: React.FC = () => {
       setConfirmUnbindPerson(null);
       await loadUnactivated();
       toast.success(
-        `已解除「${person.name}」(${person.phone}) 的量子密信会话绑定并从待归纳列表移除。该用户需在密信对话窗口重新输入激活信息后方可再次激活。`,
+        `已解除「${displayName(person)}」(${displayPhone(person)}) 的当前办公软件会话绑定并从待归纳列表移除。该用户需在该办公软件对话窗口重新输入激活信息后方可再次激活。`,
         '已解除会话绑定',
       );
     } catch (err) {
@@ -303,6 +309,7 @@ export const RolesMembersView: React.FC = () => {
         const res = await api.post<{ ok: boolean; role_id: string }>('/api/admin/roles', {
           role_name: roleNameInput.trim(),
           description: '',
+          platform,
         });
         await refreshRoles();
         if (res.role_id) {
@@ -766,7 +773,7 @@ export const RolesMembersView: React.FC = () => {
                     <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
                       <th className="py-3 pl-5 pr-3">成员姓名</th>
                       <th className="py-3 px-3">手机号码</th>
-                      <th className="py-3 px-3">密信激活状态</th>
+                      <th className="py-3 px-3">激活状态</th>
                       <th className="py-3 px-3">派单状态</th>
                       <th className="py-3 pl-3 pr-5 text-right">操作</th>
                     </tr>
@@ -802,21 +809,26 @@ export const RolesMembersView: React.FC = () => {
                             {m.phone}
                           </td>
                           <td className="py-3.5 px-3">
-                            {m.activation === 'activated' ? (
-                              <span
-                                className={`inline-flex items-center gap-1.5 text-xs font-medium ${
-                                  m.usable === false ? 'text-amber-700' : 'text-emerald-700'
-                                }`}
-                              >
-                                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                <span>{m.usable === false ? '需重激活' : '已激活'}</span>
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
-                                <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                                <span>未激活</span>
-                              </span>
-                            )}
+                            {(() => {
+                              const on = m.activations
+                                ? m.activations[platform]
+                                : m.activation === 'activated';
+                              return on ? (
+                                <span
+                                  className={`inline-flex items-center gap-1.5 text-xs font-medium ${
+                                    m.usable === false ? 'text-amber-700' : 'text-emerald-700'
+                                  }`}
+                                >
+                                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                  <span>{m.usable === false ? '需重激活' : '已激活'}</span>
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+                                  <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                                  <span>未激活</span>
+                                </span>
+                              );
+                            })()}
                           </td>
                           <td className="py-3.5 px-3">
                             <button
@@ -976,7 +988,7 @@ export const RolesMembersView: React.FC = () => {
                 <p className="text-xs text-slate-400">
                   {unactivatedKeyword.trim()
                     ? '请尝试更换姓名或手机号关键词重新搜索。'
-                    : '员工在量子密信对话窗口发送激活指令后将自动进入本列表。'}
+                    : '员工在当前办公软件对话窗口发送激活指令后将自动进入本列表。'}
                 </p>
               </div>
             ) : (
@@ -993,19 +1005,19 @@ export const RolesMembersView: React.FC = () => {
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-700 font-bold text-xs flex items-center justify-center shrink-0">
-                          {person.name.slice(0, 1)}
+                          {displayName(person).slice(0, 1)}
                         </div>
                         <div>
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-bold text-slate-900 text-sm break-all">
-                              {person.name}
+                              {displayName(person)}
                             </span>
                             <span className="font-mono text-slate-600 font-semibold tabular-nums">
-                              {person.phone}
+                              {displayPhone(person)}
                             </span>
                           </div>
                           <div className="text-[11px] text-slate-400 mt-0.5">
-                            {person.source_note || '已在量子密信对话激活 · 待管理员归纳角色'}
+                            {person.source_note || '已在当前办公软件对话激活 · 待管理员归纳角色'}
                           </div>
                         </div>
                       </div>
@@ -1027,7 +1039,7 @@ export const RolesMembersView: React.FC = () => {
                               [rowKey]: e.target.value,
                             }))
                           }
-                          aria-label={`选择 ${person.name} 的目标角色分组`}
+                          aria-label={`选择 ${displayName(person)} 的目标角色分组`}
                           className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-700 outline-none focus:bg-white focus:border-blue-500 flex-1 min-w-0"
                         >
                           {roles.map((r) => (
@@ -1051,7 +1063,7 @@ export const RolesMembersView: React.FC = () => {
                         type="button"
                         onClick={() => setConfirmUnbindPerson(person)}
                         className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors"
-                        title="解除该用户的量子密信会话绑定并从列表移除（需用户重新发送对话指令激活）"
+                        title="解除该用户的当前办公软件会话绑定并从列表移除（需用户重新发送对话指令激活）"
                       >
                         <Link2Off className="w-3.5 h-3.5" />
                         <span>移除</span>
@@ -1067,7 +1079,7 @@ export const RolesMembersView: React.FC = () => {
           <div className="px-4 sm:px-5 py-3 bg-slate-50/80 border-t border-slate-100 flex items-start gap-2 text-[11px] text-slate-500">
             <MessageSquare className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
             <span>
-              说明：用户激活仅能通过「量子密信」对话窗口向机器人发送激活指令自动绑定会话，不支持后台人工登记未绑定会话人员。
+              说明：用户激活仅能通过「当前办公软件」对话窗口向机器人发送激活指令自动绑定会话，不支持后台人工登记未绑定会话人员。
             </span>
           </div>
         </div>
@@ -1112,7 +1124,7 @@ export const RolesMembersView: React.FC = () => {
               <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200/80 text-amber-900 space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
                   <ShieldCheck className="w-4 h-4 text-amber-700 shrink-0" />
-                  <span>保留量子密信会话绑定 · 转入待归纳列表</span>
+                  <span>保留当前办公软件会话绑定 · 转入待归纳列表</span>
                 </div>
                 <p className="text-[11px] text-amber-800">
                   该操作不会解除用户的密信会话绑定，系统会将其移至右侧「已激活待归纳角色人员」列表中，您可随时将其重新一键归入其他业务角色，无需员工重新输入激活。
@@ -1178,10 +1190,10 @@ export const RolesMembersView: React.FC = () => {
               <div className="p-3 rounded-xl bg-rose-50/80 border border-rose-200/80 text-rose-900 space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
                   <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
-                  <span>将清除该用户的量子密信会话绑定</span>
+                  <span>将清除该用户的当前办公软件会话绑定</span>
                 </div>
                 <p className="text-[11px] text-rose-800">
-                  移除后，该用户的密信会话绑定（{confirmUnbindPerson.external_id || `zdxlz_${confirmUnbindPerson.phone}`}）将被彻底解除。后续该用户只有在「量子密信」对话窗口重新输入发送激活信息，完成会话绑定后才会再次出现在本列表。
+                  移除后，该用户在当前办公软件的会话绑定将被彻底解除。后续该用户只有在「当前办公软件」对话窗口重新输入发送激活信息，完成会话绑定后才会再次出现在本列表。
                 </p>
               </div>
             </div>

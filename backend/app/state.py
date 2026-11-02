@@ -434,6 +434,8 @@ class StateStore:
 
             masked = mask_phone(clean_phone)
             receipt = f"绑定成功：当前账号已关联手机号 {masked}。如非本人操作，请立即联系管理员申诉处理。"
+            # 2026-11-02：绑定成功后清掉同通道的待归纳记录，避免已激活的人还挂在待归纳列表里。
+            self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_ext,))
             self._insert_audit_unlocked("system", f"target.bind_{path_code.lower()}", "delivery_target", clean_phone, {"masked_phone": masked, "external_id": clean_ext, "path": path_code}, now_s)
             return {"ok": True, "already_same": False, "phone": clean_phone, "masked_phone": masked, "external_id": clean_ext, "receipt": receipt}
 
@@ -495,31 +497,36 @@ class StateStore:
             if not self.conn.execute(f"SELECT 1 FROM {table} WHERE {id_col} = ?", (candidate,)).fetchone():
                 return candidate
 
-    def list_roles(self) -> List[Dict[str, Any]]:
+    def list_roles(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        plat = (platform or "").strip().lower()
+        where_sql, params = ("WHERE r.platform = ?", [plat]) if plat else ("", [])
         with self.lock:
             rows = self.conn.execute(
-                "SELECT r.role_id, r.name, r.note, r.created_at, COUNT(m.id) AS member_count "
-                "FROM role r LEFT JOIN member m ON m.role_id = r.role_id GROUP BY r.role_id ORDER BY r.created_at ASC, r.role_id ASC"
+                "SELECT r.role_id, r.name, r.note, r.platform, r.created_at, COUNT(m.id) AS member_count "
+                f"FROM role r LEFT JOIN member m ON m.role_id = r.role_id {where_sql} "
+                "GROUP BY r.role_id ORDER BY r.created_at ASC, r.role_id ASC",
+                tuple(params),
             ).fetchall()
-            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "created_at": r["created_at"], "member_count": int(r["member_count"] or 0)} for r in rows]
+            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "member_count": int(r["member_count"] or 0)} for r in rows]
 
     def get_role(self, role_id: str) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT r.*, (SELECT COUNT(1) FROM member m WHERE m.role_id = r.role_id) AS member_count FROM role r WHERE r.role_id = ?", ((role_id or "").strip(),)).fetchone()
-            return {"role_id": row["role_id"], "name": row["name"], "note": row["note"], "created_at": row["created_at"], "member_count": int(row["member_count"] or 0)} if row else None
+            return {"role_id": row["role_id"], "name": row["name"], "note": row["note"], "platform": row["platform"], "created_at": row["created_at"], "member_count": int(row["member_count"] or 0)} if row else None
 
-    def create_role(self, name: str, note: Optional[str] = None, actor: str = "system") -> Dict[str, Any]:
+    def create_role(self, name: str, note: Optional[str] = None, actor: str = "system", platform: str = "zdxlz") -> Dict[str, Any]:
         clean_name = (name or "").strip()
+        plat = self._plat(platform)
         if not clean_name:
             raise BizError(400, "VALIDATION_FAILED", "角色名称不能为空")
         clean_note, now_s = (str(note).strip() if note is not None and str(note).strip() else None), self.now_str()
         with self.lock, self.conn:
-            if self.conn.execute("SELECT 1 FROM role WHERE name = ?", (clean_name,)).fetchone():
-                raise BizError(409, "ROLE_NAME_TAKEN", "角色名称已存在")
+            if self.conn.execute("SELECT 1 FROM role WHERE name = ? AND platform = ?", (clean_name, plat)).fetchone():
+                raise BizError(409, "ROLE_NAME_TAKEN", "该办公软件下角色名称已存在")
             role_id = self._generate_unique_id_unlocked("role", "role_id", "r_")
-            self.conn.execute("INSERT INTO role(role_id, name, note, created_at) VALUES (?, ?, ?, ?)", (role_id, clean_name, clean_note, now_s))
-            self._insert_audit_unlocked(actor, "role.create", "role", role_id, {"name": clean_name, "note": clean_note}, now_s)
-            return {"role_id": role_id, "name": clean_name, "note": clean_note, "created_at": now_s, "member_count": 0}
+            self.conn.execute("INSERT INTO role(role_id, name, note, platform, created_at) VALUES (?, ?, ?, ?, ?)", (role_id, clean_name, clean_note, plat, now_s))
+            self._insert_audit_unlocked(actor, "role.create", "role", role_id, {"name": clean_name, "note": clean_note, "platform": plat}, now_s)
+            return {"role_id": role_id, "name": clean_name, "note": clean_note, "platform": plat, "created_at": now_s, "member_count": 0}
 
     def update_role(self, role_id: str, name: str, note: Optional[str] = None, actor: str = "system") -> Dict[str, Any]:
         clean_id, clean_name = (role_id or "").strip(), (name or "").strip()
@@ -530,12 +537,12 @@ class StateStore:
             existing = self.conn.execute("SELECT * FROM role WHERE role_id = ?", (clean_id,)).fetchone()
             if not existing:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
-            if self.conn.execute("SELECT 1 FROM role WHERE name = ? AND role_id != ?", (clean_name, clean_id)).fetchone():
-                raise BizError(409, "ROLE_NAME_TAKEN", "角色名称已存在")
+            if self.conn.execute("SELECT 1 FROM role WHERE name = ? AND platform = ? AND role_id != ?", (clean_name, existing["platform"], clean_id)).fetchone():
+                raise BizError(409, "ROLE_NAME_TAKEN", "该办公软件下角色名称已存在")
             self.conn.execute("UPDATE role SET name = ?, note = ? WHERE role_id = ?", (clean_name, clean_note, clean_id))
             cnt = int(self.conn.execute("SELECT COUNT(1) AS cnt FROM member WHERE role_id = ?", (clean_id,)).fetchone()["cnt"] or 0)
             self._insert_audit_unlocked(actor, "role.update", "role", clean_id, {"name": clean_name, "note": clean_note}, now_s)
-            return {"role_id": clean_id, "name": clean_name, "note": clean_note, "created_at": existing["created_at"], "member_count": cnt}
+            return {"role_id": clean_id, "name": clean_name, "note": clean_note, "platform": existing["platform"], "created_at": existing["created_at"], "member_count": cnt}
 
     def delete_role(self, role_id: str, actor: str = "system") -> None:
         clean_id, now_s = (role_id or "").strip(), self.now_str()
@@ -555,8 +562,9 @@ class StateStore:
             self.conn.execute("DELETE FROM role WHERE role_id = ?", (clean_id,))
             self._insert_audit_unlocked(actor, "role.delete", "role", clean_id, {"name": existing["name"]}, now_s)
 
-    def list_role_members(self, role_id: str, q: Optional[str] = None, page: int = 1, size: int = 20) -> Dict[str, Any]:
+    def list_role_members(self, role_id: str, q: Optional[str] = None, page: int = 1, size: int = 20, platform: Optional[str] = None) -> Dict[str, Any]:
         clean_role_id = (role_id or "").strip()
+        plat = self._plat(platform)
         p, s = _clamp_page_size(page, size)
         offset, kw = (p - 1) * s, (q or "").strip()
         with self.lock:
@@ -582,7 +590,7 @@ class StateStore:
                     "zdxlz": bool(r["ext_zdxlz"]),
                     "wecom": bool(r["ext_wecom"]),
                 }
-                activated = act.get(self.platform, act["zdxlz"] or act["wecom"])
+                activated = act.get(plat, act["zdxlz"] or act["wecom"])
                 items.append(_fmt_member(
                     r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"],
                     r["source"], r["created_at"], activated, activations=act,
@@ -808,6 +816,13 @@ class StateStore:
         if missing_roles:
             raise BizError(400, "VALIDATION_FAILED", f"关联角色不存在: {', '.join(missing_roles)}")
 
+        # 2026-11-02 角色按办公软件隔离：一个任务模板只能挂在同一办公软件的角色上，
+        # 否则任务归属会同时出现在两个面板，调度也不知道该按哪边的名册建实例。
+        plat_rows = self.conn.execute(f"SELECT role_id, platform FROM role WHERE role_id IN ({placeholders})", tuple(role_ids)).fetchall()
+        role_plats = {str(r["platform"]) for r in plat_rows}
+        if len(role_plats) > 1:
+            raise BizError(400, "VALIDATION_FAILED", "同一任务模板只能选择同一办公软件下的角色")
+
         text_tpl = str(merged.get("text_tpl") or "").strip()
         if not text_tpl:
             raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
@@ -1028,23 +1043,30 @@ class StateStore:
             row = self.conn.execute(sql, ((template_id or "").strip(),)).fetchone()
             return self._deserialize_template_row(row) if row else None
 
-    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20) -> Dict[str, Any]:
+    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20, platform: Optional[str] = None) -> Dict[str, Any]:
         p, s = _clamp_page_size(page, size)
         offset = (p - 1) * s
-        where_clauses, params = ["deleted = 0"], []
+        where_clauses, params = ["t.deleted = 0"], []
         if q and q.strip():
-            where_clauses.append("name LIKE ?")
+            where_clauses.append("t.name LIKE ?")
             params.append(f"%{q.strip()}%")
         if kind and kind.strip():
-            where_clauses.append("kind = ?")
+            where_clauses.append("t.kind = ?")
             params.append(kind.strip())
         if enabled is not None:
-            where_clauses.append("enabled = ?")
+            where_clauses.append("t.enabled = ?")
             params.append(1 if enabled else 0)
+        plat = (platform or "").strip().lower()
+        if plat:
+            # 任务归属平台 = 模板所选角色所属平台（角色已按平台隔离）
+            where_clauses.append(
+                "EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)"
+            )
+            params.append(plat)
         where_sql = "WHERE " + " AND ".join(where_clauses)
         with self.lock:
-            total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM task_template {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
-            rows = self.conn.execute(f"SELECT * FROM task_template {where_sql} ORDER BY created_at DESC, template_id DESC LIMIT ? OFFSET ?", tuple(params + [s, offset])).fetchall()
+            total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM task_template t {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
+            rows = self.conn.execute(f"SELECT t.* FROM task_template t {where_sql} ORDER BY t.created_at DESC, t.template_id DESC LIMIT ? OFFSET ?", tuple(params + [s, offset])).fetchall()
             return {"total": total, "items": [self._deserialize_template_row(r) for r in rows]}
 
     def update_template(self, template_id: str, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
@@ -1199,6 +1221,13 @@ class StateStore:
             if not row:
                 raise BizError(404, "NOT_FOUND", "待归纳人员不存在")
             d = dict(row)
+            # 2026-11-02 角色按办公软件隔离：只能移入同平台的名称，避免把密信的人放进企微角色。
+            role_row = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", ((role_id or "").strip(),)).fetchone()
+            if not role_row:
+                raise BizError(404, "NOT_FOUND", "角色不存在")
+            pending_plat = str(d.get("platform") or "").strip().lower()
+            if pending_plat and pending_plat != str(role_row["platform"]).strip().lower():
+                raise BizError(400, "PLATFORM_MISMATCH", "该人员来自其他办公软件，不能移入当前平台的角色")
             # 添加到角色成员
             self.add_role_member(role_id=role_id, phone=clean_phone, name=name or d.get("name") or clean_phone[-4:], dept=dept or "", actor=actor)
             # 绑定 delivery_target（使其可接收推送）：绑定到该人员来源通道，
@@ -1214,13 +1243,15 @@ class StateStore:
         clean_id = (external_id or "").strip()
         now_s = self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT id FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
+            row = self.conn.execute("SELECT id, platform FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "待归纳人员不存在")
             self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
             # 2026-10-29 P0-4：移除待归纳的人，其推送绑定也要置为不可用，
             # 否则绑定仍在，调度器照样往一个“已被移除”的人发任务。
-            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (self.platform, clean_id))
+            # 2026-11-02 修正：按该条记录的来源通道置位，不能用全局 self.platform，
+            # 否则移除企微待归纳人员会把他的密信绑定一起停掉。
+            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (row["platform"] or self.platform, clean_id))
             self._insert_audit_unlocked(actor, "pending_member.remove", "pending_member", clean_id, None, now_s)
 
     # ── 数据快照（2026-10-27 春促数据看板：人工填数本期主通道，后续可替换为自动取数）──

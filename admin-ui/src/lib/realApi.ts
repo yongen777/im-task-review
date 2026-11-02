@@ -96,13 +96,13 @@ function roleToMock(r: any): RoleItem {
   };
 }
 
-async function fillRoleCounts(items: RoleItem[]): Promise<RoleItem[]> {
+async function fillRoleCounts(items: RoleItem[], platform: string): Promise<RoleItem[]> {
   const filled = await Promise.all(
     items.map(async (role) => {
       try {
         const res = await rawFetch<{ items?: any[] }>(
           'GET',
-          `/api/admin/roles/${encodeURIComponent(role.role_id)}/members?size=200`,
+          `/api/admin/roles/${encodeURIComponent(role.role_id)}/members?size=200${platform ? `&platform=${encodeURIComponent(platform)}` : ''}`,
         );
         const members = res.items || [];
         role.member_count = members.length;
@@ -124,6 +124,7 @@ function memberToMock(m: any): RoleMemberItem {
     dept: m.dept || '',
     status: m.enabled !== false ? 'active' : 'disabled',
     activation: m.activated ? 'activated' : 'pending',
+    activations: m.activations,
     usable: m.usable,
     external_id: m.external_id,
     activated_at: m.activated_at,
@@ -361,8 +362,9 @@ function healthToMock(d: any): AdminHealth {
 }
 
 /* ---------- 已激活待归纳人员（2026-10-28 方案B：对接后端 pending_member 表） ---------- */
-async function unactivatedMembers(): Promise<{ ok: boolean; items: any[] }> {
-  const d = await rawFetch<{ items?: any[] }>('GET', '/api/admin/pending-members');
+async function unactivatedMembers(platform?: string): Promise<{ ok: boolean; items: any[] }> {
+  const qs = platform ? `?platform=${encodeURIComponent(platform)}` : '';
+  const d = await rawFetch<{ items?: any[] }>('GET', `/api/admin/pending-members${qs}`);
   return {
     ok: true,
     items: (d.items || []).map((m: any) => ({
@@ -370,7 +372,10 @@ async function unactivatedMembers(): Promise<{ ok: boolean; items: any[] }> {
       phone: m.phone || '',
       name: m.name || '',
       last_message: m.last_message || '',
+      platform: m.platform || '',
+      updated_at: m.updated_at || '',
       activation: 'pending' as const,
+      source_note: `来自${m.platform === 'wecom' ? '企业微信' : '量子密信'} · ${m.last_message ? '最后消息：' + m.last_message : '无消息内容'}${m.updated_at ? ' · ' + m.updated_at : ''}`,
       created_at: m.activated_at || '',
     })),
   };
@@ -401,7 +406,10 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
 
   /* 未激活成员聚合 */
   if (rawPath === '/api/admin/unactivated-members') {
-    if (method === 'GET') return (await unactivatedMembers()) as unknown as T;
+    if (method === 'GET') {
+      const m = new URLSearchParams(queryText);
+      return (await unactivatedMembers(m.get('platform') || '')) as unknown as T;
+    }
     throw new Error('未激活成员请在「角色与成员名册」中操作（添加成员后，让成员给机器人发手机号即完成激活）');
   }
 
@@ -504,7 +512,8 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   }
   if (rawPath === '/api/admin/health') return healthToMock(d) as unknown as T;
   if (rawPath === '/api/admin/roles' && method === 'GET') {
-    const items = await fillRoleCounts((d.items || []).map(roleToMock));
+    const m = new URLSearchParams(queryText);
+    const items = await fillRoleCounts((d.items || []).map(roleToMock), m.get('platform') || '');
     return { ok: true, items } as unknown as T;
   }
   if (rawPath.startsWith('/api/admin/roles/') && rawPath.endsWith('/members') && method === 'GET') {

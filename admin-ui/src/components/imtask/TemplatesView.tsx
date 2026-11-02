@@ -192,12 +192,12 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
         <div className="bg-white px-4 py-2.5 border-b border-slate-200 flex items-center justify-between text-[11px]">
           <span className="font-mono font-bold text-slate-700">{remindAt || '16:30'}</span>
           <span className="font-bold text-slate-900 truncate max-w-[180px]">
-            {step === 'im' ? '量子密信 · 任务助手' : displayTitle}
+            {step === 'im' ? '办公软件 · 任务助手' : displayTitle}
           </span>
           <span className="text-[10px] text-blue-600 font-semibold">H5 专属通道</span>
         </div>
 
-        {/* 步骤1：量子密信聊天界面收到提醒文本 + H5链接 */}
+        {/* 步骤1：办公软件聊天界面收到提醒文本 + H5链接 */}
         {step === 'im' && (
           <div className="p-4 flex-1 flex flex-col justify-between space-y-4 bg-slate-100">
             <div className="space-y-3">
@@ -1515,7 +1515,7 @@ export const TemplatesView: React.FC = () => {
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <label className="font-bold text-slate-800 flex items-center gap-1.5">
                           <Layers className="w-4 h-4 text-blue-600" />
-                          <span>量子密信提醒内容配置（支持同时间多条并列下发）</span>
+                          <span>办公软件提醒内容配置（支持同时间多条并列下发）</span>
                           <span className="text-rose-500">*</span>
                         </label>
                         <div className="flex items-center gap-1.5">

@@ -36,6 +36,8 @@ interface PendingReviewsResponse {
 interface Props {
   /** 父组件刷新后递增，触发这里重新拉取 */
   refreshToken?: number;
+  /** 当前办公软件平台（zdxlz / wecom） */
+  platform?: string;
   /** 打开现有详情弹窗（完整看提交内容与附件） */
   onOpenDetail: (id: number) => void;
   /** 审核动作完成后通知父组件刷新主列表与统计卡片 */
@@ -48,7 +50,7 @@ function fmtMD(ts?: string | null): string {
   return s.length >= 16 ? `${s.slice(5, 10)} ${s.slice(11, 16)}` : s || '—';
 }
 
-export default function PendingReviewPanel({ refreshToken = 0, onOpenDetail, onChanged }: Props) {
+export default function PendingReviewPanel({ refreshToken = 0, platform = '', onOpenDetail, onChanged }: Props) {
   const toast = useToast();
   const [data, setData] = useState<PendingReviewsResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -61,7 +63,9 @@ export default function PendingReviewPanel({ refreshToken = 0, onOpenDetail, onC
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await api.get<PendingReviewsResponse>('/api/admin/instances/pending-reviews?days=7');
+      const res = await api.get<PendingReviewsResponse>(
+        `/api/admin/instances/pending-reviews?days=7${platform ? `&platform=${encodeURIComponent(platform)}` : ''}`,
+      );
       setData(res);
     } catch (err) {
       // 待办卡片是辅助信息，拉取失败不打断主流程
@@ -69,7 +73,7 @@ export default function PendingReviewPanel({ refreshToken = 0, onOpenDetail, onC
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [platform]);
 
   useEffect(() => {
     void load();

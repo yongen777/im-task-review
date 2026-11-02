@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { api, plainError, setCsrfToken } from '../../lib/api';
 import { useToast } from '../../lib/toast';
+import { useAppStore } from '../../lib/store';
 
 /**
  * P2-3: 密码输入框统一使用 type="text" + style="-webkit-text-security: disc"
@@ -388,6 +389,8 @@ interface AdminUserCardProps {
 }
 
 export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut }) => {
+  const toast = useToast();
+  const { platform, setPlatform } = useAppStore();
   const [open, setOpen] = useState(false);
   const [modal, setModal] = useState<
     'none' | 'password' | 'username' | 'logout'
@@ -438,6 +441,33 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <div className="font-bold text-slate-800">{display}</div>
             <div className="text-[10px] text-slate-400 font-mono">IMTask 调度管理中心</div>
             <div className="text-[10px] text-emerald-600 font-semibold mt-0.5">● 会话已鉴权</div>
+          </div>
+
+          {/* 2026-11-02 用户指令：在这里选择当前面板展示哪个办公软件的信息 */}
+          <div className="px-3 py-2 border-b border-slate-100">
+            <div className="text-[10px] text-slate-400 font-semibold mb-1.5">当前办公软件</div>
+            <div className="grid grid-cols-2 gap-1">
+              <button
+                onClick={() => { setPlatform('zdxlz'); setOpen(false); }}
+                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                  platform === 'zdxlz'
+                    ? 'bg-blue-600 text-white border-blue-600'
+                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                量子密信
+              </button>
+              <button
+                onClick={() => { setPlatform('wecom'); setOpen(false); }}
+                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                  platform === 'wecom'
+                    ? 'bg-blue-600 text-white border-blue-600'
+                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                }`}
+              >
+                企业微信
+              </button>
+            </div>
           </div>
 
           <div className="py-1 space-y-0.5">

@@ -75,6 +75,25 @@ def _extract_user_id(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_user_name(payload: Dict[str, Any]) -> str:
+    """事件里若平台带发送人姓名就取出来（不同平台字段名不一）。
+
+    ⛔ 不猜：只认明确的姓名字段，不能拿 loginId/userId 充数。
+    """
+    for key in ("userName", "user_name", "senderName", "sender_name", "nickName", "nick_name", "displayName"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:20]
+    for nested_key in ("sender", "user", "from"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            for key in ("name", "userName", "nickName", "displayName"):
+                val = nested.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()[:20]
+    return ""
+
+
 def _extract_event_phone(payload: Dict[str, Any]) -> str:
     """提取平台随事件显式下发的手机号（路径 A 仅在平台下发手机号时生效；真实事件通常只有 loginId/userId/toUserId，绝不猜字段）。"""
     for key in ("phone", "mobile"):
@@ -133,6 +152,7 @@ def handle_inbound_text(
     event_phone: str = "",
     send: Callable[[str, str], None],
     platform: str = "",
+    user_name: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
     """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
 
@@ -241,7 +261,7 @@ def handle_inbound_text(
     # 用户无需发送手机号——发任意消息即被后台自动登记，管理员在「已激活待归纳角色人员」
     # 专栏中看到该用户后，手动将其移入对应角色分组（分配时填写手机号完成推送绑定）。
     try:
-        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100], platform=platform or None)
+        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100], name=user_name or None, platform=platform or None)
         pending_ack = (
             "【OPS任务调度助手】\n"
             "你好，会话已激活，但尚未完成身份绑定。\n"
@@ -333,6 +353,7 @@ def process_app_event(
         return 401, {"code": "UNAUTHORIZED", "message": "回调事件时间戳已过期（疑似重放）"}
 
     user_id = _extract_user_id(event_payload)
+    user_name = _extract_user_name(event_payload)
     if not user_id:
         # 2026-10-27 平台「URL 测试」事件修复：平台点击测试下发专用报文
         # （实抓样本：msgUid="http-callback-test"、extra.test=true、userId 为空、
@@ -357,7 +378,7 @@ def process_app_event(
     return handle_inbound_text(
         state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
-        platform="zdxlz",
+        platform="zdxlz", user_name=user_name,
     )
 
 

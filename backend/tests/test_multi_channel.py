@@ -172,13 +172,13 @@ def test_member_list_returns_per_platform_activations() -> None:
 
 
 def test_instance_filter_sql_platform_condition() -> None:
-    """后台所选办公软件 -> 只显示该平台有可用绑定的人员实例。"""
+    """后台所选办公软件 -> 只显示该平台角色上的任务实例（2026-11-02 改为按模板角色归属）。"""
     from app.api.admin import _instance_filter_sql
 
     store = _mk_store()
     try:
         _from, where, params = _instance_filter_sql(store, platform="wecom")
-        assert "EXISTS" in where and "dt.platform" in where
+        assert "EXISTS" in where and "r.platform" in where
         assert "wecom" in params
     finally:
         store.close()

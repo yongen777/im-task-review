@@ -190,7 +190,7 @@ const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }>
   );
 };
 
-export const InstancesView: React.FC = () => {  const { roles, refreshStats } = useAppStore();
+export const InstancesView: React.FC = () => {  const { roles, refreshStats, platform } = useAppStore();
   const toast = useToast();
 
   // 筛选条件：按日期（默认今天）、按角色、按任务类型、按执行状态、按用户名/手机号
@@ -285,6 +285,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
         if (ph) qs.set('q', ph);
         if (pk) qs.set('period_key', pk);
         if (tid) qs.set('template_id', tid);
+        qs.set('platform', platform);
 
         const statsQs = new URLSearchParams();
         applyStatus(statsQs);
@@ -293,6 +294,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
         if (ph) statsQs.set('q', ph);
         if (pk) statsQs.set('period_key', pk);
         if (tid) statsQs.set('template_id', tid);
+        statsQs.set('platform', platform);
 
         const [listRes, statRes] = await Promise.all([
           api.get<{ ok: boolean; total: number; page: number; size: number; items: TaskInstanceItem[] }>(
@@ -310,12 +312,12 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
         setLoading(false);
       }
     },
-    [page, statusFilter, kindFilter, roleFilter, phoneFilter, periodKeyFilter, templateFilter],
+    [page, statusFilter, kindFilter, roleFilter, phoneFilter, periodKeyFilter, templateFilter, platform],
   );
 
   useEffect(() => {
     loadData(1);
-  }, [statusFilter, kindFilter, roleFilter, periodKeyFilter, templateFilter]);
+  }, [statusFilter, kindFilter, roleFilter, periodKeyFilter, templateFilter, platform]);
 
   /* 2026-10-28：关键字搜索改为实时（防抖 400ms），取消「查询」按钮 */
   useEffect(() => {
@@ -642,6 +644,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
       {/* 2026-10-30 审核待办：跨日期聚合「用户提交待审 + 补交申请待审」，无待办时整卡不渲染 */}
       <PendingReviewPanel
         refreshToken={pendingRefresh}
+        platform={platform}
         onOpenDetail={handleOpenDetail}
         onChanged={handlePendingChanged}
       />
@@ -1315,7 +1318,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats } = 
             <div className="space-y-2.5">
               <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
                 <Send className="w-3.5 h-3.5 text-blue-600" />
-                <span>量子密信提醒发送记录 ({detailData.reminders.length})</span>
+                <span>办公软件提醒发送记录 ({detailData.reminders.length})</span>
               </h4>
 
               {detailData.reminders.length === 0 ? (

@@ -106,6 +106,7 @@ export interface RoleMemberItem {
   dept: string;
   status: 'active' | 'disabled';
   activation: 'activated' | 'pending';
+  activations?: { zdxlz: boolean; wecom: boolean };
   usable?: boolean;
   external_id?: string | null;
   activated_at?: string | null;
@@ -120,6 +121,9 @@ export interface UnactivatedMemberItem {
   external_id?: string;
   activated_at?: string;
   source_note?: string;
+  platform?: string;
+  last_message?: string;
+  updated_at?: string;
   created_at: string;
 }
 
