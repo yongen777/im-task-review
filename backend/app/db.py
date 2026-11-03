@@ -234,13 +234,6 @@ CREATE TABLE IF NOT EXISTS dept_option (
   name       TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
-
--- 2026-11-03 部门选项：后台管理员配置，供成员表单与 H5 登记页下拉选择
-CREATE TABLE IF NOT EXISTS dept_option (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  name       TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL
-);
 """
 
 
