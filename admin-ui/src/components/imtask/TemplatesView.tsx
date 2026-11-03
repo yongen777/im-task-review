@@ -35,7 +35,6 @@ import {
   NoticeContentFormat,
   NoticeMessageItem,
   TemplateItem,
-  TemplatePeriod,
   UploadH5Module,
   getTemplateRoleIds,
 } from '../../lib/types';
@@ -408,8 +407,8 @@ export const TemplatesView: React.FC = () => {
   // 弹窗表单状态（任务类型简化为两大类：'notice' 纯通知提醒 | 'upload' 上传任务）
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'notice' | 'upload'>('notice');
-  const [period, setPeriod] = useState<TemplatePeriod>('day');
-  /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null） */
+  /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null）。
+     2026-11-02 用户口径：去掉「执行周期」下拉，只按这里选的星期几触发。 */
   const [execWeekdays, setExecWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
   const [roleIds, setRoleIds] = useState<string[]>([]);
   const [remindAt, setRemindAt] = useState('08:15');
@@ -500,7 +499,6 @@ export const TemplatesView: React.FC = () => {
     setEditingTpl(null);
     setName('');
     setKind(defaultKind);
-    setPeriod('day');
     setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
     const defaultRoleId = roleFilter || roles[0]?.role_id || 'role_branch_chief';
     setRoleIds(defaultRoleId ? [defaultRoleId] : []);
@@ -526,7 +524,6 @@ export const TemplatesView: React.FC = () => {
     setEditingTpl(tpl);
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
-    setPeriod(tpl.period);
     /* 2026-10-29 执行日：null/空 = 每天 → 七天全上 */
     setExecWeekdays(
       Array.isArray(tpl.exec_weekdays) && tpl.exec_weekdays.length
@@ -699,8 +696,8 @@ export const TemplatesView: React.FC = () => {
       toast.warning('请填写执行时间');
       return;
     }
-    /* 2026-10-29 执行日：day 模板必须至少选一天，否则永远不会执行 */
-    if (period === 'day' && execWeekdays.length === 0) {
+    /* 2026-10-29 执行日：必须至少选一天，否则永远不会执行（2026-11-02 起周期固定按周） */
+    if (execWeekdays.length === 0) {
       toast.warning('请至少选择一天「执行日」', '缺少执行日');
       return;
     }
@@ -808,10 +805,8 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
-          /* 2026-10-29 执行日：七天全选等价「每天」，传 null 交给后端存 NULL */
-          ...(period === 'day'
-            ? { exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays }
-            : {}),
+          /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
+          exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
           /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
              导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
           need_review: kind === 'notice' ? false : requireReview,
@@ -831,7 +826,7 @@ export const TemplatesView: React.FC = () => {
         await api.post('/api/admin/templates', {
           name: name.trim(),
           kind: kind === 'notice' ? 'notice' : 'upload',
-          period,
+          period: 'day',
           role_id: roleIds[0],
           role_ids: roleIds,
           remind_at: remindAt.trim(),
@@ -839,10 +834,8 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
-          /* 2026-10-29 执行日：七天全选等价「每天」，传 null 交给后端存 NULL */
-          ...(period === 'day'
-            ? { exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays }
-            : {}),
+          /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
+          exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
@@ -1383,12 +1376,8 @@ export const TemplatesView: React.FC = () => {
                       <select
                         value={kind}
                         disabled={Boolean(editingTpl)}
-                        onChange={(e) => {
-                          const nextKind = e.target.value as 'notice' | 'upload';
-                          setKind(nextKind);
-                          if (nextKind === 'notice' && period === 'month') {
-                            setPeriod('week');
-                          }
+                          onChange={(e) => {
+                          setKind(e.target.value as 'notice' | 'upload');
                         }}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:opacity-65 disabled:cursor-not-allowed font-semibold"
                       >
@@ -1397,76 +1386,52 @@ export const TemplatesView: React.FC = () => {
                       </select>
                     </div>
 
-                    {/* 执行周期 */}
+                    {/* 2026-11-02 用户口径：去掉「执行周期」概念 —— 管理员只选星期几，固定在每周选中的那几天触发 */}
                     <div>
                       <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
-                        <span>执行周期</span>
-                        {editingTpl && (
-                          <span className="inline-flex items-center gap-0.5 text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.2 rounded border border-amber-200">
-                            <Lock className="w-2.5 h-2.5" /> 不可修改
-                          </span>
-                        )}
+                        <span>执行日</span>
+                        <span className="text-[10px] text-slate-400 font-normal">
+                          只在这些星期生成任务；没选的日子不提醒、不产生逾期
+                        </span>
                       </label>
-                      <select
-                        value={period}
-                        disabled={Boolean(editingTpl)}
-                        onChange={(e) => setPeriod(e.target.value as TemplatePeriod)}
-                        className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:opacity-65 disabled:cursor-not-allowed"
-                      >
-                        <option value="day">每日</option>
-                        <option value="week">每周</option>
-                        {kind !== 'notice' && <option value="month">每月</option>}
-                      </select>
-                    </div>
-
-                    {/* 执行日（仅每日周期）：2026-10-29 新增，像群运维后台那样按周几执行 */}
-                    {period === 'day' && (
-                      <div>
-                        <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
-                          <span>执行日</span>
-                          <span className="text-[10px] text-slate-400 font-normal">
-                            只在这些星期生成任务；没选的日子不提醒、不产生逾期
-                          </span>
-                        </label>
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          {WEEKDAY_LABELS.map((label, i) => {
-                            const d = i + 1;
-                            const on = execWeekdays.includes(d);
-                            return (
-                              <button
-                                key={d}
-                                type="button"
-                                onClick={() => toggleExecWeekday(d)}
-                                className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
-                                  on
-                                    ? 'bg-blue-600 text-white border-blue-600'
-                                    : 'bg-slate-50 text-slate-600 border-slate-200 hover:border-blue-300'
-                                }`}
-                              >
-                                {label}
-                              </button>
-                            );
-                          })}
-                          <button
-                            type="button"
-                            onClick={() => setExecWeekdays([1, 2, 3, 4, 5])}
-                            className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
-                          >
-                            工作日
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setExecWeekdays([1, 2, 3, 4, 5, 6, 7])}
-                            className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
-                          >
-                            每天
-                          </button>
-                          <span className="text-[11px] text-slate-500 ml-1">
-                            {describeExecWeekdays(execWeekdays)}
-                          </span>
-                        </div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {WEEKDAY_LABELS.map((label, i) => {
+                          const d = i + 1;
+                          const on = execWeekdays.includes(d);
+                          return (
+                            <button
+                              key={d}
+                              type="button"
+                              onClick={() => toggleExecWeekday(d)}
+                              className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer ${
+                                on
+                                  ? 'bg-blue-600 text-white border-blue-600'
+                                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:border-blue-300'
+                              }`}
+                            >
+                              {label}
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setExecWeekdays([1, 2, 3, 4, 5])}
+                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
+                        >
+                          工作日
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setExecWeekdays([1, 2, 3, 4, 5, 6, 7])}
+                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
+                        >
+                          每天
+                        </button>
+                        <span className="text-[11px] text-slate-500 ml-1">
+                          {describeExecWeekdays(execWeekdays)}
+                        </span>
                       </div>
-                    )}
+                    </div>
 
                     {/* 执行时间 & 截止时间（2026-10-28 重排版：时间字段并列一行 + 原生时间选择器） */}
                     <div className={kind === 'notice' ? 'sm:col-span-2' : ''}>
@@ -1596,7 +1561,7 @@ export const TemplatesView: React.FC = () => {
                                 onChange={(e) =>
                                   updateNoticeItem(idx, { text_content: e.target.value })
                                 }
-                                placeholder="请输入本条任务要下发的文字提醒内容…"
+                                placeholder="请输入提醒事项......"
                                 className="w-full bg-white border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:border-blue-500 leading-relaxed"
                               />
                             ) : (
@@ -1640,7 +1605,7 @@ export const TemplatesView: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="text-[11px] text-slate-500 leading-relaxed">
-                                  到点会给成员发一条图片链接（不再发图片消息，手机端图片消息打不开），请填写这张图的名称（如「上午上门情况统计图」），成员点开链接后看到的页面就是这张图。
+                                  到点会把这张图随提醒发给成员（企业微信直接发图片消息，量子密信发可点开的图片链接），请填写图片名称（如「上午上门情况统计图」），成员看到的就是这张图。
                                 </div>
                                 {item.image_path ? (
                                   <div className="space-y-1.5">

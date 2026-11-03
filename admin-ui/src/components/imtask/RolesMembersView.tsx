@@ -20,6 +20,7 @@ import {
   MessageSquare,
   Link2Off,
   AlertTriangle,
+  Building2,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
@@ -52,10 +53,19 @@ export const RolesMembersView: React.FC = () => {
   const [confirmUnbindPerson, setConfirmUnbindPerson] = useState<UnactivatedMemberItem | null>(null);
   const [unbindingPerson, setUnbindingPerson] = useState(false);
 
-  // 单条添加成员表单（仅需用户名与手机号）
+  // 单条添加成员表单（姓名 + 手机号 + 部门，部门由后台统一配置）
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
+  const [newDept, setNewDept] = useState('');
   const [addingMember, setAddingMember] = useState(false);
+
+  // 2026-11-03 部门选项（后台配置；成员表单、编辑弹窗、H5 登记页共用同一份）
+  const [departments, setDepartments] = useState<{ id: number; name: string }[]>([]);
+  const [deptModalOpen, setDeptModalOpen] = useState(false);
+  const [newDeptName, setNewDeptName] = useState('');
+  const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
+  const [editingDeptName, setEditingDeptName] = useState('');
+  const [deptBusy, setDeptBusy] = useState(false);
 
   // 新建/编辑角色弹窗（无需角色编码）
   const [roleModalMode, setRoleModalMode] = useState<'none' | 'create' | 'edit'>('none');
@@ -66,6 +76,7 @@ export const RolesMembersView: React.FC = () => {
   // P2-1: 成员「改名/停用」弹窗（手机号只读不可改，移除所属部门）
   const [editingMember, setEditingMember] = useState<RoleMemberItem | null>(null);
   const [editMemberName, setEditMemberName] = useState('');
+  const [editMemberDept, setEditMemberDept] = useState('');
   const [editMemberStatus, setEditMemberStatus] = useState<'active' | 'disabled'>('active');
   /* 2026-10-29：一人多角色 —— 把已在某角色的成员同时加入其他角色 */
   const [assignMember, setAssignMember] = useState<RoleMemberItem | null>(null);
@@ -76,7 +87,7 @@ export const RolesMembersView: React.FC = () => {
 
   // CSV 批量导入弹窗（仅手机号与用户名）
   const [importModalOpen, setImportModalOpen] = useState(false);
-  const [csvText, setCsvText] = useState('13900000000,张三');
+  const [csvText, setCsvText] = useState('13900000000,张三,市场部');
   const [importing, setImporting] = useState(false);
 
   // 2026-11-02：批量归纳目标跟随当前选中的角色分组（用户指令）。
@@ -126,6 +137,72 @@ export const RolesMembersView: React.FC = () => {
     loadUnactivated();
   }, [loadUnactivated]);
 
+  // 2026-11-03 部门选项：后台配置，与 H5 登记页共用
+  const loadDepartments = useCallback(async () => {
+    try {
+      const res = await api.get<{ ok: boolean; items: { id: number; name: string }[] }>('/api/admin/departments');
+      setDepartments(res.items || []);
+    } catch {
+      /* 部门选项加载失败不阻塞页面 */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadDepartments();
+  }, [loadDepartments]);
+
+  const handleAddDepartment = async () => {
+    const name = newDeptName.trim();
+    if (!name) {
+      toast.warning('请填写部门名称');
+      return;
+    }
+    setDeptBusy(true);
+    try {
+      await api.post('/api/admin/departments', { name });
+      setNewDeptName('');
+      await loadDepartments();
+      toast.success(`部门「${name}」已添加。`, '部门已添加');
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '添加部门未成功');
+    } finally {
+      setDeptBusy(false);
+    }
+  };
+
+  const handleRenameDepartment = async (id: number) => {
+    const name = editingDeptName.trim();
+    if (!name) {
+      toast.warning('请填写新的部门名称');
+      return;
+    }
+    setDeptBusy(true);
+    try {
+      await api.put(`/api/admin/departments/${id}`, { name });
+      setEditingDeptId(null);
+      setEditingDeptName('');
+      await loadDepartments();
+      toast.success('部门名称已更新。', '修改已保存');
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '修改部门未成功');
+    } finally {
+      setDeptBusy(false);
+    }
+  };
+
+  const handleDeleteDepartment = async (id: number, name: string) => {
+    setDeptBusy(true);
+    try {
+      await api.delete(`/api/admin/departments/${id}`);
+      await loadDepartments();
+      toast.success(`部门「${name}」已删除（已登记人员的信息不受影响）。`, '部门已删除');
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '删除部门未成功');
+    } finally {
+      setDeptBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (selectedRoleId) {
       loadMembers(selectedRoleId);
@@ -173,6 +250,15 @@ export const RolesMembersView: React.FC = () => {
   };
   const displayPhone = (p: { phone?: string }): string =>
     (p.phone || '').trim() || '未知（待用户提供绑定）';
+  /* 2026-11-02 用户口径：姓名与手机号合成一句话，来源行（来自xx·最后消息）不再展示。
+     2026-11-03：H5 登记表单新增部门，随人一并展示。 */
+  const displayPersonLine = (p: { name?: string; phone?: string; dept?: string }): string => {
+    const n = (p.name || '').trim();
+    const ph = (p.phone || '').trim();
+    const dp = (p.dept || '').trim();
+    const head = n && ph ? `${n} ${ph}` : n ? `${n}（待用户提供绑定）` : ph ? `未命名用户 ${ph}` : '未命名用户（待用户提供绑定）';
+    return dp ? `${head} ${dp}` : head;
+  };
 
   const getRowTargetRole = (rowKey: string): string => {
     const chosen = rowTargetRoleMap[rowKey];
@@ -275,7 +361,7 @@ export const RolesMembersView: React.FC = () => {
       setConfirmUnbindPerson(null);
       await loadUnactivated();
       toast.success(
-        `已解除「${displayName(person)}」(${displayPhone(person)}) 的当前办公软件会话绑定并从待归纳列表移除。该用户需在该办公软件对话窗口重新输入激活信息后方可再次激活。`,
+        `已解除「${displayName(person)}」(${displayPhone(person)}) 的当前办公软件会话绑定并从待归纳列表移除。该用户需重新点击机器人下发的登记链接填写信息后方可再次登记。`,
         '已解除会话绑定',
       );
     } catch (err) {
@@ -355,12 +441,13 @@ export const RolesMembersView: React.FC = () => {
       await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
         phone: newPhone.trim(),
         name: newName.trim(),
-        dept: '',
+        dept: newDept,
       });
       const addedName = newName.trim();
       const addedPhone = newPhone.trim();
       setNewName('');
       setNewPhone('');
+      setNewDept('');
       await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadUnactivated()]);
       toast.success(`成员「${addedName}」(${addedPhone}) 已添加至当前角色。`, '添加成功');
     } catch (err) {
@@ -439,6 +526,7 @@ export const RolesMembersView: React.FC = () => {
   const openEditMemberModal = (m: RoleMemberItem) => {
     setEditingMember(m);
     setEditMemberName(m.name);
+    setEditMemberDept(m.dept || '');
     setEditMemberStatus(m.status);
   };
 
@@ -456,7 +544,7 @@ export const RolesMembersView: React.FC = () => {
         `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/${encodeURIComponent(editingMember.phone)}`,
         {
           name: editMemberName.trim(),
-          dept: '',
+          dept: editMemberDept,
           status: editMemberStatus,
         },
       );
@@ -553,7 +641,7 @@ export const RolesMembersView: React.FC = () => {
         );
       }
     } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : 'CSV 批量导入未成功');
+      toast.error(err instanceof Error ? plainError(err.message) : 'CSV 批量导入未成功', 'CSV 批量导入失败');
     } finally {
       setImporting(false);
     }
@@ -567,7 +655,7 @@ export const RolesMembersView: React.FC = () => {
           <div>
             <h2 className="text-lg font-bold text-slate-900 tracking-tight">角色与成员名册</h2>
             <p className="text-xs text-slate-500 mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-              <span>管理各业务角色下的成员名单（仅需用户名与手机号）</span>
+              <span>管理各业务角色下的成员名单（支持姓名、手机号、部门）</span>
               <span aria-hidden="true" className="text-slate-300">·</span>
               <span>
                 当前共 <strong className="font-semibold text-slate-800 tabular-nums">{roles.length}</strong> 个角色分组
@@ -727,16 +815,16 @@ export const RolesMembersView: React.FC = () => {
                 </div>
               </div>
 
-              {/* 第二层：单行快速添加成员表单（仅需用户名与手机号） */}
+              {/* 第二层：单行快速添加成员表单（姓名 + 手机号 + 部门） */}
               <form
                 onSubmit={handleAddMember}
-                className="px-4 sm:px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5 text-xs"
+                className="px-4 sm:px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex flex-col lg:flex-row flex-wrap items-stretch lg:items-center gap-2.5 text-xs"
               >
                 <span className="text-slate-500 font-semibold shrink-0 flex items-center gap-1.5">
                   <UserPlus className="w-3.5 h-3.5 text-blue-600" />
                   <span>快速添加成员：</span>
                 </span>
-                <div className="relative flex-1">
+                <div className="relative flex-1 min-w-[160px]">
                   <User className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                   <input
                     type="text"
@@ -746,7 +834,7 @@ export const RolesMembersView: React.FC = () => {
                     className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-500"
                   />
                 </div>
-                <div className="relative flex-1">
+                <div className="relative flex-1 min-w-[160px]">
                   <Phone className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
                   <input
                     type="text"
@@ -756,6 +844,20 @@ export const RolesMembersView: React.FC = () => {
                     className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-blue-500 tabular-nums"
                   />
                 </div>
+                <div className="relative flex-1 min-w-[180px]">
+                  <Building2 className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                  <select
+                    value={newDept}
+                    onChange={(e) => setNewDept(e.target.value)}
+                    className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-500 appearance-none cursor-pointer"
+                    title="部门可不选；选项由「部门管理」维护，也是 H5 登记页的下拉内容"
+                  >
+                    <option value="">部门（选填）</option>
+                    {departments.map((d) => (
+                      <option key={d.id} value={d.name}>{d.name}</option>
+                    ))}
+                  </select>
+                </div>
                 <button
                   type="submit"
                   disabled={addingMember}
@@ -763,6 +865,15 @@ export const RolesMembersView: React.FC = () => {
                 >
                   <Plus className="w-3.5 h-3.5" />
                   <span>添加成员</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDeptModalOpen(true)}
+                  className="px-3 py-2 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 transition-colors"
+                  title="配置部门选项（成员表单与员工 H5 登记页共用）"
+                >
+                  <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                  <span>部门管理</span>
                 </button>
               </form>
 
@@ -773,6 +884,7 @@ export const RolesMembersView: React.FC = () => {
                     <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
                       <th className="py-3 pl-5 pr-3">成员姓名</th>
                       <th className="py-3 px-3">手机号码</th>
+                      <th className="py-3 px-3">部门</th>
                       <th className="py-3 px-3">激活状态</th>
                       <th className="py-3 px-3">派单状态</th>
                       <th className="py-3 pl-3 pr-5 text-right">操作</th>
@@ -781,13 +893,13 @@ export const RolesMembersView: React.FC = () => {
                   <tbody className="divide-y divide-slate-100 text-xs">
                     {loadingMembers ? (
                       <tr>
-                        <td colSpan={5} className="py-12 text-center text-slate-400">
+                        <td colSpan={6} className="py-12 text-center text-slate-400">
                           正在加载角色成员名册…
                         </td>
                       </tr>
                     ) : filteredMembers.length === 0 ? (
                       <tr>
-                        <td colSpan={5} className="py-12 text-center text-slate-400">
+                        <td colSpan={6} className="py-12 text-center text-slate-400">
                           该角色下暂无匹配成员，可在上方直接添加或从右侧「已激活待归纳角色人员」一键移入。
                         </td>
                       </tr>
@@ -807,6 +919,16 @@ export const RolesMembersView: React.FC = () => {
                           </td>
                           <td className="py-3.5 px-3 font-mono font-semibold text-slate-700 tabular-nums">
                             {m.phone}
+                          </td>
+                          <td className="py-3.5 px-3 text-slate-600">
+                            {m.dept ? (
+                              <span className="inline-flex items-center gap-1">
+                                <Building2 className="w-3 h-3 text-slate-400" />
+                                <span>{m.dept}</span>
+                              </span>
+                            ) : (
+                              <span className="text-slate-300">—</span>
+                            )}
                           </td>
                           <td className="py-3.5 px-3">
                             {(() => {
@@ -858,14 +980,14 @@ export const RolesMembersView: React.FC = () => {
                               <button
                                 onClick={() => void openAssignRolesModal(m)}
                                 title="把该成员同时加入其他业务角色（一人可兼多角色，原角色保留）"
-                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-emerald-50 text-slate-700 hover:text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap"
                               >
                                 <Users className="w-3 h-3" />
                                 <span>加入其他角色</span>
                               </button>
                               <button
                                 onClick={() => openEditMemberModal(m)}
-                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap"
                               >
                                 <Edit3 className="w-3 h-3" />
                                 <span>改名/停用</span>
@@ -911,7 +1033,7 @@ export const RolesMembersView: React.FC = () => {
                     </span>
                   </div>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    员工在量子密信对话激活后自动进入此列表；移除将解除会话绑定，需员工重新输入激活
+                    员工给机器人发任意消息并完成链接登记后进入此列表；移除将解除会话绑定，需员工重新登记
                   </p>
                 </div>
               </div>
@@ -988,7 +1110,7 @@ export const RolesMembersView: React.FC = () => {
                 <p className="text-xs text-slate-400">
                   {unactivatedKeyword.trim()
                     ? '请尝试更换姓名或手机号关键词重新搜索。'
-                    : '员工在当前办公软件对话窗口发送激活指令后将自动进入本列表。'}
+                    : '员工在当前办公软件给机器人发送任意消息后，会收到登记链接；点击填写【姓名、手机号、部门】后自动进入本列表。'}
                 </p>
               </div>
             ) : (
@@ -1005,20 +1127,12 @@ export const RolesMembersView: React.FC = () => {
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex items-center gap-2.5">
                         <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-700 font-bold text-xs flex items-center justify-center shrink-0">
-                          {displayName(person).slice(0, 1)}
+                          {((person.name || '').trim() || '未').slice(0, 1)}
                         </div>
                         <div>
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="font-bold text-slate-900 text-sm break-all">
-                              {displayName(person)}
-                            </span>
-                            <span className="font-mono text-slate-600 font-semibold tabular-nums">
-                              {displayPhone(person)}
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-slate-400 mt-0.5">
-                            {person.source_note || '已在当前办公软件对话激活 · 待管理员归纳角色'}
-                          </div>
+                          <span className="font-bold text-slate-900 text-sm break-all">
+                            {displayPersonLine(person)}
+                          </span>
                         </div>
                       </div>
 
@@ -1028,9 +1142,9 @@ export const RolesMembersView: React.FC = () => {
                       </span>
                     </div>
 
-                    {/* 第二行：目标角色选择 + 一键移入分组 + 移除（解除会话绑定） */}
-                    <div className="flex items-center justify-between gap-2 pl-10">
-                      <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                    {/* 第二行：目标角色选择 + 一键移入分组 + 移除（解除会话绑定）；窄屏自动换行不挤压 */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pl-10">
+                      <div className="flex items-center gap-1.5 flex-1 min-w-[180px]">
                         <select
                           value={targetRole}
                           onChange={(e) =>
@@ -1052,7 +1166,7 @@ export const RolesMembersView: React.FC = () => {
                           type="button"
                           onClick={() => handleMoveSingleUnactivated(person)}
                           disabled={isMoving || roles.length === 0}
-                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-60 transition-colors"
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-60 transition-colors whitespace-nowrap"
                         >
                           <ArrowRightCircle className="w-3.5 h-3.5" />
                           <span>{isMoving ? '移入中…' : '一键移入分组'}</span>
@@ -1079,11 +1193,111 @@ export const RolesMembersView: React.FC = () => {
           <div className="px-4 sm:px-5 py-3 bg-slate-50/80 border-t border-slate-100 flex items-start gap-2 text-[11px] text-slate-500">
             <MessageSquare className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
             <span>
-              说明：用户激活仅能通过「当前办公软件」对话窗口向机器人发送激活指令自动绑定会话，不支持后台人工登记未绑定会话人员。
+              说明：用户首次给机器人发送任意消息会收到一条登记链接，点开填写【姓名、手机号、部门】完成登记；登记后由管理员分配角色即可接收提醒，不支持后台人工登记未绑定会话人员。
             </span>
           </div>
         </div>
       </div>
+
+      {/* 2026-11-03 部门管理弹窗：配置部门选项（成员表单与员工 H5 登记页共用） */}
+      {deptModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
+                  <Building2 className="w-4 h-4 text-blue-600" />
+                  <span>部门管理</span>
+                </h3>
+                <p className="text-[11px] text-slate-400">员工 H5 登记页与成员表单的下拉选项，都来自这里</p>
+              </div>
+              <button onClick={() => setDeptModalOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-400">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={newDeptName}
+                onChange={(e) => setNewDeptName(e.target.value)}
+                placeholder="新增部门名称，如：市场部"
+                className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+              />
+              <button
+                type="button"
+                disabled={deptBusy}
+                onClick={() => void handleAddDepartment()}
+                className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-xs inline-flex items-center gap-1 cursor-pointer disabled:opacity-60 shrink-0"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>添加</span>
+              </button>
+            </div>
+
+            <div className="max-h-72 overflow-y-auto space-y-1.5">
+              {departments.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-400">还没有配置部门，先添加一个</div>
+              ) : (
+                departments.map((d) => (
+                  <div key={d.id} className="flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50/60">
+                    {editingDeptId === d.id ? (
+                      <input
+                        autoFocus
+                        type="text"
+                        value={editingDeptName}
+                        onChange={(e) => setEditingDeptName(e.target.value)}
+                        className="flex-1 bg-white border border-blue-300 rounded-lg px-2.5 py-1.5 text-xs outline-none"
+                      />
+                    ) : (
+                      <span className="flex-1 text-xs font-semibold text-slate-800">{d.name}</span>
+                    )}
+                    {editingDeptId === d.id ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={deptBusy}
+                          onClick={() => void handleRenameDepartment(d.id)}
+                          className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60"
+                        >
+                          保存
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { setEditingDeptId(null); setEditingDeptName(''); }}
+                          className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 text-[11px] font-semibold cursor-pointer"
+                        >
+                          取消
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => { setEditingDeptId(d.id); setEditingDeptName(d.name); }}
+                          className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-600 hover:text-blue-700 text-[11px] font-semibold cursor-pointer inline-flex items-center gap-1"
+                        >
+                          <Edit3 className="w-3 h-3" />
+                          <span>改名</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={deptBusy}
+                          onClick={() => void handleDeleteDepartment(d.id, d.name)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 text-[11px] font-semibold cursor-pointer inline-flex items-center gap-1 disabled:opacity-60"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>删除</span>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* 交互确认弹窗 1：从当前角色中移除成员 -> 移入右侧「已激活待归纳角色人员」列表 */}
       {confirmRemoveRoleMember && currentRole && (
@@ -1164,10 +1378,10 @@ export const RolesMembersView: React.FC = () => {
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 text-base">
-                    确认移除并解除密信会话绑定？
+                    确认移除并解除会话绑定？
                   </h3>
                   <p className="text-[11px] text-slate-500">
-                    解除绑定后，用户必须在密信对话中重新输入激活指令
+                    解除绑定后，用户需重新点击登记链接填写信息后方可再次进入此列表
                   </p>
                 </div>
               </div>
@@ -1193,7 +1407,7 @@ export const RolesMembersView: React.FC = () => {
                   <span>将清除该用户的当前办公软件会话绑定</span>
                 </div>
                 <p className="text-[11px] text-rose-800">
-                  移除后，该用户在当前办公软件的会话绑定将被彻底解除。后续该用户只有在「当前办公软件」对话窗口重新输入发送激活信息，完成会话绑定后才会再次出现在本列表。
+                  移除后，该用户在当前办公软件的会话绑定将被彻底解除。后续该用户只有在「当前办公软件」中重新给机器人发消息并点击登记链接填写信息，完成登记后才会再次出现在本列表。
                 </p>
               </div>
             </div>
@@ -1269,6 +1483,20 @@ export const RolesMembersView: React.FC = () => {
                   placeholder="请输入成员真实姓名"
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
                 />
+              </div>
+
+              <div>
+                <label className="font-semibold text-slate-700 block mb-1">部门</label>
+                <select
+                  value={editMemberDept}
+                  onChange={(e) => setEditMemberDept(e.target.value)}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
+                >
+                  <option value="">不填部门</option>
+                  {departments.map((d) => (
+                    <option key={d.id} value={d.name}>{d.name}</option>
+                  ))}
+                </select>
               </div>
 
               <div>
@@ -1455,7 +1683,7 @@ export const RolesMembersView: React.FC = () => {
                   批量导入成员至「{currentRole.role_name}」
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  每行一条记录，格式：手机号,用户名（支持自动跳过表头与去重更新）
+                  每行一条记录，格式：手机号,姓名,部门（部门可留空；支持自动跳过表头与去重更新）
                 </p>
               </div>
               <button
@@ -1470,7 +1698,7 @@ export const RolesMembersView: React.FC = () => {
                 rows={6}
                 value={csvText}
                 onChange={(e) => setCsvText(e.target.value)}
-                placeholder={'手机号,用户名\n13900000000,张三'}
+                placeholder={'手机号,姓名,部门\n13900000000,张三,市场部'}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-mono text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 leading-relaxed"
               />
               <div className="flex justify-end gap-2 pt-1">

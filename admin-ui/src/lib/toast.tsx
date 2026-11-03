@@ -30,7 +30,7 @@ const ERROR_CODE_DICT: Record<string, string> = {
   NAME_REQUIRED: '请填写任务模板名称，名称不能为空。',
   INVALID_KIND: '请选择有效的任务类型（表单填报、拍照上传、文件上报或純通知）。',
   INVALID_PERIOD: '任务周期设置无效：普通任务支持每日/每周/每月，纯通知任务仅支持每日或每周。',
-  PERIOD_IMMUTABLE: '任务模板创建后，「任务类型」与「执行周期」不可更改；如需调整请新建模板。',
+  PERIOD_IMMUTABLE: '任务模板创建后「任务类型」不可更改；如需调整请新建模板。',
   ROLE_NOT_FOUND: '所选的目标角色不存在，请先在「角色与成员」中创建该角色。',
   REMIND_AT_INVALID: '提醒时间格式不正确，请按 HH:MM 格式填写（例如 09:00，多个时间用英文逗号分隔）。',
   DEADLINE_INVALID: '截止时间格式不正确，请按要求填写（例如每日填 18:00，每周填 5 18:00）。',

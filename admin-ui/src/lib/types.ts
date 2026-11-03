@@ -116,6 +116,8 @@ export interface RoleMemberItem {
 export interface UnactivatedMemberItem {
   phone: string;
   name: string;
+  /* 2026-11-03：H5 登记表单填写的部门（后台配置的选项之一） */
+  dept?: string;
   activation: 'activated';
   usable?: boolean;
   external_id?: string;

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { getCsrfToken } from '../../lib/api';
 import { copyText } from '../../lib/clipboard';
+import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 
 /* ================================================================== */
@@ -79,6 +80,8 @@ const SOURCE_LABEL: Record<string, string> = {
 
 const ChannelSettingsView: React.FC = () => {
   const toast = useToast();
+  /* 2026-11-02 用户口径：配置页打开就停在「当前选择的办公软件」上，而不是后端的 active_channel */
+  const { platform } = useAppStore();
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [state, setState] = useState<ChannelConfigResp | null>(null);
@@ -115,6 +118,21 @@ const ChannelSettingsView: React.FC = () => {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /* 每次办公软件变化（含首次打开）→ 凭证表单切到对应通道，且只切一次，不覆盖用户手动选择 */
+  const appliedPlatform = useRef<string>('');
+  useEffect(() => {
+    if (!state) return;
+    if (appliedPlatform.current === platform) return;
+    appliedPlatform.current = platform;
+    const want = platform === 'wecom' ? 'wecom_aibot' : 'zdxlz';
+    if (state.channels.some((c) => c.channel === want)) {
+      setPicked(want);
+      setForm({});
+      setTestResult(null);
+      setSavedHint(null);
+    }
+  }, [platform, state]);
 
   const current = useMemo(
     () => state?.channels.find((c) => c.channel === picked) || null,

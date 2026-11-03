@@ -193,6 +193,8 @@ function tplToMock(t: any): TemplateItem {
        否则编辑/快捷启停时前端拿不到真实值，回写就会把配置冲掉。 */
     need_review: !!t.need_review,
     attach_image_path: t.attach_image_path || null,
+    /* 2026-11-02 修复：图片名称此前没随列表下发 —— 编辑弹窗回显空、快捷启停还会把它冲掉 */
+    attach_image_name: t.attach_image_name || null,
     /* 2026-10-29 执行日：后端返回 list[int] 或 null；null/空 = 全周 */
     exec_weekdays: Array.isArray(t.exec_weekdays) && t.exec_weekdays.length
       ? t.exec_weekdays.map((n: unknown) => Number(n)).filter((n: number) => n >= 1 && n <= 7)
@@ -259,6 +261,8 @@ function tplFromMock(t: any, partial = false) {
     if (t.enabled !== undefined) out.enabled = t.enabled !== false;
     if (t.attach_image !== undefined) out.attach_image = !!t.attach_image;
     if (t.attach_image_path !== undefined) out.attach_image_path = t.attach_image_path || null;
+    /* 2026-11-02 修复：编辑模板时图片名称此前被丢掉，导致直链文案与 H5 标题永远回退「数据图片」 */
+    if (t.attach_image_name !== undefined) out.attach_image_name = t.attach_image_name || null;
     if (t.need_review !== undefined) out.need_review = !!t.need_review;
     if (t.data_keys !== undefined) out.data_keys = t.data_keys;
     applySpec();
@@ -284,6 +288,7 @@ function tplFromMock(t: any, partial = false) {
   out.period = t.period || 'day';
   out.attach_image = attach;
   out.attach_image_path = t.attach_image_path || null;
+  out.attach_image_name = t.attach_image_name || null;
   out.need_review = t.need_review !== undefined ? !!t.need_review : false;
   out.data_keys = t.data_keys || [];
   out.enabled = t.enabled !== false;
@@ -371,6 +376,7 @@ async function unactivatedMembers(platform?: string): Promise<{ ok: boolean; ite
       external_id: m.external_id,
       phone: m.phone || '',
       name: m.name || '',
+      dept: m.dept || '',
       last_message: m.last_message || '',
       platform: m.platform || '',
       updated_at: m.updated_at || '',
@@ -429,7 +435,32 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   /* 请求体映射（前端结构 → 后端结构） */
   let reqBody = body;
   if (method !== 'GET') {
-    if (rawPath === '/api/admin/templates' || rawPath.startsWith('/api/admin/templates/')) {
+    if (rawPath.endsWith('/members/import')) {
+      /* 前端 csv_text → 后端 csv_rows
+         2026-10-29 P0-2：后端 import_role_members 要求 dict 行（row/phone/name/dept），
+         原来发的是二维字符串数组，每一行都被判成“行数据格式错误” → 导入 100% 失败。
+         2026-11-03 修复：本分支必须放在 roles 分支**之前**——roles 分支
+         （startsWith('/api/admin/roles/')）会把 /roles/{id}/members/import 一起吃掉，
+         导致这里永远不可达、csv_rows 永远不生成 → 生产导入 100% 400。 */
+      reqBody = { ...(body || {}) };
+      const text = String(reqBody.csv_text || '');
+      delete reqBody.csv_text;
+      const HEADER_WORDS = /^(手机号?|电话|号码|phone|mobile|tel|姓名|名字|name|部门|dept|department)$/i;
+      reqBody.csv_rows = text
+        .split(/\r?\n/)
+        .map((l: string) => l.trim())
+        .filter(Boolean)
+        .map((line: string, idx: number) => {
+          const parts = line.split(/[,，\t]/).map((c: string) => c.trim());
+          return { row: idx + 1, phone: parts[0] || '', name: parts[1] || '', dept: parts[2] || '' };
+        })
+        /* 顺手跳过表头行，避免把“手机号,姓名,部门”当成一条错行 */
+        .filter((r: { row: number; phone: string; name: string; dept: string }) => {
+          const isHeader = HEADER_WORDS.test(r.phone) || HEADER_WORDS.test(r.name);
+          return !isHeader && (r.phone || r.name);
+        });
+      if (reqBody.dry_run === undefined) reqBody.dry_run = false;
+    } else if (rawPath === '/api/admin/templates' || rawPath.startsWith('/api/admin/templates/')) {
       /* 编辑（PUT/DELETE 带模板 id）走 partial：只发显式字段，绝不臆造 kind/period，
          否则后端判「模板类型创建后不可修改」，且会把已有 data_keys 冲空。*/
       const mId = rawPath.match(/templates\/(.+)$/);
@@ -463,28 +494,6 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
       if (reqBody.activation !== undefined) {
         delete reqBody.activation;
       }
-    } else if (rawPath.endsWith('/members/import')) {
-      /* 前端 csv_text → 后端 csv_rows
-         2026-10-29 P0-2：后端 import_role_members 要求 dict 行（row/phone/name/dept），
-         原来发的是二维字符串数组，每一行都被判成“行数据格式错误” → 导入 100% 失败。 */
-      reqBody = { ...(body || {}) };
-      const text = String(reqBody.csv_text || '');
-      delete reqBody.csv_text;
-      const HEADER_WORDS = /^(手机号?|电话|号码|phone|mobile|tel|姓名|名字|name|部门|dept|department)$/i;
-      reqBody.csv_rows = text
-        .split(/\r?\n/)
-        .map((l: string) => l.trim())
-        .filter(Boolean)
-        .map((line: string, idx: number) => {
-          const parts = line.split(/[,，\t]/).map((c: string) => c.trim());
-          return { row: idx + 1, phone: parts[0] || '', name: parts[1] || '', dept: parts[2] || '' };
-        })
-        /* 顺手跳过表头行，避免把“手机号,姓名,部门”当成一条错行 */
-        .filter((r: { row: number; phone: string; name: string; dept: string }) => {
-          const isHeader = HEADER_WORDS.test(r.phone) || HEADER_WORDS.test(r.name);
-          return !isHeader && (r.phone || r.name);
-        });
-      if (reqBody.dry_run === undefined) reqBody.dry_run = false;
     }
   }
 

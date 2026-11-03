@@ -171,7 +171,8 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
 
       {/* 右侧主内容画布 */}
       <main className="flex-1 overflow-y-auto">
-        <div className="max-w-7xl mx-auto p-6">
+        {/* 2026-11-03 用户口径：整体拉长变宽（原 max-w-7xl 在宽屏两侧留白过多） */}
+        <div className="max-w-[1760px] mx-auto p-6">
           {loading ? (
             <div className="space-y-4">
               <div className="h-20 bg-white rounded-2xl border border-slate-200/80 animate-pulse" />
