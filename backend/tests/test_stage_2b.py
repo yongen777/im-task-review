@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from app.api.events import process_app_event
-from app.api.h5 import load_h5_html, process_h5_bind, process_h5_task_info, process_h5_task_submit, process_h5_task_upload
+from app.api.h5 import load_h5_html, process_h5_bind, process_h5_task_info, process_h5_task_submit, process_h5_task_upload, reset_bind_rate
 from app.channels.zdxlz import ZdxlzChannel, encrypt_event_payload
 from app.config import SHANGHAI_TZ, Config
 from app.scheduler import FakeNotifier, Scheduler, calc_resubmit_deadline, make_idem_key
@@ -133,6 +133,8 @@ class TestStage2B(unittest.TestCase):
             self.pub_client: Any = TestClient(pub_app)
         except ImportError:
             self.pub_client = _DirectPublicClient(self.store, self.channel, self.cfg, self.notifier)
+        # 2026-11-03：登记表单测试增多，每个用例前清空绑定接口的 IP 限流，避免跨用例误伤
+        reset_bind_rate()
 
     def tearDown(self) -> None:
         try:
@@ -312,6 +314,10 @@ class TestStage2B(unittest.TestCase):
         self.store.add_role_member(rid, "13800008001", "张A", "研发", actor="admin")
         self.store.add_role_member(rid, "13800008002", "李B", "产品", actor="admin")
         self.store.add_role_member(rid, "13800008003", "王C", "设计", actor="admin")
+        # 2026-11-03：H5 登记表单必填部门，先配置部门选项
+        self.store.create_department("研发", actor="admin")
+        self.store.create_department("产品", actor="admin")
+        self.store.create_department("设计", actor="admin")
         ts, nonce = str(int(time.time())), "nonce_abc"
 
         body_b64, _ = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_hacker", "phone": "13800008001"})
@@ -327,81 +333,77 @@ class TestStage2B(unittest.TestCase):
         self.assertEqual((resp_a.status_code, resp_a.json()["path"]), (200, "A"))
         self.assertEqual(self.store.get_delivery_target("13800008001")["external_id"], "uid_zhang_a")
 
-        body_b_not_in_roster, sig_b1 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_stranger", "text": "13999999999"})
-        resp_b1 = self.pub_client.post("/api/app-events", content=body_b_not_in_roster, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_b1})
-        # ⭐ 2026-10-28 口径变更（用户指令）：手机号不在名单**不再拦截**，
-        #   先落「已激活待归纳」池（带上手机号），由管理员后续归纳角色。
-        self.assertEqual(resp_b1.status_code, 200)
-        self.assertTrue(resp_b1.json().get("pending"))
-        self.assertEqual(resp_b1.json()["masked_phone"], "139****9999")
+        # ⭐ 2026-11-03 用户口径：对话文字激活彻底停用。
+        #   未登记用户发任何文本（含手机号）→ 统一回登记提示文本 + 链接，不解析手机号。
+        body_stranger, sig_str = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_stranger", "text": "13999999999"})
+        resp_str = self.pub_client.post("/api/app-events", content=body_stranger, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_str})
+        self.assertEqual(resp_str.status_code, 200)
+        self.assertTrue(resp_str.json().get("pending"))
+        self.assertIn("你还未完成信息登记", resp_str.json()["message"])
+        self.assertIn("/h5/bind#uid=uid_stranger&plat=zdxlz", resp_str.json()["bind_url"])
         pending = self.store.get_pending_member("uid_stranger")
-        self.assertIsNotNone(pending, "未在名单的手机号必须进入待归纳池")
-        self.assertEqual(pending["phone"], "13999999999")
+        self.assertIsNotNone(pending, "未登记用户必须进入待归纳池")
+        self.assertIsNone(pending["phone"], "对话文本不再解析手机号")
         self.assertIsNone(self.store.get_delivery_target("13999999999"), "入池不得直接建立投递绑定")
 
-        body_b_dup, sig_b2 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_attacker", "text": "13800008001"})
-        resp_b2 = self.pub_client.post("/api/app-events", content=body_b_dup, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_b2})
-        self.assertEqual((resp_b2.status_code, resp_b2.json()["code"]), (409, "DUPLICATE"))
-        self.assertEqual(self.store.get_delivery_target("13800008001")["external_id"], "uid_zhang_a")
-
-        body_b_ok, sig_b3 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_li_b", "text": "13800008002"})
-        resp_b3 = self.pub_client.post("/api/app-events", content=body_b_ok, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_b3})
-        self.assertEqual(resp_b3.status_code, 200)
-        self.assertEqual(resp_b3.json()["phone_masked"], "138****8002")
-        self.assertIn("申诉", resp_b3.json()["message"])
+        # 已登记过（填过表单）的人再发消息 → 回等待文案，不再重复发链接
+        self.store.upsert_pending_member("uid_filled", phone="13900007777", name="赵七", dept="研发", platform="zdxlz", last_message="H5登记")
+        body_filled, sig_f = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_filled", "text": "在吗"})
+        resp_f = self.pub_client.post("/api/app-events", content=body_filled, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_f})
+        self.assertEqual(resp_f.status_code, 200)
+        self.assertIn("登记信息已收到", resp_f.json()["message"])
+        self.assertNotIn("bind_url", resp_f.json())
 
         self.assertEqual(self.pub_client.get("/h5/bind").status_code, 200)
-        resp_c_dup = self.pub_client.post("/api/h5/bind", json={"phone": "13800008002", "external_id": "uid_other"})
+        # 护栏：已绑定的手机号不能被别的账号覆盖（409）
+        resp_c_dup = self.pub_client.post("/api/h5/bind", json={"phone": "13800008001", "external_id": "uid_attacker", "name": "攻", "dept": "研发"})
         self.assertEqual((resp_c_dup.status_code, resp_c_dup.json()["code"]), (409, "DUPLICATE"))
+        self.assertEqual(self.store.get_delivery_target("13800008001")["external_id"], "uid_zhang_a")
 
-        resp_c_ok = self.pub_client.post("/api/h5/bind", json={"phone": "13800008003", "external_id": "uid_wang_c"})
+        # 名册内：H5 登记表单提交即绑定
+        resp_c_ok = self.pub_client.post("/api/h5/bind", json={"phone": "13800008003", "external_id": "uid_wang_c", "name": "王C", "dept": "设计"})
         self.assertEqual((resp_c_ok.status_code, resp_c_ok.json()["phone_masked"]), (200, "138****8003"))
+        self.assertEqual(self.store.get_delivery_target("13800008003")["external_id"], "uid_wang_c")
+
+        # 登记表单字段校验：缺部门 / 缺姓名直接 400
+        resp_no_dept = self.pub_client.post("/api/h5/bind", json={"phone": "13800008002", "external_id": "uid_li_b", "name": "李B", "dept": ""})
+        self.assertEqual(resp_no_dept.status_code, 400)
+        resp_bad_dept = self.pub_client.post("/api/h5/bind", json={"phone": "13800008002", "external_id": "uid_li_b", "name": "李B", "dept": "不存在的部门"})
+        self.assertEqual(resp_bad_dept.status_code, 400)
 
         audits = self.store.conn.execute("SELECT * FROM admin_audit WHERE action LIKE 'target.bind_%' ORDER BY id ASC").fetchall()
-        self.assertEqual(len(audits), 3)
+        self.assertEqual(len(audits), 2)
 
     def test_rebind_same_phone_returns_already_same(self) -> None:
-        """同一账号重复发送同一手机号：返回「已绑定」，不再抛 409（2026-10-28 修）。"""
+        """同一账号重复提交登记表单：返回「已登记」，不再抛 409（2026-11-03 改为 H5 登记表单）。"""
+        reset_bind_rate()
         rid = self.store.create_role("重复绑定角色", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800007001", "重复测", "研发", actor="admin")
+        self.store.create_department("研发", actor="admin")
 
-        ts1, nonce1 = str(int(time.time())), "nonce_repeat_1"
-        body1, sig1 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts1, nonce1,
-                                            {"userId": "uid_repeat", "text": "13800007001"})
-        first = self.pub_client.post("/api/app-events", content=body1,
-                                     headers={"X-CTQ-Timestamp": ts1, "X-CTQ-Nonce": nonce1, "X-CTQ-Signature": sig1})
+        first = self.pub_client.post("/api/h5/bind", json={"phone": "13800007001", "external_id": "uid_repeat", "name": "重复测", "dept": "研发"})
         self.assertEqual(first.status_code, 200)
         self.assertTrue(first.json()["bound"])
         self.assertFalse(first.json().get("already_same", False))
 
-        ts2, nonce2 = str(int(time.time()) + 1), "nonce_repeat_2"
-        body2, sig2 = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts2, nonce2,
-                                            {"userId": "uid_repeat", "text": "13800007001"})
-        second = self.pub_client.post("/api/app-events", content=body2,
-                                      headers={"X-CTQ-Timestamp": ts2, "X-CTQ-Nonce": nonce2, "X-CTQ-Signature": sig2})
+        second = self.pub_client.post("/api/h5/bind", json={"phone": "13800007001", "external_id": "uid_repeat", "name": "重复测", "dept": "研发"})
         self.assertEqual(second.status_code, 200)
-        self.assertTrue(second.json().get("already_same"), "重复绑定应返回已绑定而不是 409")
+        self.assertTrue(second.json().get("already_same"), "重复登记应返回已登记而不是 409")
 
-    def test_name_with_phone_enters_pending_pool(self) -> None:
-        """「姓名 手机号」也能登记：姓名解析进池，手机号照常入池（2026-10-28 用户口径）。"""
-        for label, text, want_name in (
-            ("空格分隔", "张三 13800009001", "张三"),
-            ("中文逗号", "张三，13800009002", "张三"),
-            ("号码在前", "13800009003 李四", "李四"),
-        ):
-            ts, nonce = str(int(time.time()) + 20), "nonce_np_" + str(abs(hash(label)) % 10 ** 6)
-            body, sig = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce,
-                                              {"userId": "uid_np_" + want_name, "text": text})
-            resp = self.pub_client.post("/api/app-events", content=body,
-                                        headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce,
-                                                 "X-CTQ-Signature": sig})
-            self.assertEqual(resp.status_code, 200, label)
-            self.assertTrue(resp.json().get("pending"), label)
-            self.assertEqual(resp.json().get("name"), want_name, label)
-            row = self.store.get_pending_member("uid_np_" + want_name)
-            self.assertIsNotNone(row, label)
-            self.assertEqual(row["name"], want_name, label)
-            self.assertTrue(row["phone"].startswith("13800009"), label)
+    def test_h5_registration_not_in_roster_enters_pending_pool(self) -> None:
+        """手机号不在名册：登记表单提交后进待归纳池（带姓名/手机号/部门），不建立投递绑定（2026-11-03 口径）。"""
+        reset_bind_rate()
+        self.store.create_department("市场部", actor="admin")
+        for phone, name in (("13800009001", "张三"), ("13800009002", "李四")):
+            resp = self.pub_client.post("/api/h5/bind", json={"phone": phone, "external_id": "uid_np_" + name, "name": name, "dept": "市场部"})
+            self.assertEqual(resp.status_code, 200, name)
+            self.assertTrue(resp.json().get("pending"), name)
+            row = self.store.get_pending_member("uid_np_" + name)
+            self.assertIsNotNone(row, name)
+            self.assertEqual(row["name"], name, name)
+            self.assertEqual(row["phone"], phone, name)
+            self.assertEqual(row["dept"], "市场部", name)
+            self.assertIsNone(self.store.get_delivery_target(phone), "入池不得直接建立投递绑定")
 
     def test_missed_slot_does_not_block_rescheduled_send(self) -> None:
         """2026-10-28 缺陷回归：同一天内「错过一次」不能把「改到稍后」的发送永久堵死。

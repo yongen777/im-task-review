@@ -222,9 +222,24 @@ CREATE TABLE IF NOT EXISTS pending_member (
   external_id  TEXT NOT NULL UNIQUE,
   phone        TEXT,
   name         TEXT,
+  dept         TEXT,
   last_message TEXT,
   activated_at TEXT NOT NULL,
   updated_at   TEXT NOT NULL
+);
+
+-- 2026-11-03 部门选项：后台管理员配置，供成员表单与 H5 登记页下拉选择
+CREATE TABLE IF NOT EXISTS dept_option (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+-- 2026-11-03 部门选项：后台管理员配置，供成员表单与 H5 登记页下拉选择
+CREATE TABLE IF NOT EXISTS dept_option (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
 );
 """
 
@@ -339,6 +354,8 @@ class Database:
             # 2026-11-02 多通道并行：待归纳池记录来源通道（zdxlz/wecom），
             # 提示管理员「这个人从哪个办公软件来」。唯一键暂不变（后续单独重建表）。
             _ensure_column(self.conn, "pending_member", "platform", "TEXT")
+            # 2026-11-03 H5 登记表单：待归纳池落库部门（部门选项由后台配置）
+            _ensure_column(self.conn, "pending_member", "dept", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
             # 2026-10-29 逾期补交审核制：逾期后必须「申请补交 → 管理员审核 → 30 分钟新链接」，

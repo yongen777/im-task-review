@@ -71,6 +71,7 @@ def handle_wecom_event(
     state: StateStore,
     fields: Dict[str, str],
     notifier: Any = None,
+    public_base_url: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
     """把企微回调字段映射到现有业务分支，只做格式转换，⛔ 不重写规则。"""
     msg_type = str(fields.get("MsgType") or "").lower()
@@ -91,7 +92,7 @@ def handle_wecom_event(
         content = str(fields.get("Content") or "")
         return handle_inbound_text(
             state=state, user_id=userid, msg_text=content, event_phone="", send=_send,
-            platform="wecom",
+            platform="wecom", base_url=public_base_url,
         )
 
     if msg_type == "event":
@@ -115,6 +116,7 @@ def create_wecom_router(
     token: str = "",
     aes_key: str = "",
     corpid: str = "",
+    public_base_url: str = "",
 ) -> APIRouter:
     router = APIRouter()
 
@@ -174,7 +176,7 @@ def create_wecom_router(
             return PlainTextResponse("success")
 
         # ⭐ 5 秒硬约束：先应答，业务异步处理
-        background.add_task(handle_wecom_event, state=state, fields=fields, notifier=notifier)
+        background.add_task(handle_wecom_event, state=state, fields=fields, notifier=notifier, public_base_url=public_base_url)
         return PlainTextResponse("success")
 
     return router

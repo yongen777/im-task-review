@@ -4,7 +4,8 @@
 说明（路径 A 写实口径）：
 - 量子密信平台真实下发的回调事件仅含 loginId / userId / toUserId 等标识字段，不含手机号，因此路径 A 在常规回调下不会触发；
 - 路径 A 仅在平台显式下发合法 11 位手机号字段（phone / mobile）时生效，绝不猜测或拿 loginId 等非手机号字段充当手机号；
-- 实际生产环境的主导激活路径是路径 B（用户私聊发送 11 位手机号）与路径 C（用户访问 /h5/bind 绑定页提交手机号）。
+- 实际生产环境的主导激活路径是路径 C（用户点击机器人下发的 /h5/bind 链接填写姓名/手机号/部门）；
+  2026-11-03 起「对话里发姓名手机号」的文字激活（原路径 B）已彻底停用。
 """
 from __future__ import annotations
 
@@ -12,7 +13,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 
 from ..channels.zdxlz import SignatureVerificationError, ZdxlzChannel, is_event_timestamp_fresh
 from ..scheduler import NotifierProtocol
-from ..state import BizError, StateStore, is_valid_phone, mask_phone
+from ..state import BizError, StateStore, is_valid_phone
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ def _extract_event_phone(payload: Dict[str, Any]) -> str:
 
 
 def _extract_message_text(payload: Dict[str, Any]) -> str:
-    """从回调事件 JSON 中提取用户私聊文本内容（用于主导路径 B：私聊发送 11 位手机号匹配绑定）。"""
+    """从回调事件 JSON 中提取发送方文本内容（未登记用户统一回登记链接；已绑定用户用于「申请补交」等指令）。"""
     candidates = [payload.get("text"), payload.get("content")]
     for nested_key in ("message", "msg", "data", "event"):
         nested = payload.get(nested_key)
@@ -153,13 +153,17 @@ def handle_inbound_text(
     send: Callable[[str, str], None],
     platform: str = "",
     user_name: str = "",
+    base_url: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
     """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
 
     2026-10-30 企微自建应用接入时抽出：
       · 量子密信：process_app_event 验签+解密后调用本函数；
       · 企业微信：/api/wecom/callback 解出 XML 明文后调用本函数。
-    ⛔ 业务规则（绑定 / 待归纳 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
+    ⛔ 业务规则（登记引导 / 待归纳 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
+
+    2026-11-03 用户口径：激活登记一律走 H5 表单（姓名/手机号/部门），
+    「对话里发姓名手机号」的文字激活路径彻底停用。
     """
 
     # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
@@ -174,50 +178,6 @@ def handle_inbound_text(
         except BizError as exc:
             send(exc.message, f"bind_A_err_{event_phone}")
             return exc.status_code, {"ok": False, "path": "A", "bound": False, "code": exc.code, "message": exc.message}
-
-    # 路径 B（主导路径）：用户私聊发送「姓名 + 手机号」或仅手机号
-    # ⭐ 2026-10-28 用户口径①：手机号**不再拦截**——不在名单的先落「已激活待归纳」池，
-    #    由管理员归纳角色；只有「该号已被别人绑定」才拒绝（防冒绑）。
-    # ⭐ 2026-10-28 用户口径②：平台不下发姓名，因此允许用户在手机号前/后带上姓名，
-    #    例如「张三 13900000000」「张三，13900000000」「13900000000 张三」。
-    phone_hit = re.search(r"1[3-9]\d{9}", msg_text or "")
-    if phone_hit:
-        msg_phone = phone_hit.group(0)
-        rest = (msg_text or "")[:phone_hit.start()] + (msg_text or "")[phone_hit.end():]
-        msg_name = re.sub(r"[\s,，、;；:：+＋|/\\-]+", "", rest).strip()[:20]
-        masked = mask_phone(msg_phone)
-        existing = state.get_delivery_target(msg_phone, platform=platform or None)
-        owner = str((existing or {}).get("external_id") or "") if existing else ""
-        if existing and owner and owner != user_id:
-            dup_text = "该手机号已被其他账号绑定，禁止覆盖；如非本人操作请联系管理员申诉。"
-            send(dup_text, f"bind_dup_{msg_phone}")
-            return 409, {"ok": False, "path": "B", "bound": False,
-                         "code": "DUPLICATE", "message": dup_text}
-        if existing and owner == user_id:
-            same_text = f"当前账号已关联手机号 {masked}，无需重复绑定。"
-            send(same_text, f"bind_same_{msg_phone}")
-            return 200, {"ok": True, "path": "B", "bound": True, "already_same": True,
-                         "masked_phone": masked, "message": same_text}
-        if not state.phone_in_roster(msg_phone):
-            rec = state.upsert_pending_member(user_id, last_message=msg_text,
-                                              phone=msg_phone, name=msg_name or None, platform=platform or None)
-            who = (f"{msg_name}（{masked}）" if msg_name else f"手机号 {masked}")
-            pending_text = (f"已登记{who}，已进入「已激活待归纳」名单。\n"
-                            f"管理员为你分配业务角色后，即可接收任务提醒。")
-            send(pending_text, f"bind_pending_{msg_phone}")
-            return 200, {"ok": True, "path": "B", "bound": False, "pending": True,
-                         "masked_phone": masked, "name": msg_name, "pending_id": rec.get("id"),
-                         "message": pending_text}
-        try:
-            res = state.bind_member_with_guardrails(phone=msg_phone, external_id=user_id, path="B", platform=platform or None)
-            send(res["receipt"], f"bind_B_{msg_phone}")
-            return 200, {
-                "ok": True, "path": "B", "bound": True,
-                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
-            }
-        except BizError as exc:
-            send(exc.message, f"bind_B_err_{msg_phone}")
-            return exc.status_code, {"ok": False, "path": "B", "bound": False, "code": exc.code, "message": exc.message}
 
     bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
     if bound_member is not None:
@@ -257,27 +217,34 @@ def handle_inbound_text(
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
 
-    # ── 2026-10-28 方案B：未绑定用户发任意消息 → 自动录入「已激活待归纳人员」──
-    # 用户无需发送手机号——发任意消息即被后台自动登记，管理员在「已激活待归纳角色人员」
-    # 专栏中看到该用户后，手动将其移入对应角色分组（分配时填写手机号完成推送绑定）。
+    # ── 2026-11-03 用户口径：激活登记一律走 H5 表单（姓名/手机号/部门）──
+    # 未登记用户发任何文本 → 统一回同一条登记提示文本 + 专属链接；
+    # 已通过链接提交过登记、还在等管理员分配角色的人 → 回等待文案（不再重复发链接）。
+    pending_row = None
+    try:
+        pending_row = state.get_pending_member(user_id)
+    except Exception:  # noqa: BLE001 - 查不到只当未登记处理
+        pending_row = None
+    if pending_row is not None and (pending_row.get("phone") or pending_row.get("name")):
+        wait_text = (
+            "【OPS任务调度助手】\n"
+            "你的登记信息已收到，请等待管理员为你分配业务角色，分配完成后即可接收任务提醒。"
+        )
+        send(wait_text, "pending_wait")
+        return 200, {"ok": True, "bound": False, "pending": True, "message": wait_text}
+
     try:
         state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100], name=user_name or None, platform=platform or None)
-        pending_ack = (
-            "【OPS任务调度助手】\n"
-            "你好，会话已激活，但尚未完成身份绑定。\n"
-            "我不支持聊天和文字指令，请回复「姓名 手机号」（例：张三 13900000000）完成绑定；\n"
-            "绑定后由管理员分配业务角色，即可接收任务提醒。"
-        )
-        send(pending_ack, "pending_auto")
-        return 200, {"ok": True, "bound": False, "pending": True, "message": pending_ack}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - 登记失败不影响把提示文本发给用户
         logger.warning("pending_member 自动登记失败 external_id=%s: %s", user_id, exc)
-        # 登记失败时 fallback 到原有绑定指引
-        bind_url = f"{base_url}/h5/bind#uid={user_id}"
-        guide_text = (f"您尚未完成身份绑定。请回复「姓名 手机号」（例：张三 13900000000），"
-                      f"或点击以下链接绑定：\n👉 {bind_url}")
-        send(guide_text, "bind_guide")
-        return 200, {"ok": True, "bound": False, "bind_url": bind_url, "message": guide_text}
+    bind_url = f"{base_url.rstrip('/')}/h5/bind#uid={user_id}" + (f"&plat={platform}" if platform else "")
+    prompt_text = (
+        "【OPS任务调度助手】\n"
+        "你还未完成信息登记。请点击下方链接填写【姓名、手机号、部门】，完成后即可接收任务提醒：\n"
+        f"{bind_url}"
+    )
+    send(prompt_text, "register_prompt")
+    return 200, {"ok": True, "bound": False, "pending": True, "bind_url": bind_url, "message": prompt_text}
 
 
 def process_app_event(
@@ -293,9 +260,9 @@ def process_app_event(
 ) -> Tuple[int, Dict[str, Any]]:
     """§3.2 & §7.3 核心处理逻辑，返回 (status_code, body_dict)：
     - 验签失败一律返回 401，绝不进入绑定逻辑；
-    - 路径 A（仅在平台下发手机号时生效）：平台真实事件仅有 loginId/userId/toUserId 不含手机号，主导路径为 B 与 C；
-    - 路径 B（主导路径）：用户私聊仅发送 11 位手机号 -> 校验三条护栏后匹配绑定；
-    - 未绑定且未发手机号 -> 回复绑定指引（引导用户直接私聊回复 11 位手机号走路径 B，或点击 /h5/bind 走路径 C）。
+    - 路径 A（仅在平台下发手机号时生效）：平台真实事件仅有 loginId/userId/toUserId 不含手机号；
+    - 路径 C（主导路径）：未登记用户回统一提示文本 + /h5/bind 登记链接（填写姓名/手机号/部门）；
+      已登记待分配角色的用户回等待文案；已绑定用户支持「申请补交」指令与固定 ack。
     """
     base_url = public_base_url.rstrip("/")
     active_notifier: NotifierProtocol = notifier if notifier is not None else channel
@@ -378,7 +345,7 @@ def process_app_event(
     return handle_inbound_text(
         state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
-        platform="zdxlz", user_name=user_name,
+        platform="zdxlz", user_name=user_name, base_url=base_url,
     )
 
 

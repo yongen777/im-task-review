@@ -4,16 +4,17 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="referrer" content="no-referrer" />
-  <title>账号绑定 - IMTask</title>
+  <title>信息登记 - IMTask</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f4f6f9; color: #1f2937; padding: 16px; line-height: 1.5; }
-    .card { max-width: 440px; margin: 24px auto; background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    .card { max-width: 440px; margin: 24px auto; background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 2px 10px rgba(0,0,0,.05); }
     .title { font-size: 18px; font-weight: 600; margin-bottom: 8px; color: #111827; }
     .desc { font-size: 13px; color: #6b7280; margin-bottom: 18px; }
     .field { margin-bottom: 16px; }
     .field label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; }
-    .field input { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 15px; }
+    .field label .req { color: #dc2626; margin-left: 2px; }
+    .field input, .field select { width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 15px; background: #fff; }
     .btn { width: 100%; padding: 12px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
     .btn:disabled { background: #9ca3af; cursor: not-allowed; }
     .msg { margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
@@ -23,20 +24,33 @@
 </head>
 <body>
   <div class="card">
-    <div class="title">量子密信身份绑定</div>
-    <div class="desc">请输入管理员已录入名册的 11 位手机号码完成绑定激活。</div>
+    <div class="title">信息登记</div>
+    <div class="desc">请填写姓名、手机号码与部门完成登记。登记后由管理员为你分配业务角色，即可接收任务提醒。</div>
     <div class="field">
-      <label for="phoneInput">手机号码</label>
+      <label for="nameInput">姓名<span class="req">*</span></label>
+      <input id="nameInput" type="text" maxlength="20" placeholder="请输入真实姓名" />
+    </div>
+    <div class="field">
+      <label for="phoneInput">手机号码<span class="req">*</span></label>
       <input id="phoneInput" type="tel" maxlength="11" placeholder="请输入 11 位手机号" />
     </div>
-    <button class="btn" id="bindBtn" type="button">立即绑定</button>
+    <div class="field">
+      <label for="deptSelect">部门<span class="req">*</span></label>
+      <select id="deptSelect">
+        <option value="">加载部门选项中…</option>
+      </select>
+    </div>
+    <button class="btn" id="bindBtn" type="button">提交登记</button>
     <div id="msgBox" class="msg"></div>
   </div>
   <script>
     (function () {
       const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
       const externalId = params.get("uid") || params.get("u") || params.get("external_id") || "";
+      const platform = params.get("plat") || params.get("platform") || "";
+      const nameInput = document.getElementById("nameInput");
       const phoneInput = document.getElementById("phoneInput");
+      const deptSelect = document.getElementById("deptSelect");
       const bindBtn = document.getElementById("bindBtn");
       const msgBox = document.getElementById("msgBox");
 
@@ -45,25 +59,63 @@
         msgBox.className = "msg " + type;
       }
 
-      bindBtn.addEventListener("click", () => {
-        const phone = phoneInput.value.trim();
+      // 部门选项由后台管理员配置；未配置时给出明确提示
+      fetch("/api/h5/departments")
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var items = (d && d.items) || [];
+          deptSelect.innerHTML = "";
+          if (!items.length) {
+            var opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "暂无可选部门，请联系管理员配置";
+            deptSelect.appendChild(opt);
+            deptSelect.disabled = true;
+            return;
+          }
+          var placeholder = document.createElement("option");
+          placeholder.value = "";
+          placeholder.textContent = "请选择部门";
+          deptSelect.appendChild(placeholder);
+          items.forEach(function (it) {
+            var o = document.createElement("option");
+            o.value = it.name;
+            o.textContent = it.name;
+            deptSelect.appendChild(o);
+          });
+        })
+        .catch(function () {
+          deptSelect.innerHTML = "";
+          var opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "部门选项加载失败，请刷新重试";
+          deptSelect.appendChild(opt);
+        });
+
+      bindBtn.addEventListener("click", function () {
+        var name = nameInput.value.trim();
+        var phone = phoneInput.value.trim();
+        var dept = deptSelect.value;
+        if (!name) return showMsg("请填写姓名", "error");
         if (!/^1[3-9]\d{9}$/.test(phone)) return showMsg("请输入合法的 11 位大陆手机号", "error");
+        if (!dept) return showMsg("请选择部门", "error");
         if (!externalId) return showMsg("链接缺少用户标识 (#uid=...)", "error");
         bindBtn.disabled = true;
         fetch("/api/h5/bind", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phone: phone, external_id: externalId })
+          body: JSON.stringify({ phone: phone, external_id: externalId, name: name, dept: dept, platform: platform })
         })
-          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-          .then(({ ok, data }) => {
-            if (!ok) {
+          .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); })
+          .then(function (res) {
+            if (!res.ok) {
               bindBtn.disabled = false;
-              return showMsg(data.message || "绑定失败", "error");
+              return showMsg(res.data.message || "提交失败", "error");
             }
-            showMsg(data.message || "绑定成功", "success");
+            showMsg(res.data.message || "提交成功", "success");
+            bindBtn.textContent = "已提交";
           })
-          .catch(() => {
+          .catch(function () {
             bindBtn.disabled = false;
             showMsg("网络异常，请稍后重试", "error");
           });

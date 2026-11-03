@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api.events import handle_inbound_text  # noqa: E402
+from app.api.h5 import process_h5_bind  # noqa: E402
 from app.config import SHANGHAI_TZ  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler, make_idem_key  # noqa: E402
 from app.state import StateStore  # noqa: E402
@@ -144,21 +145,34 @@ def test_unbound_member_sends_nothing() -> None:
         store.close()
 
 
-def test_inbound_text_binds_on_explicit_platform() -> None:
+def test_text_activation_dead_and_h5_registration_binds_wecom() -> None:
+    """2026-11-03 口径：对话文字激活彻底停用；登记一律走 H5 表单（姓名/手机号/部门），绑定写入来源平台。"""
     store = _mk_store()
     try:
-        role = store.create_role(name="绑定组")
+        role = store.create_role(name="绑定组", platform="wecom")
         store.add_role_member(role["role_id"], phone=PHONE, name=NAME)
+        store.create_department("市场部", actor="t")
         sent: list[tuple] = []
 
         def _send(text: str, tag: str) -> None:
             sent.append((text, tag))
 
+        # 1) 未登记用户发「姓名 手机号」→ 不再绑定，只回统一登记链接
         code, body = handle_inbound_text(
             state=store, user_id="wecom_uid_bind", msg_text=f"{NAME} {PHONE}",
-            send=_send, platform="wecom",
+            send=_send, platform="wecom", base_url="http://x.example.com",
         )
-        assert code == 200 and body.get("bound") is True, body
+        assert code == 200 and body.get("bound") is False, body
+        assert store.get_delivery_target(PHONE, platform="wecom") is None, "⛔ 文字不得再触发绑定"
+        assert "你还未完成信息登记" in body["message"]
+        assert body["bind_url"].endswith("#uid=wecom_uid_bind&plat=wecom"), body["bind_url"]
+
+        # 2) H5 登记表单（platform=wecom）→ 绑定写入 wecom，不串密信
+        code2, body2 = process_h5_bind(
+            state=store,
+            data={"phone": PHONE, "external_id": "wecom_uid_bind", "platform": "wecom", "name": NAME, "dept": "市场部"},
+        )
+        assert code2 == 200 and body2.get("bound") is True, body2
         assert store.get_delivery_target(PHONE, platform="wecom") is not None
         assert store.get_delivery_target(PHONE, platform="zdxlz") is None
     finally:

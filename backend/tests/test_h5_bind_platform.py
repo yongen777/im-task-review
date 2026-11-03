@@ -14,12 +14,14 @@ from app.scheduler import FakeNotifier
 from app.state import StateStore
 
 PHONE = "13800000007"
+DEPT = "一支局"
 
 
 def _store() -> StateStore:
     store = StateStore(Path(tempfile.mkdtemp(prefix="imtask_h5bind_")) / "im.db")
     role = store.create_role("绑定测试组", actor="t", platform="wecom")
-    store.add_role_member(role["role_id"], phone=PHONE, name="李四", dept="一支局")
+    store.add_role_member(role["role_id"], phone=PHONE, name="李四", dept=DEPT)
+    store.create_department(DEPT, actor="t")
     return store
 
 
@@ -29,7 +31,7 @@ def test_h5_bind_receipt_goes_to_bound_platform() -> None:
         z, w = FakeNotifier(), FakeNotifier()
         code, body = process_h5_bind(
             state=store,
-            data={"phone": PHONE, "external_id": "woOC_wecom_uid", "platform": "wecom"},
+            data={"phone": PHONE, "external_id": "woOC_wecom_uid", "platform": "wecom", "name": "李四", "dept": DEPT},
             notifier=z,                     # 旧行为会发到这里（错）
             notifiers={"zdxlz": z, "wecom": w},
         )
@@ -49,7 +51,7 @@ def test_h5_bind_defaults_to_current_platform() -> None:
         store.platform = "wecom"
         z, w = FakeNotifier(), FakeNotifier()
         code, _ = process_h5_bind(
-            state=store, data={"phone": PHONE, "external_id": "woOC_uid_2"},
+            state=store, data={"phone": PHONE, "external_id": "woOC_uid_2", "name": "李四", "dept": DEPT},
             notifier=z, notifiers={"zdxlz": z, "wecom": w},
         )
         assert code == 200
@@ -64,7 +66,7 @@ def test_h5_bind_falls_back_to_single_notifier() -> None:
     try:
         z = FakeNotifier()
         code, _ = process_h5_bind(
-            state=store, data={"phone": PHONE, "external_id": "uid_3"}, notifier=z,
+            state=store, data={"phone": PHONE, "external_id": "uid_3", "name": "李四", "dept": DEPT}, notifier=z,
         )
         assert code == 200
         assert len(z.sent_messages) == 1

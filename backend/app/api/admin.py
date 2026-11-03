@@ -794,6 +794,55 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         }
 
     # ==================================================================
+    # 2026-11-03 部门选项（后台配置；成员表单与 H5 登记页共用）
+    # ==================================================================
+    @router.get("/departments")
+    async def list_departments(request: Request):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        return {"ok": True, "items": state.list_departments()}
+
+    @router.post("/departments")
+    async def create_department(request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        body = await _read_json_body(request)
+        try:
+            dept = state.create_department(str(body.get("name") or ""), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, "department": dept}
+
+    @router.put("/departments/{dept_id}")
+    async def update_department(dept_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        body = await _read_json_body(request)
+        try:
+            dept = state.update_department(int(dept_id), str(body.get("name") or ""), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, "department": dept}
+
+    @router.delete("/departments/{dept_id}")
+    async def delete_department(dept_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            state.delete_department(int(dept_id), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True}
+
+    # ==================================================================
     # §9.3 角色与成员接口
     # ==================================================================
     @router.get("/roles")
@@ -858,7 +907,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if not stored_phone:
             return JSONResponse(status_code=400, content={
                 "ok": False, "code": "PHONE_REQUIRED",
-                "message": "该用户尚未在对话中发送「姓名 手机号」，请等待其发送后再归纳",
+                "message": "该用户尚未通过登记链接填写手机号，请等待其填写完成后再归纳",
             })
         try:
             res = state.assign_pending_member(

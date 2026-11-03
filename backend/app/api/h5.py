@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import threading
@@ -20,6 +21,8 @@ except ImportError:  # pragma: no cover
 
 from ..scheduler import NotifierProtocol
 from ..state import BizError, StateStore, calc_resubmit_deadline
+
+logger = logging.getLogger(__name__)
 
 # 2026-10-28：补齐日常拍照格式——jpeg（Windows/相机常见）与 webp（微信转发常见）
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp"}
@@ -40,6 +43,12 @@ def _bind_rate_per_min() -> int:
         return max(0, int(raw))
     except ValueError:
         return 5
+
+
+def reset_bind_rate() -> None:
+    """测试用：清空绑定接口的 IP 限流计数。"""
+    with _BIND_RATE_LOCK:
+        _BIND_RATE.clear()
 
 
 def _bind_rate_limited(client_ip: str) -> bool:
@@ -150,25 +159,66 @@ def process_h5_bind(
     external_id = str(data.get("external_id") or data.get("uid") or data.get("user_id") or data.get("userId") or "").strip()
     platform = str(data.get("platform") or "").strip().lower() or state.platform
 
-    try:
-        res = state.bind_member_with_guardrails(
-            phone=phone, external_id=external_id, path="C", platform=platform
-        )
-    except BizError as exc:
-        return exc.status_code, {"code": exc.code, "message": exc.message}
+    # 2026-11-03 用户口径：激活登记改为 H5 表单 —— 姓名 + 手机号 + 部门（部门为必选）。
+    # ⛔ 对话里发「姓名 手机号」的旧激活路径已彻底停用，这里统一收口。
+    name = str(data.get("name") or "").strip()
+    dept = str(data.get("dept") or "").strip()
+    if not external_id:
+        return 400, {"code": "VALIDATION_FAILED", "message": "链接缺少用户标识，请从机器人下发的链接进入"}
+    if not name or len(name) > 20:
+        return 400, {"code": "VALIDATION_FAILED", "message": "请填写姓名（1~20 个字）"}
+    if not dept:
+        return 400, {"code": "VALIDATION_FAILED", "message": "请选择部门"}
+    if not state.department_exists(dept):
+        return 400, {"code": "VALIDATION_FAILED", "message": "部门不存在，请刷新页面后重新选择"}
 
-    # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
-    nt = (notifiers or {}).get(platform) or notifier
-    if nt is not None and external_id:
-        idem = hashlib.sha1(f"bind_C|{external_id}|{phone}|{state.now_str()}".encode("utf-8")).hexdigest()
+    # 防冒绑：该手机号在本平台已被别的账号绑定时拒绝（与原护栏一致）
+    existing = state.get_delivery_target(phone, platform=platform)
+    owner = str((existing or {}).get("external_id") or "") if existing else ""
+    if existing and owner and owner != external_id:
+        return 409, {"code": "DUPLICATE", "message": "该手机号已被其他账号绑定，禁止覆盖；如非本人操作请联系管理员申诉"}
+    if existing and owner == external_id:
+        masked = phone[:3] + "****" + phone[-4:]
+        return 200, {"ok": True, "path": "C", "bound": True, "already_same": True,
+                    "phone": phone, "masked_phone": masked, "phone_masked": masked,
+                    "message": f"当前账号已关联手机号 {masked}，无需重复登记。"}
+
+    if state.phone_in_roster(phone):
+        # 名册内：直接完成绑定（原路径 C 护栏逻辑不变）
         try:
-            nt.send_text(external_id, res["receipt"], idem)
-        except Exception:
-            pass
+            res = state.bind_member_with_guardrails(
+                phone=phone, external_id=external_id, path="C", platform=platform
+            )
+        except BizError as exc:
+            return exc.status_code, {"code": exc.code, "message": exc.message}
 
+        # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
+        nt = (notifiers or {}).get(platform) or notifier
+        if nt is not None and external_id:
+            idem = hashlib.sha1(f"bind_C|{external_id}|{phone}|{state.now_str()}".encode("utf-8")).hexdigest()
+            try:
+                nt.send_text(external_id, res["receipt"], idem)
+            except Exception:
+                pass
+
+        return 200, {
+            "ok": True, "path": "C", "bound": True, "phone": res["phone"],
+            "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
+        }
+
+    # 2026-11-03 用户口径：手机号不在名册 → 不再报错，落「已激活待归纳」池（带姓名/手机号/部门），
+    # 由管理员分配业务角色后即可接收提醒。
+    state.upsert_pending_member(
+        external_id=external_id, phone=phone, name=name, dept=dept, platform=platform,
+        last_message="H5登记",
+    )
+    pending_msg = (
+        f"{name}，信息登记已收到。\n"
+        "管理员为你分配业务角色后，即可接收任务提醒，请耐心等待。"
+    )
     return 200, {
-        "ok": True, "path": "C", "bound": True, "phone": res["phone"],
-        "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
+        "ok": True, "path": "C", "bound": False, "pending": True,
+        "phone": phone, "name": name, "dept": dept, "message": pending_msg,
     }
 
 
@@ -330,7 +380,57 @@ def process_h5_task_upload(
     }
 
 
-def process_h5_task_submit(*, state: StateStore, raw_token: str, data: Any) -> Tuple[int, Dict[str, Any]]:
+def _push_submit_feedback(
+    *, state: StateStore, inst: Optional[Dict[str, Any]], submission_id: Any,
+    notifier: Optional[NotifierProtocol] = None,
+    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+) -> None:
+    """2026-11-03 用户口径：任务提交成功后给提交人回推一条「【任务名】提交成功」。
+
+    · 通道 = 任务所属办公软件（与调度投递同口径），不串到别的平台；
+    · 幂等：发送动作之前查重，同一 submission 只推一条；
+    · 发送/记账失败只记日志，绝不影响提交结果本身。
+    """
+    try:
+        if not inst:
+            return
+        tpl = state.get_template(str(inst.get("template_id") or "")) or {}
+        plats = state.role_platforms(list(tpl.get("role_ids") or []))
+        platform = plats.pop() if len(plats) == 1 else ""
+        nt = (notifiers or {}).get(platform) if (platform and notifiers) else notifier
+        if nt is None:
+            logger.warning("提交反馈未发送（无可用通道）instance=%s", inst.get("id"))
+            return
+        target = (
+            state.get_delivery_target(str(inst.get("phone") or ""), platform=platform)
+            if (platform and notifiers)
+            else state.get_delivery_target(str(inst.get("phone") or ""))
+        )
+        ext_id = str((target or {}).get("external_id") or "")
+        if not ext_id:
+            logger.warning("提交反馈未发送（成员未激活绑定）instance=%s", inst.get("id"))
+            return
+        now_s = state.now_str()
+        idem = hashlib.sha1(f"submit_ack|{inst.get('id')}|{submission_id}".encode("utf-8")).hexdigest()
+        if state.has_sent_reminder(idem):
+            return
+        res = nt.send_text(ext_id, f"【{tpl.get('name') or '任务'}】提交成功", idem)
+        state.record_reminder_log(
+            template_id=str(inst.get("template_id") or ""), instance_id=int(inst["id"]),
+            phone=str(inst.get("phone") or ""), kind="submit_ack", planned_at=now_s,
+            attempted_at=now_s, sent_at=now_s if res.ok else None,
+            result="sent" if res.ok else "failed", retry=0,
+            error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=idem,
+        )
+    except Exception as exc:  # noqa: BLE001 - 反馈回推绝不能把提交接口拖挂
+        logger.warning("提交反馈回推异常 instance=%s: %s", (inst or {}).get("id"), exc)
+
+
+def process_h5_task_submit(
+    *, state: StateStore, raw_token: str, data: Any,
+    notifier: Optional[NotifierProtocol] = None,
+    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+) -> Tuple[int, Dict[str, Any]]:
     """§8 & §9.8 H5 任务提交核心逻辑。"""
     if not isinstance(data, dict):
         return 400, {"code": "VALIDATION_FAILED", "message": "请求体必须为 JSON 对象"}
@@ -353,6 +453,8 @@ def process_h5_task_submit(*, state: StateStore, raw_token: str, data: Any) -> T
 
     tok = state.get_h5_token(raw_token)
     inst = state.get_instance(int(tok["instance_id"])) if tok and tok.get("instance_id") else None
+    # 2026-11-03 用户口径：提交成功后回推一条「【任务名】提交成功」
+    _push_submit_feedback(state=state, inst=inst, submission_id=res.get("submission_id"), notifier=notifier, notifiers=notifiers)
     return 200, {**res, "instance": inst}
 
 
@@ -370,6 +472,11 @@ def create_h5_router(
     @router.get("/h5/bind", response_class=HTMLResponse)
     async def h5_bind_page():
         return HTMLResponse(content=load_h5_html("bind.html"))
+
+    # 2026-11-03：H5 登记表单的部门下拉选项（后台管理员配置，公开只读）
+    @router.get("/api/h5/departments")
+    async def api_h5_departments():
+        return {"ok": True, "items": state.list_departments()}
 
     # 2026-10-29：通知附图的「公网直链」。平台 CDN 返回 application/octet-stream、
     # 且 32KB 的图要 5s+ 才下发完，手机端量子密信的图片消息一直转圈打不开（PC 端因有缓存才正常）。
@@ -495,7 +602,9 @@ def create_h5_router(
         if not isinstance(data, dict):
             return JSONResponse(status_code=400, content={"code": "VALIDATION_FAILED", "message": "请求体必须为 JSON 对象"})
         raw_token = _extract_token_from_request(request, data.get("token"))
-        status_code, content = process_h5_task_submit(state=state, raw_token=raw_token, data=data)
+        status_code, content = process_h5_task_submit(
+            state=state, raw_token=raw_token, data=data, notifier=notifier, notifiers=notifiers
+        )
         return JSONResponse(status_code=status_code, content=content)
 
     return router

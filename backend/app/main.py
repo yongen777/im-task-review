@@ -136,7 +136,8 @@ def create_apps(
 
             def _aibot_inbound(user_id: str, msg_text: str, send) -> None:
                 handle_inbound_text(
-                    state=store, user_id=user_id, msg_text=msg_text, send=send, platform="wecom"
+                    state=store, user_id=user_id, msg_text=msg_text, send=send,
+                    platform="wecom", base_url=cfg.public_base_url,
                 )
 
             notifiers["wecom"] = WecomAibotNotifier(cfg, on_text=_aibot_inbound)
@@ -243,6 +244,7 @@ def create_apps(
             token=getattr(cfg, "wecom_token", ""),
             aes_key=getattr(cfg, "wecom_aes_key", ""),
             corpid=getattr(cfg, "wecom_corpid", ""),
+            public_base_url=cfg.public_base_url,
         )
     )
 

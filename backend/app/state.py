@@ -1157,6 +1157,59 @@ class StateStore:
             return [self._deserialize_template_row(r) for r in self.conn.execute(sql).fetchall()]
 
     # ── 已激活待归纳人员（2026-10-28 方案B：用户发任意消息自动录入，管理员后续归纳角色）──
+    # ── 部门选项（2026-11-03：后台配置，H5 登记页与成员表单共用）──
+    def list_departments(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute("SELECT id, name, created_at FROM dept_option ORDER BY id ASC").fetchall()
+        return [{"id": int(r["id"]), "name": str(r["name"]), "created_at": r["created_at"]} for r in rows]
+
+    def department_exists(self, name: str) -> bool:
+        clean = (name or "").strip()
+        if not clean:
+            return False
+        with self.lock:
+            return self.conn.execute("SELECT 1 FROM dept_option WHERE name = ? LIMIT 1", (clean,)).fetchone() is not None
+
+    def create_department(self, name: str, actor: str = "system") -> Dict[str, Any]:
+        clean = (name or "").strip()
+        if not clean:
+            raise BizError(400, "VALIDATION_FAILED", "部门名称不能为空")
+        if len(clean) > 30:
+            raise BizError(400, "VALIDATION_FAILED", "部门名称过长（最多 30 字）")
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            if self.conn.execute("SELECT 1 FROM dept_option WHERE name = ?", (clean,)).fetchone():
+                raise BizError(409, "DEPT_NAME_TAKEN", "部门名称已存在")
+            cur = self.conn.execute("INSERT INTO dept_option(name, created_at) VALUES (?, ?)", (clean, now_s))
+            dept_id = int(cur.lastrowid)
+            self._insert_audit_unlocked(actor, "dept.create", "dept_option", str(dept_id), {"name": clean}, now_s)
+        return {"id": dept_id, "name": clean}
+
+    def update_department(self, dept_id: int, name: str, actor: str = "system") -> Dict[str, Any]:
+        clean = (name or "").strip()
+        if not clean:
+            raise BizError(400, "VALIDATION_FAILED", "部门名称不能为空")
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT id, name FROM dept_option WHERE id = ?", (int(dept_id),)).fetchone()
+            if not row:
+                raise BizError(404, "NOT_FOUND", "部门不存在")
+            if self.conn.execute("SELECT 1 FROM dept_option WHERE name = ? AND id != ?", (clean, int(dept_id))).fetchone():
+                raise BizError(409, "DEPT_NAME_TAKEN", "部门名称已存在")
+            self.conn.execute("UPDATE dept_option SET name = ? WHERE id = ?", (clean, int(dept_id)))
+            self._insert_audit_unlocked(actor, "dept.update", "dept_option", str(int(dept_id)), {"name": clean}, now_s)
+        return {"id": int(dept_id), "name": clean}
+
+    def delete_department(self, dept_id: int, actor: str = "system") -> None:
+        """删除部门选项：成员/待归纳里已存的部门是文本快照，不受影响。"""
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT id, name FROM dept_option WHERE id = ?", (int(dept_id),)).fetchone()
+            if not row:
+                raise BizError(404, "NOT_FOUND", "部门不存在")
+            self.conn.execute("DELETE FROM dept_option WHERE id = ?", (int(dept_id),))
+            self._insert_audit_unlocked(actor, "dept.delete", "dept_option", str(int(dept_id)), {"name": row["name"]}, now_s)
+
     def phone_in_roster(self, phone: str) -> bool:
         """手机号是否已在成员名单（member 表）里。用于「先入待归纳池、不拦截」的分流判断。"""
         clean = (phone or "").strip()
@@ -1168,18 +1221,21 @@ class StateStore:
     def upsert_pending_member(self, external_id: str, last_message: str = "",
                               phone: Optional[str] = None,
                               name: Optional[str] = None,
-                              platform: Optional[str] = None) -> Dict[str, Any]:
-        """用户给机器人发任意消息时自动录入待归纳池（幂等，已存在则仅更新变化字段）。
+                              platform: Optional[str] = None,
+                              dept: Optional[str] = None) -> Dict[str, Any]:
+        """用户给机器人发任意消息 / H5 登记表单提交时录入待归纳池（幂等，已存在则仅更新变化字段）。
 
         ⭐ 2026-10-28 用户口径：手机号**不再要求先在名单里**——
            提交的手机号直接落池（标记未核实），由管理员归纳角色时才决定归属。
         ⭐ 2026-11-02 多通道：记录来源通道（zdxlz/wecom），后台显示「从哪个办公软件来」。
+        ⭐ 2026-11-03 H5 登记表单：落库姓名 / 手机号 / 部门。
         """
         clean_id = (external_id or "").strip()
         if not clean_id:
             raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
         clean_phone = (phone or "").strip() or None
         clean_name = (name or "").strip() or None
+        clean_dept = (dept or "").strip() or None
         clean_platform = self._plat(platform) if platform else None
         now_s = self.now_str()
         with self.lock, self.conn:
@@ -1187,16 +1243,16 @@ class StateStore:
             if existing:
                 self.conn.execute(
                     "UPDATE pending_member SET last_message = ?,"
-                    " phone = COALESCE(?, phone), name = COALESCE(?, name),"
+                    " phone = COALESCE(?, phone), name = COALESCE(?, name), dept = COALESCE(?, dept),"
                     " platform = COALESCE(?, platform), updated_at = ?"
                     " WHERE external_id = ?",
-                    (last_message[:200], clean_phone, clean_name, clean_platform, now_s, clean_id),
+                    (last_message[:200], clean_phone, clean_name, clean_dept, clean_platform, now_s, clean_id),
                 )
             else:
                 self.conn.execute(
-                    "INSERT INTO pending_member(external_id, phone, name, last_message, platform, activated_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (clean_id, clean_phone, clean_name, last_message[:200], clean_platform, now_s, now_s),
+                    "INSERT INTO pending_member(external_id, phone, name, dept, last_message, platform, activated_at, updated_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (clean_id, clean_phone, clean_name, clean_dept, last_message[:200], clean_platform, now_s, now_s),
                 )
         return self.get_pending_member(clean_id) or {"external_id": clean_id}
 
@@ -1226,7 +1282,7 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
         if not clean_phone:
             raise BizError(400, "PHONE_REQUIRED",
-                           "该人员尚未登记手机号，请让其在机器人对话中发送 11 位手机号后再归纳")
+                           "该人员尚未通过登记链接填写手机号，请等待其填写后再归纳")
         now_s = self.now_str()
         with self.lock, self.conn:
             row = self.conn.execute("SELECT * FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
@@ -1240,8 +1296,9 @@ class StateStore:
             pending_plat = str(d.get("platform") or "").strip().lower()
             if pending_plat and pending_plat != str(role_row["platform"]).strip().lower():
                 raise BizError(400, "PLATFORM_MISMATCH", "该人员来自其他办公软件，不能移入当前平台的角色")
-            # 添加到角色成员
-            self.add_role_member(role_id=role_id, phone=clean_phone, name=name or d.get("name") or clean_phone[-4:], dept=dept or "", actor=actor)
+            # 添加到角色成员；部门优先取管理员显式传入，缺省用该人员在登记表单里填的部门
+            clean_dept = (dept or "").strip() or str(d.get("dept") or "").strip()
+            self.add_role_member(role_id=role_id, phone=clean_phone, name=name or d.get("name") or clean_phone[-4:], dept=clean_dept, actor=actor)
             # 绑定 delivery_target（使其可接收推送）：绑定到该人员来源通道，
             # 多通道并行时不能默认写到当前通道，否则会把企微 userid 绑到密信上。
             self.upsert_delivery_target(phone=clean_phone, external_id=clean_id, platform=d.get("platform"))

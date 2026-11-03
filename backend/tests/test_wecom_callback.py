@@ -223,7 +223,7 @@ def test_post_unbound_user_goes_to_pending_pool() -> None:
                    content=_post_body(enc))
         assert r.status_code == 200
         assert store.get_pending_member("lisi") is not None
-        assert notifier.sent and "尚未完成身份绑定" in notifier.sent[0][1]
+        assert notifier.sent and "你还未完成信息登记" in notifier.sent[0][1]
     finally:
         store.close()
 
