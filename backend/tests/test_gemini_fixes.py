@@ -57,6 +57,9 @@ def test_csv_import_dict_format():
     store = _mk_store()
     try:
         rid = store.create_role("导入组", actor="t")["role_id"]
+        # 2026-11-03：部门必须命中后台配置的部门选项
+        store.create_department("一部", actor="t")
+        store.create_department("二部", actor="t")
         rows = [
             {"row": 1, "phone": "13900002001", "name": "甲", "dept": "一部"},
             {"row": 2, "phone": "13900002002", "name": "乙", "dept": "二部"},

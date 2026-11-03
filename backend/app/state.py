@@ -521,6 +521,24 @@ class StateStore:
             ).fetchall()
         return {str(r["platform"]).strip().lower() for r in rows}
 
+    def get_binding_by_external_id(self, external_id: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """按 external_id 反查可用绑定（2026-11-03：登记页防重复提交用）。"""
+        clean_ext = (external_id or "").strip()
+        if not clean_ext:
+            return None
+        plat = (platform or "").strip().lower()
+        with self.lock:
+            if plat:
+                row = self.conn.execute(
+                    "SELECT * FROM delivery_target WHERE platform = ? AND external_id = ? AND usable = 1",
+                    (plat, clean_ext),
+                ).fetchone()
+            else:
+                row = self.conn.execute(
+                    "SELECT * FROM delivery_target WHERE external_id = ? AND usable = 1", (clean_ext,)
+                ).fetchone()
+        return dict(row) if row else None
+
     def get_role(self, role_id: str) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT r.*, (SELECT COUNT(1) FROM member m WHERE m.role_id = r.role_id) AS member_count FROM role r WHERE r.role_id = ?", ((role_id or "").strip(),)).fetchone()
@@ -785,6 +803,10 @@ class StateStore:
                     continue
                 if not name:
                     invalid.append({"row": row_num, "phone": phone, "reason": "姓名不能为空"})
+                    continue
+                # 2026-11-03：部门非空时必须命中后台配置的部门选项，不允许静默写入不存在的部门
+                if dept is not None and not self.department_exists(dept):
+                    invalid.append({"row": row_num, "phone": phone, "reason": f"部门不存在：{dept}"})
                     continue
                 if phone in existing_phones or phone in batch_seen_phones:
                     already_exists += 1

@@ -203,6 +203,9 @@ class TestStage2A(unittest.TestCase):
     def test_r43_member_import_dry_run_and_commit(self) -> None:
         rid = self.store.create_role("渠道经理", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800138001", "张三", "一部", actor="admin")
+        # 2026-11-03：部门必须命中后台配置的部门选项
+        for dept in ("一部", "二部", "三部", "四部", "五部"):
+            self.store.create_department(dept, actor="admin")
 
         csv_rows = [
             {"name": "张三", "phone": "13800138001", "dept": "一部"},

@@ -172,6 +172,27 @@ def process_h5_bind(
     if not state.department_exists(dept):
         return 400, {"code": "VALIDATION_FAILED", "message": "部门不存在，请刷新页面后重新选择"}
 
+    # 2026-11-03 防重复提交：已登记过的账号不允许「退出重进再提交覆盖」
+    #   ① 已绑定：同手机号回「无需重复登记」；换手机号直接拒绝（防一人多号/顶号）；
+    #   ② 已提交登记待分配：原样保留，不覆盖姓名/手机号/部门。
+    bound = state.get_binding_by_external_id(external_id, platform=platform)
+    if bound:
+        bound_phone = str(bound.get("phone") or "")
+        masked_bound = bound_phone[:3] + "****" + bound_phone[-4:] if len(bound_phone) == 11 else ""
+        if bound_phone and bound_phone != phone:
+            return 409, {"code": "DUPLICATE",
+                        "message": f"该账号已绑定手机号 {masked_bound}，请勿重复登记；如需更换手机号请联系管理员"}
+        return 200, {"ok": True, "path": "C", "bound": True, "already_same": True,
+                    "phone": bound_phone, "masked_phone": masked_bound, "phone_masked": masked_bound,
+                    "message": f"当前账号已关联手机号 {masked_bound}，无需重复登记。"}
+    pending_existing = state.get_pending_member(external_id)
+    if pending_existing is not None and (pending_existing.get("phone") or pending_existing.get("name")):
+        p_name = str(pending_existing.get("name") or "").strip() or "未命名用户"
+        p_phone = str(pending_existing.get("phone") or "").strip()
+        p_masked = p_phone[:3] + "****" + p_phone[-4:] if len(p_phone) == 11 else "手机号未提供"
+        return 200, {"ok": True, "path": "C", "pending": True, "already_same": True,
+                    "message": f"你已提交过登记信息（{p_name}，{p_masked}），请等待管理员分配业务角色，无需重复提交。"}
+
     # 防冒绑：该手机号在本平台已被别的账号绑定时拒绝（与原护栏一致）
     existing = state.get_delivery_target(phone, platform=platform)
     owner = str((existing or {}).get("external_id") or "") if existing else ""
@@ -217,6 +238,18 @@ def process_h5_bind(
         f"{name}，信息登记已收到。\n"
         "管理员为你分配业务角色后，即可接收任务提醒，请耐心等待。"
     )
+    # 2026-11-03 用户反馈：登记提交成功但没有收到任何信息反馈 → 按平台回推一条确认
+    nt = (notifiers or {}).get(platform) or notifier
+    if nt is not None and external_id:
+        fidem = hashlib.sha1(f"bind_pending|{platform}|{external_id}|{phone}".encode("utf-8")).hexdigest()
+        try:
+            nt.send_text(
+                external_id,
+                f"【OPS任务调度助手】已收到你的登记信息（{name}，{dept}）。管理员为你分配业务角色后，即可接收任务提醒。",
+                fidem,
+            )
+        except Exception as exc:  # noqa: BLE001 - 回执失败不影响登记
+            logger.warning("登记回执发送失败 external=%s: %s", external_id, exc)
     return 200, {
         "ok": True, "path": "C", "bound": False, "pending": True,
         "phone": phone, "name": name, "dept": dept, "message": pending_msg,
@@ -478,6 +511,26 @@ def create_h5_router(
     @router.get("/api/h5/departments")
     async def api_h5_departments():
         return {"ok": True, "items": state.list_departments()}
+
+    # 2026-11-03：登记页打开时查询是否已登记（已登记则页面直接锁定，防退出重进后重复提交覆盖）
+    @router.get("/api/h5/bind/status")
+    async def api_h5_bind_status(uid: str = "", platform: str = ""):
+        ext = (uid or "").strip()
+        plat = (platform or "").strip().lower() or state.platform
+        if not ext:
+            return {"ok": True, "registered": False}
+        bound = state.get_binding_by_external_id(ext, platform=plat)
+        if bound:
+            p = str(bound.get("phone") or "")
+            masked = p[:3] + "****" + p[-4:] if len(p) == 11 else ""
+            return {"ok": True, "registered": True, "bound": True, "phone_masked": masked}
+        pending = state.get_pending_member(ext)
+        if pending is not None and (pending.get("phone") or pending.get("name")):
+            p = str(pending.get("phone") or "")
+            masked = p[:3] + "****" + p[-4:] if len(p) == 11 else ""
+            return {"ok": True, "registered": True, "bound": False,
+                    "name": str(pending.get("name") or ""), "phone_masked": masked}
+        return {"ok": True, "registered": False}
 
     # 2026-10-29：通知附图的「公网直链」。平台 CDN 返回 application/octet-stream、
     # 且 32KB 的图要 5s+ 才下发完，手机端量子密信的图片消息一直转圈打不开（PC 端因有缓存才正常）。

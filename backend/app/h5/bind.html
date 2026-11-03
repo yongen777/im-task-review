@@ -59,6 +59,31 @@
         msgBox.className = "msg " + type;
       }
 
+      /* 2026-11-03：已登记/已提交后整页锁定，防退出重进后重复提交覆盖 */
+      function lockForm(text) {
+        nameInput.disabled = true;
+        phoneInput.disabled = true;
+        deptSelect.disabled = true;
+        bindBtn.disabled = true;
+        bindBtn.textContent = "已提交";
+        showMsg(text, "success");
+      }
+
+      // 打开页面先查：该账号是否已登记（已绑定 / 已提交待分配）→ 直接锁定
+      if (externalId) {
+        fetch("/api/h5/bind/status?uid=" + encodeURIComponent(externalId) + "&platform=" + encodeURIComponent(platform))
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || !d.registered) return;
+            if (d.bound) {
+              lockForm("你已完成登记" + (d.phone_masked ? "（" + d.phone_masked + "）" : "") + "，无需重复提交。");
+            } else {
+              lockForm("你已提交登记" + (d.name ? "（" + d.name + "）" : "") + "，请等待管理员分配业务角色，无需重复提交。");
+            }
+          })
+          .catch(function () { /* 查询失败不阻塞填写 */ });
+      }
+
       // 部门选项由后台管理员配置；未配置时给出明确提示
       fetch("/api/h5/departments")
         .then(function (r) { return r.json(); })
@@ -112,8 +137,7 @@
               bindBtn.disabled = false;
               return showMsg(res.data.message || "提交失败", "error");
             }
-            showMsg(res.data.message || "提交成功", "success");
-            bindBtn.textContent = "已提交";
+            lockForm(res.data.message || "提交成功");
           })
           .catch(function () {
             bindBtn.disabled = false;
