@@ -139,3 +139,96 @@ def test_zdxlz_attach_image_goes_link_not_native() -> None:
         assert len(texts) == 2, texts
     finally:
         store.close()
+
+
+# ── 4. 绑定只认「本平台」名册；否则落本平台待归纳池 ─────────────────
+def test_h5_bind_requires_same_platform_roster_else_pending() -> None:
+    """2026-11-03 现场漏点：人在企微角色里、拿密信链接登记，旧逻辑（全局名册）直接绑上了密信，
+    导致此人既不在密信角色里、也不在密信待归纳池，密信面板里凭空消失。"""
+    from app.api.h5 import process_h5_bind
+
+    store = _store()
+    try:
+        w_role = store.create_role("企微组", actor="t", platform="wecom")["role_id"]
+        store.add_role_member(w_role, PHONE, NAME, DEPT, actor="t")
+        store.create_department(DEPT, actor="t")
+
+        code, body = process_h5_bind(
+            state=store,
+            data={"phone": PHONE, "external_id": "zd_uid_x", "platform": "zdxlz", "name": NAME, "dept": DEPT},
+        )
+        assert code == 200 and body.get("pending") is True, body
+        row = store.get_pending_member("zd_uid_x")
+        assert row is not None and row["platform"] == "zdxlz" and row["phone"] == PHONE
+        assert store.get_delivery_target(PHONE, platform="zdxlz") is None, "⛔ 不得绕过本平台名册直接绑定"
+
+        # 在企微平台登记同名册 → 正常绑定
+        code2, body2 = process_h5_bind(
+            state=store,
+            data={"phone": PHONE, "external_id": "wx_uid_x", "platform": "wecom", "name": NAME, "dept": DEPT},
+        )
+        assert code2 == 200 and body2.get("bound") is True, body2
+    finally:
+        store.close()
+
+
+# ── 5. 移出分组 → 未完成任务实例一并清掉 ───────────────────────────
+def _notice_tpl(store: StateStore, role_ids: list, name: str) -> str:
+    tpl = store.create_template(
+        {
+            "name": name, "kind": "notice", "role_ids": role_ids,
+            "text_tpl": "提醒正文", "notice_times": ["08:00"], "period": "day", "enabled": True,
+        },
+        actor="t",
+    )
+    return tpl["template_id"]
+
+
+def test_remove_member_purges_open_instances_of_that_role() -> None:
+    store = _store()
+    try:
+        ra = store.create_role("密信A组", actor="t", platform="zdxlz")["role_id"]
+        rb = store.create_role("密信B组", actor="t", platform="zdxlz")["role_id"]
+        store.add_role_member(ra, PHONE, NAME, DEPT, actor="t")
+        store.add_role_member(rb, PHONE, NAME, DEPT, actor="t")
+
+        exclusive_tpl = _notice_tpl(store, [ra], "仅A组任务")
+        shared_tpl = _notice_tpl(store, [ra, rb], "A+B共用任务")
+        pkey, deadline = "2026-11-03", "2026-11-03 23:59:00"
+        for tid in (exclusive_tpl, shared_tpl):
+            store.ensure_template_instances(tid, pkey, deadline)
+        # 另一天的已完成实例：删人时必须保留历史
+        store.ensure_template_instances(exclusive_tpl, "2026-11-02", "2026-11-02 23:59:00")
+        done = store.get_instance_by_key(exclusive_tpl, PHONE, "2026-11-02")
+        store.conn.execute("UPDATE task_instance SET status = 'approved' WHERE id = ?", (int(done["id"]),))
+        store.conn.commit()
+
+        # 只退出 A 组：仅A组模板的未完成实例删除；共用模板实例保留（还在 B 组）；已完成历史保留
+        store.delete_role_member(ra, PHONE, actor="t")
+        assert store.get_instance_by_key(exclusive_tpl, PHONE, pkey) is None, "仅A组任务的未完成实例应删除"
+        assert store.get_instance_by_key(shared_tpl, PHONE, pkey) is not None, "还在B组，共用模板实例不得删"
+        assert store.get_instance(done["id"]) is not None, "已完成历史不得删除"
+
+        # 再退出 B 组：共用模板实例也删除
+        store.delete_role_member(rb, PHONE, actor="t")
+        assert store.get_instance_by_key(shared_tpl, PHONE, pkey) is None
+    finally:
+        store.close()
+
+
+def test_remove_member_keeps_terminal_instances() -> None:
+    store = _store()
+    try:
+        ra = store.create_role("密信C组", actor="t", platform="zdxlz")["role_id"]
+        store.add_role_member(ra, PHONE, NAME, DEPT, actor="t")
+        tid = _notice_tpl(store, [ra], "通知任务")
+        pkey = "2026-11-03"
+        store.ensure_template_instances(tid, pkey, "2026-11-03 23:59:00")
+        inst = store.get_instance_by_key(tid, PHONE, pkey)
+        store.conn.execute("UPDATE task_instance SET status = 'sent' WHERE id = ?", (int(inst["id"]),))
+        store.conn.commit()
+
+        store.delete_role_member(ra, PHONE, actor="t")
+        assert store.get_instance(inst["id"]) is not None, "已发送的通知实例是历史，不得删除"
+    finally:
+        store.close()

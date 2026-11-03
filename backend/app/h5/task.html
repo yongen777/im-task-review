@@ -382,6 +382,17 @@
               submitBtn.disabled = false;
               return showMsg(data.message || "提交失败", "error");
             }
+            /* 2026-11-03 用户口径：提交成功后整页立即锁定，防重复提交（刷新后由后端状态兜底锁定）。 */
+            const content = document.getElementById("content");
+            const tip = document.createElement("div");
+            tip.className = "locked-tip";
+            tip.textContent = data.status === "approved"
+              ? "提交成功，任务已完成。本条已锁定，如需修改请联系管理员。"
+              : "提交成功，等待管理员审核。本条已锁定，如需修改请联系管理员驳回后重新提交。";
+            content.insertBefore(tip, submitBtn);
+            content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
+            submitBtn.disabled = true;
+            submitBtn.style.display = "none";
             showMsg(data.message || "提交成功！", "success");
           })
           .catch(() => {

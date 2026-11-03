@@ -409,8 +409,8 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "缺少用户标识 external_id")
         now_s = self.now_str()
         with self.lock, self.conn:
-            if not self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean_phone,)).fetchone():
-                raise BizError(400, "VALIDATION_FAILED", "该手机号不在任务名单中，请联系管理员核实")
+            if not self.phone_in_roster(clean_phone, platform=platform):
+                raise BizError(400, "VALIDATION_FAILED", "该手机号不在当前办公软件的任务名单中，请联系管理员核实")
             existing = self.conn.execute("SELECT * FROM delivery_target WHERE platform = ? AND phone = ?", (platform, clean_phone)).fetchone()
             if existing:
                 is_usable = int(existing["usable"] if "usable" in existing.keys() and existing["usable"] is not None else 1) == 1
@@ -706,9 +706,43 @@ class StateStore:
                     "UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?",
                     (plat, ext_id),
                 )
+
+            # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的「未完成任务实例」一并清掉，
+            # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
+            # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留；
+            # 已终结的历史（approved/sent/expired）保留不删，统计与追溯不受影响。
+            removed_instance_ids: List[int] = []
+            open_rows = self.conn.execute(
+                "SELECT id, template_id FROM task_instance WHERE phone = ? "
+                "AND status IN ('pending','submitted','overdue','rejected')",
+                (clean_phone,),
+            ).fetchall()
+            for inst in open_rows:
+                trow = self.conn.execute(
+                    "SELECT role_ids FROM task_template WHERE template_id = ?", (inst["template_id"],)
+                ).fetchone()
+                try:
+                    tpl_roles = [str(x) for x in json.loads((trow["role_ids"] if trow else "") or "[]") if str(x).strip()]
+                except Exception:
+                    tpl_roles = []
+                if not tpl_roles:
+                    continue
+                placeholders = ",".join("?" for _ in tpl_roles)
+                still_member = self.conn.execute(
+                    f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) LIMIT 1",
+                    (clean_phone, *tpl_roles),
+                ).fetchone() is not None
+                if still_member:
+                    continue
+                self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
+                self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
+                removed_instance_ids.append(int(inst["id"]))
+
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
-                {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending}, now_s,
+                {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending,
+                 "removed_instances": len(removed_instance_ids)}, now_s,
             )
 
     def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system") -> Dict[str, Any]:
@@ -1225,13 +1259,25 @@ class StateStore:
             self.conn.execute("DELETE FROM dept_option WHERE id = ?", (int(dept_id),))
             self._insert_audit_unlocked(actor, "dept.delete", "dept_option", str(int(dept_id)), {"name": row["name"]}, now_s)
 
-    def phone_in_roster(self, phone: str) -> bool:
-        """手机号是否已在成员名单（member 表）里。用于「先入待归纳池、不拦截」的分流判断。"""
+    def phone_in_roster(self, phone: str, platform: Optional[str] = None) -> bool:
+        """手机号是否在成员名单里。
+
+        传 platform → 只查该办公软件下的角色名册（2026-11-03 平台隔离口径：
+        密信绑定只认密信角色、企微绑定只认企微角色）；
+        不传 → 查全局（历史调用兼容）。
+        """
         clean = (phone or "").strip()
         if not clean:
             return False
+        plat = (platform or "").strip().lower()
         with self.lock:
-            return self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone() is not None
+            if not plat:
+                return self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone() is not None
+            return self.conn.execute(
+                "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                "WHERE m.phone = ? AND r.platform = ? LIMIT 1",
+                (clean, plat),
+            ).fetchone() is not None
 
     def upsert_pending_member(self, external_id: str, last_message: str = "",
                               phone: Optional[str] = None,

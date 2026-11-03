@@ -66,7 +66,9 @@ def test_h5_bind_falls_back_to_single_notifier() -> None:
     try:
         z = FakeNotifier()
         code, _ = process_h5_bind(
-            state=store, data={"phone": PHONE, "external_id": "uid_3", "name": "李四", "dept": DEPT}, notifier=z,
+            state=store,
+            data={"phone": PHONE, "external_id": "uid_3", "platform": "wecom", "name": "李四", "dept": DEPT},
+            notifier=z,
         )
         assert code == 200
         assert len(z.sent_messages) == 1

@@ -183,8 +183,8 @@ def process_h5_bind(
                     "phone": phone, "masked_phone": masked, "phone_masked": masked,
                     "message": f"当前账号已关联手机号 {masked}，无需重复登记。"}
 
-    if state.phone_in_roster(phone):
-        # 名册内：直接完成绑定（原路径 C 护栏逻辑不变）
+    if state.phone_in_roster(phone, platform=platform):
+        # 名册内（且在本平台有角色归属）：直接完成绑定（原路径 C 护栏逻辑不变）
         try:
             res = state.bind_member_with_guardrails(
                 phone=phone, external_id=external_id, path="C", platform=platform
@@ -206,8 +206,9 @@ def process_h5_bind(
             "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
         }
 
-    # 2026-11-03 用户口径：手机号不在名册 → 不再报错，落「已激活待归纳」池（带姓名/手机号/部门），
-    # 由管理员分配业务角色后即可接收提醒。
+    # 2026-11-03 平台隔离口径：手机号不在**本平台**名册 → 不报错，落本平台的待归纳池
+    # （带姓名/手机号/部门），由管理员分配本平台角色后即可接收提醒。
+    # 注意：只看本平台角色，避免“在企微角色里”就能绑上密信绑定（11:41 现场就是这么漏的）。
     state.upsert_pending_member(
         external_id=external_id, phone=phone, name=name, dept=dept, platform=platform,
         last_message="H5登记",
