@@ -291,9 +291,16 @@ def process_app_event(
             return
         idem = hashlib.sha1(f"event_reply|{receive_id}|{tag}|{state.now_str()}".encode("utf-8")).hexdigest()
         try:
-            active_notifier.send_text(receive_id, text, idem)
-        except Exception:
-            pass
+            res = active_notifier.send_text(receive_id, text, idem)
+            # 2026-11-03 修复：回执失败不允许再静默吞掉（此前 except: pass，
+            # 通道错位时用户侧就是“完全不回话”，日志里却一片干净）。
+            if not getattr(res, "ok", True):
+                logger.warning(
+                    "回调回复发送失败 receive_id=%s tag=%s result=%s error=%s",
+                    receive_id, tag, getattr(res, "result", ""), getattr(res, "error", ""),
+                )
+        except Exception as exc:  # noqa: BLE001 - 回复失败不影响事件应答（仍 200）
+            logger.warning("回调回复发送异常 receive_id=%s tag=%s: %s", receive_id, tag, exc)
 
     try:
         event_payload = channel.parse_callback_event(timestamp=timestamp, nonce=nonce, signature=signature, body_text=body_text)

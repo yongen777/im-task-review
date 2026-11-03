@@ -7,7 +7,7 @@ import contextlib
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import uvicorn
 from fastapi import FastAPI
@@ -99,6 +99,17 @@ def _register_admin_spa_pages(admin_app: FastAPI) -> None:
     @admin_app.get("/logs", response_class=HTMLResponse)
     async def serve_admin_spa():
         return HTMLResponse(content=load_admin_index_html())
+
+
+def _channel_notifier(notifiers: Optional[dict], platform: str, fallback) -> Any:
+    """按平台取对应通道的通知器。
+
+    2026-11-03 修复（实锤：errcode=93006 invalid chatid）：回调回复/回执必须走
+    「事件来源平台」的通道。此前密信回调的回复跟随 active 通道（当时=企微 bot），
+    拿密信 userId 去企微发消息必然失败，用户侧表现为机器人完全不回话。
+    该平台未装配时才退回传入的 fallback（单通道部署/测试兼容）。
+    """
+    return (notifiers or {}).get(platform) or fallback
 
 
 def create_apps(
@@ -218,12 +229,14 @@ def create_apps(
     _register_healthz(admin_app, store, chan, cfg)
 
     # 业务端口挂载：POST /api/app-events 与 H5 提交/绑定路由
+    # 2026-11-03 修复：回调回复/回执必须走**来源平台**的通道，不能跟 active 通道走。
+    # 线上实锤：密信回调的回复被发给企微 bot（errcode=93006 invalid chatid），用户侧表现为“完全不回话”。
     public_app.include_router(
         create_events_router(
             state=store,
             channel=chan,
             public_base_url=cfg.public_base_url,
-            notifier=active_notifier,
+            notifier=_channel_notifier(notifiers, "zdxlz", chan),
         )
     )
     public_app.include_router(
@@ -240,7 +253,7 @@ def create_apps(
     public_app.include_router(
         create_wecom_router(
             store,
-            active_notifier,
+            _channel_notifier(notifiers, "wecom", active_notifier),
             token=getattr(cfg, "wecom_token", ""),
             aes_key=getattr(cfg, "wecom_aes_key", ""),
             corpid=getattr(cfg, "wecom_corpid", ""),

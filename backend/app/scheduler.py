@@ -814,12 +814,15 @@ class Scheduler:
                                         continue
                                     if not ext_id:
                                         continue  # 未激活成员文本链路已记 skipped，附图同样跳过
-                                    pending.append((inst, ext_id, nt, idem_link, idem_media))
+                                    pending.append((inst, ext_id, nt, platform, idem_link, idem_media))
                             if pending:
                                 link_url: Optional[str] = None
-                                for inst, ext_id, nt, idem_link, idem_media in pending:
+                                for inst, ext_id, nt, platform, idem_link, idem_media in pending:
                                     handled = False
-                                    if callable(getattr(nt, "send_image", None)):
+                                    # 2026-11-03：量子密信永远不发原生图片（手机端点不开，10-29 实测口径），
+                                    # 直接走 H5 链接。此前密信侧 send_image 签名不匹配，每次靠 TypeError
+                                    # 异常兜底才落到链接（08:15 日志实锤），现在显式跳过。
+                                    if platform != "zdxlz" and callable(getattr(nt, "send_image", None)):
                                         handled = self._send_image_media(
                                             external_id=ext_id, image_path=img_src_path, idem=idem_media,
                                             template_id=tpl["template_id"], instance_id=int(inst["id"]),

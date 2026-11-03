@@ -672,25 +672,40 @@ class StateStore:
             self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
             # 2026-10-29 P0-3：移出成员时把推送绑定一并收回到待归纳池，
             # 否则 delivery_target 仍指向该人，形成“已移出却还能收到任务”的幽灵绑定。
-            # 2026-10-29 补丁2：一人可同时属于多个角色（UNIQUE(role_id, phone)），
-            # 只是从 A 角色移出、但还留在 B 角色时，不能掐断他的推送绑定，也不该回待归纳池。
-            still_in_other_role = self.conn.execute(
-                "SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean_phone,)
-            ).fetchone() is not None
-            dt = self.conn.execute("SELECT external_id FROM delivery_target WHERE phone = ?", (clean_phone,)).fetchone()
+            # 2026-11-03 平台隔离口径（用户反馈修正）：按「绑定所在平台」逐条判断——
+            # 该平台已无任何角色归属时，这条绑定才回收到**该平台**的待归纳池；
+            # 人在企微角色里、只是退出了密信角色时，密信绑定回收、企微绑定不动
+            # （旧逻辑按“全局是否还在任意角色”判断，导致密信面板里人凭空消失）。
             back_to_pending = False
-            if (not still_in_other_role) and dt and dt["external_id"]:
-                ext_id = str(dt["external_id"])
-                existing_pending = self.conn.execute(
-                    "SELECT id FROM pending_member WHERE external_id = ?", (ext_id,)
-                ).fetchone()
-                if not existing_pending:
+            for dt in self.conn.execute(
+                "SELECT platform, external_id FROM delivery_target WHERE phone = ? AND usable = 1",
+                (clean_phone,),
+            ).fetchall():
+                plat = str(dt["platform"] or "").strip().lower()
+                still_in_plat_role = self.conn.execute(
+                    "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    "WHERE m.phone = ? AND r.platform = ? LIMIT 1",
+                    (clean_phone, plat),
+                ).fetchone() is not None
+                if still_in_plat_role:
+                    continue
+                ext_id = str(dt["external_id"] or "").strip()
+                if not ext_id:
+                    continue
+                if not self.conn.execute(
+                    "SELECT 1 FROM pending_member WHERE external_id = ?", (ext_id,)
+                ).fetchone():
                     self.conn.execute(
-                        "INSERT INTO pending_member(external_id, phone, name, activated_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                        (ext_id, clean_phone, row["name"], now_s, now_s),
+                        "INSERT INTO pending_member(external_id, phone, name, dept, platform, activated_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (ext_id, clean_phone, row["name"], row["dept"], plat, now_s, now_s),
                     )
                     back_to_pending = True
-                self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (self.platform, ext_id))
+                # 回收的绑定置为不可用（重新登记/重新移入角色时会恢复）
+                self.conn.execute(
+                    "UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?",
+                    (plat, ext_id),
+                )
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
                 {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending}, now_s,
