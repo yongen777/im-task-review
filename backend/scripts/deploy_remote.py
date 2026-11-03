@@ -14,7 +14,7 @@
   4. 不删除 /opt/imtask 下任何目录 —— tar 解压只覆盖；data/ 永不打包、永不上传
   5. 打包强制断言 admin_static/index.html + assets/*.js 存在（缺则中止，防后台白屏）
 
-部署流程：打包 → 预检 → 备份(app+.env) → 上传覆盖 → 装依赖 → 重启 → 验收
+部署流程：版本库一致性检查 → 打包 → 预检 → 备份(app+.env) → 上传覆盖 → 装依赖 → 重启 → 验收
 （healthz 四项 + echostr 回显 + 后台 200 + 远程 pytest）→ 失败自动回滚。
 """
 from __future__ import annotations
@@ -65,6 +65,125 @@ def scp_upload(host, port, user, key, local_path, remote_path, timeout=300):
     if proc.returncode != 0:
         print("    scp 失败:", (proc.stderr or "").strip()[:200])
     return proc.returncode
+
+
+REPO_ROOT = Path(os.environ.get("IMT_REPO", r"D:\im-task-review"))
+REPO_PAIRS = [
+    ("app", "backend/app"),
+    ("tests", "backend/tests"),
+    ("scripts", "backend/scripts"),
+]
+
+
+def _tree_map(root: Path, sub: str) -> dict[str, Path]:
+    base = root / sub
+    if not base.is_dir():
+        return {}
+    out: dict[str, Path] = {}
+    for f in base.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(base)
+        if any(part in EXCLUDE_DIRS for part in rel.parts):
+            continue
+        if f.suffix in EXCLUDE_SUFFIX:
+            continue
+        # 前端构建产物带哈希、且版本库会累积历史版本（工作区只留当前版），
+        # 逐文件比对会产生大量假差异 → 只比 index.html，assets 交给打包断言管。
+        if "admin_static/assets" in str(rel).replace("\\", "/"):
+            continue
+        out[str(rel).replace("\\", "/")] = f
+    return out
+
+
+def _same_content(fa: Path, fb: Path) -> bool:
+    """内容是否等价。
+
+    两道归一化，缺一个闸门就没用：
+      1. 忽略 CRLF/LF 差异（Windows 检出与工作区行尾常不一致）；
+      2. 两边都先跑一遍脱敏替换 —— 版本库里存的是**脱敏副本**（真实姓名/手机号/IP
+         换成占位值），直接比字节会把每个含真实姓名的文件都判成"不同"。
+    规则见 scripts/scrub_rules.py（与提交前脱敏用的是同一份）。
+    """
+    a, b = fa.read_bytes(), fb.read_bytes()
+    if a == b:
+        return True
+    try:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from scrub_rules import scrub  # type: ignore[import-not-found]
+
+        na = scrub(a.decode("utf-8").replace("\r\n", "\n"))
+        nb = scrub(b.decode("utf-8").replace("\r\n", "\n"))
+    except UnicodeDecodeError:
+        return False
+    except Exception:  # noqa: BLE001 - 规则文件缺失时退回纯行尾归一化
+        try:
+            na = a.decode("utf-8").replace("\r\n", "\n")
+            nb = b.decode("utf-8").replace("\r\n", "\n")
+        except UnicodeDecodeError:
+            return False
+    return na == nb
+
+
+def check_repo_sync(allow_drift: bool) -> None:
+    """部署前闸门：工作区代码必须与版本库一致，否则中止。
+
+    为什么需要：2026-11-02~03 连续四次出现「线上已跑、代码没入库」——
+    改动只落在工作区，git 里还是上一版。事后靠人工补提交，一旦漏掉，
+    线上代码就和版本库脱钩，回滚/追责都失去依据。
+    这里做两件事：
+      1. 版本库自身必须 clean（有未提交改动 → 中止）；
+      2. 工作区与版本库逐文件比对（内容不同 → 中止并列出差异文件）。
+    ⛔ 只读检查，不改任何文件；确实要强推时用 --allow-drift。
+    """
+    if not (REPO_ROOT / ".git").exists():
+        print(f"    ⚠ 未找到版本库 {REPO_ROOT}，跳过一致性检查（建议设置 IMT_REPO）")
+        return
+
+    dirty = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    ).stdout.strip()
+    diffs: list[str] = []
+    for ws_sub, repo_sub in REPO_PAIRS:
+        a = _tree_map(ROOT, ws_sub)
+        b = _tree_map(REPO_ROOT, repo_sub)
+        for rel in sorted(set(a) | set(b)):
+            fa, fb = a.get(rel), b.get(rel)
+            if fa is None:
+                diffs.append(f"{repo_sub}/{rel}（版本库有、工作区没有）")
+            elif fb is None:
+                diffs.append(f"{ws_sub}/{rel}（工作区有、版本库没有）")
+            elif not _same_content(fa, fb):
+                diffs.append(f"{ws_sub}/{rel}（内容不同）")
+    for extra in ("README.md", "requirements.txt"):
+        fa, fb = ROOT / extra, REPO_ROOT / "backend" / extra
+        if fa.exists() and fb.exists() and not _same_content(fa, fb):
+            diffs.append(f"{extra}（内容不同）")
+
+    if not dirty and not diffs:
+        print(f"    ✓ 代码与版本库一致（{REPO_ROOT.name}）")
+        return
+
+    if allow_drift:
+        print(f"    ⚠ 代码与版本库不一致，但已指定 --allow-drift，继续部署")
+        if dirty:
+            print(f"      版本库有未提交改动：{len(dirty.splitlines())} 项")
+        for d in diffs[:10]:
+            print(f"      · {d}")
+        return
+
+    print("✗ 代码与版本库不一致，中止部署（防止线上代码与 git 脱钩）")
+    if dirty:
+        print(f"  版本库有未提交改动：{len(dirty.splitlines())} 项")
+        for line in dirty.splitlines()[:10]:
+            print(f"    {line}")
+    for d in diffs[:10]:
+        print(f"  差异：{d}")
+    if len(diffs) > 10:
+        print(f"  …另有 {len(diffs) - 10} 个文件不同")
+    print("  处理方式：先把改动同步进版本库并提交；确需照现状上线时加 --allow-drift")
+    raise SystemExit(1)
 
 
 def build_tarball() -> tuple[Path, int, list[str]]:
@@ -126,11 +245,16 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="只打包+连通+预检，不改服务器任何状态")
     ap.add_argument("--skip-deps", action="store_true")
     ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--allow-drift", action="store_true",
+                    help="允许工作区与版本库不一致（默认会中止，防止线上代码与 git 脱钩）")
     args = ap.parse_args()
     H, P, U, K = args.host, args.port, args.user, args.key
 
     if not Path(K).is_file():
         raise SystemExit(f"✗ 私钥不存在: {K}")
+
+    print("⓪ 版本库一致性检查（工作区 vs git）")
+    check_repo_sync(args.allow_drift)
 
     print("① 打包（app/scripts/tests/requirements.txt，排除 data 与缓存）")
     tar_path, count, names = build_tarball()

@@ -131,23 +131,38 @@ def load_h5_html(filename: str) -> str:
 
 
 def process_h5_bind(
-    *, state: StateStore, data: Any, notifier: Optional[NotifierProtocol] = None
+    *, state: StateStore, data: Any,
+    notifier: Optional[NotifierProtocol] = None,
+    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
-    """§3.2 路径 C：H5 提交 11 位手机号完成绑定（严格执行三条护栏 + 审计 + 回执）。"""
+    """§3.2 路径 C：H5 提交 11 位手机号完成绑定（严格执行三条护栏 + 审计 + 回执）。
+
+    2026-11-03 多通道修正：原先回执固定用 active_notifier（实际就是密信通道），
+    企微用户走 H5 绑定时会把回执发给密信通道，而 external_id 是企微 userid →
+    必然失败且被静默吞掉，用户看不到回执。
+    现在**绑哪个平台就用哪个平台的 notifier**：
+      · platform 优先取请求体里的 platform（前端可显式声明），缺省用 state.platform；
+      · 绑定本身也显式带 platform，保证「绑定记录 / 回执通道」是同一个平台。
+    """
     if not isinstance(data, dict):
         return 400, {"code": "VALIDATION_FAILED", "message": "请求体必须为 JSON 对象"}
     phone = str(data.get("phone") or "").strip()
     external_id = str(data.get("external_id") or data.get("uid") or data.get("user_id") or data.get("userId") or "").strip()
+    platform = str(data.get("platform") or "").strip().lower() or state.platform
 
     try:
-        res = state.bind_member_with_guardrails(phone=phone, external_id=external_id, path="C")
+        res = state.bind_member_with_guardrails(
+            phone=phone, external_id=external_id, path="C", platform=platform
+        )
     except BizError as exc:
         return exc.status_code, {"code": exc.code, "message": exc.message}
 
-    if notifier is not None and external_id:
+    # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
+    nt = (notifiers or {}).get(platform) or notifier
+    if nt is not None and external_id:
         idem = hashlib.sha1(f"bind_C|{external_id}|{phone}|{state.now_str()}".encode("utf-8")).hexdigest()
         try:
-            notifier.send_text(external_id, res["receipt"], idem)
+            nt.send_text(external_id, res["receipt"], idem)
         except Exception:
             pass
 
@@ -341,7 +356,11 @@ def process_h5_task_submit(*, state: StateStore, raw_token: str, data: Any) -> T
     return 200, {**res, "instance": inst}
 
 
-def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[NotifierProtocol] = None) -> APIRouter:
+def create_h5_router(
+    state: StateStore, uploads_dir: Path,
+    notifier: Optional[NotifierProtocol] = None,
+    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+) -> APIRouter:
     router = APIRouter()
 
     @router.get("/h5/task", response_class=HTMLResponse)
@@ -434,7 +453,7 @@ def create_h5_router(state: StateStore, uploads_dir: Path, notifier: Optional[No
             data = await request.json()
         except Exception:
             return JSONResponse(status_code=400, content={"code": "VALIDATION_FAILED", "message": "请求体必须为合法 JSON"})
-        status_code, content = process_h5_bind(state=state, data=data, notifier=notifier)
+        status_code, content = process_h5_bind(state=state, data=data, notifier=notifier, notifiers=notifiers)
         return JSONResponse(status_code=status_code, content=content)
 
     @router.post("/api/h5/task/info")
