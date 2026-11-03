@@ -513,11 +513,13 @@ def _probe_channel(channel: str, payload: Dict[str, str], *, notifier: Any = Non
     return False, f"不支持的通道：{channel}"
 
 
-def create_admin_router(state: StateStore, notifier: Any = None, public_base_url: str = "") -> APIRouter:
+def create_admin_router(state: StateStore, notifier: Any = None, public_base_url: str = "", notifiers: Optional[Dict[str, Any]] = None) -> APIRouter:
     router = APIRouter(prefix="/api/admin")
     # 2026-10-29 逾期补交审核：审核通过后要主动把新链接推给用户。
     # notifier 由 main.py 按现有装配方式注入（⛔ 不造全局单例）；缺省时只记日志不发送。
     _notifier = notifier
+    # 2026-11-03 多通道：platform -> notifier，推送新链接时按任务归属平台选通道。
+    _notifiers: Dict[str, Any] = dict(notifiers or {})
 
     # ==================================================================
     # §9.1 会话与认证接口（admin_session + HttpOnly Cookie）
@@ -1479,13 +1481,23 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # 通过：签发 30 分钟 resubmit token 并把新链接推给用户；拒绝：推拒绝文案。
     # 幂等由 state 侧保证（只有 resubmit_status='pending' 才能审），重复点击第二次会 400。
     def _push_resubmit_message(inst: Dict[str, Any], text: str, tag: str) -> bool:
-        target = state.get_delivery_target(inst["phone"])
+        # 2026-11-03：按任务归属平台选通道（密信任务发密信、企微任务发企微），
+        # 不再跟全局 active 通道走，避免补交新链接串到另一个办公软件。
+        tpl = state.get_template(inst["template_id"])
+        plats = state.role_platforms(list((tpl or {}).get("role_ids") or []))
+        platform = plats.pop() if len(plats) == 1 else ""
+        nt = _notifiers.get(platform) if (platform and _notifiers) else _notifier
+        target = (
+            state.get_delivery_target(inst["phone"], platform=platform)
+            if (platform and _notifiers)
+            else state.get_delivery_target(inst["phone"])
+        )
         ext_id = (target or {}).get("external_id")
-        if _notifier is None or not ext_id:
+        if nt is None or not ext_id:
             logger.warning("补交审核通知未发送（notifier 或 external_id 缺失） instance=%s", inst.get("id"))
             return False
         try:
-            res = _notifier.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}")
+            res = nt.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}")
             return bool(getattr(res, "ok", False))
         except Exception as exc:  # noqa: BLE001
             logger.warning("补交审核通知发送失败 instance=%s: %s", inst.get("id"), exc)

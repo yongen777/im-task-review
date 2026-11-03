@@ -71,7 +71,8 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
         ],
     },
     "wecom_aibot": {
-        "label": "企业微信（智能机器人）",
+        # 2026-11-02 用户口径：后台展示就写「企业微信」，不带括号后缀。
+        "label": "企业微信",
         # 长连接模式没有回调地址：官方原文「无需域名或 IP 即可接收消息并返回结果」，
         # 所以 callback_path 留空，前端据此不渲染「回调地址」那一栏。
         "callback_path": "",

@@ -261,7 +261,7 @@ def test_wizard_schema_for_aibot_has_no_callback() -> None:
 
     meta = CHANNEL_SCHEMA["wecom_aibot"]
     assert meta["callback_path"] == ""
-    assert meta["label"] == "企业微信（智能机器人）"
+    assert meta["label"] == "企业微信"
     assert [f["key"] for f in meta["fields"]] == ["bot_id", "bot_secret"]
     assert all(f["required"] and f["secret"] for f in meta["fields"])
     assert build_callback_url("https://task.example.com", "wecom_aibot") == ""

@@ -509,6 +509,18 @@ class StateStore:
             ).fetchall()
             return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "member_count": int(r["member_count"] or 0)} for r in rows]
 
+    def role_platforms(self, role_ids: List[str]) -> set:
+        """这组角色覆盖到的办公软件集合（用于判断任务归属平台）。"""
+        ids = [str(r or "").strip() for r in (role_ids or []) if str(r or "").strip()]
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT DISTINCT platform FROM role WHERE role_id IN ({placeholders})", tuple(ids)
+            ).fetchall()
+        return {str(r["platform"]).strip().lower() for r in rows}
+
     def get_role(self, role_id: str) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT r.*, (SELECT COUNT(1) FROM member m WHERE m.role_id = r.role_id) AS member_count FROM role r WHERE r.role_id = ?", ((role_id or "").strip(),)).fetchone()

@@ -340,20 +340,36 @@ class Scheduler:
         self.notifiers: Dict[str, NotifierProtocol] = dict(notifiers or {})
         self.image_sender = image_sender  # None 时跳过图片投递（文本照发，不阻塞主链路）
 
-    def _targets_for(self, phone: str) -> List[Tuple[str, Optional[str], NotifierProtocol]]:
-        """该成员全部可用投递目标 [(platform, external_id, notifier)]。
+    def _targets_for(self, phone: str, only_platform: Optional[str] = None) -> List[Tuple[str, Optional[str], NotifierProtocol]]:
+        """该成员可用的投递目标 [(platform, external_id, notifier)]。
 
-        · 多通道：按已启用通道逐个查绑定，**双绑定双发**（用户 2026-11-02 拍板 B）；
-        · 单通道/测试：退回旧逻辑（当前 store.platform + self.notifier）。
+        · 2026-11-03 用户口径（取代 11-02 的「双绑定双发」）：任务属于哪个办公软件，就只往那个
+          办公软件发 ——密信的任务不再串到企微，企微的任务也不串到密信；
+          · only_platform 传任务归属平台：只查该平台绑定；
+          · only_platform 为 None（任务平台判断不出来）时 fail-open 查全部启用通道。
+        · 单通道/测试（notifiers 为空）：退回旧逻辑（当前 store.platform + self.notifier）。
         """
         if not self.notifiers:
             t = self.state.get_delivery_target(phone)
             return [("", (t or {}).get("external_id"), self.notifier)]
+        want = (only_platform or "").strip().lower()
         out: List[Tuple[str, Optional[str], NotifierProtocol]] = []
         for platform, nt in self.notifiers.items():
+            if want and platform != want:
+                continue
             t = self.state.get_delivery_target(phone, platform=platform)
             out.append((platform, (t or {}).get("external_id"), nt))
         return out
+
+    def _template_platform(self, tpl: Dict[str, Any]) -> Optional[str]:
+        """任务归属平台 = 模板所选角色的平台（角色已按办公软件隔离，创建时禁止混选）。
+
+        角色缺失或跨平台混选（理论上不会发生）→ None = 不过滤，fail-open 全通道。
+        """
+        plats = self.state.role_platforms(list(tpl.get("role_ids") or []))
+        if len(plats) == 1:
+            return plats.pop()
+        return None
 
     @staticmethod
     def _idem_for(base: str, platform: str) -> str:
@@ -614,10 +630,10 @@ class Scheduler:
         resubmit_disp = format_deadline_display(instance["resubmit_deadline"], ref_dt=cur_dt)
         msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n请在 {resubmit_disp} 前重新提交。\n👉 重新提交：{h5_url}"
 
-        # 多通道（B）：该成员每个绑定通道各发一条（各通道独立幂等）。
+        # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
         last_res: Optional[SendResult] = None
         any_target = False
-        for platform, ext_id, nt in self._targets_for(instance["phone"]):
+        for platform, ext_id, nt in self._targets_for(instance["phone"], only_platform=self._template_platform(tpl)):
             any_target = True
             idem = self._idem_for(base_idem, platform)
             if not ext_id:
@@ -714,9 +730,9 @@ class Scheduler:
                             )
                             return body.strip()
 
-                        # 多通道（用户口径 B）：该成员在几个平台有绑定就发几条，各通道独立幂等。
+                        # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
                         sent_any = False
-                        for platform, ext_id, nt in self._targets_for(inst["phone"]):
+                        for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                             idem = self._idem_for(
                                 make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str),
                                 platform,
@@ -785,7 +801,7 @@ class Scheduler:
                             # 先筛「本轮真正还需要发的人」：一个人都不需要就既不发布副本、也不发消息。
                             pending: List[tuple] = []
                             for inst in instances:
-                                for platform, ext_id, nt in self._targets_for(inst["phone"]):
+                                for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                                     idem_link = self._idem_for(make_idem_key(
                                         tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str
                                     ), platform)
@@ -864,8 +880,8 @@ class Scheduler:
                         f"提交入口（点击链接打开上传任务）：\n{h5_url}"
                     )
 
-                # 多通道（B）：每个绑定通道各发一条，各通道独立幂等。
-                for platform, ext_id, nt in self._targets_for(inst["phone"]):
+                # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+                for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                     idem = self._idem_for(
                         make_idem_key(tpl["template_id"], inst["phone"], p_key, "remind", 1, planned_str),
                         platform,
@@ -903,8 +919,8 @@ class Scheduler:
                     f"如需提交请回复【申请补交】，待管理员审核通过后将发送新链接。"
                 )
 
-            # 多通道（B）：每个绑定通道各发一条，各通道独立幂等。
-            for platform, ext_id, nt in self._targets_for(inst["phone"]):
+            # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+            for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                 idem_platform = self._idem_for(
                     make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
                     platform,

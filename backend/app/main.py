@@ -172,7 +172,7 @@ def create_apps(
         active_platform = "wecom" if _channel in ("wecom", "wecom_aibot") else _channel
         active_notifier = notifiers.get(active_platform) or (next(iter(notifiers.values())) if notifiers else chan)
         logger.info(
-            "多通道投递已启用：%s（用户口径 B：双绑定双发，各通道独立幂等）",
+            "多通道投递已启用：%s（2026-11-03 用户口径：任务按所属办公软件投递，不串通道）",
             ", ".join(enabled_platforms) if enabled_platforms else "无（回退默认通道）",
         )
 
@@ -247,7 +247,7 @@ def create_apps(
     # 管理后台端口挂载：权限守卫 + /api/admin/* + 静态托管外壳 (/login 与 4 个管理页面)
     register_admin_guard(admin_app, store)
     admin_app.include_router(
-        create_admin_router(store, notifier=active_notifier, public_base_url=cfg.public_base_url)
+        create_admin_router(store, notifier=active_notifier, public_base_url=cfg.public_base_url, notifiers=notifiers)
     )
     _register_admin_spa_pages(admin_app)
 
