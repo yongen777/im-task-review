@@ -39,6 +39,11 @@ def _store() -> StateStore:
 
 # ── 1. CSV 导入：部门校验 ───────────────────────────────────────────
 def test_import_validates_department_and_allows_blank() -> None:
+    """2026-11-04 用户口径变更：CSV 里的部门若部门管理里没有，**不拦截**——自动建好该部门。
+
+    旧口径（2026-11-03）是把"部门不存在"的行判 invalid 不入库；现改为自动建档后正常导入。
+    部门为空仍允许（成员无部门）。
+    """
     store = _store()
     try:
         rid = store.create_role("导入组", actor="t", platform="zdxlz")["role_id"]
@@ -54,13 +59,17 @@ def test_import_validates_department_and_allows_blank() -> None:
             dry_run=False,
             actor="t",
         )
-        assert res["will_add"] == 2, res
-        assert any(x["row"] == 2 and "部门不存在" in x["reason"] for x in res["invalid"]), res
+        assert res["will_add"] == 3, res
+        assert not res["invalid"], res
+        assert "火星部" in (res.get("departments_created") or []), res
 
         members = {m["phone"]: m for m in store.list_role_members(rid, size=50)["items"]}
         assert members[PHONE]["dept"] == DEPT
         assert members["13800000303"]["dept"] in (None, "")
-        assert OTHER_PHONE not in members, "部门不存在的行不得入库"
+        assert members[OTHER_PHONE]["dept"] == "火星部", "新部门应随成员一起入库"
+        # 新部门已自动建进「部门管理」，后续 H5 登记/成员表单下拉都能选到
+        assert store.department_exists("火星部"), "新部门应自动创建"
+        assert [d["name"] for d in store.list_departments()] == [DEPT, "火星部"]
     finally:
         store.close()
 

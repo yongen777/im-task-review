@@ -762,7 +762,7 @@ class StateStore:
             existing_phones = {r["phone"] for r in self.conn.execute("SELECT phone FROM member WHERE role_id = ?", (clean_role_id,)).fetchall()}
             will_add, already_exists = 0, 0
             invalid: List[Dict[str, Any]] = []
-            to_insert: List[Tuple[str, str, Optional[str]]] = []
+            to_insert: List[Tuple[int, str, str, Optional[str]]] = []
             batch_seen_phones: set[str] = set()
 
             for idx, raw_row in enumerate(csv_rows, start=1):
@@ -791,24 +791,57 @@ class StateStore:
                 if not name:
                     invalid.append({"row": row_num, "phone": phone, "reason": "姓名不能为空"})
                     continue
-                # 2026-11-03：部门非空时必须命中后台配置的部门选项，不允许静默写入不存在的部门
-                if dept is not None and not self.department_exists(dept):
-                    invalid.append({"row": row_num, "phone": phone, "reason": f"部门不存在：{dept}"})
-                    continue
+                # 2026-11-04 用户口径：CSV 里的部门若「部门管理」里没有，**不拦截**——
+                # 自动把该部门建进部门选项（成员表 dept 仍存文本快照），
+                # 这样 H5 登记页/成员表单的下拉立刻能选到，不会出现"名册里有、下拉里没有"的死锁。
                 if phone in existing_phones or phone in batch_seen_phones:
                     already_exists += 1
                     continue
 
                 batch_seen_phones.add(phone)
                 will_add += 1
-                to_insert.append((phone, name, dept))
+                to_insert.append((row_num, phone, name, dept))
+
+            # 部门自动建档：本次导入用到的、部门管理里还没有的部门，导入时一并建好。
+            dept_cache: Dict[str, bool] = {}
+            created_depts: List[str] = []
+            for _row_no, _phone, _name, _dept in to_insert:
+                if not _dept:
+                    continue
+                if _dept in dept_cache:
+                    continue
+                if len(_dept) > 30:
+                    dept_cache[_dept] = False
+                    continue
+                if self.department_exists(_dept):
+                    dept_cache[_dept] = True
+                    continue
+                dept_cache[_dept] = True
+                if not dry_run:
+                    cur = self.conn.execute(
+                        "INSERT OR IGNORE INTO dept_option(name, created_at) VALUES (?, ?)",
+                        (_dept, now_s),
+                    )
+                    if cur.lastrowid:
+                        self._insert_audit_unlocked(
+                            actor, "dept.create", "dept_option", str(int(cur.lastrowid)),
+                            {"name": _dept, "source": "member_import"}, now_s,
+                        )
+                created_depts.append(_dept)
 
             if not dry_run:
-                for phone, name, dept in to_insert:
+                insert_rows: List[Tuple[int, str, str, Optional[str]]] = []
+                for row_no, phone, name, dept in to_insert:
+                    if dept and not dept_cache.get(dept, True):
+                        invalid.append({"row": row_no, "phone": phone, "reason": f"部门名称过长（最多 30 字）：{dept}"})
+                        continue
+                    insert_rows.append((row_no, phone, name, dept))
+                for _row_no, phone, name, dept in insert_rows:
                     self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at) VALUES (?, ?, ?, ?, 1, 'import', ?)", (clean_role_id, phone, name, dept, now_s))
-                self._insert_audit_unlocked(actor, "member.import", "role", clean_role_id, {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid)}, now_s)
+                will_add = len(insert_rows)
+                self._insert_audit_unlocked(actor, "member.import", "role", clean_role_id, {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid), "departments_created": created_depts}, now_s)
 
-            return {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists, "invalid": invalid}
+            return {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists, "invalid": invalid, "departments_created": created_depts}
 
     def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
