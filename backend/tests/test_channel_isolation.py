@@ -175,34 +175,61 @@ def test_create_apps_sets_store_platform_from_config() -> None:
         chan.close()
 
 
-def test_member_create_and_update_read_current_channel() -> None:
-    """add_role_member / update_role_member 返回的「已激活」也要跟当前通道走。
+def test_member_create_and_update_read_role_platform() -> None:
+    """add_role_member / update_role_member 返回的「已激活」按**角色所属平台**判定。
 
-    管理端新增/编辑成员时，接口会把该成员在当前通道下是否有可用绑定一起返回，
-    前端据此显示「已激活 / 未激活」。这两处原来写死 platform='zdxlz'，
-    切到企业微信后会把量子密信的绑定当成企微已激活（或反之）。
+    2026-11-04 修正：原来按「当前通道」(store.platform) 判定 —— 管理员在企微面板
+    给密信角色加成员时，会拿企微通道去查绑定，取错通道 → 激活状态显示不对。
+    业务语义应是：密信角色看密信绑定、企微角色看企微绑定。
+
+    角色归属平台与当前通道不一致时，仍以**角色所属平台**为准。
     """
     store = _mk("wecom")
     try:
-        rid = store.create_role("云中台软研队伍", actor="t")["role_id"]
-        store.upsert_delivery_target(PHONE, "wecom_userid_006")
+        # 角色是密信的（platform 显式 zdxlz），但当前通道是企微
+        rid = store.create_role("密信组", actor="t", platform="zdxlz")["role_id"]
+        store.upsert_delivery_target(PHONE, "wecom_userid_006")  # 只在企微绑了
+        store.upsert_delivery_target(PHONE, "zdxlz_uid_006", platform="zdxlz")  # 密信也绑了
 
-        # 企微下已有绑定 → 新增成员返回已激活
+        # 角色是密信 → 看密信绑定 → 已激活（不受当前通道影响）
         created = store.add_role_member(rid, PHONE, "张三", "市场部", actor="t")
         assert created["activated"] is True
 
-        # 切回量子密信：这边还没绑定 → 编辑成员不能显示成已激活
-        store.platform = "zdxlz"
+        # 编辑成员同样按角色平台
         updated = store.update_role_member(rid, PHONE, name="张三")
-        assert updated["activated"] is False
+        assert updated["activated"] is True
 
-        # 密信侧也绑上 → 已激活
-        store.upsert_delivery_target(PHONE, "zdxlz_uid_006")
-        updated2 = store.update_role_member(rid, PHONE, name="张三")
-        assert updated2["activated"] is True
+        # 换一个只有企微绑定的企微角色 → 已激活（企微侧确实绑了）
+        rid_w = store.create_role("企微组", actor="t", platform="wecom")["role_id"]
+        created_w = store.add_role_member(rid_w, PHONE, "张三", "市场部", actor="t")
+        assert created_w["activated"] is True
 
-        # 再切回企微：仍然看企微的绑定，不受密信影响
-        store.platform = "wecom"
-        assert store.update_role_member(rid, PHONE, name="张三")["activated"] is True
+        # 该号在企微没绑 → 企微角色下应为未激活（平台隔离不被放宽）
+        other = "13900009999"
+        rid_w2 = store.create_role("企微组2", actor="t", platform="wecom")["role_id"]
+        created_w2 = store.add_role_member(rid_w2, other, "李四", "市场部", actor="t")
+        assert created_w2["activated"] is False
+    finally:
+        store.close()
+
+
+def test_is_phone_activated_none_means_any_platform() -> None:
+    """platform=None = **任意平台已激活即可**（激活关系全局共享）。
+
+    2026-11-04 修正：原来 _plat(None) 会回退到当前通道，
+    于是「在企微激活过的人」在密信侧被判成未激活，与"跨管理员免二次激活"矛盾。
+    """
+    store = _mk("zdxlz")
+    try:
+        store.upsert_delivery_target("13000008881", "z_uid", platform="zdxlz")
+        store.upsert_delivery_target("13000008882", "w_uid", platform="wecom")
+        # 密信激活的 → 任意平台都算已激活；限定企微则不算
+        assert store.is_phone_activated("13000008881", platform=None) is True
+        assert store.is_phone_activated("13000008881", platform="zdxlz") is True
+        assert store.is_phone_activated("13000008881", platform="wecom") is False
+        # 只在企微激活的 → 任意平台算已激活（全局共享）
+        assert store.is_phone_activated("13000008882", platform=None) is True
+        # 未激活
+        assert store.is_phone_activated("13000008899", platform=None) is False
     finally:
         store.close()

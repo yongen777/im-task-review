@@ -619,17 +619,47 @@ class StateStore:
         return out
 
     def is_phone_activated(self, phone: str, platform: Optional[str] = None) -> bool:
-        """该手机号在（指定）平台是否已被激活（全局共享，跨管理员同样成立）。"""
-        plat = self._plat(platform)
+        """该手机号在（指定）平台是否已被激活（全局共享，跨管理员同样成立）。
+
+        ⚠️ 2026-11-04 修正：platform 传 None / 空 = **任意平台已激活即可**，
+        而不是回退到「当前通道」（原来走 _plat(None) → store.platform，
+        于是「在企微激活过的人」在密信侧被判成未激活，与"激活关系全局共享"矛盾）。
+        要限定平台时显式传 platform。
+        """
         clean = (phone or "").strip()
         if not clean:
             return False
+        plat = (platform or "").strip().lower()
         with self.lock:
+            if plat:
+                return self.conn.execute(
+                    "SELECT 1 FROM delivery_target WHERE phone = ? AND platform = ? AND usable = 1 "
+                    "AND external_id IS NOT NULL AND external_id != '' LIMIT 1",
+                    (clean, plat),
+                ).fetchone() is not None
             return self.conn.execute(
-                "SELECT 1 FROM delivery_target WHERE phone = ? AND platform = ? AND usable = 1 AND external_id IS NOT NULL AND external_id != '' LIMIT 1",
-                (clean, plat),
+                "SELECT 1 FROM delivery_target WHERE phone = ? AND usable = 1 "
+                "AND external_id IS NOT NULL AND external_id != '' LIMIT 1",
+                (clean,),
             ).fetchone() is not None
 
+
+    def external_id_for(self, phone: str, platform: Optional[str] = None) -> Optional[str]:
+        """取该手机号在（指定 / 角色所属）平台的绑定 uid；没有则 None。
+
+        2026-11-04：platform 传 None = 角色所属平台由调用方显式给出；
+        这里只负责「取绑定」，不猜通道。
+        """
+        clean = (phone or "").strip()
+        plat = (platform or "").strip().lower()
+        if not clean or not plat:
+            return None
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1 LIMIT 1",
+                (plat, clean),
+            ).fetchone()
+        return (row["external_id"] if row else None) or None
 
     def is_phone_in_members(self, phone: str) -> bool:
         with self.lock:
@@ -926,11 +956,13 @@ class StateStore:
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
             cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, 1, ?, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, source, now_s, int(owner_id)))
-            # 2026-10-30：这里原来写死 'zdxlz'，切企微后返回的 external_id 取错通道，
-            # 管理员新增/编辑成员时看到的「激活状态」会串。与其它读写一致，跟随当前通道。
-            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1", (self.platform, clean_phone)).fetchone()
+            # 2026-11-04：这里原来跟随「当前通道」(self.platform)，导致在企微面板给密信角色
+            # 加成员时取错通道 → 「激活状态」显示不对。改按**角色所属平台**判定（业务语义）。
+            _role_plat = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+            _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
+            _ext = self.external_id_for(clean_phone, _plat_key)
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "source": source}, now_s)
-            return _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, dt_row and dt_row["external_id"])
+            return _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
         clean_role_id, clean_phone, now_s = (role_id or "").strip(), (phone or "").strip(), self.now_str()
@@ -944,11 +976,12 @@ class StateStore:
             new_dept = row["dept"] if dept is None else (str(dept).strip() or None)
             new_enabled = (1 if bool(enabled) else 0) if enabled is not None else int(row["enabled"])
             self.conn.execute("UPDATE member SET name = ?, dept = ?, enabled = ? WHERE id = ?", (new_name, new_dept, new_enabled, int(row["id"])))
-            # 2026-10-30：这里原来写死 'zdxlz'，切企微后返回的 external_id 取错通道，
-            # 管理员新增/编辑成员时看到的「激活状态」会串。与其它读写一致，跟随当前通道。
-            dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1", (self.platform, clean_phone)).fetchone()
+            # 2026-11-04：同 add_role_member —— 按**角色所属平台**判定激活状态。
+            _role_plat = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+            _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
+            _ext = self.external_id_for(clean_phone, _plat_key)
             self._insert_audit_unlocked(actor, "member.update", "member", f"{clean_role_id}:{clean_phone}", {"name": new_name, "dept": new_dept, "enabled": bool(new_enabled)}, now_s)
-            return _fmt_member(int(row["id"]), clean_role_id, clean_phone, new_name, new_dept, new_enabled, row["source"], row["created_at"], dt_row and dt_row["external_id"])
+            return _fmt_member(int(row["id"]), clean_role_id, clean_phone, new_name, new_dept, new_enabled, row["source"], row["created_at"], _ext)
 
     def delete_role_member(self, role_id: str, phone: str, actor: str = "system") -> None:
         clean_role_id, clean_phone, now_s = (role_id or "").strip(), (phone or "").strip(), self.now_str()
