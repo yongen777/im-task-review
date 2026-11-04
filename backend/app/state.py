@@ -395,10 +395,15 @@ class StateStore:
 
     @staticmethod
     def parse_admin_account(row: Any) -> Dict[str, Any]:
-        """admin_user 行 → 对外结构（allowed_platforms 解析成数组）。"""
+        """admin_user 行 → 对外结构（allowed_platforms 解析成数组）。
+
+        ⚠️ 2026-11-04：口令哈希绝不出现在任何对外响应里 —— 这里统一剔除
+        （此前 list_admin_accounts 用 SELECT * 把 pwd_hash 带给了前端）。
+        """
         if row is None:
             return {}
         d = dict(row)
+        d.pop("pwd_hash", None)
         try:
             plats = json.loads(d.get("allowed_platforms") or "")
         except Exception:

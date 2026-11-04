@@ -230,3 +230,26 @@ def test_data_isolation_between_sub_admins() -> None:
         assert len(a.get("/api/admin/templates").json()["items"]) == 1
     finally:
         store.close()
+
+
+def test_no_password_hash_in_any_account_response() -> None:
+    """账号列表/创建/重置 都不能把口令哈希带出去（2026-11-04 生产实测发现过）。"""
+    store = _store()
+    try:
+        store.upsert_admin_user("admin", "Admin@2026", must_change=False)
+        app = _app(store)
+        c = _login(app, "admin", "Admin@2026")
+        aid = _mk_admin(c, "s1", ["zdxlz"])
+        for url in ("/api/admin/accounts",):
+            body = c.get(url).text
+            assert "pwd_hash" not in body, body[:300]
+            assert "pbkdf2" not in body, body[:300]
+        created = c.post("/api/admin/accounts", json={"username": "s2"}).text
+        assert "pwd_hash" not in created, created[:300]
+        reset = c.post(f"/api/admin/accounts/{aid}/reset-password").text
+        assert "pwd_hash" not in reset, reset[:300]
+        # 单个账号（me）同样不能带
+        me = c.get("/api/admin/me").text
+        assert "pwd_hash" not in me and "pbkdf2" not in me, me[:300]
+    finally:
+        store.close()
