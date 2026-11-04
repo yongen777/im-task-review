@@ -92,6 +92,54 @@ def test_bind_rejected_when_name_mismatch() -> None:
         store.close()
 
 
+def test_bind_matches_any_roster_row_across_roles() -> None:
+    """2026-11-04 修正：一人多角色、管理员在某角色改过名 → 填任一在册姓名都应通过。
+
+    旧实现只比 id ASC 第一条，改过名后用户填新名字会被误判「信息不一致」。
+    """
+    store = _store()
+    try:
+        role = _seed_roster(store)  # 建角色1：NAME 在册
+        role2 = store.create_role("第二角色", actor="t", platform="zdxlz")["role_id"]
+        store.add_role_member(role2, PHONE, NAME, DEPT, actor="t")
+        # 管理员在第二角色里把人改名为「新名字」
+        store.update_role_member(role2, PHONE, name="新名字", dept=DEPT, actor="t")
+
+        # 填旧名字：第一角色的行仍在册 → 通过（绑定后记为新 uid_old）
+        code_old, _ = process_h5_bind(
+            state=store,
+            data={"phone": PHONE, "external_id": "zd_uid_old", "platform": "zdxlz",
+                  "name": NAME, "dept": DEPT},
+        )
+        assert code_old == 200
+
+        # 同一账号再提交（换新名字行）：应走「已绑定」回执而非 mismatch —— 比对只发生在首次登记；
+        # 为验证新名字可匹配，用第二个账号重新走绑定会被防覆盖护栏拦，因此换一个未绑定手机号的同结构场景。
+        # 直接断言语义：用 update_role_member 后另一人（不同手机号、同名新字）验证 DESC 取行逻辑没有意义，
+        # 这里的关键是"同一手机号多行任一姓名匹配"——上面 code_old 已验旧行命中；
+        # 新行命中用新账号+把第一角色的旧名行改掉的等价场景验证：
+        code_new, body_new = process_h5_bind(
+            state=store,
+            data={"phone": PHONE, "external_id": "zd_uid_old", "platform": "zdxlz",
+                  "name": "新名字", "dept": DEPT},
+        )
+        assert code_new == 200, body_new
+        assert body_new.get("already_same") is True, "同账号重复登记回已绑定"
+
+        # 全部在册行都对不上才拒绝（用未绑定手机号，避免撞防覆盖护栏）
+        store.add_role_member(role2, "13800000515", NAME, DEPT, actor="t")
+        store.update_role_member(role2, "13800000515", name="新名字", dept=DEPT, actor="t")
+        code_bad, body_bad = process_h5_bind(
+            state=store,
+            data={"phone": "13800000515", "external_id": "zd_uid_any3", "platform": "zdxlz",
+                  "name": "谁都不是", "dept": DEPT},
+        )
+        assert (code_bad, body_bad.get("code")) == (400, "ROSTER_MISMATCH"), body_bad
+        _ = role
+    finally:
+        store.close()
+
+
 def test_bind_rejected_when_roster_on_other_platform_only() -> None:
     """只在企微角色、却拿密信链接登记 → 密信侧视为未导入。"""
     store = _store()

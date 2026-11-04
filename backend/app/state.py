@@ -1183,8 +1183,12 @@ class StateStore:
     def match_roster_member(self, phone: str, name: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """2026-11-03 新激活模型：按「手机号 + 姓名」与本平台名册比对（部门不作为拦截项）。
 
-        命中 → 返回该成员行（含 dept，供回执展示）；手机号在名册但姓名不符 → 返回 None
-        并由调用方提示「信息与后台不一致」；手机号完全不在名册 → 调用方提示「管理员未导入」。
+        命中 → 返回该成员行（含 dept，供回执展示）；手机号在名册但所有行姓名都不符 →
+        返回 None 并由调用方提示「信息与后台不一致」；手机号完全不在名册 → 调用方提示「管理员未导入」。
+
+        2026-11-04（验收遗留修正）：取该手机号在本平台的**全部在册行，任一行姓名匹配即通过**。
+        旧实现取 id ASC 第一条，导致"管理员后来在某角色给该人改了名"时，
+        用户填新名字会被误判不一致。
         """
         clean_phone = (phone or "").strip()
         clean_name = (name or "").strip()
@@ -1193,12 +1197,12 @@ class StateStore:
             if plat:
                 rows = self.conn.execute(
                     "SELECT m.phone, m.name, m.dept FROM member m JOIN role r ON r.role_id = m.role_id "
-                    "WHERE m.phone = ? AND r.platform = ? ORDER BY m.id ASC LIMIT 1",
+                    "WHERE m.phone = ? AND r.platform = ? ORDER BY m.id DESC",
                     (clean_phone, plat),
                 ).fetchall()
             else:
                 rows = self.conn.execute(
-                    "SELECT phone, name, dept FROM member WHERE phone = ? ORDER BY id ASC LIMIT 1",
+                    "SELECT phone, name, dept FROM member WHERE phone = ? ORDER BY id DESC",
                     (clean_phone,),
                 ).fetchall()
         for r in rows:
