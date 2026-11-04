@@ -120,20 +120,22 @@ def test_h5_overdue_old_link_rejected_requires_resubmit():
         store.close()
 
 
-def test_delete_member_moves_to_pending():
-    """P0-3：移出成员 → 回到待归纳池，且推送绑定置为不可用。"""
+def test_delete_member_removes_binding_completely():
+    """P0-3（2026-11-03 新口径）：移出成员 → 该平台绑定彻底删除（无停用态、无待归纳）。"""
     store = _mk_store()
     try:
         tpl = _form_tpl(store)
         rid = tpl["role_ids"][0]
         store.delete_role_member(rid, "13900001001", actor="t")
 
-        pending = store.get_pending_member("uid_jia")
-        assert pending is not None, "移出成员后应回到待归纳池"
-        assert pending["phone"] == "13900001001"
-
-        target = store.get_delivery_target("13900001001", include_unusable=True)
-        assert target is not None and int(target["usable"]) == 0
+        # 彻底删除：无可用绑定、也无停用态残留、不回待归纳池
+        with store.lock:
+            rows = store.conn.execute(
+                "SELECT * FROM delivery_target WHERE phone = ?", ("13900001001",)
+            ).fetchall()
+            pending_cnt = store.conn.execute("SELECT COUNT(*) FROM pending_member").fetchone()[0]
+        assert rows == []
+        assert pending_cnt == 0
     finally:
         store.close()
 
@@ -161,18 +163,18 @@ def test_transaction_atomicity(monkeypatch):
 # ── 第二批 ──────────────────────────────────────────────────────────
 
 
-def test_remove_pending_clears_delivery_target():
-    """P0-4：移除待归纳人员时，其推送绑定必须置为不可用。"""
+def test_removed_member_binding_fully_deleted():
+    """2026-11-03 新口径：待归纳机制下线，移出成员即彻底删绑定（原 P0-4 场景已收敛到移出角色）。"""
     store = _mk_store()
     try:
-        store.upsert_pending_member("uid_pending", phone="13900003001", name="待定甲")
         store.upsert_delivery_target("13900003001", "uid_pending")
         assert store.get_delivery_target("13900003001") is not None
-
-        store.remove_pending_member("uid_pending", actor="t")
-        assert store.get_pending_member("uid_pending") is None
-        target = store.get_delivery_target("13900003001", include_unusable=True)
-        assert target is not None and int(target["usable"]) == 0
+        with store.lock:
+            store.conn.execute(
+                "DELETE FROM delivery_target WHERE phone = ?", ("13900003001",)
+            )
+            store.conn.commit()
+        assert store.get_delivery_target("13900003001", include_unusable=True) is None
     finally:
         store.close()
 
@@ -461,26 +463,26 @@ def test_instance_list_exposes_template_time():
 
 
 def test_removed_member_is_not_revived_by_any_message():
-    """补丁1：被移出的成员发任意消息不能被静默复活，且能重新回到待归纳池。"""
+    """补丁1（2026-11-03 新口径）：被移出的成员绑定已彻底删除，任意消息不能复活。"""
     store = _mk_store()
     try:
         tpl = _form_tpl(store)          # 建角色 + 成员 + delivery_target(usable=1)
         rid = tpl["role_ids"][0]
 
         store.delete_role_member(rid, "13900001001", actor="t")
-        assert store.get_pending_member("uid_jia") is not None, "移出后应在待归纳池"
 
-        # 关键断言：此时按 external_id「触碰」不应再识别为已绑定成员
+        # 关键断言：绑定已删（无可用、无停用态），按 external_id「触碰」不识别为已绑定
         assert store.touch_delivery_target_by_external_id("uid_jia") is None
-        # 也不该把 usable 复活
-        target = store.get_delivery_target("13900001001", include_unusable=True)
-        assert target is not None and int(target["usable"]) == 0
+        assert store.get_delivery_target("13900001001", include_unusable=True) is None
+        with store.lock:
+            pending_cnt = store.conn.execute("SELECT COUNT(*) FROM pending_member").fetchone()[0]
+        assert pending_cnt == 0
     finally:
         store.close()
 
 
 def test_multi_role_member_stays_bound_when_removed_from_one_role():
-    """补丁2：一人多角色时，从其中一个角色移出不能掐断另一个角色的推送绑定。"""
+    """补丁2（同平台一人多角色）：从其中一个角色移出不能删另一个角色的推送绑定。"""
     store = _mk_store()
     try:
         r1 = store.create_role("角色A", actor="t")["role_id"]
@@ -491,15 +493,13 @@ def test_multi_role_member_stays_bound_when_removed_from_one_role():
 
         store.delete_role_member(r1, "13900007001", actor="t")
 
-        # 仍留在角色 B：绑定必须还能用，且不能进待归纳池
+        # 仍留在角色 B：绑定必须还能用
         assert store.get_delivery_target("13900007001") is not None
-        assert store.get_pending_member("uid_multi") is None
         assert store.touch_delivery_target_by_external_id("uid_multi") is not None
 
-        # 从最后一个角色移出后才回收
+        # 从最后一个角色移出后彻底删除（不再回待归纳池）
         store.delete_role_member(r2, "13900007001", actor="t")
-        assert store.get_delivery_target("13900007001") is None          # 默认只查 usable=1
-        assert store.get_pending_member("uid_multi") is not None
+        assert store.get_delivery_target("13900007001", include_unusable=True) is None
     finally:
         store.close()
 

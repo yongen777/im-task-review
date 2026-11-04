@@ -197,19 +197,6 @@ def test_member_list_returns_per_platform_activations() -> None:
         store.close()
 
 
-def test_pending_list_filters_by_platform() -> None:
-    store = _mk_store()
-    try:
-        store.upsert_pending_member("zdx_uid", last_message="a", platform="zdxlz")
-        store.upsert_pending_member("wo_uid", last_message="b", platform="wecom")
-        z = store.list_pending_members(platform="zdxlz")
-        w = store.list_pending_members(platform="wecom")
-        assert [x["external_id"] for x in z] == ["zdx_uid"]
-        assert [x["external_id"] for x in w] == ["wo_uid"]
-    finally:
-        store.close()
-
-
 def test_instance_filter_sql_platform_condition() -> None:
     """后台所选办公软件 -> 只显示该平台角色上的任务实例（2026-11-02 改为按模板角色归属）。"""
     from app.api.admin import _instance_filter_sql

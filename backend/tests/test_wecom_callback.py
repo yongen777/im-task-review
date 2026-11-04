@@ -210,24 +210,6 @@ def test_post_text_message_triggers_resubmit_branch() -> None:
         store.close()
 
 
-def test_post_unbound_user_goes_to_pending_pool() -> None:
-    """未绑定用户发任意文本 → 自动落「已激活待归纳」池（与密信同一套规则）。"""
-    store = _mk_store()
-    try:
-        notifier = FakeNotifier()
-        c = _client(store, notifier)
-        ts, nonce = "1600000002", "n2"
-        enc = _encrypt(_text_plain("你好", userid="lisi", msg_id="3000001"))
-        sig = _sign(ts, nonce, enc)
-        r = c.post("/api/wecom/callback", params={"msg_signature": sig, "timestamp": ts, "nonce": nonce},
-                   content=_post_body(enc))
-        assert r.status_code == 200
-        assert store.get_pending_member("lisi") is not None
-        assert notifier.sent and "你还未完成信息登记" in notifier.sent[0][1]
-    finally:
-        store.close()
-
-
 def test_post_duplicate_msgid_handled_once() -> None:
     """企微 5 秒超时会重试 3 次：同一 MsgId 只能处理一次，避免给用户回两遍。"""
     store = _mk_store()

@@ -159,8 +159,12 @@ def process_h5_bind(
     external_id = str(data.get("external_id") or data.get("uid") or data.get("user_id") or data.get("userId") or "").strip()
     platform = str(data.get("platform") or "").strip().lower() or state.platform
 
-    # 2026-11-03 用户口径：激活登记改为 H5 表单 —— 姓名 + 手机号 + 部门（部门为必选）。
-    # ⛔ 对话里发「姓名 手机号」的旧激活路径已彻底停用，这里统一收口。
+    # 2026-11-03 新激活模型（用户/组长拍板）：后台先导入，用户才能激活。
+    #   唯一路径：管理员把人员导入角色 → 用户发消息收链接 → 填表与后台名册比对：
+    #   · 手机号+姓名都一致（部门不拦截）→ 绑定成功；
+    #   · 手机号在名册但姓名不符 → 提示「信息与后台不一致」；
+    #   · 手机号不在本平台名册 → 提示「管理员尚未在后台导入你的信息，请联系管理员」。
+    #   ⛔ 不再有待归纳池流程。
     name = str(data.get("name") or "").strip()
     dept = str(data.get("dept") or "").strip()
     if not external_id:
@@ -169,12 +173,8 @@ def process_h5_bind(
         return 400, {"code": "VALIDATION_FAILED", "message": "请填写姓名（1~20 个字）"}
     if not dept:
         return 400, {"code": "VALIDATION_FAILED", "message": "请选择部门"}
-    if not state.department_exists(dept):
-        return 400, {"code": "VALIDATION_FAILED", "message": "部门不存在，请刷新页面后重新选择"}
 
-    # 2026-11-03 防重复提交：已登记过的账号不允许「退出重进再提交覆盖」
-    #   ① 已绑定：同手机号回「无需重复登记」；换手机号直接拒绝（防一人多号/顶号）；
-    #   ② 已提交登记待分配：原样保留，不覆盖姓名/手机号/部门。
+    # 防重复提交：已绑定的账号不允许「退出重进再提交覆盖」（同号回执、换号拒绝）
     bound = state.get_binding_by_external_id(external_id, platform=platform)
     if bound:
         bound_phone = str(bound.get("phone") or "")
@@ -185,13 +185,6 @@ def process_h5_bind(
         return 200, {"ok": True, "path": "C", "bound": True, "already_same": True,
                     "phone": bound_phone, "masked_phone": masked_bound, "phone_masked": masked_bound,
                     "message": f"当前账号已关联手机号 {masked_bound}，无需重复登记。"}
-    pending_existing = state.get_pending_member(external_id)
-    if pending_existing is not None and (pending_existing.get("phone") or pending_existing.get("name")):
-        p_name = str(pending_existing.get("name") or "").strip() or "未命名用户"
-        p_phone = str(pending_existing.get("phone") or "").strip()
-        p_masked = p_phone[:3] + "****" + p_phone[-4:] if len(p_phone) == 11 else "手机号未提供"
-        return 200, {"ok": True, "path": "C", "pending": True, "already_same": True,
-                    "message": f"你已提交过登记信息（{p_name}，{p_masked}），请等待管理员分配业务角色，无需重复提交。"}
 
     # 防冒绑：该手机号在本平台已被别的账号绑定时拒绝（与原护栏一致）
     existing = state.get_delivery_target(phone, platform=platform)
@@ -204,55 +197,35 @@ def process_h5_bind(
                     "phone": phone, "masked_phone": masked, "phone_masked": masked,
                     "message": f"当前账号已关联手机号 {masked}，无需重复登记。"}
 
-    if state.phone_in_roster(phone, platform=platform):
-        # 名册内（且在本平台有角色归属）：直接完成绑定（原路径 C 护栏逻辑不变）
-        try:
-            res = state.bind_member_with_guardrails(
-                phone=phone, external_id=external_id, path="C", platform=platform
-            )
-        except BizError as exc:
-            return exc.status_code, {"code": exc.code, "message": exc.message}
+    # 与后台名册比对：手机号必须在册，姓名必须一致（部门不拦截）
+    if not state.phone_in_roster(phone, platform=platform):
+        return 400, {"code": "NOT_IN_ROSTER",
+                    "message": "管理员尚未在后台导入你的信息，请联系管理员"}
+    matched = state.match_roster_member(phone, name, platform=platform)
+    if matched is None:
+        return 400, {"code": "ROSTER_MISMATCH",
+                    "message": "你填写的信息与后台导入的信息不一致，请核对姓名与手机号后重新提交"}
 
-        # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
-        nt = (notifiers or {}).get(platform) or notifier
-        if nt is not None and external_id:
-            idem = hashlib.sha1(f"bind_C|{external_id}|{phone}|{state.now_str()}".encode("utf-8")).hexdigest()
-            try:
-                nt.send_text(external_id, res["receipt"], idem)
-            except Exception:
-                pass
+    # 比对通过：完成绑定
+    try:
+        res = state.bind_member_with_guardrails(
+            phone=phone, external_id=external_id, path="C", platform=platform
+        )
+    except BizError as exc:
+        return exc.status_code, {"code": exc.code, "message": exc.message}
 
-        return 200, {
-            "ok": True, "path": "C", "bound": True, "phone": res["phone"],
-            "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
-        }
-
-    # 2026-11-03 平台隔离口径：手机号不在**本平台**名册 → 不报错，落本平台的待归纳池
-    # （带姓名/手机号/部门），由管理员分配本平台角色后即可接收提醒。
-    # 注意：只看本平台角色，避免“在企微角色里”就能绑上密信绑定（11:41 现场就是这么漏的）。
-    state.upsert_pending_member(
-        external_id=external_id, phone=phone, name=name, dept=dept, platform=platform,
-        last_message="H5登记",
-    )
-    pending_msg = (
-        f"{name}，信息登记已收到。\n"
-        "管理员为你分配业务角色后，即可接收任务提醒，请耐心等待。"
-    )
-    # 2026-11-03 用户反馈：登记提交成功但没有收到任何信息反馈 → 按平台回推一条确认
+    # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
     nt = (notifiers or {}).get(platform) or notifier
     if nt is not None and external_id:
-        fidem = hashlib.sha1(f"bind_pending|{platform}|{external_id}|{phone}".encode("utf-8")).hexdigest()
+        idem = hashlib.sha1(f"bind_C|{external_id}|{phone}|{state.now_str()}".encode("utf-8")).hexdigest()
         try:
-            nt.send_text(
-                external_id,
-                f"【OPS任务调度助手】已收到你的登记信息（{name}，{dept}）。管理员为你分配业务角色后，即可接收任务提醒。",
-                fidem,
-            )
-        except Exception as exc:  # noqa: BLE001 - 回执失败不影响登记
-            logger.warning("登记回执发送失败 external=%s: %s", external_id, exc)
+            nt.send_text(external_id, res["receipt"], idem)
+        except Exception:
+            pass
+
     return 200, {
-        "ok": True, "path": "C", "bound": False, "pending": True,
-        "phone": phone, "name": name, "dept": dept, "message": pending_msg,
+        "ok": True, "path": "C", "bound": True, "phone": res["phone"],
+        "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
     }
 
 
@@ -512,7 +485,7 @@ def create_h5_router(
     async def api_h5_departments():
         return {"ok": True, "items": state.list_departments()}
 
-    # 2026-11-03：登记页打开时查询是否已登记（已登记则页面直接锁定，防退出重进后重复提交覆盖）
+    # 2026-11-03：登记页打开时查询是否已绑定（已绑定则页面直接锁定，防重复提交）
     @router.get("/api/h5/bind/status")
     async def api_h5_bind_status(uid: str = "", platform: str = ""):
         ext = (uid or "").strip()
@@ -524,12 +497,6 @@ def create_h5_router(
             p = str(bound.get("phone") or "")
             masked = p[:3] + "****" + p[-4:] if len(p) == 11 else ""
             return {"ok": True, "registered": True, "bound": True, "phone_masked": masked}
-        pending = state.get_pending_member(ext)
-        if pending is not None and (pending.get("phone") or pending.get("name")):
-            p = str(pending.get("phone") or "")
-            masked = p[:3] + "****" + p[-4:] if len(p) == 11 else ""
-            return {"ok": True, "registered": True, "bound": False,
-                    "name": str(pending.get("name") or ""), "phone_masked": masked}
         return {"ok": True, "registered": False}
 
     # 2026-10-29：通知附图的「公网直链」。平台 CDN 返回 application/octet-stream、

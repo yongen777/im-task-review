@@ -434,8 +434,6 @@ class StateStore:
 
             masked = mask_phone(clean_phone)
             receipt = f"绑定成功：当前账号已关联手机号 {masked}。如非本人操作，请立即联系管理员申诉处理。"
-            # 2026-11-02：绑定成功后清掉同通道的待归纳记录，避免已激活的人还挂在待归纳列表里。
-            self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_ext,))
             self._insert_audit_unlocked("system", f"target.bind_{path_code.lower()}", "delivery_target", clean_phone, {"masked_phone": masked, "external_id": clean_ext, "path": path_code}, now_s)
             return {"ok": True, "already_same": False, "phone": clean_phone, "masked_phone": masked, "external_id": clean_ext, "receipt": receipt}
 
@@ -688,13 +686,11 @@ class StateStore:
             if not row:
                 raise BizError(404, "NOT_FOUND", "成员不存在")
             self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
-            # 2026-10-29 P0-3：移出成员时把推送绑定一并收回到待归纳池，
-            # 否则 delivery_target 仍指向该人，形成“已移出却还能收到任务”的幽灵绑定。
-            # 2026-11-03 平台隔离口径（用户反馈修正）：按「绑定所在平台」逐条判断——
-            # 该平台已无任何角色归属时，这条绑定才回收到**该平台**的待归纳池；
-            # 人在企微角色里、只是退出了密信角色时，密信绑定回收、企微绑定不动
-            # （旧逻辑按“全局是否还在任意角色”判断，导致密信面板里人凭空消失）。
-            back_to_pending = False
+            # 2026-11-03 新激活模型（用户拍板：移除=彻底删除）：按「绑定所在平台」逐条判断，
+            # 该平台已无任何角色归属时，**彻底删除**该平台的绑定记录（不再有停用态、也不回待归纳池），
+            # 用户需重新给机器人发消息、走 H5 登记重新激活（比对新版后台名册）。
+            # 人在企微角色里、只是退出密信角色时：只删密信绑定，企微绑定不动。
+            removed_bindings: List[str] = []
             for dt in self.conn.execute(
                 "SELECT platform, external_id FROM delivery_target WHERE phone = ? AND usable = 1",
                 (clean_phone,),
@@ -710,20 +706,11 @@ class StateStore:
                 ext_id = str(dt["external_id"] or "").strip()
                 if not ext_id:
                     continue
-                if not self.conn.execute(
-                    "SELECT 1 FROM pending_member WHERE external_id = ?", (ext_id,)
-                ).fetchone():
-                    self.conn.execute(
-                        "INSERT INTO pending_member(external_id, phone, name, dept, platform, activated_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (ext_id, clean_phone, row["name"], row["dept"], plat, now_s, now_s),
-                    )
-                    back_to_pending = True
-                # 回收的绑定置为不可用（重新登记/重新移入角色时会恢复）
                 self.conn.execute(
-                    "UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?",
+                    "DELETE FROM delivery_target WHERE platform = ? AND external_id = ?",
                     (plat, ext_id),
                 )
+                removed_bindings.append(f"{plat}:{ext_id[-6:]}")
 
             # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的「未完成任务实例」一并清掉，
             # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
@@ -759,7 +746,7 @@ class StateStore:
 
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
-                {"name": row["name"], "dept": row["dept"], "back_to_pending": back_to_pending,
+                {"name": row["name"], "dept": row["dept"], "removed_bindings": removed_bindings,
                  "removed_instances": len(removed_instance_ids)}, now_s,
             )
 
@@ -1193,6 +1180,32 @@ class StateStore:
                 {"name": row["name"], "expired_instances": int(expired_cnt or 0)}, now_s,
             )
 
+    def match_roster_member(self, phone: str, name: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """2026-11-03 新激活模型：按「手机号 + 姓名」与本平台名册比对（部门不作为拦截项）。
+
+        命中 → 返回该成员行（含 dept，供回执展示）；手机号在名册但姓名不符 → 返回 None
+        并由调用方提示「信息与后台不一致」；手机号完全不在名册 → 调用方提示「管理员未导入」。
+        """
+        clean_phone = (phone or "").strip()
+        clean_name = (name or "").strip()
+        plat = self._plat(platform) if platform else None
+        with self.lock:
+            if plat:
+                rows = self.conn.execute(
+                    "SELECT m.phone, m.name, m.dept FROM member m JOIN role r ON r.role_id = m.role_id "
+                    "WHERE m.phone = ? AND r.platform = ? ORDER BY m.id ASC LIMIT 1",
+                    (clean_phone, plat),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT phone, name, dept FROM member WHERE phone = ? ORDER BY id ASC LIMIT 1",
+                    (clean_phone,),
+                ).fetchall()
+        for r in rows:
+            if str(r["name"] or "").strip() == clean_name:
+                return {"phone": r["phone"], "name": r["name"], "dept": r["dept"]}
+        return None
+
     def get_dedup_enabled_members_for_roles(self, role_ids: List[str]) -> List[Dict[str, Any]]:
         clean_ids = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
         if not clean_ids:
@@ -1301,110 +1314,8 @@ class StateStore:
                 (clean, plat),
             ).fetchone() is not None
 
-    def upsert_pending_member(self, external_id: str, last_message: str = "",
-                              phone: Optional[str] = None,
-                              name: Optional[str] = None,
-                              platform: Optional[str] = None,
-                              dept: Optional[str] = None) -> Dict[str, Any]:
-        """用户给机器人发任意消息 / H5 登记表单提交时录入待归纳池（幂等，已存在则仅更新变化字段）。
-
-        ⭐ 2026-10-28 用户口径：手机号**不再要求先在名单里**——
-           提交的手机号直接落池（标记未核实），由管理员归纳角色时才决定归属。
-        ⭐ 2026-11-02 多通道：记录来源通道（zdxlz/wecom），后台显示「从哪个办公软件来」。
-        ⭐ 2026-11-03 H5 登记表单：落库姓名 / 手机号 / 部门。
-        """
-        clean_id = (external_id or "").strip()
-        if not clean_id:
-            raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
-        clean_phone = (phone or "").strip() or None
-        clean_name = (name or "").strip() or None
-        clean_dept = (dept or "").strip() or None
-        clean_platform = self._plat(platform) if platform else None
-        now_s = self.now_str()
-        with self.lock, self.conn:
-            existing = self.conn.execute("SELECT id FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
-            if existing:
-                self.conn.execute(
-                    "UPDATE pending_member SET last_message = ?,"
-                    " phone = COALESCE(?, phone), name = COALESCE(?, name), dept = COALESCE(?, dept),"
-                    " platform = COALESCE(?, platform), updated_at = ?"
-                    " WHERE external_id = ?",
-                    (last_message[:200], clean_phone, clean_name, clean_dept, clean_platform, now_s, clean_id),
-                )
-            else:
-                self.conn.execute(
-                    "INSERT INTO pending_member(external_id, phone, name, dept, last_message, platform, activated_at, updated_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (clean_id, clean_phone, clean_name, clean_dept, last_message[:200], clean_platform, now_s, now_s),
-                )
-        return self.get_pending_member(clean_id) or {"external_id": clean_id}
-
-    def get_pending_member(self, external_id: str) -> Optional[Dict[str, Any]]:
-        with self.lock:
-            row = self.conn.execute("SELECT * FROM pending_member WHERE external_id = ?", ((external_id or "").strip(),)).fetchone()
-            return dict(row) if row else None
-
-    def list_pending_members(self, limit: int = 200, platform: Optional[str] = None) -> List[Dict[str, Any]]:
-        plat = (platform or "").strip().lower()
-        sql = "SELECT * FROM pending_member"
-        params: List[Any] = []
-        if plat:
-            sql += " WHERE platform = ?"
-            params.append(plat)
-        sql += " ORDER BY activated_at DESC LIMIT ?"
-        params.append(max(1, min(int(limit), 500)))
-        with self.lock:
-            rows = self.conn.execute(sql, tuple(params)).fetchall()
-            return [dict(r) for r in rows]
-
-    def assign_pending_member(self, external_id: str, phone: str, name: str, role_id: str, dept: Optional[str] = None, actor: str = "system") -> Dict[str, Any]:
-        """管理员将待归纳人员移入角色（同时建立 delivery_target 绑定，使其可接收提醒推送）。"""
-        clean_id = (external_id or "").strip()
-        clean_phone = (phone or "").strip()
-        if not clean_id:
-            raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
-        if not clean_phone:
-            raise BizError(400, "PHONE_REQUIRED",
-                           "该人员尚未通过登记链接填写手机号，请等待其填写后再归纳")
-        now_s = self.now_str()
-        with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
-            if not row:
-                raise BizError(404, "NOT_FOUND", "待归纳人员不存在")
-            d = dict(row)
-            # 2026-11-02 角色按办公软件隔离：只能移入同平台的名称，避免把密信的人放进企微角色。
-            role_row = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", ((role_id or "").strip(),)).fetchone()
-            if not role_row:
-                raise BizError(404, "NOT_FOUND", "角色不存在")
-            pending_plat = str(d.get("platform") or "").strip().lower()
-            if pending_plat and pending_plat != str(role_row["platform"]).strip().lower():
-                raise BizError(400, "PLATFORM_MISMATCH", "该人员来自其他办公软件，不能移入当前平台的角色")
-            # 添加到角色成员；部门优先取管理员显式传入，缺省用该人员在登记表单里填的部门
-            clean_dept = (dept or "").strip() or str(d.get("dept") or "").strip()
-            self.add_role_member(role_id=role_id, phone=clean_phone, name=name or d.get("name") or clean_phone[-4:], dept=clean_dept, actor=actor)
-            # 绑定 delivery_target（使其可接收推送）：绑定到该人员来源通道，
-            # 多通道并行时不能默认写到当前通道，否则会把企微 userid 绑到密信上。
-            self.upsert_delivery_target(phone=clean_phone, external_id=clean_id, platform=d.get("platform"))
-            # 从待归纳池移除
-            self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
-            self._insert_audit_unlocked(actor, "pending_member.assign", "pending_member", clean_id, {"phone": clean_phone, "role_id": role_id}, now_s)
-        return {"ok": True, "external_id": clean_id, "phone": clean_phone, "role_id": role_id}
-
-    def remove_pending_member(self, external_id: str, actor: str = "system") -> None:
-        """从待归纳池移除人员（解除绑定，用户需重新发消息方可再次录入）。"""
-        clean_id = (external_id or "").strip()
-        now_s = self.now_str()
-        with self.lock, self.conn:
-            row = self.conn.execute("SELECT id, platform FROM pending_member WHERE external_id = ?", (clean_id,)).fetchone()
-            if not row:
-                raise BizError(404, "NOT_FOUND", "待归纳人员不存在")
-            self.conn.execute("DELETE FROM pending_member WHERE external_id = ?", (clean_id,))
-            # 2026-10-29 P0-4：移除待归纳的人，其推送绑定也要置为不可用，
-            # 否则绑定仍在，调度器照样往一个“已被移除”的人发任务。
-            # 2026-11-02 修正：按该条记录的来源通道置位，不能用全局 self.platform，
-            # 否则移除企微待归纳人员会把他的密信绑定一起停掉。
-            self.conn.execute("UPDATE delivery_target SET usable = 0 WHERE platform = ? AND external_id = ?", (row["platform"] or self.platform, clean_id))
-            self._insert_audit_unlocked(actor, "pending_member.remove", "pending_member", clean_id, None, now_s)
+    # ── 2026-11-03 新激活模型（后台先导入才能激活）：待归纳池整体废弃 ──
+    # ⛔ 不再写入/读取 pending_member；生产历史数据由部署脚本一次性清理。
 
     # ── 数据快照（2026-10-27 春促数据看板：人工填数本期主通道，后续可替换为自动取数）──
     def upsert_data_snapshot(self, source_key: str, period_key: str, values: Dict[str, Any], note: Optional[str] = None, updated_by: str = "system") -> Dict[str, Any]:

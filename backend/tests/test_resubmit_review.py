@@ -263,27 +263,6 @@ def _send_text_event(store, channel, notifier, cfg, text: str) -> Tuple[int, Dic
     )
 
 
-def test_apply_message_reply_and_not_into_pending_pool() -> None:
-    store, channel, notifier, cfg = _event_env()
-    try:
-        _tpl, inst = _mk_overdue(store)
-        code, body = _send_text_event(store, channel, notifier, cfg, "申请补交")
-        assert code == 200
-        assert body["path"] == "resubmit"
-        assert body["result"] == "applied"
-
-        # 回执文案
-        texts = [m.text for m in notifier.sent_messages]
-        assert any("已收到补交申请" in t for t in texts), texts
-        # ⛔ 不能落进待归纳池
-        assert store.get_pending_member(UID) is None
-        # 实例进入 pending
-        assert store.get_instance(inst["id"])["resubmit_status"] == "pending"
-    finally:
-        channel.close()
-        store.close()
-
-
 def test_apply_message_replies_none_when_no_overdue() -> None:
     store, channel, notifier, cfg = _event_env()
     try:

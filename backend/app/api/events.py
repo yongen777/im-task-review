@@ -217,26 +217,9 @@ def handle_inbound_text(
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
 
-    # ── 2026-11-03 用户口径：激活登记一律走 H5 表单（姓名/手机号/部门）──
-    # 未登记用户发任何文本 → 统一回同一条登记提示文本 + 专属链接；
-    # 已通过链接提交过登记、还在等管理员分配角色的人 → 回等待文案（不再重复发链接）。
-    pending_row = None
-    try:
-        pending_row = state.get_pending_member(user_id)
-    except Exception:  # noqa: BLE001 - 查不到只当未登记处理
-        pending_row = None
-    if pending_row is not None and (pending_row.get("phone") or pending_row.get("name")):
-        wait_text = (
-            "【OPS任务调度助手】\n"
-            "你的登记信息已收到，请等待管理员为你分配业务角色，分配完成后即可接收任务提醒。"
-        )
-        send(wait_text, "pending_wait")
-        return 200, {"ok": True, "bound": False, "pending": True, "message": wait_text}
-
-    try:
-        state.upsert_pending_member(external_id=user_id, last_message=msg_text[:100], name=user_name or None, platform=platform or None)
-    except Exception as exc:  # noqa: BLE001 - 登记失败不影响把提示文本发给用户
-        logger.warning("pending_member 自动登记失败 external_id=%s: %s", user_id, exc)
+    # ── 2026-11-03 新激活模型（组长口径）：后台先导入，用户才能激活 ──
+    # 未绑定用户发任何文本 → 统一回登记链接（填表时与后台名册比对，未导入会被拦）。
+    # ⛔ 不再写待归纳池；不存在"提交后等待分配"的中间状态。
     bind_url = f"{base_url.rstrip('/')}/h5/bind#uid={user_id}" + (f"&plat={platform}" if platform else "")
     prompt_text = (
         "【OPS任务调度助手】\n"
@@ -244,7 +227,7 @@ def handle_inbound_text(
         f"{bind_url}"
     )
     send(prompt_text, "register_prompt")
-    return 200, {"ok": True, "bound": False, "pending": True, "bind_url": bind_url, "message": prompt_text}
+    return 200, {"ok": True, "bound": False, "bind_url": bind_url, "message": prompt_text}
 
 
 def process_app_event(
@@ -261,8 +244,8 @@ def process_app_event(
     """§3.2 & §7.3 核心处理逻辑，返回 (status_code, body_dict)：
     - 验签失败一律返回 401，绝不进入绑定逻辑；
     - 路径 A（仅在平台下发手机号时生效）：平台真实事件仅有 loginId/userId/toUserId 不含手机号；
-    - 路径 C（主导路径）：未登记用户回统一提示文本 + /h5/bind 登记链接（填写姓名/手机号/部门）；
-      已登记待分配角色的用户回等待文案；已绑定用户支持「申请补交」指令与固定 ack。
+    - 路径 C（主导路径）：未绑定用户回统一提示文本 + /h5/bind 登记链接（填写姓名/手机号/部门，
+      后台先导入才能通过比对）；已绑定用户支持「申请补交」指令与固定 ack。
     """
     base_url = public_base_url.rstrip("/")
     active_notifier: NotifierProtocol = notifier if notifier is not None else channel

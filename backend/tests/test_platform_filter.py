@@ -139,22 +139,3 @@ def test_stats_filter_matches_list() -> None:
     finally:
         store.close()
 
-
-def test_pending_members_filter_by_platform() -> None:
-    store = _mk_store()
-    try:
-        store.upsert_pending_member("zd_new_1", "你好", phone=ZD_ONLY, name="密信新人", platform="zdxlz")
-        store.upsert_pending_member("wx_new_1", "你好", phone=WX_ONLY, name="企微新人", platform="wecom")
-        c = _env(store)
-
-        zd = c.get("/api/admin/pending-members?platform=zdxlz").json()
-        assert [it["platform"] for it in zd["items"]] == ["zdxlz"]
-        assert zd["total"] == 1
-
-        wx = c.get("/api/admin/pending-members?platform=wecom").json()
-        assert [it["platform"] for it in wx["items"]] == ["wecom"]
-
-        allp = c.get("/api/admin/pending-members").json()
-        assert allp["total"] == 2
-    finally:
-        store.close()

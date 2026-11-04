@@ -81,15 +81,3 @@ def test_template_cannot_mix_platform_roles() -> None:
     finally:
         store.close()
 
-
-def test_pending_member_cannot_move_across_platform() -> None:
-    tmp = Path(tempfile.mkdtemp(prefix="imtask_pending_plat_"))
-    store = StateStore(tmp / "im.db")
-    try:
-        w_role = store.create_role("企微组", actor="t", platform="wecom")["role_id"]
-        store.upsert_pending_member("zd_new", "你好", phone="13900008201", name="密信新人", platform="zdxlz")
-        with pytest.raises(BizError) as exc:
-            store.assign_pending_member("zd_new", "13900008201", "密信新人", w_role, actor="t")
-        assert exc.value.code == "PLATFORM_MISMATCH"
-    finally:
-        store.close()

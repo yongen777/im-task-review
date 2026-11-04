@@ -3,10 +3,10 @@
 
 1. 回调回复必须走**来源平台**的通道（`main._channel_notifier`）——
    实锤：密信回调回复被发给企微 bot（errcode=93006 invalid chatid），用户侧“完全不回话”；
-2. 移出角色按「绑定平台」回收到对应平台的待归纳池（人在企微角色、退出密信角色时，
-   密信绑定回密信池、企微绑定不动）——旧逻辑按“全局是否还在任意角色”判断，人在面板里凭空消失；
-3. 量子密信永远不发原生图片（10-29 实测口径：手机端点不开），直接走 H5 链接，
-   不再靠 send_image 签名不匹配的 TypeError 兜底（08:15 日志实锤）。
+2. 量子密信永远不发原生图片（10-29 实测口径：手机端点不开），直接走 H5 链接，
+   不再靠 send_image 签名不匹配的 TypeError 兜底（08:15 日志实锤）；
+3. 移出分组 → 未完成任务实例一并清掉（带"另一角色保留/已完成历史不删"边界）。
+   （绑定名册比对与"移除=彻底删绑定"2026-11-03 下午已迁至 test_activation_model.py）
 """
 
 from __future__ import annotations
@@ -45,56 +45,7 @@ def test_channel_notifier_picks_source_platform() -> None:
     assert _channel_notifier(None, "wecom", fb) is fb
 
 
-# ── 2. 移出角色按平台回池 ─────────────────────────────────────────
-def test_remove_from_role_recycles_binding_per_platform() -> None:
-    store = _store()
-    try:
-        z_role = store.create_role("密信组", actor="t", platform="zdxlz")["role_id"]
-        w_role = store.create_role("企微组", actor="t", platform="wecom")["role_id"]
-        store.add_role_member(z_role, PHONE, NAME, DEPT, actor="t")
-        store.add_role_member(w_role, PHONE, NAME, DEPT, actor="t")
-        store.upsert_delivery_target(PHONE, "zd_uid_1", platform="zdxlz")
-        store.upsert_delivery_target(PHONE, "wx_uid_1", platform="wecom")
-
-        # 只退出密信角色：密信绑定回密信待归纳池（带姓名/部门），企微绑定不动
-        store.delete_role_member(z_role, PHONE, actor="t")
-        p = store.get_pending_member("zd_uid_1")
-        assert p is not None, "退出最后一个密信角色后，密信绑定应回待归纳池"
-        assert (p["platform"], p["phone"], p["name"], p["dept"]) == ("zdxlz", PHONE, NAME, DEPT)
-        assert store.get_pending_member("wx_uid_1") is None, "还在企微角色，企微绑定不应回池"
-
-        zt = store.get_delivery_target(PHONE, platform="zdxlz", include_unusable=True)
-        assert zt is not None and zt["usable"] == 0
-        wt = store.get_delivery_target(PHONE, platform="wecom")
-        assert wt is not None and wt["usable"] == 1, "企微绑定必须保持可用"
-
-        # 再退出企微角色：企微绑定也回池
-        store.delete_role_member(w_role, PHONE, actor="t")
-        p2 = store.get_pending_member("wx_uid_1")
-        assert p2 is not None and p2["platform"] == "wecom"
-        assert store.get_delivery_target(PHONE, platform="wecom", include_unusable=True)["usable"] == 0
-    finally:
-        store.close()
-
-
-def test_remove_one_of_two_roles_same_platform_keeps_binding() -> None:
-    """同平台还有别的角色时（一人多角色），移出一个不回收绑定。"""
-    store = _store()
-    try:
-        ra = store.create_role("密信A组", actor="t", platform="zdxlz")["role_id"]
-        rb = store.create_role("密信B组", actor="t", platform="zdxlz")["role_id"]
-        store.add_role_member(ra, PHONE, NAME, DEPT, actor="t")
-        store.add_role_member(rb, PHONE, NAME, DEPT, actor="t")
-        store.upsert_delivery_target(PHONE, "zd_uid_2", platform="zdxlz")
-
-        store.delete_role_member(ra, PHONE, actor="t")
-        assert store.get_pending_member("zd_uid_2") is None
-        assert store.get_delivery_target(PHONE, platform="zdxlz")["usable"] == 1
-    finally:
-        store.close()
-
-
-# ── 3. 密信附图永远走链接 ──────────────────────────────────────────
+# ── 2. 密信附图永远走链接 ──────────────────────────────────────────
 class _ZdxlzLikeNotifier(FakeNotifier):
     """模拟密信通道：有 send_image 但签名与调度器不兼容——一旦被调用立即报错。"""
 
@@ -141,38 +92,7 @@ def test_zdxlz_attach_image_goes_link_not_native() -> None:
         store.close()
 
 
-# ── 4. 绑定只认「本平台」名册；否则落本平台待归纳池 ─────────────────
-def test_h5_bind_requires_same_platform_roster_else_pending() -> None:
-    """2026-11-03 现场漏点：人在企微角色里、拿密信链接登记，旧逻辑（全局名册）直接绑上了密信，
-    导致此人既不在密信角色里、也不在密信待归纳池，密信面板里凭空消失。"""
-    from app.api.h5 import process_h5_bind
-
-    store = _store()
-    try:
-        w_role = store.create_role("企微组", actor="t", platform="wecom")["role_id"]
-        store.add_role_member(w_role, PHONE, NAME, DEPT, actor="t")
-        store.create_department(DEPT, actor="t")
-
-        code, body = process_h5_bind(
-            state=store,
-            data={"phone": PHONE, "external_id": "zd_uid_x", "platform": "zdxlz", "name": NAME, "dept": DEPT},
-        )
-        assert code == 200 and body.get("pending") is True, body
-        row = store.get_pending_member("zd_uid_x")
-        assert row is not None and row["platform"] == "zdxlz" and row["phone"] == PHONE
-        assert store.get_delivery_target(PHONE, platform="zdxlz") is None, "⛔ 不得绕过本平台名册直接绑定"
-
-        # 在企微平台登记同名册 → 正常绑定
-        code2, body2 = process_h5_bind(
-            state=store,
-            data={"phone": PHONE, "external_id": "wx_uid_x", "platform": "wecom", "name": NAME, "dept": DEPT},
-        )
-        assert code2 == 200 and body2.get("bound") is True, body2
-    finally:
-        store.close()
-
-
-# ── 5. 移出分组 → 未完成任务实例一并清掉 ───────────────────────────
+# ── 3. 移出分组 → 未完成任务实例一并清掉 ───────────────────────────
 def _notice_tpl(store: StateStore, role_ids: list, name: str) -> str:
     tpl = store.create_template(
         {
