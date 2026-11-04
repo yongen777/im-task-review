@@ -366,26 +366,7 @@ function healthToMock(d: any): AdminHealth {
   } as AdminHealth;
 }
 
-/* ---------- 已激活待归纳人员（2026-10-28 方案B：对接后端 pending_member 表） ---------- */
-async function unactivatedMembers(platform?: string): Promise<{ ok: boolean; items: any[] }> {
-  const qs = platform ? `?platform=${encodeURIComponent(platform)}` : '';
-  const d = await rawFetch<{ items?: any[] }>('GET', `/api/admin/pending-members${qs}`);
-  return {
-    ok: true,
-    items: (d.items || []).map((m: any) => ({
-      external_id: m.external_id,
-      phone: m.phone || '',
-      name: m.name || '',
-      dept: m.dept || '',
-      last_message: m.last_message || '',
-      platform: m.platform || '',
-      updated_at: m.updated_at || '',
-      activation: 'pending' as const,
-      source_note: `来自${m.platform === 'wecom' ? '企业微信' : '量子密信'} · ${m.last_message ? '最后消息：' + m.last_message : '无消息内容'}${m.updated_at ? ' · ' + m.updated_at : ''}`,
-      created_at: m.activated_at || '',
-    })),
-  };
-}
+/* ---------- 已激活待归纳人员：2026-11-03 新激活模型下线（后端已返 410） ---------- */
 
 /* ---------- 主入口 ---------- */
 export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: any): Promise<T> {
@@ -410,13 +391,9 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
     } as unknown as T;
   }
 
-  /* 未激活成员聚合 */
-  if (rawPath === '/api/admin/unactivated-members') {
-    if (method === 'GET') {
-      const m = new URLSearchParams(queryText);
-      return (await unactivatedMembers(m.get('platform') || '')) as unknown as T;
-    }
-    throw new Error('未激活成员请在「角色与成员名册」中操作（添加成员后，让成员给机器人发手机号即完成激活）');
+  /* 未激活成员聚合：2026-11-03 新激活模型下线（后台先导入才能激活，无待归纳池） */
+  if (rawPath === '/api/admin/unactivated-members' || rawPath === '/api/admin/pending-members') {
+    throw new Error('待归纳机制已下线：请先在「角色与成员」中导入/添加成员，成员给机器人发消息后会收到登记链接完成激活');
   }
 
   /* 路径映射 */
@@ -512,12 +489,26 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
         line: Number(x?.row || 0),
         reason: String(x?.reason || '格式不符'),
       })),
+      /* 2026-11-04：CSV 里的新部门会被自动建进「部门管理」，把建了哪些部门回传给前端提示 */
+      departments_created: Array.isArray(d?.departments_created) ? d.departments_created.map((x: any) => String(x)) : [],
     } as unknown as T;
   }
   if (rawPath === '/api/admin/me') {
     /* 会话恢复：boot 探测时从响应同步 csrf（修复旧 Cookie 直接进站后写操作 403） */
     if (d && d.csrf_token) setCsrfToken(d.csrf_token);
-    return { ok: true, username: d.username, must_change_password: !!d.must_change, csrf_token: getCsrfToken() } as unknown as T;
+    /* 2026-11-04 多管理员分级：一并带回角色级别 / 显示名 / 授权平台 */
+    return {
+      ok: true,
+      id: d.id,
+      username: d.username,
+      must_change: !!d.must_change,
+      must_change_password: !!d.must_change,
+      role_level: d.role_level === 'super_admin' ? 'super_admin' : 'sub_admin',
+      display_name: d.display_name || d.username,
+      allowed_platforms: Array.isArray(d.allowed_platforms) ? d.allowed_platforms : ['zdxlz', 'wecom'],
+      is_super_admin: d.role_level === 'super_admin',
+      csrf_token: getCsrfToken(),
+    } as unknown as T;
   }
   if (rawPath === '/api/admin/health') return healthToMock(d) as unknown as T;
   if (rawPath === '/api/admin/roles' && method === 'GET') {

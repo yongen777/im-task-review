@@ -16,42 +16,39 @@ import {
   ShieldCheck,
   ArrowRightCircle,
   UserCheck,
+  UserMinus,
   Search,
   MessageSquare,
   Link2Off,
   AlertTriangle,
   Building2,
+  Globe,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
-import { RoleItem, RoleMemberItem, UnactivatedMemberItem } from '../../lib/types';
+import { GlobalActivatedMemberItem, RoleItem, RoleMemberItem } from '../../lib/types';
 
 export const RolesMembersView: React.FC = () => {
-  const { roles, refreshRoles, platform } = useAppStore();
+  const { roles, refreshRoles, platform, isSuperAdmin } = useAppStore();
   const toast = useToast();
+  /* 2026-11-04 多管理员分级：全局搜索已激活成员（激活关系跨管理员共享，免二次激活） */
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [globalQuery, setGlobalQuery] = useState('');
+  const [globalResults, setGlobalResults] = useState<GlobalActivatedMemberItem[]>([]);
+  const [globalBusy, setGlobalBusy] = useState(false);
 
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
   const [members, setMembers] = useState<RoleMemberItem[]>([]);
   const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberKeyword, setMemberKeyword] = useState('');
 
-  // 已激活待归纳角色人员列表、搜索查询与一键移入角色分组状态
-  const [unactivatedList, setUnactivatedList] = useState<UnactivatedMemberItem[]>([]);
-  const [loadingUnactivated, setLoadingUnactivated] = useState(false);
-  const [unactivatedKeyword, setUnactivatedKeyword] = useState('');
-  const [rowTargetRoleMap, setRowTargetRoleMap] = useState<Record<string, string>>({});
-  const [batchTargetRoleId, setBatchTargetRoleId] = useState<string>('');
-  const [movingPhone, setMovingPhone] = useState<string | null>(null);
-  const [batchMoving, setBatchMoving] = useState(false);
+  // 2026-11-03 新激活模型（后台先导入才能激活）：「已激活待归纳角色人员」整体下线，
+  // 成员只能从后台 CSV 导入/手动添加进入角色，再由用户自己走 H5 登记比对激活。
 
-  // 两个移除动作的交互确认弹窗状态
-  // 1) 从当前角色移除成员 -> 移入右侧「已激活待归纳角色人员」列表（保留会话绑定）
+  // 从当前角色移除成员的交互确认弹窗（移除=彻底删绑定，用户需重新登记激活）
   const [confirmRemoveRoleMember, setConfirmRemoveRoleMember] = useState<RoleMemberItem | null>(null);
   const [removingRoleMember, setRemovingRoleMember] = useState(false);
-  // 2) 从「已激活待归纳角色人员」移除 -> 解除量子密信会话绑定，需用户重新对话输入激活
-  const [confirmUnbindPerson, setConfirmUnbindPerson] = useState<UnactivatedMemberItem | null>(null);
-  const [unbindingPerson, setUnbindingPerson] = useState(false);
 
   // 单条添加成员表单（姓名 + 手机号 + 部门，部门由后台统一配置）
   const [newName, setNewName] = useState('');
@@ -90,14 +87,6 @@ export const RolesMembersView: React.FC = () => {
   const [csvText, setCsvText] = useState('13900000000,张三,市场部');
   const [importing, setImporting] = useState(false);
 
-  // 2026-11-02：批量归纳目标跟随当前选中的角色分组（用户指令）。
-  // 手动改下拉时保持用户选择，直到切换到别的角色卡再重置。
-  useEffect(() => {
-    if (selectedRoleId && roles.some((r) => r.role_id === selectedRoleId)) {
-      setBatchTargetRoleId(selectedRoleId);
-    }
-  }, [selectedRoleId, roles]);
-
   const loadMembers = useCallback(
     async (roleId: string) => {
       if (!roleId) {
@@ -118,24 +107,6 @@ export const RolesMembersView: React.FC = () => {
     },
     [toast, platform],
   );
-
-  const loadUnactivated = useCallback(async () => {
-    setLoadingUnactivated(true);
-    try {
-      const res = await api.get<{ ok: boolean; items: UnactivatedMemberItem[] }>(
-        `/api/admin/unactivated-members?platform=${encodeURIComponent(platform)}`,
-      );
-      setUnactivatedList(res.items || []);
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '加载已激活待归纳人员失败');
-    } finally {
-      setLoadingUnactivated(false);
-    }
-  }, [toast, platform]);
-
-  useEffect(() => {
-    loadUnactivated();
-  }, [loadUnactivated]);
 
   // 2026-11-03 部门选项：后台配置，与 H5 登记页共用
   const loadDepartments = useCallback(async () => {
@@ -227,149 +198,7 @@ export const RolesMembersView: React.FC = () => {
     );
   }, [members, memberKeyword]);
 
-  const filteredUnactivatedList = useMemo(() => {
-    if (!unactivatedKeyword.trim()) return unactivatedList;
-    const kw = unactivatedKeyword.trim().toLowerCase();
-    return unactivatedList.filter(
-      (u) => u.phone.includes(kw) || u.name.toLowerCase().includes(kw),
-    );
-  }, [unactivatedList, unactivatedKeyword]);
-
-  /* 2026-10-29 P0-5：待归纳人员可能还没报手机号（phone=""），用 phone 做 key/行标识会撞车。
-     统一用 external_id 优先、phone 兜底的稳定标识。 */
-  const rowKeyOf = (p: { external_id?: string; phone?: string }): string =>
-    String(p.external_id || p.phone || '');
-
-  // 2026-11-02：平台事件通常只下发 userId，不下发姓名/手机号。
-  // 没有名字时给可辨识的占位（平台 + ID 尾号），手机号未知时明确标注，避免管理员分不清是谁。
-  const displayName = (p: { name?: string; external_id?: string; phone?: string }): string => {
-    const n = (p.name || '').trim();
-    if (n) return n;
-    const tail = (p.external_id || '').slice(-4) || (p.phone || '').slice(-4) || '-';
-    return `未命名用户（ID尾号 ${tail}）`;
-  };
-  const displayPhone = (p: { phone?: string }): string =>
-    (p.phone || '').trim() || '未知（待用户提供绑定）';
-  /* 2026-11-02 用户口径：姓名与手机号合成一句话，来源行（来自xx·最后消息）不再展示。
-     2026-11-03：H5 登记表单新增部门，随人一并展示。 */
-  const displayPersonLine = (p: { name?: string; phone?: string; dept?: string }): string => {
-    const n = (p.name || '').trim();
-    const ph = (p.phone || '').trim();
-    const dp = (p.dept || '').trim();
-    const head = n && ph ? `${n} ${ph}` : n ? `${n}（待用户提供绑定）` : ph ? `未命名用户 ${ph}` : '未命名用户（待用户提供绑定）';
-    return dp ? `${head} ${dp}` : head;
-  };
-
-  const getRowTargetRole = (rowKey: string): string => {
-    const chosen = rowTargetRoleMap[rowKey];
-    if (chosen && roles.some((r) => r.role_id === chosen)) {
-      return chosen;
-    }
-    return selectedRoleId || roles[0]?.role_id || '';
-  };
-
-  // 一键将单个已激活待归纳人员归入指定角色分组
-  const handleMoveSingleUnactivated = async (person: UnactivatedMemberItem) => {
-    const rowKey = rowKeyOf(person);
-    const targetRoleId = getRowTargetRole(rowKey);
-    if (!targetRoleId) {
-      toast.warning('请先选择目标角色分组');
-      return;
-    }
-    setMovingPhone(rowKey);
-    try {
-      // 2026-10-28 修：改用后端正式路径 pending-members/move，按 external_id 定位
-      // （原 unactivated-members + phone 的组合是历史 mock 契约，后端只有兼容别名）
-      await api.post<{ ok: boolean; assignment?: { phone?: string; role_id?: string } }>(
-        '/api/admin/pending-members/move',
-        { external_id: person.external_id, role_id: targetRoleId },
-      );
-      await Promise.all([
-        loadUnactivated(),
-        refreshRoles(),
-        selectedRoleId ? loadMembers(selectedRoleId) : Promise.resolve(),
-      ]);
-      const roleName = roles.find((r) => r.role_id === targetRoleId)?.role_name || targetRoleId;
-      toast.success(
-        `已将已激活人员「${person.name || person.phone}」(${person.phone}) 一键归入角色分组「${roleName}」。`,
-        '一键移入成功',
-      );
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '移入角色分组失败');
-    } finally {
-      setMovingPhone(null);
-    }
-  };
-
-  // 一键批量将当前列表中的已激活待归纳人员归入目标角色分组
-  const handleBatchMoveAllUnactivated = async () => {
-    const targetItems = filteredUnactivatedList.length > 0 ? filteredUnactivatedList : unactivatedList;
-    if (targetItems.length === 0) return;
-    const targetRoleId = batchTargetRoleId || selectedRoleId || roles[0]?.role_id || '';
-    if (!targetRoleId) {
-      toast.warning('请先选择目标角色分组');
-      return;
-    }
-    setBatchMoving(true);
-    try {
-      // 2026-10-28 修：后端 pending-members/move 是单人接口，批量逐条调用并统计成功数
-      let moved = 0;
-      let lastErr = '';
-      for (const u of targetItems) {
-        if (!u.external_id) {
-          lastErr = '存在缺少用户标识的记录，请刷新页面后重试';
-          continue;
-        }
-        try {
-          await api.post('/api/admin/pending-members/move', {
-            external_id: u.external_id,
-            role_id: targetRoleId,
-          });
-          moved += 1;
-        } catch (err) {
-          lastErr = err instanceof Error ? plainError(err.message) : '移入失败';
-        }
-      }
-      await Promise.all([
-        loadUnactivated(),
-        refreshRoles(),
-        selectedRoleId ? loadMembers(selectedRoleId) : Promise.resolve(),
-      ]);
-      const roleName = roles.find((r) => r.role_id === targetRoleId)?.role_name || targetRoleId;
-      if (moved > 0) {
-        toast.success(
-          `已将 ${moved} 名已激活待归纳人员一键归入「${roleName}」分组。`,
-          '批量一键移入完成',
-        );
-      }
-      if (lastErr) toast.error(lastErr, '部分未移入');
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '批量移入失败');
-    } finally {
-      setBatchMoving(false);
-    }
-  };
-
-  // 确认从「已激活待归纳角色人员」移除 -> 解除密信会话绑定，需用户重新输入激活
-  const handleConfirmUnbindUnactivated = async () => {
-    if (!confirmUnbindPerson) return;
-    const person = confirmUnbindPerson;
-    setUnbindingPerson(true);
-    try {
-      // 2026-10-28 修：按 external_id 删除（原来用 phone，列表未刷新时为空会删不掉）
-      await api.delete(`/api/admin/pending-members/${encodeURIComponent(person.external_id || person.phone)}`);
-      setConfirmUnbindPerson(null);
-      await loadUnactivated();
-      toast.success(
-        `已解除「${displayName(person)}」(${displayPhone(person)}) 的当前办公软件会话绑定并从待归纳列表移除。该用户需重新点击机器人下发的登记链接填写信息后方可再次登记。`,
-        '已解除会话绑定',
-      );
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '移除并解除会话绑定失败');
-    } finally {
-      setUnbindingPerson(false);
-    }
-  };
+  // 2026-11-03 新激活模型：「已激活待归纳」列表整体下线，相关状态与处理函数一并移除。
 
   const handleOpenCreateRole = () => {
     setEditingRoleId('');
@@ -429,14 +258,53 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
+  /* 2026-11-04 多管理员分级：全局搜索已激活成员（跨管理员共享激活关系） */
+  const searchGlobalActivated = useCallback(async (keyword: string) => {
+    setGlobalBusy(true);
+    try {
+      const res = await api.get<{ ok: boolean; items: GlobalActivatedMemberItem[] }>(
+        `/api/admin/global-activated-members?q=${encodeURIComponent(keyword.trim())}&platform=${platform}`,
+      );
+      setGlobalResults(res.items || []);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '全局搜索失败');
+    } finally {
+      setGlobalBusy(false);
+    }
+  }, [platform, toast]);
+
+  const pullGlobalMember = async (item: GlobalActivatedMemberItem) => {
+    if (!selectedRoleId) {
+      toast.warning('请先在左侧选择要拉入的角色分组');
+      return;
+    }
+    setGlobalBusy(true);
+    try {
+      const res = await api.post<{ ok: boolean; global_reused?: boolean }>(
+        `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`,
+        { phone: item.phone, name: item.name || item.phone, dept: item.dept || '' },
+      );
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
+      toast.success(
+        res.global_reused
+          ? `「${item.name || item.phone}」已拉入当前分组（该号码此前已激活，无需二次激活）`
+          : `「${item.name || item.phone}」已拉入当前分组`,
+        '已拉入',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '拉入失败');
+    } finally {
+      setGlobalBusy(false);
+    }
+  };
+
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedRoleId) return;
     if (!newName.trim() || !newPhone.trim()) {
       toast.warning('请填写用户名和 11 位手机号');
       return;
-    }
-    setAddingMember(true);
+    }    setAddingMember(true);
     try {
       await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
         phone: newPhone.trim(),
@@ -448,7 +316,7 @@ export const RolesMembersView: React.FC = () => {
       setNewName('');
       setNewPhone('');
       setNewDept('');
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadUnactivated()]);
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(`成员「${addedName}」(${addedPhone}) 已添加至当前角色。`, '添加成功');
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '添加成员未成功');
@@ -500,7 +368,7 @@ export const RolesMembersView: React.FC = () => {
       const nameOf = (rid: string) => roles.find((r) => r.role_id === rid)?.role_name || rid;
       const addedNames = (res.added || []).map(nameOf);
       const memberName = assignMember.name;
-      await Promise.all([refreshRoles(), loadMembers(selectedRoleId), loadUnactivated()]);
+      await Promise.all([refreshRoles(), loadMembers(selectedRoleId)]);
       setAssignMember(null);
       setAssignRoleIds([]);
       if (addedNames.length > 0) {
@@ -586,7 +454,7 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  // 确认从当前角色移除成员 -> 移入右侧「已激活待归纳角色人员」列表（保留会话绑定）
+  // 确认从当前角色移除成员：彻底删除绑定 + 清未完成实例（用户需重新登记激活）
   const handleConfirmRemoveFromRole = async () => {
     if (!selectedRoleId || !confirmRemoveRoleMember) return;
     const member = confirmRemoveRoleMember;
@@ -597,10 +465,10 @@ export const RolesMembersView: React.FC = () => {
         `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/${encodeURIComponent(member.phone)}`,
       );
       setConfirmRemoveRoleMember(null);
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadUnactivated()]);
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
-        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」移出，并转入右侧「已激活待归纳角色人员」列表（密信会话绑定已保留）。`,
-        '已移至待归纳角色列表',
+        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」移出（该平台会话绑定已解除；成员需重新完成 H5 登记激活后才能再接收任务）。`,
+        '已移出角色',
       );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '移出角色成员失败');
@@ -624,19 +492,25 @@ export const RolesMembersView: React.FC = () => {
         updated: number;
         skipped: number;
         errors: Array<{ line: number; reason: string }>;
+        departments_created?: string[];
       }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/import`, {
         csv_text: csvText,
       });
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadUnactivated()]);
+      /* 导入可能自动新建部门 → 刷新部门列表，否则新部门在下拉/部门管理里看不到 */
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadDepartments()]);
       setImportModalOpen(false);
+      const createdDepts = res.departments_created || [];
+      const deptNote = createdDepts.length
+        ? `，并自动新建 ${createdDepts.length} 个部门（${createdDepts.join('、')}）`
+        : '';
       if (res.errors && res.errors.length > 0) {
         toast.warning(
-          `新增 ${res.added} 人、更新 ${res.updated} 人；有 ${res.errors.length} 行格式不符已跳过（第 ${res.errors[0].line} 行：${res.errors[0].reason}）。`,
+          `新增 ${res.added} 人、更新 ${res.updated} 人${deptNote}；有 ${res.errors.length} 行格式不符已跳过（第 ${res.errors[0].line} 行：${res.errors[0].reason}）。`,
           '导入部分完成',
         );
       } else {
         toast.success(
-          `批量导入成功：新增 ${res.added} 名成员，更新 ${res.updated} 名现有成员。`,
+          `批量导入成功：新增 ${res.added} 名成员，更新 ${res.updated} 名现有成员${deptNote}。`,
           'CSV 导入完成',
         );
       }
@@ -664,10 +538,9 @@ export const RolesMembersView: React.FC = () => {
               <span>
                 在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{totalRosterCount}</strong> 人
               </span>
-              <span aria-hidden="true" className="text-slate-300">·</span>
-              <span>
-                已激活待归纳角色 <strong className="font-semibold text-indigo-600 tabular-nums">{unactivatedList.length}</strong> 人
-              </span>
+            </p>
+            <p className="text-[11px] text-slate-400 mt-1">
+              激活方式：先把成员导入/添加到角色，成员再给机器人发任意消息 → 点击登记链接完成比对激活；未导入的成员无法激活。
             </p>
           </div>
         </div>
@@ -711,6 +584,12 @@ export const RolesMembersView: React.FC = () => {
                         <div className="font-bold text-slate-900 text-sm truncate">
                           {r.role_name}
                         </div>
+                        {/* 2026-11-04 多管理员分级：超管可见「创建人」 */}
+                        {isSuperAdmin && (
+                          <div className="text-[10px] text-slate-400 font-medium truncate">
+                            创建人：{r.owner_display_name || r.owner_username || '—'}
+                          </div>
+                        )}
                       </div>
                     </div>
 
@@ -759,23 +638,23 @@ export const RolesMembersView: React.FC = () => {
               );
             })}
 
-            {/* 快捷新建角色虚线卡片 */}
-            <button
-              type="button"
-              onClick={handleOpenCreateRole}
-              className="rounded-xl p-3.5 border border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/20 text-slate-500 hover:text-blue-600 transition-all cursor-pointer flex items-center justify-center gap-2 min-h-[76px]"
-            >
-              <Plus className="w-4 h-4" />
-              <span className="text-xs font-semibold">添加新角色分组</span>
-            </button>
+            {/* 快捷新建角色虚线卡片（2026-11-04：超管只读，不显示新建入口） */}
+            {!isSuperAdmin && (
+              <button
+                type="button"
+                onClick={handleOpenCreateRole}
+                className="rounded-xl p-3.5 border border-dashed border-slate-300 hover:border-blue-500 hover:bg-blue-50/20 text-slate-500 hover:text-blue-600 transition-all cursor-pointer flex items-center justify-center gap-2 min-h-[76px]"
+              >
+                <Plus className="w-4 h-4" />
+                <span className="text-xs font-semibold">添加新角色分组</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
 
-      {/* 下方主工作区：左侧 7 列「当前角色成员名册」 + 右侧 5 列「已激活待归纳角色人员」 */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-        {/* 左侧主面板 (7 cols)：当前角色成员名册 */}
-        <div className="lg:col-span-7 bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
+      {/* 主工作区：当前角色成员名册（新激活模型：待归纳列表已下线，占满整行） */}
+      <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
           {currentRole ? (
             <>
               {/* 第一层：角色名册标题 + 搜索框 + CSV 批量导入（合一清爽顶栏） */}
@@ -790,7 +669,7 @@ export const RolesMembersView: React.FC = () => {
                     </span>
                   </div>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    管理该角色下的派单人员名单；从角色「移除」会将成员移回右侧「已激活待归纳角色人员」列表
+                    管理该角色下的派单人员名单；从角色「移除」会同时解除该成员在该平台的会话绑定，需重新登记激活
                   </p>
                 </div>
 
@@ -806,16 +685,27 @@ export const RolesMembersView: React.FC = () => {
                     />
                   </div>
                   <button
-                    onClick={() => setImportModalOpen(true)}
-                    className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                    onClick={() => setGlobalSearchOpen(true)}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                    title="全局搜索已激活成员：激活关系跨管理员共享，搜到即可直接拉入本分组，无需二次激活"
                   >
-                    <Upload className="w-3.5 h-3.5" />
-                    <span>CSV 批量导入</span>
+                    <Globe className="w-3.5 h-3.5" />
+                    <span>全局搜索已激活成员</span>
                   </button>
+                  {!isSuperAdmin && (
+                    <button
+                      onClick={() => setImportModalOpen(true)}
+                      className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>CSV 批量导入</span>
+                    </button>
+                  )}
                 </div>
               </div>
 
-              {/* 第二层：单行快速添加成员表单（姓名 + 手机号 + 部门） */}
+              {/* 第二层：单行快速添加成员表单（姓名 + 手机号 + 部门）—— 超管只读，不显示 */}
+              {!isSuperAdmin && (
               <form
                 onSubmit={handleAddMember}
                 className="px-4 sm:px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex flex-col lg:flex-row flex-wrap items-stretch lg:items-center gap-2.5 text-xs"
@@ -876,6 +766,7 @@ export const RolesMembersView: React.FC = () => {
                   <span>部门管理</span>
                 </button>
               </form>
+              )}
 
               {/* 第三层：成员列表表格（宽敞 5 列排版） */}
               <div className="overflow-x-auto">
@@ -900,7 +791,7 @@ export const RolesMembersView: React.FC = () => {
                     ) : filteredMembers.length === 0 ? (
                       <tr>
                         <td colSpan={6} className="py-12 text-center text-slate-400">
-                          该角色下暂无匹配成员，可在上方直接添加或从右侧「已激活待归纳角色人员」一键移入。
+                          该角色下暂无匹配成员，可在上方直接添加或用「CSV 批量导入」录入。
                         </td>
                       </tr>
                     ) : (
@@ -994,7 +885,7 @@ export const RolesMembersView: React.FC = () => {
                               </button>
                               <button
                                 onClick={() => setConfirmRemoveRoleMember(m)}
-                                title="将该成员移出当前角色并转入右侧已激活待归纳角色人员列表"
+                                title="将该成员移出当前角色：删除其在当前平台的会话绑定并清除未完成任务（需重新登记激活）"
                                 className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-amber-50 text-slate-600 hover:text-amber-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
                               >
                                 <Trash2 className="w-3 h-3" />
@@ -1014,189 +905,6 @@ export const RolesMembersView: React.FC = () => {
               请先在上方选择或新建一个业务角色分组。
             </div>
           )}
-        </div>
-
-        {/* 右侧待归纳池面板 (5 cols)：用户已在密信对话激活、但管理员尚未归纳角色的全部人员 */}
-        <div className="lg:col-span-5 bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden flex flex-col">
-          {/* 顶部标题、查询搜索框与批量移入控制栏 */}
-          <div className="p-4 sm:px-5 border-b border-slate-100 space-y-3">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl bg-emerald-500/10 text-emerald-600 flex items-center justify-center shrink-0">
-                  <UserCheck className="w-4 h-4" />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <h3 className="font-bold text-slate-900 text-base">已激活待归纳角色人员</h3>
-                    <span className="text-xs font-semibold text-indigo-600 tabular-nums">
-                      · {filteredUnactivatedList.length} / {unactivatedList.length} 人待归纳
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    员工给机器人发任意消息并完成链接登记后进入此列表；移除将解除会话绑定，需员工重新登记
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* 搜索查询框（支持按姓名或手机号查询待归纳人员） */}
-            <div className="relative">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-              <input
-                type="text"
-                value={unactivatedKeyword}
-                onChange={(e) => setUnactivatedKeyword(e.target.value)}
-                placeholder="搜索已激活待归纳人员姓名或手机号…"
-                aria-label="搜索已激活待归纳人员"
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-16 py-2 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 transition-colors"
-              />
-              {unactivatedKeyword && (
-                <button
-                  type="button"
-                  onClick={() => setUnactivatedKeyword('')}
-                  className="absolute right-2.5 top-2 px-1.5 py-0.5 rounded-md text-[11px] text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 cursor-pointer"
-                >
-                  清空
-                </button>
-              )}
-            </div>
-
-            {/* 批量一键移动工具条 */}
-            {filteredUnactivatedList.length > 0 && roles.length > 0 && (
-              <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200/70 flex items-center justify-between gap-2 text-xs">
-                <div className="flex items-center gap-2 min-w-0 flex-1">
-                  <span className="text-slate-500 font-medium shrink-0 pl-1">批量归纳至:</span>
-                  <select
-                    value={batchTargetRoleId || selectedRoleId}
-                    onChange={(e) => setBatchTargetRoleId(e.target.value)}
-                    className="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 outline-none focus:border-blue-500 truncate flex-1"
-                  >
-                    {roles.map((r) => (
-                      <option key={r.role_id} value={r.role_id}>
-                        {r.role_name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleBatchMoveAllUnactivated}
-                  disabled={batchMoving}
-                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg text-xs flex items-center gap-1.5 cursor-pointer shrink-0 disabled:opacity-60 transition-colors"
-                >
-                  <UserCheck className="w-3.5 h-3.5" />
-                  <span>{batchMoving ? '归入中…' : '全部一键移入'}</span>
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* 中间：已激活待归纳角色人员卡片列表（双层宽敞布局，完整展示用户全名绝不遮挡） */}
-          <div className="divide-y divide-slate-100 max-h-[460px] overflow-y-auto">
-            {loadingUnactivated ? (
-              <div className="py-12 text-center text-slate-400 text-xs">
-                正在加载已激活待归纳人员列表…
-              </div>
-            ) : filteredUnactivatedList.length === 0 ? (
-              <div className="py-12 px-5 text-center space-y-1.5">
-                <div className="w-9 h-9 rounded-full bg-emerald-50 text-emerald-600 flex items-center justify-center mx-auto">
-                  <CheckCircle2 className="w-5 h-5" />
-                </div>
-                <div className="text-xs font-bold text-slate-700">
-                  {unactivatedKeyword.trim()
-                    ? '未查询到匹配的已激活待归纳人员'
-                    : '当前无已激活待归纳角色人员'}
-                </div>
-                <p className="text-xs text-slate-400">
-                  {unactivatedKeyword.trim()
-                    ? '请尝试更换姓名或手机号关键词重新搜索。'
-                    : '员工在当前办公软件给机器人发送任意消息后，会收到登记链接；点击填写【姓名、手机号、部门】后自动进入本列表。'}
-                </p>
-              </div>
-            ) : (
-              filteredUnactivatedList.map((person) => {
-                const rowKey = rowKeyOf(person);
-                const targetRole = getRowTargetRole(rowKey);
-                const isMoving = movingPhone === rowKey;
-                return (
-                  <div
-                    key={rowKey}
-                    className="px-4 sm:px-5 py-3.5 hover:bg-slate-50/70 transition-colors space-y-2.5 text-xs"
-                  >
-                    {/* 第一行：完整展示用户全名 + 手机号 + 激活及会话状态标签（无 truncate 遮挡） */}
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex items-center gap-2.5">
-                        <div className="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-700 font-bold text-xs flex items-center justify-center shrink-0">
-                          {((person.name || '').trim() || '未').slice(0, 1)}
-                        </div>
-                        <div>
-                          <span className="font-bold text-slate-900 text-sm break-all">
-                            {displayPersonLine(person)}
-                          </span>
-                        </div>
-                      </div>
-
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200/70 text-[11px] font-medium shrink-0">
-                        <ShieldCheck className="w-3 h-3" />
-                        <span>已激活 · 待归纳角色</span>
-                      </span>
-                    </div>
-
-                    {/* 第二行：目标角色选择 + 一键移入分组 + 移除（解除会话绑定）；窄屏自动换行不挤压 */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 pl-10">
-                      <div className="flex items-center gap-1.5 flex-1 min-w-[180px]">
-                        <select
-                          value={targetRole}
-                          onChange={(e) =>
-                            setRowTargetRoleMap((prev) => ({
-                              ...prev,
-                              [rowKey]: e.target.value,
-                            }))
-                          }
-                          aria-label={`选择 ${displayName(person)} 的目标角色分组`}
-                          className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-700 outline-none focus:bg-white focus:border-blue-500 flex-1 min-w-0"
-                        >
-                          {roles.map((r) => (
-                            <option key={r.role_id} value={r.role_id}>
-                              {r.role_name}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          onClick={() => handleMoveSingleUnactivated(person)}
-                          disabled={isMoving || roles.length === 0}
-                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-60 transition-colors whitespace-nowrap"
-                        >
-                          <ArrowRightCircle className="w-3.5 h-3.5" />
-                          <span>{isMoving ? '移入中…' : '一键移入分组'}</span>
-                        </button>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={() => setConfirmUnbindPerson(person)}
-                        className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 transition-colors"
-                        title="解除该用户的当前办公软件会话绑定并从列表移除（需用户重新发送对话指令激活）"
-                      >
-                        <Link2Off className="w-3.5 h-3.5" />
-                        <span>移除</span>
-                      </button>
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {/* 底部说明：激活仅支持对话形式 */}
-          <div className="px-4 sm:px-5 py-3 bg-slate-50/80 border-t border-slate-100 flex items-start gap-2 text-[11px] text-slate-500">
-            <MessageSquare className="w-3.5 h-3.5 text-indigo-600 shrink-0 mt-0.5" />
-            <span>
-              说明：用户首次给机器人发送任意消息会收到一条登记链接，点开填写【姓名、手机号、部门】完成登记；登记后由管理员分配角色即可接收提醒，不支持后台人工登记未绑定会话人员。
-            </span>
-          </div>
-        </div>
       </div>
 
       {/* 2026-11-03 部门管理弹窗：配置部门选项（成员表单与员工 H5 登记页共用） */}
@@ -1299,21 +1007,21 @@ export const RolesMembersView: React.FC = () => {
         </div>
       )}
 
-      {/* 交互确认弹窗 1：从当前角色中移除成员 -> 移入右侧「已激活待归纳角色人员」列表 */}
+      {/* 交互确认弹窗：从当前角色移除成员（移除=删角色+清未完成实例+彻底删该平台绑定） */}
       {confirmRemoveRoleMember && currentRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
-                  <ArrowRightCircle className="w-5 h-5" />
+                <div className="w-9 h-9 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
+                  <UserMinus className="w-5 h-5" />
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 text-base">
-                    确认将该成员移出当前角色？
+                    确认将成员移出该角色分组？
                   </h3>
                   <p className="text-[11px] text-slate-500">
-                    移出角色后将自动转入「已激活待归纳角色人员」列表
+                    移出后该成员将不再接收本角色任务提醒
                   </p>
                 </div>
               </div>
@@ -1337,11 +1045,11 @@ export const RolesMembersView: React.FC = () => {
               </p>
               <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200/80 text-amber-900 space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
-                  <ShieldCheck className="w-4 h-4 text-amber-700 shrink-0" />
-                  <span>保留当前办公软件会话绑定 · 转入待归纳列表</span>
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
+                  <span>将解除该成员在该办公软件的会话绑定</span>
                 </div>
                 <p className="text-[11px] text-amber-800">
-                  该操作不会解除用户的密信会话绑定，系统会将其移至右侧「已激活待归纳角色人员」列表中，您可随时将其重新一键归入其他业务角色，无需员工重新输入激活。
+                  移出后：该角色的未完成任务实例一并清除；若该成员在其它平台仍有角色，其它平台不受影响；其在本平台的激活绑定将被彻底删除，需重新给机器人发消息、点击登记链接完成比对后才可再次接收任务（该成员未在后台导入前无法激活）。
                 </p>
               </div>
             </div>
@@ -1360,73 +1068,7 @@ export const RolesMembersView: React.FC = () => {
                 disabled={removingRoleMember}
                 className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
               >
-                {removingRoleMember ? '正在移出…' : '确认移至待归纳列表'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 交互确认弹窗 2：从「已激活待归纳角色人员」移除 -> 解除量子密信会话绑定，需用户重新输入激活 */}
-      {confirmUnbindPerson && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
-            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
-                  <Link2Off className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-slate-900 text-base">
-                    确认移除并解除会话绑定？
-                  </h3>
-                  <p className="text-[11px] text-slate-500">
-                    解除绑定后，用户需重新点击登记链接填写信息后方可再次进入此列表
-                  </p>
-                </div>
-              </div>
-              <button
-                onClick={() => setConfirmUnbindPerson(null)}
-                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs text-slate-600 leading-relaxed">
-              <p>
-                您即将从「已激活待归纳角色人员」列表中移除{' '}
-                <strong className="font-bold text-slate-900">
-                  {confirmUnbindPerson.name} ({confirmUnbindPerson.phone})
-                </strong>
-                。
-              </p>
-              <div className="p-3 rounded-xl bg-rose-50/80 border border-rose-200/80 text-rose-900 space-y-1">
-                <div className="font-semibold flex items-center gap-1.5">
-                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
-                  <span>将清除该用户的当前办公软件会话绑定</span>
-                </div>
-                <p className="text-[11px] text-rose-800">
-                  移除后，该用户在当前办公软件的会话绑定将被彻底解除。后续该用户只有在「当前办公软件」中重新给机器人发消息并点击登记链接填写信息，完成登记后才会再次出现在本列表。
-                </p>
-              </div>
-            </div>
-
-            <div className="pt-2 flex justify-end gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setConfirmUnbindPerson(null)}
-                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmUnbindUnactivated}
-                disabled={unbindingPerson}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
-              >
-                {unbindingPerson ? '正在解除绑定…' : '确认解除绑定并移除'}
+                {removingRoleMember ? '正在移出…' : '确认移出并解除绑定'}
               </button>
             </div>
           </div>
@@ -1669,6 +1311,82 @@ export const RolesMembersView: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-11-04 多管理员分级：全局搜索已激活成员（跨管理员共享激活关系，免二次激活） */}
+      {globalSearchOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
+                  <Globe className="w-4 h-4 text-emerald-600" />
+                  <span>全局搜索已激活成员</span>
+                </h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  激活关系全平台共享：搜到的人已被激活过，拉入本分组后无需二次激活
+                </p>
+              </div>
+              <button onClick={() => setGlobalSearchOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void searchGlobalActivated(globalQuery);
+              }}
+              className="flex items-center gap-2"
+            >
+              <div className="relative flex-1">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  value={globalQuery}
+                  onChange={(e) => setGlobalQuery(e.target.value)}
+                  placeholder="按手机号或姓名搜索（留空看最近激活的）"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs outline-none focus:bg-white focus:border-blue-500"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={globalBusy}
+                className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-xl cursor-pointer disabled:opacity-60 shrink-0"
+              >
+                {globalBusy ? '搜索中…' : '搜索'}
+              </button>
+            </form>
+            <div className="max-h-[46vh] overflow-y-auto divide-y divide-slate-100">
+              {globalResults.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-400">
+                  {globalBusy ? '搜索中…' : '没有匹配的已激活成员（对方需先在密信/企微给机器人发一句话完成登记）'}
+                </div>
+              ) : (
+                globalResults.map((it) => (
+                  <div key={`${it.platform}-${it.phone}`} className="py-2.5 flex items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-bold text-xs text-slate-800">{it.name || '（未登记姓名）'}</span>
+                        <span className="text-[11px] font-mono text-slate-500">{it.phone}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">
+                          {it.platform === 'wecom' ? '企业微信' : '量子密信'}
+                        </span>
+                        {it.dept && <span className="text-[10px] text-slate-400">{it.dept}</span>}
+                      </div>
+                      <div className="text-[10px] text-emerald-600 mt-0.5">已激活 · 无需二次激活</div>
+                    </div>
+                    <button
+                      onClick={() => void pullGlobalMember(it)}
+                      disabled={globalBusy}
+                      className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold text-[11px] cursor-pointer disabled:opacity-50 shrink-0"
+                    >
+                      拉入当前分组
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       )}

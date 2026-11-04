@@ -25,8 +25,12 @@ const MASKED_INPUT_STYLE = { WebkitTextSecurity: 'disc' } as unknown as React.CS
 export interface AdminMe {
   username: string;
   must_change_password: boolean;
+  /** 2026-11-04 多管理员分级 */
+  role_level?: 'super_admin' | 'sub_admin';
+  display_name?: string;
+  allowed_platforms?: Array<'zdxlz' | 'wecom'>;
+  is_super_admin?: boolean;
 }
-
 /* ------------------------------------------------------------------ */
 /* 修改密码弹窗（P2-3 & P2-4：改密成功后提示「密码已修改，请用新密码重新登录」并切回登录） */
 /* ------------------------------------------------------------------ */
@@ -390,7 +394,7 @@ interface AdminUserCardProps {
 
 export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut }) => {
   const toast = useToast();
-  const { platform, setPlatform } = useAppStore();
+  const { platform, setPlatform, allowedPlatforms, isSuperAdmin } = useAppStore();
   const [open, setOpen] = useState(false);
   const [modal, setModal] = useState<
     'none' | 'password' | 'username' | 'logout'
@@ -428,7 +432,7 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <div className="font-bold text-xs text-slate-800 leading-tight">{display}</div>
             <div className="text-[10px] text-blue-600 flex items-center gap-1 font-medium">
               <Shield className="w-2.5 h-2.5" />
-              <span>系统管理员</span>
+              <span>{isSuperAdmin ? '超级管理员' : '分级管理员'}</span>
             </div>
           </div>
         </div>
@@ -443,30 +447,35 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <div className="text-[10px] text-emerald-600 font-semibold mt-0.5">● 会话已鉴权</div>
           </div>
 
-          {/* 2026-11-02 用户指令：在这里选择当前面板展示哪个办公软件的信息 */}
+          {/* 2026-11-02 用户指令：在这里选择当前面板展示哪个办公软件的信息
+              2026-11-04 多管理员分级：只显示本账号被授权的平台 */}
           <div className="px-3 py-2 border-b border-slate-100">
             <div className="text-[10px] text-slate-400 font-semibold mb-1.5">当前办公软件</div>
             <div className="grid grid-cols-2 gap-1">
-              <button
-                onClick={() => { setPlatform('zdxlz'); setOpen(false); }}
-                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
-                  platform === 'zdxlz'
-                    ? 'bg-blue-600 text-white border-blue-600'
-                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                量子密信
-              </button>
-              <button
-                onClick={() => { setPlatform('wecom'); setOpen(false); }}
-                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
-                  platform === 'wecom'
-                    ? 'bg-blue-600 text-white border-blue-600'
-                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                企业微信
-              </button>
+              {allowedPlatforms.includes('zdxlz') && (
+                <button
+                  onClick={() => { setPlatform('zdxlz'); setOpen(false); }}
+                  className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                    platform === 'zdxlz'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  量子密信
+                </button>
+              )}
+              {allowedPlatforms.includes('wecom') && (
+                <button
+                  onClick={() => { setPlatform('wecom'); setOpen(false); }}
+                  className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
+                    platform === 'wecom'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  企业微信
+                </button>
+              )}
             </div>
           </div>
 

@@ -390,7 +390,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
 };
 
 export const TemplatesView: React.FC = () => {
-  const { templates, roles, refreshTemplates } = useAppStore();
+  const { templates, roles, refreshTemplates, isSuperAdmin } = useAppStore();
   const toast = useToast();
 
   // 顶部筛选条件：按角色选择 + 按任务类型选择 + 关键词
@@ -908,22 +908,31 @@ export const TemplatesView: React.FC = () => {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={() => openCreateModal('upload')}
-            className="px-3.5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition-all"
-          >
-            <Plus className="w-4 h-4" />
-            <span>新建上传任务</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => openCreateModal('notice')}
-            className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition-all"
-          >
-            <Plus className="w-4 h-4" />
-            <span>新建通知提醒</span>
-          </button>
+          {/* 2026-11-04 多管理员分级：超管只读，不能新建任务（业务数据由分级管理员维护） */}
+          {isSuperAdmin ? (
+            <span className="text-[11px] text-indigo-600 bg-indigo-50 border border-indigo-200/70 px-2.5 py-1.5 rounded-xl font-semibold">
+              超级管理员只读视图 · 任务由分级管理员账号创建
+            </span>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => openCreateModal('upload')}
+                className="px-3.5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition-all"
+              >
+                <Plus className="w-4 h-4" />
+                <span>新建上传任务</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => openCreateModal('notice')}
+                className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-xl shadow-xs flex items-center gap-1.5 cursor-pointer transition-all"
+              >
+                <Plus className="w-4 h-4" />
+                <span>新建通知提醒</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -980,11 +989,13 @@ export const TemplatesView: React.FC = () => {
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200/80 text-[11px] font-bold text-slate-500">
                 <th className="py-3.5 px-4 w-48 whitespace-nowrap">任务名称</th>
+                {isSuperAdmin && (
+                  <th className="py-3.5 px-3 w-28 whitespace-nowrap">创建人</th>
+                )}
                 <th className="py-3.5 px-3 w-36 whitespace-nowrap">所属角色</th>
                 <th className="py-3.5 px-3 w-32 whitespace-nowrap">任务类型</th>
                 <th className="py-3.5 px-3 w-28 whitespace-nowrap">执行时间</th>
-                <th className="py-3.5 px-3">任务内容配置</th>
-                <th className="py-3.5 px-3 w-28 whitespace-nowrap">状态</th>
+                <th className="py-3.5 px-3">任务内容配置</th>                <th className="py-3.5 px-3 w-28 whitespace-nowrap">状态</th>
                 <th className="py-3.5 px-4 w-36 text-right whitespace-nowrap">操作</th>
               </tr>
             </thead>
@@ -1009,6 +1020,15 @@ export const TemplatesView: React.FC = () => {
                       <td className="py-4 px-4 whitespace-nowrap">
                         <span className="font-bold text-slate-900 text-xs">{tpl.name}</span>
                       </td>
+
+                      {/* 1.5 创建人（仅超管可见） */}
+                      {isSuperAdmin && (
+                        <td className="py-4 px-3 whitespace-nowrap">
+                          <span className="text-[11px] text-slate-600 font-semibold">
+                            {tpl.owner_display_name || tpl.owner_username || '—'}
+                          </span>
+                        </td>
+                      )}
 
                       {/* 2. 所属角色（支持多角色展示） */}
                       <td className="py-4 px-3">

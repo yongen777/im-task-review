@@ -190,7 +190,7 @@ const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }>
   );
 };
 
-export const InstancesView: React.FC = () => {  const { roles, refreshStats, platform } = useAppStore();
+export const InstancesView: React.FC = () => {  const { roles, refreshStats, platform, isSuperAdmin } = useAppStore();
   const toast = useToast();
 
   // 筛选条件：按日期（默认今天）、按角色、按任务类型、按执行状态、按用户名/手机号
@@ -805,6 +805,9 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200/80 text-[11px] font-bold text-slate-500">
                 <th className="py-3.5 px-4 whitespace-nowrap">任务名称</th>
+                {isSuperAdmin && (
+                  <th className="py-3.5 px-3 whitespace-nowrap">创建人</th>
+                )}
                 <th className="py-3.5 px-3 whitespace-nowrap">任务类型</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">所属角色</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">执行人</th>
@@ -848,6 +851,15 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
                       <td className="py-4 px-4 whitespace-nowrap">
                         <span className="font-bold text-slate-900 text-xs">{inst.template_name}</span>
                       </td>
+
+                      {/* 1.5 创建人（仅超管可见） */}
+                      {isSuperAdmin && (
+                        <td className="py-4 px-3 whitespace-nowrap">
+                          <span className="text-[11px] text-slate-600 font-semibold">
+                            {(inst as any).owner_display_name || (inst as any).owner_username || '—'}
+                          </span>
+                        </td>
+                      )}
 
                       {/* 2. 任务类型 */}
                       <td className="py-4 px-3 whitespace-nowrap">

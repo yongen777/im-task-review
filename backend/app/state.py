@@ -297,6 +297,15 @@ class StateStore:
             else:
                 cur = self.conn.execute("INSERT INTO admin_user(username, pwd_hash, must_change, created_at) VALUES (?, ?, ?, ?)", (clean_user, pwd_hash, must_flag, now_s))
                 user_id, action = int(cur.lastrowid), "admin.create_cli"
+            # 2026-11-04 多管理员分级：主账号 admin 恒为超级管理员 + 双平台
+            # （新建时也要兜住：迁移只保证"已存在"的 admin 行，新建路径同样要写对角色）
+            if clean_user == "admin":
+                self.conn.execute(
+                    "UPDATE admin_user SET role_level = 'super_admin', "
+                    "display_name = CASE WHEN display_name = '' THEN '超级管理员' ELSE display_name END, "
+                    "allowed_platforms = '[\"zdxlz\",\"wecom\"]' WHERE id = ?",
+                    (user_id,),
+                )
             self._insert_audit_unlocked(actor, action, "admin_user", clean_user, {"must_change": bool(must_change)}, now_s)
             return user_id
 
@@ -368,6 +377,254 @@ class StateStore:
     def list_audit_logs(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM admin_audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+
+    # ── 2026-11-04 多管理员分级（超级管理员 + 分级管理员）────────────────────
+    # 口径（用户 2026-11-04 定）：
+    #   · admin = 超级管理员：全局只读 + 管理员账号管理（不建角色/模板/成员、不改业务数据）；
+    #   · 分级管理员：只读写自己名下（owner_id）的角色/成员/模板/实例，账号级限制可用办公软件平台；
+    #   · 成员的「平台会话激活」（delivery_target）全平台全局共享 —— 谁先激活过就都算已激活，无需二次激活。
+    DEFAULT_SUB_ADMIN_PASSWORD = "Hds22999!"
+    SUPER_ADMIN = "super_admin"
+    SUB_ADMIN = "sub_admin"
+    ALL_PLATFORMS = ("zdxlz", "wecom")
+
+    @staticmethod
+    def normalize_admin_password(raw: str) -> str:
+        """兼容中文全角感叹号：Hds22999！ → Hds22999!（用户初始密码常从中文输入法敲出）。"""
+        return (raw or "").replace("！", "!")
+
+    @staticmethod
+    def parse_admin_account(row: Any) -> Dict[str, Any]:
+        """admin_user 行 → 对外结构（allowed_platforms 解析成数组）。"""
+        if row is None:
+            return {}
+        d = dict(row)
+        try:
+            plats = json.loads(d.get("allowed_platforms") or "")
+        except Exception:
+            plats = []
+        if not isinstance(plats, list):
+            plats = []
+        d["allowed_platforms"] = [str(p).strip().lower() for p in plats if str(p).strip()]
+        d["enabled"] = int(d.get("enabled") or 0)
+        d["must_change"] = int(d.get("must_change") or 0)
+        d["role_level"] = str(d.get("role_level") or self.SUB_ADMIN)
+        return d
+
+    def admin_display_name(self, admin_id: int) -> str:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT username, display_name FROM admin_user WHERE id = ?", (int(admin_id),)
+            ).fetchone()
+        if not row:
+            return ""
+        return str(row["display_name"] or row["username"] or "")
+
+    def create_admin_account(
+        self,
+        username: str,
+        display_name: str = "",
+        allowed_platforms: Optional[List[str]] = None,
+        actor: str = "system",
+        role_level: str = SUB_ADMIN,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """新建分级管理员：初始密码固定 Hds22999!（可覆盖），强制首登改密。"""
+        clean_user = (username or "").strip()
+        clean_disp = (display_name or "").strip() or clean_user
+        if not clean_user:
+            raise BizError(400, "VALIDATION_FAILED", "用户名不能为空")
+        if not clean_user.replace("_", "").replace("-", "").isalnum():
+            raise BizError(400, "VALIDATION_FAILED", "用户名只能包含字母、数字、下划线或连字符")
+        if len(clean_user) > 32:
+            raise BizError(400, "VALIDATION_FAILED", "用户名过长（最多 32 字符）")
+        plats = [str(p).strip().lower() for p in (allowed_platforms or list(self.ALL_PLATFORMS)) if str(p).strip()]
+        plats = [p for p in plats if p in self.ALL_PLATFORMS]
+        if not plats:
+            raise BizError(400, "VALIDATION_FAILED", "至少要授权一个办公软件平台")
+        pwd = self.normalize_admin_password(password or self.DEFAULT_SUB_ADMIN_PASSWORD)
+        pwd_err = validate_new_password(pwd)
+        if pwd_err:
+            raise BizError(400, "VALIDATION_FAILED", pwd_err)
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            if self.conn.execute("SELECT 1 FROM admin_user WHERE username = ?", (clean_user,)).fetchone():
+                raise BizError(409, "USERNAME_TAKEN", "该用户名已存在")
+            cur = self.conn.execute(
+                "INSERT INTO admin_user(username, pwd_hash, must_change, created_at, display_name, role_level, allowed_platforms, enabled) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?, 1)",
+                (clean_user, hash_password(pwd), now_s, clean_disp, str(role_level or self.SUB_ADMIN),
+                 json.dumps(plats, ensure_ascii=False)),
+            )
+            admin_id = int(cur.lastrowid)
+            self._insert_audit_unlocked(
+                actor, "admin.account.create", "admin_user", str(admin_id),
+                {"username": clean_user, "display_name": clean_disp, "allowed_platforms": plats,
+                 "role_level": str(role_level or self.SUB_ADMIN)}, now_s,
+            )
+        return {"id": admin_id, "username": clean_user, "display_name": clean_disp,
+                "role_level": str(role_level or self.SUB_ADMIN), "allowed_platforms": plats, "enabled": 1}
+
+    def list_admin_accounts(self) -> List[Dict[str, Any]]:
+        """管理员账号列表 + 各自的数据统计（角色/成员/模板/实例）。"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM admin_user ORDER BY CASE role_level WHEN 'super_admin' THEN 0 ELSE 1 END, id ASC"
+            ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                d = self.parse_admin_account(r)
+                aid = int(d["id"])
+                d["role_count"] = int(self.conn.execute("SELECT COUNT(1) FROM role WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
+                d["member_count"] = int(self.conn.execute("SELECT COUNT(1) FROM member WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
+                d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (aid,)).fetchone()[0] or 0)
+                d["instance_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_instance WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
+                out.append(d)
+        return out
+
+    def update_admin_account(
+        self,
+        admin_id: int,
+        display_name: Optional[str] = None,
+        allowed_platforms: Optional[List[str]] = None,
+        enabled: Optional[bool] = None,
+        actor: str = "system",
+    ) -> Dict[str, Any]:
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (int(admin_id),)).fetchone()
+            if not row:
+                raise BizError(404, "NOT_FOUND", "管理员账号不存在")
+            if str(row["username"]) == "admin":
+                if enabled is False:
+                    raise BizError(400, "VALIDATION_FAILED", "超级管理员账号不能停用")
+                if allowed_platforms is not None:
+                    raise BizError(400, "VALIDATION_FAILED", "超级管理员固定拥有全部平台权限")
+            sets: List[str] = []
+            params: List[Any] = []
+            if display_name is not None:
+                sets.append("display_name = ?")
+                params.append((display_name or "").strip())
+            if allowed_platforms is not None:
+                plats = [str(p).strip().lower() for p in allowed_platforms if str(p).strip()]
+                plats = [p for p in plats if p in self.ALL_PLATFORMS]
+                if not plats:
+                    raise BizError(400, "VALIDATION_FAILED", "至少要授权一个办公软件平台")
+                sets.append("allowed_platforms = ?")
+                params.append(json.dumps(plats, ensure_ascii=False))
+            if enabled is not None:
+                sets.append("enabled = ?")
+                params.append(1 if enabled else 0)
+            if sets:
+                self.conn.execute(
+                    f"UPDATE admin_user SET {', '.join(sets)} WHERE id = ?", tuple(params + [int(admin_id)])
+                )
+                self._insert_audit_unlocked(
+                    actor, "admin.account.update", "admin_user", str(int(admin_id)),
+                    {"display_name": display_name, "allowed_platforms": allowed_platforms, "enabled": enabled}, now_s,
+                )
+            if enabled is False:
+                self.conn.execute("DELETE FROM admin_session WHERE user_id = ?", (int(admin_id),))
+            row2 = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (int(admin_id),)).fetchone()
+        return self.parse_admin_account(row2)
+
+    def reset_admin_password(self, admin_id: int, actor: str = "system") -> Dict[str, Any]:
+        """重置为初始密码 Hds22999! 并强制改密；同时踢掉该账号的在线会话。"""
+        now_s = self.now_str()
+        pwd = self.DEFAULT_SUB_ADMIN_PASSWORD
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (int(admin_id),)).fetchone()
+            if not row:
+                raise BizError(404, "NOT_FOUND", "管理员账号不存在")
+            self.conn.execute(
+                "UPDATE admin_user SET pwd_hash = ?, must_change = 1 WHERE id = ?",
+                (hash_password(pwd), int(admin_id)),
+            )
+            self.conn.execute("DELETE FROM admin_session WHERE user_id = ?", (int(admin_id),))
+            self._insert_audit_unlocked(
+                actor, "admin.account.reset_password", "admin_user", str(int(admin_id)),
+                {"username": row["username"], "must_change": True}, now_s,
+            )
+        return {"ok": True, "username": str(row["username"]), "must_change_password": True}
+
+    def delete_admin_account(self, admin_id: int, actor: str = "system") -> None:
+        """删除分级管理员：名下有角色/成员/模板时拒绝（避免留下无主数据）。"""
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            row = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (int(admin_id),)).fetchone()
+            if not row:
+                raise BizError(404, "NOT_FOUND", "管理员账号不存在")
+            if str(row["username"]) == "admin":
+                raise BizError(400, "VALIDATION_FAILED", "超级管理员账号不能删除")
+            for tbl, label in (("role", "角色分组"), ("member", "成员"), ("task_template", "任务模板")):
+                n = int(self.conn.execute(f"SELECT COUNT(1) FROM {tbl} WHERE owner_id = ?", (int(admin_id),)).fetchone()[0] or 0)
+                if n:
+                    raise BizError(400, "VALIDATION_FAILED", f"该账号名下还有 {n} 个{label}，请先转移或删除")
+            self.conn.execute("DELETE FROM admin_session WHERE user_id = ?", (int(admin_id),))
+            self.conn.execute("DELETE FROM admin_user WHERE id = ?", (int(admin_id),))
+            self._insert_audit_unlocked(actor, "admin.account.delete", "admin_user", str(int(admin_id)),
+                                        {"username": row["username"]}, now_s)
+
+    def transfer_owner(self, owner_id: int, actor: str = "system") -> Dict[str, Any]:
+        """把历史业务数据（角色/成员/模板/实例）整体挂到某个管理员名下。"""
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            if not self.conn.execute("SELECT 1 FROM admin_user WHERE id = ?", (int(owner_id),)).fetchone():
+                raise BizError(404, "NOT_FOUND", "目标管理员账号不存在")
+            moved: Dict[str, int] = {}
+            for tbl in ("role", "member", "task_template", "task_instance"):
+                cur = self.conn.execute(f"UPDATE {tbl} SET owner_id = ? WHERE owner_id != ?", (int(owner_id), int(owner_id)))
+                moved[tbl] = int(cur.rowcount or 0)
+            self._insert_audit_unlocked(actor, "admin.account.transfer_owner", "admin_user", str(int(owner_id)),
+                                        {"moved": moved}, now_s)
+        return {"ok": True, "owner_id": int(owner_id), "moved": moved}
+
+    def search_global_activated(self, q: str = "", platform: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """全局搜索**已激活**（delivery_target 有绑定）的成员 —— 跨管理员共享，免二次激活。
+
+        姓名/部门取该手机号在 member 表里的任一条（优先最近插入），供"一键拉入我的分组"时带出。
+        """
+        plat = (platform or "").strip().lower()
+        like = f"%{(q or '').strip()}%"
+        where = ["dt.usable = 1", "dt.external_id IS NOT NULL", "dt.external_id != ''"]
+        params: List[Any] = []
+        if plat:
+            where.append("dt.platform = ?")
+            params.append(plat)
+        if (q or "").strip():
+            where.append("(dt.phone LIKE ? OR EXISTS (SELECT 1 FROM member m WHERE m.phone = dt.phone AND m.name LIKE ?))")
+            params.extend([like, like])
+        sql = (
+            "SELECT dt.platform, dt.phone, dt.external_id, dt.activated_at, dt.last_event_at "
+            "FROM delivery_target dt WHERE " + " AND ".join(where) +
+            " ORDER BY dt.last_event_at DESC LIMIT ?"
+        )
+        with self.lock:
+            rows = self.conn.execute(sql, tuple(params + [int(limit)])).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                m = self.conn.execute(
+                    "SELECT name, dept FROM member WHERE phone = ? ORDER BY id DESC LIMIT 1", (r["phone"],)
+                ).fetchone()
+                out.append({
+                    "phone": r["phone"], "platform": r["platform"], "external_id": r["external_id"],
+                    "name": (m["name"] if m else "") or "", "dept": (m["dept"] if m else "") or "",
+                    "activated_at": r["activated_at"], "last_event_at": r["last_event_at"],
+                })
+        return out
+
+    def is_phone_activated(self, phone: str, platform: Optional[str] = None) -> bool:
+        """该手机号在（指定）平台是否已被激活（全局共享，跨管理员同样成立）。"""
+        plat = self._plat(platform)
+        clean = (phone or "").strip()
+        if not clean:
+            return False
+        with self.lock:
+            return self.conn.execute(
+                "SELECT 1 FROM delivery_target WHERE phone = ? AND platform = ? AND usable = 1 AND external_id IS NOT NULL AND external_id != '' LIMIT 1",
+                (clean, plat),
+            ).fetchone() is not None
+
 
     def is_phone_in_members(self, phone: str) -> bool:
         with self.lock:
@@ -495,17 +752,26 @@ class StateStore:
             if not self.conn.execute(f"SELECT 1 FROM {table} WHERE {id_col} = ?", (candidate,)).fetchone():
                 return candidate
 
-    def list_roles(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+    def list_roles(self, platform: Optional[str] = None, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         plat = (platform or "").strip().lower()
-        where_sql, params = ("WHERE r.platform = ?", [plat]) if plat else ("", [])
+        where_clauses, params = [], []
+        if plat:
+            where_clauses.append("r.platform = ?")
+            params.append(plat)
+        if owner_id is not None:
+            where_clauses.append("r.owner_id = ?")
+            params.append(int(owner_id))
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         with self.lock:
             rows = self.conn.execute(
-                "SELECT r.role_id, r.name, r.note, r.platform, r.created_at, COUNT(m.id) AS member_count "
-                f"FROM role r LEFT JOIN member m ON m.role_id = r.role_id {where_sql} "
+                "SELECT r.role_id, r.name, r.note, r.platform, r.created_at, r.owner_id, COUNT(m.id) AS member_count, "
+                "u.username AS owner_username, u.display_name AS owner_display_name "
+                f"FROM role r LEFT JOIN member m ON m.role_id = r.role_id "
+                f"LEFT JOIN admin_user u ON u.id = r.owner_id {where_sql} "
                 "GROUP BY r.role_id ORDER BY r.created_at ASC, r.role_id ASC",
                 tuple(params),
             ).fetchall()
-            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "member_count": int(r["member_count"] or 0)} for r in rows]
+            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "owner_id": int(r["owner_id"] or 1), "owner_username": r["owner_username"], "owner_display_name": r["owner_display_name"], "member_count": int(r["member_count"] or 0)} for r in rows]
 
     def role_platforms(self, role_ids: List[str]) -> set:
         """这组角色覆盖到的办公软件集合（用于判断任务归属平台）。"""
@@ -542,7 +808,7 @@ class StateStore:
             row = self.conn.execute("SELECT r.*, (SELECT COUNT(1) FROM member m WHERE m.role_id = r.role_id) AS member_count FROM role r WHERE r.role_id = ?", ((role_id or "").strip(),)).fetchone()
             return {"role_id": row["role_id"], "name": row["name"], "note": row["note"], "platform": row["platform"], "created_at": row["created_at"], "member_count": int(row["member_count"] or 0)} if row else None
 
-    def create_role(self, name: str, note: Optional[str] = None, actor: str = "system", platform: str = "zdxlz") -> Dict[str, Any]:
+    def create_role(self, name: str, note: Optional[str] = None, actor: str = "system", platform: str = "zdxlz", owner_id: int = 1) -> Dict[str, Any]:
         clean_name = (name or "").strip()
         plat = self._plat(platform)
         if not clean_name:
@@ -552,9 +818,9 @@ class StateStore:
             if self.conn.execute("SELECT 1 FROM role WHERE name = ? AND platform = ?", (clean_name, plat)).fetchone():
                 raise BizError(409, "ROLE_NAME_TAKEN", "该办公软件下角色名称已存在")
             role_id = self._generate_unique_id_unlocked("role", "role_id", "r_")
-            self.conn.execute("INSERT INTO role(role_id, name, note, platform, created_at) VALUES (?, ?, ?, ?, ?)", (role_id, clean_name, clean_note, plat, now_s))
+            self.conn.execute("INSERT INTO role(role_id, name, note, platform, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)", (role_id, clean_name, clean_note, plat, now_s, int(owner_id)))
             self._insert_audit_unlocked(actor, "role.create", "role", role_id, {"name": clean_name, "note": clean_note, "platform": plat}, now_s)
-            return {"role_id": role_id, "name": clean_name, "note": clean_note, "platform": plat, "created_at": now_s, "member_count": 0}
+            return {"role_id": role_id, "name": clean_name, "note": clean_note, "platform": plat, "created_at": now_s, "member_count": 0, "owner_id": int(owner_id)}
 
     def update_role(self, role_id: str, name: str, note: Optional[str] = None, actor: str = "system") -> Dict[str, Any]:
         clean_id, clean_name = (role_id or "").strip(), (name or "").strip()
@@ -641,7 +907,7 @@ class StateStore:
             for r in rows
         ]
 
-    def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system") -> Dict[str, Any]:
+    def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
         clean_role_id, clean_phone, clean_name = (role_id or "").strip(), (phone or "").strip(), (name or "").strip()
         clean_dept = str(dept).strip() if dept is not None and str(dept).strip() else None
         if not is_valid_phone(clean_phone):
@@ -654,7 +920,7 @@ class StateStore:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
-            cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, source, now_s))
+            cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, 1, ?, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, source, now_s, int(owner_id)))
             # 2026-10-30：这里原来写死 'zdxlz'，切企微后返回的 external_id 取错通道，
             # 管理员新增/编辑成员时看到的「激活状态」会串。与其它读写一致，跟随当前通道。
             dt_row = self.conn.execute("SELECT external_id FROM delivery_target WHERE platform = ? AND phone = ? AND usable = 1", (self.platform, clean_phone)).fetchone()
@@ -750,7 +1016,7 @@ class StateStore:
                  "removed_instances": len(removed_instance_ids)}, now_s,
             )
 
-    def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system") -> Dict[str, Any]:
+    def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
         """R43 + §9.3：批量导入成员（行解析加 try 保护，非法行进 invalid 列表而不抛 500）。"""
         clean_role_id = (role_id or "").strip()
         if not isinstance(csv_rows, list):
@@ -837,7 +1103,7 @@ class StateStore:
                         continue
                     insert_rows.append((row_no, phone, name, dept))
                 for _row_no, phone, name, dept in insert_rows:
-                    self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at) VALUES (?, ?, ?, ?, 1, 'import', ?)", (clean_role_id, phone, name, dept, now_s))
+                    self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, 1, 'import', ?, ?)", (clean_role_id, phone, name, dept, now_s, int(owner_id)))
                 will_add = len(insert_rows)
                 self._insert_audit_unlocked(actor, "member.import", "role", clean_role_id, {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid), "departments_created": created_depts}, now_s)
 
@@ -845,6 +1111,8 @@ class StateStore:
 
     def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
+        # 2026-11-04 多管理员分级：模板归属（owner_id）随模板一起带出，调度建实例时继承
+        d["owner_id"] = int(d.get("owner_id") or 1)
         try:
             role_ids = json.loads(d.get("role_ids") or "[]")
         except Exception:
@@ -873,6 +1141,10 @@ class StateStore:
             exec_weekdays = None
         return {
             "template_id": d["template_id"], "name": d["name"], "kind": d["kind"], "role_ids": role_ids,
+            "owner_id": d["owner_id"],
+            # 2026-11-04：超管全局查看时要看到「创建人」（owner 名字），列表 SQL 已 JOIN admin_user
+            "owner_username": d.get("owner_username"),
+            "owner_display_name": d.get("owner_display_name"),
             "schema_json": schema_json, "allow_note": bool(d.get("allow_note", 0)), "text_tpl": d["text_tpl"],
             "remind_at": d.get("remind_at"), "notice_times": notice_times, "deadline": d.get("deadline"),
             "period": d["period"], "anchor_weekday": d.get("anchor_weekday"), "anchor_dom": d.get("anchor_dom"),
@@ -1120,21 +1392,21 @@ class StateStore:
             "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
 
-    def create_template(self, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
+    def create_template(self, payload: Dict[str, Any], actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
                     norm["attach_image_name"], norm["exec_weekdays"], norm["data_keys"], norm["spec_json"],
-                    norm["enabled"], actor, now_s, now_s,
+                    norm["enabled"], actor, now_s, now_s, int(owner_id),
                 ),
             )
             self._insert_audit_unlocked(actor, "template.create", "task_template", template_id, {"name": norm["name"], "kind": norm["kind"], "period": norm["period"]}, now_s)
@@ -1146,7 +1418,7 @@ class StateStore:
             row = self.conn.execute(sql, ((template_id or "").strip(),)).fetchone()
             return self._deserialize_template_row(row) if row else None
 
-    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20, platform: Optional[str] = None) -> Dict[str, Any]:
+    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20, platform: Optional[str] = None, owner_id: Optional[int] = None) -> Dict[str, Any]:
         p, s = _clamp_page_size(page, size)
         offset = (p - 1) * s
         where_clauses, params = ["t.deleted = 0"], []
@@ -1159,6 +1431,9 @@ class StateStore:
         if enabled is not None:
             where_clauses.append("t.enabled = ?")
             params.append(1 if enabled else 0)
+        if owner_id is not None:
+            where_clauses.append("t.owner_id = ?")
+            params.append(int(owner_id))
         plat = (platform or "").strip().lower()
         if plat:
             # 任务归属平台 = 模板所选角色所属平台（角色已按平台隔离）
@@ -1169,7 +1444,12 @@ class StateStore:
         where_sql = "WHERE " + " AND ".join(where_clauses)
         with self.lock:
             total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM task_template t {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
-            rows = self.conn.execute(f"SELECT t.* FROM task_template t {where_sql} ORDER BY t.created_at DESC, t.template_id DESC LIMIT ? OFFSET ?", tuple(params + [s, offset])).fetchall()
+            rows = self.conn.execute(
+            f"SELECT t.*, u.username AS owner_username, u.display_name AS owner_display_name "
+            f"FROM task_template t LEFT JOIN admin_user u ON u.id = t.owner_id "
+            f"{where_sql} ORDER BY t.created_at DESC, t.template_id DESC LIMIT ? OFFSET ?",
+            tuple(params + [s, offset]),
+        ).fetchall()
             return {"total": total, "items": [self._deserialize_template_row(r) for r in rows]}
 
     def update_template(self, template_id: str, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
@@ -1396,8 +1676,12 @@ class StateStore:
         snap = self.get_data_snapshot(source_key, period_key)
         return dict(snap["values"]) if snap else {}
 
-    def list_data_snapshots(self, source_key: Optional[str] = None, period_key: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def list_data_snapshots(self, source_key: Optional[str] = None, period_key: Optional[str] = None, limit: int = 50, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         where_clauses, params = ["1=1"], []
+        if owner_id is not None:
+            # 数据快照的 source_key 即模板 id → 按模板归属过滤
+            where_clauses.append("source_key IN (SELECT template_id FROM task_template WHERE owner_id = ?)")
+            params.append(int(owner_id))
         if source_key and source_key.strip():
             where_clauses.append("source_key LIKE ?")
             params.append(f"%{source_key.strip()}%")
@@ -1771,9 +2055,12 @@ class StateStore:
     def ensure_instance(self, template_id: str, phone: str, name_snap: str, dept_snap: Optional[str], period_key: str, deadline_at: str) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
+            # 2026-11-04 多管理员分级：实例归属继承模板的 owner_id（调度器自动建实例时也要带上）
+            tpl_owner = self.conn.execute("SELECT owner_id FROM task_template WHERE template_id = ?", (template_id,)).fetchone()
+            owner_val = int(tpl_owner["owner_id"]) if tpl_owner else 1
             cur = self.conn.execute(
-                "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (template_id, phone, name_snap, dept_snap, period_key, deadline_at, now_s),
+                "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (template_id, phone, name_snap, dept_snap, period_key, deadline_at, now_s, owner_val),
             )
             created = cur.rowcount > 0
             res = dict(self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND phone = ? AND period_key = ?", (template_id, phone, period_key)).fetchone())
@@ -1790,8 +2077,8 @@ class StateStore:
         with self.lock, self.conn:
             for m in members:
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-                    (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s),
+                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                    (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s, int(tpl.get("owner_id") or 1)),
                 )
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
 
@@ -1888,8 +2175,12 @@ class StateStore:
             )
             return int(cur.lastrowid) if cur.rowcount > 0 else None
 
-    def list_reminder_logs(self, template_id: Optional[str] = None, instance_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    def list_reminder_logs(self, template_id: Optional[str] = None, instance_id: Optional[int] = None, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         where, params = [], []
+        if owner_id is not None:
+            # 2026-11-04 多管理员分级：提醒日志按模板归属过滤（reminder_log 自身无 owner 列）
+            where.append("EXISTS (SELECT 1 FROM task_template t WHERE t.template_id = reminder_log.template_id AND t.owner_id = ?)")
+            params.append(int(owner_id))
         if template_id is not None:
             where.append("template_id = ?")
             params.append(template_id)

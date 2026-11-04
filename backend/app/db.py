@@ -243,6 +243,32 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: s
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 
+def _migrate_multi_admin(conn: sqlite3.Connection) -> None:
+    """2026-11-04 多管理员分级：超级管理员（只读+账号管理）+ 分级管理员（数据按 owner_id 隔离）。
+
+    幂等：全部是 ADD COLUMN / UPDATE，重复执行安全；历史数据 owner_id 默认 1（admin），
+    由运维脚本决定是否改挂到某个具体分级管理员名下。
+
+    ⚠️ 业务表名以本仓库为准：role / member / task_template / task_instance
+    （外部方案里写的 `roster` 表在本仓库不存在，成员表叫 member）。
+    """
+    _ensure_column(conn, "admin_user", "display_name", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "admin_user", "role_level", "TEXT NOT NULL DEFAULT 'sub_admin'")
+    _ensure_column(conn, "admin_user", "allowed_platforms", "TEXT NOT NULL DEFAULT '[\"zdxlz\",\"wecom\"]'")
+    _ensure_column(conn, "admin_user", "enabled", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "admin_user", "last_login_at", "TEXT")
+    for _t in ("role", "member", "task_template", "task_instance"):
+        _ensure_column(conn, _t, "owner_id", "INTEGER NOT NULL DEFAULT 1")
+    # 主账号 admin 固定为超级管理员 + 双平台
+    conn.execute(
+        "UPDATE admin_user SET role_level = 'super_admin', "
+        "display_name = CASE WHEN display_name = '' THEN '超级管理员' ELSE display_name END, "
+        "allowed_platforms = '[\"zdxlz\",\"wecom\"]' "
+        "WHERE username = 'admin'"
+    )
+    conn.commit()
+
+
 def _migrate_reminder_log_unique(conn: sqlite3.Connection) -> None:
     """若旧库 reminder_log 为单列 idem_key UNIQUE，使用显式事务 BEGIN IMMEDIATE 原子迁移为 UNIQUE(idem_key, retry)。"""
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reminder_log'").fetchone()
@@ -359,6 +385,8 @@ class Database:
             _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
             # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
             _migrate_role_platform(self.conn)
+            # 2026-11-04 多管理员分级（超级管理员 + 分级管理员，数据按 owner_id 隔离）
+            _migrate_multi_admin(self.conn)
 
             now_str = self._now_str_fn()
             row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()

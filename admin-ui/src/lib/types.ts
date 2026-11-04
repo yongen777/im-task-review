@@ -68,6 +68,10 @@ export interface TemplateItem {
   exec_weekdays?: number[] | null;
   created_at: string;
   updated_at?: string;
+  /* 2026-11-04 多管理员分级：归属管理员（超管全局查看时展示「创建人」+ 按管理员筛选） */
+  owner_id?: number;
+  owner_username?: string | null;
+  owner_display_name?: string | null;
 }
 
 export function getTemplateRoleIds(
@@ -98,6 +102,10 @@ export interface RoleItem {
   active_count: number;
   activated_count: number;
   created_at?: string;
+  /* 2026-11-04 多管理员分级：归属管理员（超管全局查看时展示「创建人」+ 按管理员筛选） */
+  owner_id?: number;
+  owner_username?: string | null;
+  owner_display_name?: string | null;
 }
 
 export interface RoleMemberItem {
@@ -270,6 +278,50 @@ export interface AdminHealth {
   event_crypto: 'ready' | 'plaintext';
   public_base_url: string;
   is_loopback_public_url: boolean;
+}
+
+/** 2026-11-04 多管理员分级：当前登录管理员档案 */
+export type AdminRoleLevel = 'super_admin' | 'sub_admin';
+
+export interface AdminMe {
+  ok?: boolean;
+  id?: number;
+  username: string;
+  csrf_token?: string;
+  must_change?: boolean;
+  must_change_password?: boolean;
+  role_level: AdminRoleLevel;
+  display_name?: string;
+  allowed_platforms: Array<'zdxlz' | 'wecom'>;
+  is_super_admin?: boolean;
+}
+
+/** 分级管理员账号（超管的账号管理页用） */
+export interface AdminAccountItem {
+  id: number;
+  username: string;
+  display_name: string;
+  role_level: AdminRoleLevel;
+  allowed_platforms: Array<'zdxlz' | 'wecom'>;
+  enabled: number;
+  must_change: number;
+  last_login_at?: string | null;
+  created_at?: string;
+  role_count?: number;
+  member_count?: number;
+  template_count?: number;
+  instance_count?: number;
+}
+
+/** 全局已激活成员（跨管理员共享，免二次激活） */
+export interface GlobalActivatedMemberItem {
+  phone: string;
+  platform: 'zdxlz' | 'wecom';
+  external_id: string;
+  name: string;
+  dept: string;
+  activated_at?: string;
+  last_event_at?: string;
 }
 
 export function isUploadTaskKind(kind: TemplateKind): boolean {

@@ -56,6 +56,109 @@ MUST_CHANGE_ALLOWED_ENDPOINTS = {
     ("POST", "/api/admin/logout"),
 }
 
+# ── 2026-11-04 多管理员分级（超级管理员 + 分级管理员）─────────────────────
+SUPER_ADMIN_LEVEL = "super_admin"
+# 超管允许的写操作：只有账号管理与通道配置（全局设置），业务数据一律只读
+SUPER_ADMIN_WRITE_ALLOW_PREFIXES = ("/api/admin/accounts", "/api/admin/channel-config")
+SUPER_ADMIN_WRITE_ALLOW_EXACT = {"/api/admin/change-password", "/api/admin/logout"}
+
+
+def _admin_profile(state: StateStore, sess: Dict[str, Any]) -> Dict[str, Any]:
+    """当前登录管理员档案（role_level / display_name / allowed_platforms）。"""
+    user = state.get_admin_by_id(int(sess.get("user_id") or 0)) or {}
+    return state.parse_admin_account(user)
+
+
+def _is_super_admin(admin: Dict[str, Any]) -> bool:
+    return str(admin.get("role_level") or "") == SUPER_ADMIN_LEVEL
+
+
+def _owner_filter(admin: Dict[str, Any], owner_id_param: Optional[str]) -> Optional[int]:
+    """列表接口的 owner 过滤值：超管=指定管理员或 None(全部)；分级管理员=自己。"""
+    if _is_super_admin(admin):
+        if owner_id_param and str(owner_id_param) not in ("all", ""):
+            try:
+                return int(owner_id_param)
+            except (TypeError, ValueError):
+                return None
+        return None
+    return int(admin.get("id") or 0)
+
+
+def _platform_allowed(admin: Dict[str, Any], platform: Optional[str]) -> bool:
+    """分级管理员的办公软件平台授权校验；超管恒为 True。"""
+    plat = (platform or "").strip().lower()
+    if not plat or _is_super_admin(admin):
+        return True
+    return plat in [str(p).lower() for p in (admin.get("allowed_platforms") or [])]
+
+
+def _check_path_ownership(state: StateStore, admin: Dict[str, Any], path: str) -> Optional[JSONResponse]:
+    """分级管理员：路径里带角色/模板/实例 id 的接口，校验资源归属；不是自己的 → 403。"""
+    if _is_super_admin(admin):
+        return None
+    parts = [p for p in path.split("/") if p]
+    if len(parts) < 4 or parts[0] != "api" or parts[1] != "admin":
+        return None
+    owner_id = int(admin.get("id") or 0)
+    try:
+        with state.lock:
+            if parts[2] == "roles":
+                row = state.conn.execute("SELECT owner_id FROM role WHERE role_id = ?", (parts[3],)).fetchone()
+                if row is not None and int(row["owner_id"] or 1) != owner_id:
+                    return error_response(403, "FORBIDDEN_OWNER", "该角色分组不属于当前管理员")
+            elif parts[2] == "templates":
+                row = state.conn.execute("SELECT owner_id FROM task_template WHERE template_id = ?", (parts[3],)).fetchone()
+                if row is not None and int(row["owner_id"] or 1) != owner_id:
+                    return error_response(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
+            elif parts[2] == "instances":
+                row = state.conn.execute("SELECT owner_id FROM task_instance WHERE id = ?", (int(parts[3]),)).fetchone()
+                if row is not None and int(row["owner_id"] or 1) != owner_id:
+                    return error_response(403, "FORBIDDEN_OWNER", "该任务实例不属于当前管理员")
+    except Exception:
+        return None
+    return None
+
+
+def _check_template_role_scope(
+    state: StateStore, admin: Dict[str, Any], body: Dict[str, Any]
+) -> Optional[JSONResponse]:
+    """2026-11-04：模板的 role_ids 必须全部属于当前管理员，且其平台在授权范围内。
+
+    缺这一步的话，分级管理员可以把「别人的角色」挂到自己的模板上，
+    于是自己的任务模板会给别人的成员派单——越权。
+    """
+    if _is_super_admin(admin):
+        return None
+    raw_ids = body.get("role_ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [x for x in raw_ids.replace(",", " ").split() if x]
+    role_ids = [str(x).strip() for x in raw_ids if str(x).strip()]
+    if not role_ids:
+        return None
+    owner_id = int(admin.get("id") or 0)
+    allowed = [str(p).lower() for p in (admin.get("allowed_platforms") or [])]
+    try:
+        with state.lock:
+            for rid in role_ids:
+                row = state.conn.execute(
+                    "SELECT owner_id, platform FROM role WHERE role_id = ?", (rid,)
+                ).fetchone()
+                if row is None:
+                    return error_response(400, "ROLE_NOT_FOUND", f"角色分组不存在：{rid}")
+                if int(row["owner_id"] or 1) != owner_id:
+                    return error_response(
+                        403, "FORBIDDEN_OWNER", "只能选择自己创建的角色分组作为任务对象"
+                    )
+                plat = str(row["platform"] or "").lower()
+                if allowed and plat not in allowed:
+                    return error_response(
+                        403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权该办公软件平台"
+                    )
+    except Exception:
+        return None
+    return None
+
 
 def error_response(status_code: int, code: str, message: str) -> JSONResponse:
     """§9 通用错误响应结构：{"ok": false, "code": "...", "message": "...", "error": {"code": "...", "message": "..."}}。"""
@@ -214,6 +317,25 @@ def register_admin_guard(app: FastAPI, state: StateStore) -> None:
                 return error_response(
                     403, "MUST_CHANGE_PASSWORD", "首次登录必须先修改密码"
                 )
+            # ── 2026-11-04 多管理员分级 ────────────────────────────────
+            admin = _admin_profile(state, sess)
+            if _is_super_admin(admin):
+                # 超管：全局只读 + 账号/通道配置可写；业务写接口一律拒绝
+                if method in ("POST", "PUT", "DELETE", "PATCH") and not (
+                    path.startswith(SUPER_ADMIN_WRITE_ALLOW_PREFIXES)
+                    or path in SUPER_ADMIN_WRITE_ALLOW_EXACT
+                ):
+                    return error_response(
+                        403, "SUPER_ADMIN_READONLY",
+                        "超级管理员仅负责全平台查看与账号分配，业务数据（任务/角色/成员）请由分级管理员账号维护",
+                    )
+            else:
+                # 分级管理员：全局通道配置只读给超管；路径里的资源必须属于自己
+                if path.startswith("/api/admin/channel-config"):
+                    return error_response(403, "FORBIDDEN", "通道配置仅超级管理员可访问")
+                forbidden = _check_path_ownership(state, admin, path)
+                if forbidden is not None:
+                    return forbidden
         return await call_next(request)
 
 
@@ -230,6 +352,7 @@ def _instance_filter_sql(
     status: Optional[str] = None,
     resubmit_status: Optional[str] = None,
     platform: Optional[str] = None,
+    owner_id: Optional[int] = None,
 ) -> tuple[str, str, List[Any]]:
     """「任务实例」统一筛选条件（列表 / 统计 / 导出共用）。
 
@@ -239,7 +362,8 @@ def _instance_filter_sql(
     """
     from_sql = (
         "FROM task_instance i "
-        "LEFT JOIN task_template t ON t.template_id = i.template_id"
+        "LEFT JOIN task_template t ON t.template_id = i.template_id "
+        "LEFT JOIN admin_user u ON u.id = i.owner_id"
     )
     where: List[str] = []
     params: List[Any] = []
@@ -247,6 +371,11 @@ def _instance_filter_sql(
     # 2026-10-29 用户口径：停用（enabled=0）或已删除的模板，其历史实例不再出现在
     # 任务实例列表与统计里——否则「停用」了还挂在列表上，看起来像没生效。
     where.append("t.enabled = 1 AND t.deleted = 0")
+
+    # 2026-11-04 多管理员分级：实例按归属（继承模板 owner_id）隔离
+    if owner_id is not None:
+        where.append("i.owner_id = ?")
+        params.append(int(owner_id))
 
     if template_id and template_id.strip():
         where.append("i.template_id = ?")
@@ -331,6 +460,7 @@ def _query_instances(
     phone: Optional[str] = None,
     q: Optional[str] = None,
     platform: Optional[str] = None,
+    owner_id: Optional[int] = None,
     page: int = 1,
     size: int = 20,
 ) -> Dict[str, Any]:
@@ -348,6 +478,7 @@ def _query_instances(
         phone=phone,
         q=q,
         platform=platform,
+        owner_id=owner_id,
     )
     with state.lock:
         total = int(
@@ -360,7 +491,9 @@ def _query_instances(
         rows = state.conn.execute(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
-            f"t.notice_times AS template_notice_times "
+            f"t.notice_times AS template_notice_times, "
+            # 2026-11-04 多管理员分级：超管全局查看时需要看到「创建人」
+            f"u.username AS owner_username, u.display_name AS owner_display_name "
             # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），
             # 管理员顺着看一天的排期；日期维度仍是最近的在上面（period_key DESC）。
             # 通知类 remind_at 可能为空，用 COALESCE 兜底到末尾，最后再用 id 保证稳定顺序。
@@ -528,7 +661,8 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     async def login(request: Request):
         body = await _read_json_body(request)
         username = str(body.get("username") or "").strip()
-        password = str(body.get("password") or "")
+        # 2026-11-04：初始密码常从中文输入法敲出全角「！」，登录时统一归一化
+        password = StateStore.normalize_admin_password(str(body.get("password") or ""))
         if not username or not password:
             return error_response(401, "BAD_CREDENTIALS", "用户名或密码错误")
 
@@ -544,6 +678,8 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             _login_note_failure(fail_key)
             return error_response(401, "BAD_CREDENTIALS", "用户名或密码错误")
         _login_clear(fail_key)
+        if not int(user.get("enabled") or 0):
+            return error_response(403, "ACCOUNT_DISABLED", "该管理员账号已被停用，请联系超级管理员")
 
         sess = state.create_admin_session(int(user["id"]))
         state.write_audit(
@@ -553,6 +689,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             target_id=user["username"],
             detail={"must_change": bool(user["must_change"])},
         )
+        _prof = state.parse_admin_account(user)
         resp = JSONResponse(
             status_code=200,
             content={
@@ -560,6 +697,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 "username": user["username"],
                 "must_change": bool(user["must_change"]),
                 "csrf_token": sess["csrf"],
+                "role_level": _prof.get("role_level", "sub_admin"),
+                "display_name": _prof.get("display_name") or user["username"],
+                "allowed_platforms": _prof.get("allowed_platforms") or [],
+                "is_super_admin": _prof.get("role_level") == SUPER_ADMIN_LEVEL,
             },
         )
         resp.set_cookie(
@@ -599,11 +740,17 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
+        _prof = _admin_profile(state, sess)
         return {
             "ok": True,
             "username": sess["username"],
             "must_change": bool(sess["must_change"]),
             "csrf_token": sess["csrf"],
+            "id": _prof.get("id"),
+            "role_level": _prof.get("role_level", "sub_admin"),
+            "display_name": _prof.get("display_name") or sess["username"],
+            "allowed_platforms": _prof.get("allowed_platforms") or [],
+            "is_super_admin": _prof.get("role_level") == SUPER_ADMIN_LEVEL,
         }
 
     @router.post("/change-password")
@@ -637,6 +784,122 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return {"ok": True}
 
     # ==================================================================
+    # 2026-11-04 多管理员分级：管理员账号管理（仅超级管理员）
+    # ==================================================================
+    def _require_super(state: StateStore, sess: Dict[str, Any]) -> Optional[JSONResponse]:
+        admin = _admin_profile(state, sess)
+        if not _is_super_admin(admin):
+            return error_response(403, "FORBIDDEN", "仅超级管理员可管理分级管理员账号")
+        return None
+
+    @router.get("/accounts")
+    async def list_accounts(request: Request):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        return {"ok": True, "items": state.list_admin_accounts(),
+                "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD}
+
+    @router.post("/accounts")
+    async def create_account(request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        body = await _read_json_body(request)
+        try:
+            acct = state.create_admin_account(
+                username=str(body.get("username") or ""),
+                display_name=str(body.get("display_name") or ""),
+                allowed_platforms=body.get("allowed_platforms"),
+                actor=sess["username"],
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, "account": acct,
+                "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD,
+                "must_change_password": True}
+
+    @router.put("/accounts/{admin_id}")
+    async def update_account(admin_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        body = await _read_json_body(request)
+        enabled = body.get("enabled")
+        try:
+            acct = state.update_admin_account(
+                admin_id,
+                display_name=body.get("display_name"),
+                allowed_platforms=body.get("allowed_platforms"),
+                enabled=(None if enabled is None else bool(enabled)),
+                actor=sess["username"],
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, "account": acct}
+
+    @router.post("/accounts/{admin_id}/reset-password")
+    async def reset_account_password(admin_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        try:
+            res = state.reset_admin_password(admin_id, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, **res, "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD}
+
+    @router.delete("/accounts/{admin_id}")
+    async def delete_account(admin_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        try:
+            state.delete_admin_account(admin_id, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True}
+
+    @router.get("/global-activated-members")
+    async def global_activated_members(
+        request: Request,
+        q: Optional[str] = None,
+        platform: Optional[str] = None,
+        limit: int = 50,
+    ):
+        """全局搜索**已激活**成员：激活关系（delivery_target）全平台共享，跨管理员免二次激活。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        _plat = (platform or "").strip().lower()
+        if not _platform_allowed(_admin, _plat):
+            return error_response(403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权该办公软件平台")
+        items = state.search_global_activated(q=q or "", platform=_plat or None, limit=limit)
+        return {"ok": True, "items": items}
+
+    # ==================================================================
     # §9.2 任务模板接口
     # ==================================================================
     @router.get("/templates")
@@ -648,6 +911,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         page: int = 1,
         size: int = 20,
         platform: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -655,8 +919,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         enabled_bool = _parse_optional_bool(enabled)
+        _admin = _admin_profile(state, sess)
         res = state.list_templates(
-            q=q, kind=kind, enabled=enabled_bool, page=page, size=size, platform=platform
+            q=q, kind=kind, enabled=enabled_bool, page=page, size=size, platform=platform,
+            owner_id=_owner_filter(_admin, owner_id),
         )
         return {"ok": True, "total": res["total"], "items": res["items"]}
 
@@ -668,8 +934,12 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
+        _admin = _admin_profile(state, sess)
+        _scope_err = _check_template_role_scope(state, _admin, body)
+        if _scope_err is not None:
+            return _scope_err
         try:
-            tpl = state.create_template(body, actor=sess["username"])
+            tpl = state.create_template(body, actor=sess["username"], owner_id=int(_admin.get("id") or 0))
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "template_id": tpl["template_id"], "template": tpl}
@@ -694,6 +964,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
+        _admin = _admin_profile(state, sess)
+        _scope_err = _check_template_role_scope(state, _admin, body)
+        if _scope_err is not None:
+            return _scope_err
         try:
             tpl = state.update_template(template_id, body, actor=sess["username"])
         except BizError as exc:
@@ -846,13 +1120,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # §9.3 角色与成员接口
     # ==================================================================
     @router.get("/roles")
-    async def list_roles(request: Request, platform: Optional[str] = None):
+    async def list_roles(request: Request, platform: Optional[str] = None, owner_id: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
         assert sess is not None
 
-        items = state.list_roles(platform=platform)
+        _admin = _admin_profile(state, sess)
+        items = state.list_roles(platform=platform, owner_id=_owner_filter(_admin, owner_id))
         return {"ok": True, "items": items}
 
     @router.post("/roles")
@@ -863,12 +1138,17 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
+        _admin = _admin_profile(state, sess)
+        _plat = str(body.get("platform") or "zdxlz")
+        if not _platform_allowed(_admin, _plat):
+            return error_response(403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权该办公软件平台")
         try:
             role = state.create_role(
                 name=str(body.get("name") or ""),
                 note=body.get("note"),
                 actor=sess["username"],
-                platform=str(body.get("platform") or "zdxlz"),
+                platform=_plat,
+                owner_id=int(_admin.get("id") or 0),
             )
         except BizError as exc:
             return biz_error_response(exc)
@@ -898,7 +1178,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         try:
-            items = state.list_data_snapshots(source_key=source_key, period_key=period_key, limit=limit)
+            items = state.list_data_snapshots(
+                source_key=source_key, period_key=period_key, limit=limit,
+                owner_id=_owner_filter(_admin_profile(state, sess), None),
+            )
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "total": len(items), "items": items}
@@ -983,18 +1266,29 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
+        _admin = _admin_profile(state, sess)
+        _phone = str(body.get("phone") or "").strip()
         try:
             member = state.add_role_member(
                 role_id=role_id,
-                phone=str(body.get("phone") or ""),
+                phone=_phone,
                 name=str(body.get("name") or ""),
                 dept=body.get("dept"),
                 source="manual",
                 actor=sess["username"],
+                owner_id=int(_admin.get("id") or 0),
             )
         except BizError as exc:
             return biz_error_response(exc)
-        return {"ok": True, "member": member}
+        # 2026-11-04：成员激活关系全局共享 —— 别的管理员已激活过就无需二次激活
+        _global_reused = state.is_phone_activated(_phone, platform=None)
+        return {
+            "ok": True,
+            "member": member,
+            "global_reused": _global_reused,
+            "global_reused_count": 1 if _global_reused else 0,
+            "global_reused_phones": [_phone] if _global_reused else [],
+        }
 
     @router.get("/members/{phone}/roles")
     async def list_member_roles(phone: str, request: Request):
@@ -1090,15 +1384,27 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         body = await _read_json_body(request)
         csv_rows = body.get("csv_rows")
         dry_run = bool(body.get("dry_run", True))
+        _admin = _admin_profile(state, sess)
         try:
             res = state.import_role_members(
                 role_id=role_id,
                 csv_rows=csv_rows,  # type: ignore[arg-type]
                 dry_run=dry_run,
                 actor=sess["username"],
+                owner_id=int(_admin.get("id") or 0),
             )
         except BizError as exc:
             return biz_error_response(exc)
+        # 2026-11-04：本次导入里有多少人已被（任意管理员）激活 → 免二次激活
+        _reused_phones: List[str] = []
+        for _row in (csv_rows or []):
+            if isinstance(_row, dict):
+                _p = str(_row.get("phone") or "").strip()
+                if _p and _p not in _reused_phones and state.is_phone_activated(_p, platform=None):
+                    _reused_phones.append(_p)
+        res["global_reused"] = bool(_reused_phones)
+        res["global_reused_count"] = len(_reused_phones)
+        res["global_reused_phones"] = _reused_phones
         return res
 
     # ==================================================================
@@ -1125,6 +1431,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             status=status,
             q=q,
             platform=platform,
+            owner_id=_owner_filter(_admin, owner_id),
             page=1,
             size=200,
         )
@@ -1187,12 +1494,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         platform: Optional[str] = None,
         page: int = 1,
         size: int = 20,
+        owner_id: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
         assert sess is not None
 
+        _admin = _admin_profile(state, sess)
         res = _query_instances(
             state,
             template_id=template_id,
@@ -1205,6 +1514,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             phone=phone,
             q=q,
             platform=platform,
+            owner_id=_owner_filter(_admin, owner_id),
             page=page,
             size=size,
         )
@@ -1593,6 +1903,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
+        _admin = _admin_profile(state, sess)
 
         p, s = _clamp_page_size(page, size)
         offset = (p - 1) * s
@@ -1613,6 +1924,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if result and result.strip():
             where.append("r.result = ?")
             params.append(result.strip())
+        # 2026-11-04 多管理员分级：提醒日志按模板归属过滤（子账号只看自己的）
+        _own = _owner_filter(_admin, None)
+        if _own is not None:
+            where.append("EXISTS (SELECT 1 FROM task_template t2 WHERE t2.template_id = r.template_id AND t2.owner_id = ?)")
+            params.append(int(_own))
 
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         with state.lock:
@@ -1650,6 +1966,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         offset = (p - 1) * s
         where: List[str] = []
         params: List[Any] = []
+        # 2026-11-04 多管理员分级：分级管理员只看得到自己的操作记录；超管看全部
+        _admin = _admin_profile(state, sess)
+        if not _is_super_admin(_admin):
+            where.append("username = ?")
+            params.append(str(sess.get("username") or ""))
         if username and username.strip():
             where.append("username LIKE ?")
             params.append(f"%{username.strip()}%")
@@ -1696,12 +2017,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         phone: Optional[str] = None,
         q: Optional[str] = None,
         platform: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
         assert sess is not None
 
+        _admin = _admin_profile(state, sess)
         # 2026-10-28：统计卡片与列表共用同一套筛选，避免「筛了列表但卡片数字不变」
         from_sql, where_sql, params = _instance_filter_sql(
             state,
@@ -1714,6 +2037,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             phone=phone,
             q=q,
             platform=platform,
+            owner_id=_owner_filter(_admin, owner_id),
         )
         counts = {
             "total": 0,
