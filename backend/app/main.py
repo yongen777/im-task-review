@@ -93,6 +93,7 @@ def _register_admin_spa_pages(admin_app: FastAPI) -> None:
 
     @admin_app.get("/", response_class=HTMLResponse)
     @admin_app.get("/login", response_class=HTMLResponse)
+    @admin_app.get("/change-password", response_class=HTMLResponse)
     @admin_app.get("/templates", response_class=HTMLResponse)
     @admin_app.get("/roles", response_class=HTMLResponse)
     @admin_app.get("/instances", response_class=HTMLResponse)
