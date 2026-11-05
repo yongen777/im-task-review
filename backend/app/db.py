@@ -254,6 +254,8 @@ def _migrate_multi_admin(conn: sqlite3.Connection) -> None:
     """
     _ensure_column(conn, "admin_user", "display_name", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "admin_user", "role_level", "TEXT NOT NULL DEFAULT 'sub_admin'")
+    # 2026-11-05 代登录（assume/unassume）：代管会话记录原超管会话 sid，供一键切回
+    _ensure_column(conn, "admin_session", "parent_sid", "TEXT")
     _ensure_column(conn, "admin_user", "allowed_platforms", "TEXT NOT NULL DEFAULT '[\"zdxlz\",\"wecom\"]'")
     _ensure_column(conn, "admin_user", "enabled", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(conn, "admin_user", "last_login_at", "TEXT")

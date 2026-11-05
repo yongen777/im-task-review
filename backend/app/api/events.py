@@ -201,6 +201,12 @@ def handle_inbound_text(
                 reply = "该任务已申请过补交，不可重复申请。"
             elif result == "window_expired":
                 reply = "已超补交申请窗口（需在截止时间后 24 小时内申请），本次不受理。"
+            elif result == "admin_disabled":
+                # 2026-11-05 用户/workbuddy 拍板：管理员停用期间不受理补交，但要说清是「人不在」
+                # 而不是「没有任务」——否则员工以为系统坏了。
+                n = len(res.get("items") or [])
+                reply = (f"你名下有 {n} 个逾期任务，但该任务的管理员账号已停用，暂时无法受理补交。"
+                         "请联系管理员恢复账号后再申请。")
             else:
                 reply = "当前没有可申请补交的逾期任务。"
             send(reply, f"resubmit_{result}")

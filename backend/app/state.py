@@ -330,12 +330,21 @@ class StateStore:
         with self.lock, self.conn:
             self.conn.execute("UPDATE admin_user SET pwd_hash = ?, must_change = 0 WHERE id = ?", (hash_password(new_password), user_id))
 
-    def create_admin_session(self, user_id: int, ttl_hours: int = SESSION_TTL_HOURS) -> Dict[str, str]:
+    def create_admin_session(self, user_id: int, ttl_hours: int = SESSION_TTL_HOURS, parent_sid: Optional[str] = None) -> Dict[str, str]:
+        """签发管理会话。parent_sid：代登录（assume）时记录原超管会话，供 unassume 一键切回。
+
+        HttpOnly Cookie 前端拿不到 sid，所以切回必须在服务端完成：新会话上挂 parent_sid，
+        unassume 用当前代管会话反查原超管会话并重新下发 Cookie。
+        """
         sid, csrf = secrets.token_hex(32), secrets.token_hex(24)
         now_dt = self.now()
         created_at, expires_at = format_dt(now_dt), format_dt(now_dt + timedelta(hours=ttl_hours))
         with self.lock, self.conn:
-            self.conn.execute("INSERT INTO admin_session(sid, user_id, csrf, created_at, last_seen, expires_at) VALUES (?, ?, ?, ?, ?, ?)", (sid, user_id, csrf, created_at, created_at, expires_at))
+            self.conn.execute(
+                "INSERT INTO admin_session(sid, user_id, csrf, created_at, last_seen, expires_at, parent_sid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, user_id, csrf, created_at, created_at, expires_at, (parent_sid or None)),
+            )
         return {"sid": sid, "csrf": csrf, "created_at": created_at, "expires_at": expires_at}
 
     def get_admin_session(self, sid: str) -> Optional[Dict[str, Any]]:
@@ -346,7 +355,7 @@ class StateStore:
             row = self.conn.execute(
                 # 2026-11-05：会话有效性绑定账号状态 —— 停用账号的会话一律视为无效。
                 # update_admin_account 停用时已主动删会话，这里是查询口的兜底（防其它路径改库绕过）。
-                "SELECT s.sid, s.user_id, s.csrf, s.created_at, s.last_seen, s.expires_at, u.username, u.must_change "
+                "SELECT s.sid, s.user_id, s.csrf, s.parent_sid, s.created_at, s.last_seen, s.expires_at, u.username, u.must_change "
                 "FROM admin_session s JOIN admin_user u ON u.id = s.user_id "
                 "WHERE s.sid = ? AND u.enabled = 1",
                 (sid,),
@@ -359,6 +368,7 @@ class StateStore:
             self.conn.execute("UPDATE admin_session SET last_seen = ? WHERE sid = ?", (now_s, sid))
             return {
                 "sid": row["sid"], "user_id": int(row["user_id"]), "csrf": row["csrf"],
+                "parent_sid": row["parent_sid"],
                 "created_at": row["created_at"], "last_seen": now_s, "expires_at": row["expires_at"],
                 "username": row["username"], "must_change": bool(row["must_change"]),
             }
@@ -483,12 +493,167 @@ class StateStore:
             for r in rows:
                 d = self.parse_admin_account(r)
                 aid = int(d["id"])
-                d["role_count"] = int(self.conn.execute("SELECT COUNT(1) FROM role WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
-                d["member_count"] = int(self.conn.execute("SELECT COUNT(1) FROM member WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
-                d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (aid,)).fetchone()[0] or 0)
-                d["instance_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_instance WHERE owner_id = ?", (aid,)).fetchone()[0] or 0)
+                # 2026-11-05 口径（用户拍板）：
+                #   · 超管卡片 = 全平台汇总（超管视角就是全局总览，自己名下永远为空不代表平台没数据）；
+                #   · 分级卡片 = 该管理员名下；
+                #   · 成员数按「人」去重（DISTINCT phone，一人多角色只算一次；停用也算在册）。
+                is_super = str(d["role_level"] or "") == self.SUPER_ADMIN
+                scope = None if is_super else aid
+                d["role_count"] = self._count_by_owner("role", scope)
+                d["member_count"] = self._distinct_member_count(scope)
+                if scope is None:
+                    d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE deleted = 0").fetchone()[0] or 0)
+                else:
+                    d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (scope,)).fetchone()[0] or 0)
+                d["instance_count"] = self._count_by_owner("task_instance", scope)
                 out.append(d)
         return out
+
+    def _count_by_owner(self, table: str, owner_id: Optional[int]) -> int:
+        if owner_id is None:
+            return int(self.conn.execute(f"SELECT COUNT(1) FROM {table}").fetchone()[0] or 0)
+        return int(self.conn.execute(f"SELECT COUNT(1) FROM {table} WHERE owner_id = ?", (int(owner_id),)).fetchone()[0] or 0)
+
+    def _distinct_member_count(self, owner_id: Optional[int]) -> int:
+        sql = "SELECT COUNT(DISTINCT phone) FROM member"
+        params: tuple = ()
+        if owner_id is not None:
+            sql += " WHERE owner_id = ?"
+            params = (int(owner_id),)
+        return int(self.conn.execute(sql, params).fetchone()[0] or 0)
+
+    def member_distinct_total(self, platform: Optional[str] = None, owner_id: Optional[int] = None) -> int:
+        """按「人」去重的在册人数（视角/平台与角色列表同一过滤口径；停用也算在册）。"""
+        sql = (
+            "SELECT COUNT(DISTINCT m.phone) FROM member m JOIN role r ON r.role_id = m.role_id WHERE 1=1"
+        )
+        params: List[Any] = []
+        plat = (platform or "").strip().lower()
+        if plat:
+            sql += " AND r.platform = ?"
+            params.append(plat)
+        if owner_id is not None:
+            sql += " AND r.owner_id = ?"
+            params.append(int(owner_id))
+        return int(self.conn.execute(sql, params).fetchone()[0] or 0)
+
+    # ── 全平台成员池（2026-11-05 用户需求：超管按「人」管理的全局名册）──
+    # member 表按 (role_id, phone) 建行 —— 同一人在 N 个角色里是 N 行；池按 phone 聚合。
+    # 主行取 MAX(id)（最近一次导入/落库的行）作为姓名/部门的默认显示值；
+    # 行间不一致时给 inconsistent 标志（前端提示"该手机号在 N 个角色中，姓名/部门不一致"）。
+    POOL_STATUS_ACTIVE = "active"
+    POOL_STATUS_PARTIAL = "partial"
+    POOL_STATUS_DISABLED = "disabled"
+
+    def list_member_pool(self, q: str = "", size: int = 500) -> List[Dict[str, Any]]:
+        clean_q = (q or "").strip()
+        sql = (
+            "SELECT m.phone AS phone, COUNT(1) AS row_count, COUNT(DISTINCT m.role_id) AS role_count, "
+            "COUNT(DISTINCT m.owner_id) AS admin_count, SUM(COALESCE(m.enabled, 1)) AS enabled_count, "
+            "COUNT(DISTINCT m.name) AS distinct_names, COUNT(DISTINCT COALESCE(m.dept, '')) AS distinct_depts, "
+            "p.name AS display_name, p.dept AS display_dept, "
+            "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 JOIN admin_user u ON u.id = m2.owner_id "
+            " WHERE m2.phone = m.phone) AS owner_names, "
+            "(SELECT GROUP_CONCAT(DISTINCT dt.platform) FROM delivery_target dt "
+            " WHERE dt.phone = m.phone AND dt.usable = 1) AS activated_platforms "
+            "FROM member m "
+            "JOIN member p ON p.id = (SELECT MAX(id) FROM member WHERE phone = m.phone) "
+        )
+        params: List[Any] = []
+        if clean_q:
+            sql += ("WHERE EXISTS (SELECT 1 FROM member x WHERE x.phone = m.phone "
+                    "AND (x.name LIKE ? OR x.phone LIKE ?)) ")
+            params += [f"%{clean_q}%", f"%{clean_q}%"]
+        sql += "GROUP BY m.phone ORDER BY display_name ASC, m.phone ASC LIMIT ?"
+        params.append(int(size))
+        out: List[Dict[str, Any]] = []
+        with self.lock:
+            for r in self.conn.execute(sql, params).fetchall():
+                rows_n = int(r["row_count"] or 0)
+                enabled_n = int(r["enabled_count"] or 0)
+                status = (
+                    self.POOL_STATUS_ACTIVE if enabled_n >= rows_n
+                    else (self.POOL_STATUS_DISABLED if enabled_n == 0 else self.POOL_STATUS_PARTIAL)
+                )
+                out.append({
+                    "phone": str(r["phone"]),
+                    "display_name": str(r["display_name"] or ""),
+                    "display_dept": str(r["display_dept"] or ""),
+                    "status": status,
+                    "row_count": rows_n,
+                    "role_count": int(r["role_count"] or 0),
+                    "admin_count": int(r["admin_count"] or 0),
+                    "owner_names": str(r["owner_names"] or ""),
+                    "activated_platforms": [p for p in str(r["activated_platforms"] or "").split(",") if p],
+                    "name_inconsistent": int(r["distinct_names"] or 0) > 1,
+                    "dept_inconsistent": int(r["distinct_depts"] or 0) > 1,
+                })
+        return out
+
+    def _pool_require_phone(self, phone: str) -> str:
+        clean = (phone or "").strip()
+        if not clean:
+            raise BizError(400, "VALIDATION_FAILED", "缺少手机号")
+        with self.lock:
+            if not self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone():
+                raise BizError(404, "NOT_FOUND", "该手机号不在任何名册中")
+        return clean
+
+    def member_pool_set_status(self, phone: str, enabled: bool, actor: str = "system") -> Dict[str, Any]:
+        """全局启停：该手机号在所有管理员名下的 member 行统一 enabled（2026-11-05 用户口径：超管操作全局同步）。"""
+        clean = self._pool_require_phone(phone)
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE member SET enabled = ? WHERE phone = ?", (1 if enabled else 0, clean))
+            n = int(cur.rowcount or 0)
+            self._insert_audit_unlocked(
+                actor, "member_pool.set_status", "member", clean,
+                {"enabled": bool(enabled), "rows": n}, now_s)
+        return {"ok": True, "phone": clean, "rows": n}
+
+    def member_pool_update_profile(self, phone: str, name: Optional[str], dept: Optional[str], actor: str = "system") -> Dict[str, Any]:
+        """全局改姓名/部门：该手机号全部 member 行同步同一值。⛔ 不收手机号字段，手机号永不可改（用户红线）。"""
+        clean = self._pool_require_phone(phone)
+        sets, params = [], []
+        if name is not None:
+            nm = str(name).strip()
+            if not nm or len(nm) > 20:
+                raise BizError(400, "VALIDATION_FAILED", "姓名需 1~20 个字")
+            sets.append("name = ?")
+            params.append(nm)
+        if dept is not None:
+            sets.append("dept = ?")
+            params.append(str(dept).strip())
+        if not sets:
+            raise BizError(400, "VALIDATION_FAILED", "没有要修改的字段")
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            params.append(clean)
+            cur = self.conn.execute(f"UPDATE member SET {', '.join(sets)} WHERE phone = ?", params)
+            n = int(cur.rowcount or 0)
+            self._insert_audit_unlocked(
+                actor, "member_pool.update_profile", "member", clean,
+                {"name": name, "dept": dept, "rows": n}, now_s)
+        return {"ok": True, "phone": clean, "rows": n}
+
+    def member_pool_delete(self, phone: str, actor: str = "system") -> Dict[str, Any]:
+        """全局删除：该手机号从所有名册移除；删除后全平台无任何归属时绑定一并删除（激活共享口径）。"""
+        clean = self._pool_require_phone(phone)
+        now_s = self.now_str()
+        removed_bindings: List[str] = []
+        with self.lock, self.conn:
+            n = int(self.conn.execute("DELETE FROM member WHERE phone = ?", (clean,)).rowcount or 0)
+            if self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone() is None:
+                for dt in self.conn.execute(
+                    "SELECT DISTINCT platform FROM delivery_target WHERE phone = ?", (clean,)
+                ).fetchall():
+                    removed_bindings.append(str(dt["platform"] or ""))
+                self.conn.execute("DELETE FROM delivery_target WHERE phone = ?", (clean,))
+            self._insert_audit_unlocked(
+                actor, "member_pool.delete", "member", clean,
+                {"rows": n, "bindings_removed": removed_bindings}, now_s)
+        return {"ok": True, "phone": clean, "rows": n, "bindings_removed": removed_bindings}
 
     def update_admin_account(
         self,
@@ -555,23 +720,138 @@ class StateStore:
             )
         return {"ok": True, "username": str(row["username"]), "must_change_password": True}
 
-    def delete_admin_account(self, admin_id: int, actor: str = "system") -> None:
-        """删除分级管理员：名下有角色/成员/模板时拒绝（避免留下无主数据）。"""
+    def backup_database(self, tag: str = "manual") -> str:
+        """SQLite 文件级备份（先 WAL checkpoint 保证备份完整，落在 data/ 目录），返回备份路径。"""
+        import shutil
+
+        with self.lock:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            ts = self.now_str().replace(":", "").replace("-", "").replace(" ", "-")
+            dest = self.db.db_path.parent / f"{self.db.db_path.name}.bak-{tag}-{ts}"
+            shutil.copy2(self.db.db_path, dest)
+        return str(dest)
+
+    @staticmethod
+    def _purge_upload_file(uploads_dir: Path, rel_path: str) -> bool:
+        """删除 uploads 目录下的一个相对路径文件；路径越界（不在 uploads_dir 内）直接跳过并视为未删。"""
+        rel = str(rel_path or "").strip()
+        if not rel:
+            return False
+        try:
+            target = (uploads_dir / rel).resolve()
+            target.relative_to(uploads_dir.resolve())
+        except (ValueError, OSError):
+            return False
+        try:
+            if target.is_file():
+                target.unlink()
+                return True
+        except OSError:
+            return False
+        return False
+
+    def delete_admin_account(self, admin_id: int, actor: str = "system", uploads_dir: Optional[Path] = None) -> Dict[str, Any]:
+        """级联删除分级管理员（2026-11-05 用户拍板：账号与名下数据全部物理删除，不可逆）。
+
+        范围：会话 → 账号本体 → 名下角色/成员/模板（含软删）/实例 → 实例上的提交、
+        上传引用、补交 token、提醒日志 → 磁盘附件文件（路径先校验在 uploads 目录内再删）。
+        绑定（激活状态）**条件删**：手机号删完全平台已无任何 member 行才删（激活全局共享，
+        别的管理员名册里还有此人时保留）；用 member 表反推，delivery_target 本身无 owner 概念。
+        审计日志永不删；删除动作本身记审计 admin.account.purge 并带全部明细。
+        """
         now_s = self.now_str()
+        aid = int(admin_id)
+        detail: Dict[str, int] = {}
+        removed_bindings: List[str] = []
+        removed_files = 0
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (int(admin_id),)).fetchone()
+            row = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (aid,)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "管理员账号不存在")
             if str(row["username"]) == "admin":
                 raise BizError(400, "VALIDATION_FAILED", "超级管理员账号不能删除")
-            for tbl, label in (("role", "角色分组"), ("member", "成员"), ("task_template", "任务模板")):
-                n = int(self.conn.execute(f"SELECT COUNT(1) FROM {tbl} WHERE owner_id = ?", (int(admin_id),)).fetchone()[0] or 0)
-                if n:
-                    raise BizError(400, "VALIDATION_FAILED", f"该账号名下还有 {n} 个{label}，请先转移或删除")
-            self.conn.execute("DELETE FROM admin_session WHERE user_id = ?", (int(admin_id),))
-            self.conn.execute("DELETE FROM admin_user WHERE id = ?", (int(admin_id),))
-            self._insert_audit_unlocked(actor, "admin.account.delete", "admin_user", str(int(admin_id)),
-                                        {"username": row["username"]}, now_s)
+
+            tpl_sql = "SELECT template_id FROM task_template WHERE owner_id = ?"
+            inst_sql = "SELECT id FROM task_instance WHERE owner_id = ?"
+            phones = [str(r[0]) for r in self.conn.execute(
+                "SELECT DISTINCT phone FROM member WHERE owner_id = ?", (aid,)).fetchall()]
+
+            # 磁盘附件：提交上传的 rel_path + 模板通知图 attach_image_path（先收集，事务内删文件，失败只计数不回滚）
+            if uploads_dir is not None:
+                rels = [str(r[0]) for r in self.conn.execute(
+                    f"SELECT rel_path FROM upload_ref WHERE template_id IN ({tpl_sql})", (aid,)).fetchall()]
+                rels += [str(r[0]) for r in self.conn.execute(
+                    "SELECT attach_image_path FROM task_template WHERE owner_id = ? "
+                    "AND COALESCE(attach_image_path, '') != ''", (aid,)).fetchall()]
+                for rel in rels:
+                    if self._purge_upload_file(uploads_dir, rel):
+                        removed_files += 1
+
+            # 子表（挂在名下模板/实例上的记录）
+            detail["submission"] = int(self.conn.execute(
+                f"DELETE FROM submission WHERE instance_id IN ({inst_sql})", (aid,)).rowcount or 0)
+            detail["upload_ref"] = int(self.conn.execute(
+                f"DELETE FROM upload_ref WHERE template_id IN ({tpl_sql})", (aid,)).rowcount or 0)
+            detail["h5_token"] = int(self.conn.execute(
+                f"DELETE FROM h5_token WHERE template_id IN ({tpl_sql})", (aid,)).rowcount or 0)
+            detail["reminder_log"] = int(self.conn.execute(
+                f"DELETE FROM reminder_log WHERE template_id IN ({tpl_sql})", (aid,)).rowcount or 0)
+            # 业务主数据
+            detail["task_instance"] = int(self.conn.execute(
+                "DELETE FROM task_instance WHERE owner_id = ?", (aid,)).rowcount or 0)
+            detail["task_template"] = int(self.conn.execute(
+                "DELETE FROM task_template WHERE owner_id = ?", (aid,)).rowcount or 0)
+            detail["member"] = int(self.conn.execute(
+                "DELETE FROM member WHERE owner_id = ?", (aid,)).rowcount or 0)
+            detail["role"] = int(self.conn.execute(
+                "DELETE FROM role WHERE owner_id = ?", (aid,)).rowcount or 0)
+            # 会话 + 账号本体
+            detail["admin_session"] = int(self.conn.execute(
+                "DELETE FROM admin_session WHERE user_id = ?", (aid,)).rowcount or 0)
+            self.conn.execute("DELETE FROM admin_user WHERE id = ?", (aid,))
+            # 绑定条件删：全平台已无任何 member 行的手机号，绑定（所有平台）一并清除
+            for ph in phones:
+                if self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (ph,)).fetchone() is None:
+                    self.conn.execute("DELETE FROM delivery_target WHERE phone = ?", (ph,))
+                    removed_bindings.append(ph)
+
+            self._insert_audit_unlocked(
+                actor, "admin.account.purge", "admin_user", str(aid),
+                {"username": str(row["username"]), "deleted": detail,
+                 "bindings_removed": removed_bindings, "attachments_removed": removed_files}, now_s,
+            )
+        return {"ok": True, "username": str(row["username"]), "deleted": detail,
+                "bindings_removed": removed_bindings, "attachments_removed": removed_files}
+
+    def transfer_owner_between(self, from_admin: int, to_admin: int, actor: str = "system") -> Dict[str, Any]:
+        """定向转移：把 from 管理员名下的全部业务数据挂到 to 名下（删除前「先转移」选项用）。
+
+        与 transfer_owner 不同：transfer_owner 是「全平台数据归并到一人」的历史迁移函数，
+        不能用于账号间定向转移（会连别人的数据一起转走）。
+        """
+        fid, tid = int(from_admin), int(to_admin)
+        now_s = self.now_str()
+        with self.lock, self.conn:
+            src = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (fid,)).fetchone()
+            dst = self.conn.execute("SELECT * FROM admin_user WHERE id = ?", (tid,)).fetchone()
+            if not src:
+                raise BizError(404, "NOT_FOUND", "源管理员账号不存在")
+            if not dst:
+                raise BizError(404, "NOT_FOUND", "目标管理员账号不存在")
+            if fid == tid:
+                raise BizError(400, "VALIDATION_FAILED", "源与目标不能是同一个账号")
+            if str(dst["role_level"] or "") == self.SUPER_ADMIN:
+                raise BizError(400, "VALIDATION_FAILED", "业务数据不能转移到超级管理员名下（超管名下保持为空）")
+            moved: Dict[str, int] = {}
+            for tbl in ("role", "member", "task_template", "task_instance"):
+                cur = self.conn.execute(
+                    f"UPDATE {tbl} SET owner_id = ? WHERE owner_id = ?", (tid, fid))
+                moved[tbl] = int(cur.rowcount or 0)
+            self._insert_audit_unlocked(
+                actor, "admin.account.transfer_between", "admin_user", f"{fid}->{tid}",
+                {"from": str(src["username"]), "to": str(dst["username"]), "moved": moved}, now_s,
+            )
+        return {"ok": True, "from": str(src["username"]), "to": str(dst["username"]), "moved": moved}
 
     def transfer_owner(self, owner_id: int, actor: str = "system") -> Dict[str, Any]:
         """把历史业务数据（角色/成员/模板/实例）整体挂到某个管理员名下。"""
@@ -1595,7 +1875,17 @@ class StateStore:
 
     def list_active_templates(self, include_notice: bool = True) -> List[Dict[str, Any]]:
         with self.lock:
-            sql = "SELECT * FROM task_template WHERE enabled = 1 AND deleted = 0" + ("" if include_notice else " AND kind != 'notice'") + " ORDER BY template_id ASC"
+            # 2026-11-05 拍板口径落地：「停用管理员 = 名下模板立即停止派发」。
+            # 此前只查模板自身的 enabled/deleted，管理员账号被停用后模板照常发消息（口径未实现的实测缺口）。
+            # 一处补齐全调度链生效：通知/实例生成/提醒全部从这里取模板。
+            # owner 缺失的历史行（owner_id=0/NULL）不拦 —— COALESCE 视为启用，避免误伤孤儿数据。
+            sql = (
+                "SELECT t.* FROM task_template t "
+                "LEFT JOIN admin_user u ON u.id = t.owner_id "
+                "WHERE t.enabled = 1 AND t.deleted = 0 AND COALESCE(u.enabled, 1) = 1"
+                + ("" if include_notice else " AND t.kind != 'notice'")
+                + " ORDER BY t.template_id ASC"
+            )
             return [self._deserialize_template_row(r) for r in self.conn.execute(sql).fetchall()]
 
     # ── 已激活待归纳人员（2026-10-28 方案B：用户发任意消息自动录入，管理员后续归纳角色）──
@@ -1862,14 +2152,18 @@ class StateStore:
         - already        窗口内实例都已申请过（一次机会已用）
         - window_expired 有逾期实例但都超过 24h 申请窗口
         - none           根本没有逾期实例
+        - admin_disabled 有逾期实例但所属模板的管理员账号已停用，不受理（2026-11-05 口径：
+                        挂起没人能审的申请，不如明确告知员工；已发出的 30 分钟补交 token 不受影响）
         """
         clean_phone = (phone or "").strip()
         cur_dt = now_dt or self.now()
         now_s = format_dt(cur_dt)
         with self.lock, self.conn:
             rows = self.conn.execute(
-                "SELECT i.*, t.name AS template_name FROM task_instance i "
+                "SELECT i.*, t.name AS template_name, COALESCE(u.enabled, 1) AS owner_enabled "
+                "FROM task_instance i "
                 "JOIN task_template t ON t.template_id = i.template_id "
+                "LEFT JOIN admin_user u ON u.id = t.owner_id "
                 f"WHERE i.phone = ? AND i.status IN ('overdue','expired') AND {self._resubmit_scope_sql()} "
                 "ORDER BY i.deadline_at",
                 (clean_phone,),
@@ -1887,7 +2181,16 @@ class StateStore:
             if not inside:
                 return {"result": "window_expired" if outside else "none", "items": []}
 
-            fresh = [d for d in inside if not str(d.get("resubmit_status") or "").strip()]
+            active: List[Dict[str, Any]] = []
+            for d in inside:
+                # ⚠️ 不能写 `int(v or 1)`：v=0（停用）会被 `or` 短路成 1，停用判定整个失效。
+                v = d.get("owner_enabled")
+                if v is None or int(v) == 1:
+                    active.append(d)
+            if not active:
+                return {"result": "admin_disabled", "items": inside}
+
+            fresh = [d for d in active if not str(d.get("resubmit_status") or "").strip()]
             if not fresh:
                 return {"result": "already", "items": []}
 

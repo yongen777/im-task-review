@@ -54,12 +54,21 @@ MUST_CHANGE_ALLOWED_ENDPOINTS = {
     ("GET", "/api/admin/me"),
     ("POST", "/api/admin/change-password"),
     ("POST", "/api/admin/logout"),
+    # 2026-11-05：切回超管不依赖代管账号是否已改密（代登录一个未改密的新号也要能一键切回）
+    ("POST", "/api/admin/accounts/unassume"),
 }
 
 # ── 2026-11-04 多管理员分级（超级管理员 + 分级管理员）─────────────────────
 SUPER_ADMIN_LEVEL = "super_admin"
 # 超管允许的写操作：只有账号管理与通道配置（全局设置），业务数据一律只读
-SUPER_ADMIN_WRITE_ALLOW_PREFIXES = ("/api/admin/accounts", "/api/admin/channel-config")
+SUPER_ADMIN_WRITE_ALLOW_PREFIXES = (
+    "/api/admin/accounts",
+    "/api/admin/channel-config",
+    # 2026-11-05 拍板：部门是全局共享库，增/改/删仅超管（分级只能通过导入自动建档）；
+    # 成员池是超管的全局名册操作入口（分级自己的增删改仍走角色内接口，仅作用于自己名下）。
+    "/api/admin/departments",
+    "/api/admin/member-pool",
+)
 SUPER_ADMIN_WRITE_ALLOW_EXACT = {"/api/admin/change-password", "/api/admin/logout"}
 
 
@@ -759,6 +768,8 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             "display_name": _prof.get("display_name") or sess["username"],
             "allowed_platforms": _prof.get("allowed_platforms") or [],
             "is_super_admin": _prof.get("role_level") == SUPER_ADMIN_LEVEL,
+            # 2026-11-05：代登录标识（前端显示代管徽章 + 「切回」入口）
+            "assumed": bool(sess.get("parent_sid")),
         }
 
     @router.post("/change-password")
@@ -873,6 +884,104 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return biz_error_response(exc)
         return {"ok": True, **res, "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD}
 
+    @router.post("/accounts/{admin_id}/assume")
+    async def assume_account(admin_id: int, request: Request):
+        """超管免退出切换身份（2026-11-05 用户需求）：以超管权限为目标分级管理员签发新会话。
+
+        切换后即以目标身份操作（可建模板/发消息），全程审计 admin.assume；
+        目标须启用、不能代超管；切回由前端用保存的原超管会话，不走本接口（代管身份是 sub_admin，重复调自然 403）。
+        """
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        target = state.get_admin_by_id(int(admin_id))
+        if not target:
+            return error_response(404, "NOT_FOUND", "目标账号不存在")
+        if str(target.get("role_level") or "") == SUPER_ADMIN_LEVEL:
+            return error_response(400, "VALIDATION_FAILED", "不能代超级管理员账号登录")
+        if not int(target.get("enabled") or 0):
+            return error_response(400, "VALIDATION_FAILED", "目标账号已被停用，不能代登录")
+        new_sess = state.create_admin_session(int(target["id"]), parent_sid=str(sess["sid"]))
+        prof = state.parse_admin_account(target)
+        state.write_audit(
+            username=sess["username"], action="admin.assume", target_type="admin_user",
+            target_id=str(target["username"]), detail={"as": str(target["username"])},
+        )
+        resp = JSONResponse(status_code=200, content={
+            "ok": True, "csrf_token": new_sess["csrf"],
+            "profile": {
+                "username": str(target["username"]),
+                "display_name": str(prof.get("display_name") or target["username"]),
+                "role_level": str(prof.get("role_level") or StateStore.SUB_ADMIN),
+                "allowed_platforms": prof.get("allowed_platforms") or [],
+                "is_super_admin": False,
+            },
+        })
+        resp.set_cookie(key=COOKIE_NAME, value=new_sess["sid"], max_age=SESSION_TTL_HOURS * 3600,
+                        httponly=True, samesite="lax", path="/")
+        return resp
+
+    @router.post("/accounts/unassume")
+    async def unassume_account(request: Request):
+        """代管身份一键切回原超级管理员（2026-11-05）。HttpOnly Cookie 前端拿不到 sid，
+        所以切回必须在服务端做：代管会话上挂了 parent_sid，这里反查原超管会话并重新下发 Cookie。
+        普通分级管理员会话没有 parent_sid，自然 400 —— 不需要额外权限判断。"""
+        sess, err = require_session(request, state, check_csrf=True, allow_must_change=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        parent_sid = str(sess.get("parent_sid") or "")
+        if not parent_sid:
+            return error_response(400, "VALIDATION_FAILED", "当前会话不是代登录会话，无需切回")
+        parent_sess = state.get_admin_session(parent_sid)
+        if not parent_sess:
+            return error_response(400, "SESSION_EXPIRED", "原超级管理员会话已失效，请重新登录")
+        parent_user = state.get_admin_by_id(int(parent_sess["user_id"]))
+        if not parent_user or str(parent_user.get("role_level") or "") != SUPER_ADMIN_LEVEL:
+            return error_response(400, "SESSION_EXPIRED", "原会话已不再属于超级管理员，请重新登录")
+        prof = state.parse_admin_account(parent_user)
+        state.write_audit(
+            username=sess["username"], action="admin.unassume", target_type="admin_user",
+            target_id=str(parent_user["username"]), detail={"from": str(sess["username"])},
+        )
+        resp = JSONResponse(status_code=200, content={
+            "ok": True, "csrf_token": parent_sess["csrf"],
+            "profile": {
+                "username": str(parent_user["username"]),
+                "display_name": str(prof.get("display_name") or parent_user["username"]),
+                "role_level": SUPER_ADMIN_LEVEL,
+                "allowed_platforms": prof.get("allowed_platforms") or [],
+                "is_super_admin": True,
+            },
+        })
+        resp.set_cookie(key=COOKIE_NAME, value=parent_sid, max_age=SESSION_TTL_HOURS * 3600,
+                        httponly=True, samesite="lax", path="/")
+        return resp
+
+    @router.post("/accounts/{admin_id}/transfer")
+    async def transfer_account_data(admin_id: int, request: Request):
+        """定向转移：把该管理员名下全部业务数据移交给另一分级管理员（删除前「先转移」选项用）。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        body = await _read_json_body(request)
+        to_id = body.get("to_admin_id")
+        if to_id is None:
+            return error_response(400, "VALIDATION_FAILED", "缺少接替管理员 to_admin_id")
+        try:
+            res = state.transfer_owner_between(int(admin_id), int(to_id), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return res
+
     @router.delete("/accounts/{admin_id}")
     async def delete_account(admin_id: int, request: Request):
         sess, err = require_session(request, state, check_csrf=True)
@@ -882,11 +991,18 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         forbidden = _require_super(state, sess)
         if forbidden is not None:
             return forbidden
+        cfg = getattr(request.app.state, "config", None)
+        uploads_dir = cfg.uploads_dir if cfg is not None else None
+        # 2026-11-05 级联删除（不可逆）：执行前先做一次 DB 文件级备份 —— 备份是唯一恢复手段，失败即拒绝删除。
         try:
-            state.delete_admin_account(admin_id, actor=sess["username"])
+            backup_path = state.backup_database(tag=f"purge-{int(admin_id)}")
+        except Exception as exc:  # noqa: BLE001 - 备份失败必须拦住不可逆删除
+            return error_response(500, "BACKUP_FAILED", f"删除前备份失败，已中止删除：{exc}")
+        try:
+            res = state.delete_admin_account(int(admin_id), actor=sess["username"], uploads_dir=uploads_dir)
         except BizError as exc:
             return biz_error_response(exc)
-        return {"ok": True}
+        return {"ok": True, **res, "backup": backup_path}
 
     @router.get("/global-activated-members")
     async def global_activated_members(
@@ -1092,6 +1208,9 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
         body = await _read_json_body(request)
         try:
             dept = state.create_department(str(body.get("name") or ""), actor=sess["username"])
@@ -1105,6 +1224,9 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
         body = await _read_json_body(request)
         try:
             dept = state.update_department(int(dept_id), str(body.get("name") or ""), actor=sess["username"])
@@ -1118,11 +1240,75 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
         try:
             state.delete_department(int(dept_id), actor=sess["username"])
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True}
+
+    # ── 全平台成员池（2026-11-05）：超管按「人」管理的全局名册，操作全局同步到所有管理员名下 ──
+    @router.get("/member-pool")
+    async def list_member_pool(request: Request, q: Optional[str] = None, size: int = 500):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        return {"ok": True, "items": state.list_member_pool(q=q or "", size=size)}
+
+    @router.put("/member-pool/{phone}/status")
+    async def member_pool_set_status(phone: str, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        body = await _read_json_body(request)
+        try:
+            res = state.member_pool_set_status(phone, bool(body.get("enabled")), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return res
+
+    @router.put("/member-pool/{phone}")
+    async def member_pool_update_profile(phone: str, request: Request):
+        """全局改姓名/部门。⛔ 接口不收手机号 —— 手机号永不可改（用户红线）。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        body = await _read_json_body(request)
+        try:
+            res = state.member_pool_update_profile(
+                phone, name=body.get("name"), dept=body.get("dept"), actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return res
+
+    @router.delete("/member-pool/{phone}")
+    async def member_pool_delete(phone: str, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        try:
+            res = state.member_pool_delete(phone, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return res
 
     # ==================================================================
     # §9.3 角色与成员接口
@@ -1133,10 +1319,12 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if err is not None:
             return err
         assert sess is not None
-
         _admin = _admin_profile(state, sess)
-        items = state.list_roles(platform=platform, owner_id=_owner_filter(_admin, owner_id))
-        return {"ok": True, "items": items}
+        _owner = _owner_filter(_admin, owner_id)
+        items = state.list_roles(platform=platform, owner_id=_owner)
+        # 2026-11-05：在册人数按「人」去重（一人多角色只算一次；停用也算在册），
+        # 替代前端把各角色人数加总的重复统计。
+        return {"ok": True, "items": items, "member_distinct_total": state.member_distinct_total(platform=platform, owner_id=_owner)}
 
     @router.post("/roles")
     async def create_role(request: Request):
