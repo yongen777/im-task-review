@@ -2,8 +2,10 @@
 """远程导入：把本地定义的春促片长 7 时点模板推到服务器后台（走 admin API，无需 SSH）。
 
 用法：
-    python scripts/remote_import_chuncu.py            # 默认推到 203.0.113.10:9013
-    环境变量 IMT_REMOTE_ADMIN_URL / IMT_REMOTE_ADMIN_USER / IMT_REMOTE_ADMIN_PASS 可覆盖
+    set IMT_REMOTE_ADMIN_URL=https://<后台地址>:9013
+    python scripts/remote_import_chuncu.py
+    环境变量 IMT_REMOTE_ADMIN_URL / IMT_REMOTE_ADMIN_USER / IMT_REMOTE_ADMIN_PASS 提供连接信息
+    （后台地址不设默认值，避免把某一套环境的地址写死在脚本里）
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.import_chuncu_templates import ROLE_NAME, TEMPLATES  # noqa: E402
 
-BASE = os.environ.get("IMT_REMOTE_ADMIN_URL", "http://203.0.113.10:9013")
+BASE = os.environ.get("IMT_REMOTE_ADMIN_URL", "").strip()
 USER = os.environ.get("IMT_REMOTE_ADMIN_USER", "admin")
 PASS = os.environ.get("IMT_REMOTE_ADMIN_PASS", "")
 
@@ -27,11 +29,19 @@ PASS = os.environ.get("IMT_REMOTE_ADMIN_PASS", "")
 class AdminClient:
     def __init__(self, base: str) -> None:
         p = urlparse(base)
-        self.host, self.port, self.conn = p.hostname, p.port or 80, None
+        if p.scheme not in ("http", "https") or not p.hostname:
+            raise SystemExit(f"后台地址非法：{base!r}（需形如 https://host:9013）")
+        self.https = p.scheme == "https"
+        self.host = p.hostname
+        self.port = p.port or (443 if self.https else 80)
         self.sid, self.csrf = "", ""
 
+    def _new_conn(self):
+        cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+        return cls(self.host, self.port, timeout=20)
+
     def _call(self, method: str, path: str, payload=None):
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=20)
+        conn = self._new_conn()
         headers = {"Content-Type": "application/json"}
         if self.sid:
             headers["Cookie"] = self.sid
@@ -45,7 +55,7 @@ class AdminClient:
         return resp.status, data
 
     def login(self, user: str, password: str) -> None:
-        conn = http.client.HTTPConnection(self.host, self.port, timeout=20)
+        conn = self._new_conn()
         body = json.dumps({"username": user, "password": password})
         conn.request("POST", "/api/admin/login", body=body, headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
@@ -66,9 +76,14 @@ class AdminClient:
 
 
 def main() -> int:
+    if not BASE:
+        raise SystemExit("缺少后台地址：请设置 IMT_REMOTE_ADMIN_URL（如 https://<地址>:9013）")
     if not PASS:
         raise SystemExit("缺少管理员密码：请设置 IMT_REMOTE_ADMIN_PASS 环境变量")
     cli = AdminClient(BASE)
+    if not cli.https and cli.host not in ("127.0.0.1", "localhost", "::1"):
+        # 登录会把密码与 CSRF 令牌放进请求体/请求头，明文 HTTP 在公网可被直接截获。
+        print("⚠ 目标为明文 HTTP：建议改用 HTTPS，或先建 SSH 隧道再指向 127.0.0.1")
     cli.login(USER, PASS)
 
     # 1) 角色：存在则复用

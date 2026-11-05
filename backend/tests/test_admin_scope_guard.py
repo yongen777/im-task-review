@@ -232,6 +232,33 @@ def test_data_isolation_between_sub_admins() -> None:
         store.close()
 
 
+def test_sub_admin_cannot_download_other_admins_upload() -> None:
+    """2026-11-05：附件下载按归属校验 —— 分级管理员拿别人的 ref 只能得到 404。"""
+    store = _store()
+    try:
+        store.upsert_admin_user("admin", "Admin@2026", must_change=False)
+        app = _app(store)
+        a = _sub(app, "a1")
+        b = _sub(app, "b1")
+        role_a = _role(a, "甲组")
+        tpl_a = a.post("/api/admin/templates", json={
+            "name": "甲的任务", "kind": "notice", "role_ids": [role_a],
+            "text_tpl": "干活", "notice_times": ["09:00"], "period": "day"}).json()["template_id"]
+
+        uploads = store.db.db_path.parent / "uploads"
+        uploads.mkdir(parents=True, exist_ok=True)
+        (uploads / "a-report.txt").write_text("甲的上报", encoding="utf-8")
+        store.create_upload_ref(
+            ref="ref-a-report", phone=PHONE_A, template_id=tpl_a, file_name="a-report.txt",
+            mime="text/plain", size=12, rel_path="a-report.txt",
+        )
+
+        assert a.get("/api/admin/uploads/ref-a-report").status_code == 200
+        assert b.get("/api/admin/uploads/ref-a-report").status_code == 404
+    finally:
+        store.close()
+
+
 def test_no_password_hash_in_any_account_response() -> None:
     """账号列表/创建/重置 都不能把口令哈希带出去（2026-11-04 生产实测发现过）。"""
     store = _store()

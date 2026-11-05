@@ -344,8 +344,16 @@ class Database:
         self.lock = threading.RLock()
         # 2026-10-29 P1-1：改为 DEFERRED 隔离级别，使 `with self.conn:` 真正开事务、
         # 中途异常能整体回滚；原来 isolation_level=None 是自动提交，多条写操作没有原子性。
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level="DEFERRED")
+        # 2026-11-05：补写锁等待。调度线程与请求线程共用一个连接，WAL 下写写仍互斥；
+        # 不设 timeout 时遇到瞬时竞争会立刻抛 database is locked，这里统一等 15s。
+        self.conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            isolation_level="DEFERRED",
+            timeout=15.0,
+        )
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA busy_timeout=15000")
         self.init_schema()
 
     def init_schema(self) -> None:

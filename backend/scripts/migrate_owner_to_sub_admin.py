@@ -5,10 +5,10 @@
 分级管理员。以后我创建任务和管理成员就在你创建的这个我的分级管理员里。」
 
 做法：
-  1. 建（或复用）一个分级管理员账号：username=zhengjia, display_name=张三, 双平台授权；
+  1. 建（或复用）一个分级管理员账号（用户名与显示名由命令行显式指定，双平台授权）；
      初始密码走系统默认（Hds22999!）+ must_change=1（首次登录强制改密）。
   2. 把历史业务数据（role / member / task_template / task_instance）owner_id 从 1 改挂到它名下。
-  3. admin 保持 super_admin，历史数据即以「张三」这个分级管理员的名义存在。
+  3. admin 保持 super_admin，历史数据即以该分级管理员的名义存在。
 
 幂等：重复执行不会重复建号、不会重复迁移（transfer_owner 只改 != 目标的行）。
 回滚：把四张表 owner_id 改回 1 即可（脚本 --rollback）。
@@ -27,8 +27,8 @@ from app.state import StateStore  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True, help="SQLite 路径")
-    ap.add_argument("--username", default="zhengjia")
-    ap.add_argument("--display-name", default="张三")
+    ap.add_argument("--username", required=True, help="分级管理员登录名")
+    ap.add_argument("--display-name", required=True, help="分级管理员显示名")
     ap.add_argument("--rollback", action="store_true", help="把历史数据改回 owner_id=1（admin）")
     args = ap.parse_args()
 

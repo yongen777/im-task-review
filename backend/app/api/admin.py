@@ -1860,6 +1860,22 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         up = state.get_upload_ref(ref)
         if not up:
             return error_response(404, "NOT_FOUND", "附件不存在")
+        # 2026-11-05 多管理员隔离：附件 ref 是随机哈希，但分级管理员不应能跨管理员下载附件（IDOR）。
+        # 归属判定：模板属于自己，或该手机号在自己名下的角色里。不满足一律 404（不泄露存在性）。
+        _admin = _admin_profile(state, sess)
+        if not _is_super_admin(_admin):
+            own_id = int(_admin.get("id") or 0)
+            tpl = state.get_template(str(up.get("template_id") or ""), include_deleted=True) if up.get("template_id") else None
+            owns_tpl = bool(tpl) and int(tpl.get("owner_id") or 0) == own_id
+            if not owns_tpl:
+                with state.lock:
+                    in_own_role = state.conn.execute(
+                        "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                        "WHERE m.phone = ? AND r.owner_id = ? LIMIT 1",
+                        (str(up.get("phone") or ""), own_id),
+                    ).fetchone()
+                if in_own_role is None:
+                    return error_response(404, "NOT_FOUND", "附件不存在")
         cfg = getattr(request.app.state, "config", None)
         uploads_dir = cfg.uploads_dir if cfg is not None else (state.db.db_path.parent / "uploads")
         disk_path = uploads_dir / up["rel_path"]
