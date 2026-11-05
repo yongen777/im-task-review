@@ -1,11 +1,34 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { api } from './api';
-import { AdminAccountItem, AdminHealth, AdminMe, InstanceStats, RoleItem, TemplateItem } from './types';
+import {
+  AdminAccountItem,
+  AdminHealth,
+  AdminRoleLevel,
+  InstanceStats,
+  OfficePlatform,
+  RoleItem,
+  TemplateItem,
+} from './types';
 
-export type Platform = 'zdxlz' | 'wecom';
+export type Platform = OfficePlatform;
 const PLATFORM_KEY = 'imtask.platform';
 
+export interface CurrentAdminInfo {
+  id?: number;
+  username: string;
+  display_name?: string;
+  role_level?: AdminRoleLevel;
+  allowed_platforms?: OfficePlatform[];
+  must_change_password: boolean;
+}
+
 interface AppContextType {
+  me: CurrentAdminInfo;
+  isSuperAdmin: boolean;
+  allowedPlatforms: Platform[];
+  ownerFilter: string;
+  setOwnerFilter: (ownerId: string) => void;
+  adminAccounts: AdminAccountItem[];
   templates: TemplateItem[];
   roles: RoleItem[];
   stats: InstanceStats | null;
@@ -17,131 +40,151 @@ interface AppContextType {
   refreshTemplates: () => Promise<void>;
   refreshRoles: () => Promise<void>;
   refreshStats: () => Promise<void>;
-  /** 2026-11-04 多管理员分级：当前登录管理员档案 */
-  me: AdminMe | null;
-  /** 超级管理员（全局只读 + 账号管理） */
-  isSuperAdmin: boolean;
-  /** 本账号被授权的办公软件平台 */
-  allowedPlatforms: Platform[];
-  /** 2026-11-04：管理员账号列表（仅超管能拉到） */
-  adminAccounts: AdminAccountItem[];
-  /** 2026-11-04：超管的「所属管理员筛选」（'' = 全部） */
-  ownerFilter: string;
-  setOwnerFilter: (v: string) => void;
   refreshAdminAccounts: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | null>(null);
 
-export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.ReactNode }> = ({
+  me,
+  children,
+}) => {
+  const isSuperAdmin = me.role_level === 'super_admin' || me.username === 'admin';
+  const allowedPlatforms: Platform[] =
+    isSuperAdmin
+      ? ['zdxlz', 'wecom']
+      : Array.isArray(me.allowed_platforms) && me.allowed_platforms.length > 0
+        ? me.allowed_platforms
+        : ['zdxlz'];
+
   const [templates, setTemplates] = useState<TemplateItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [stats, setStats] = useState<InstanceStats | null>(null);
   const [health, setHealth] = useState<AdminHealth | null>(null);
-  const [loading, setLoading] = useState(true);
-  // 2026-11-04 多管理员分级：当前账号档案（角色级别 / 授权平台）
-  const [me, setMe] = useState<AdminMe | null>(null);
-  const [allowedPlatforms, setAllowedPlatforms] = useState<Platform[]>(['zdxlz', 'wecom']);
-  // 2026-11-04：超管的「所属管理员筛选」（'' = 全部）；分级管理员固定看自己（后端强制）
-  const [ownerFilter, setOwnerFilter] = useState<string>('');
   const [adminAccounts, setAdminAccounts] = useState<AdminAccountItem[]>([]);
-  const isSuperAdmin = me?.role_level === 'super_admin';
+  const [loading, setLoading] = useState(true);
+  // 超管默认看全部管理员 ('all')，也可切换看某个具体管理员 ('1', '2', ...)
+  const [ownerFilter, setOwnerFilterState] = useState<string>('all');
+
   const [platform, setPlatformState] = useState<Platform>(() => {
     const saved = (localStorage.getItem(PLATFORM_KEY) || '').trim() as Platform;
-    return saved === 'zdxlz' || saved === 'wecom' ? saved : 'zdxlz';
+    const candidate: Platform = saved === 'zdxlz' || saved === 'wecom' ? saved : 'zdxlz';
+    return allowedPlatforms.includes(candidate) ? candidate : allowedPlatforms[0] || 'zdxlz';
   });
 
-  const setPlatform = useCallback((p: Platform) => {
-    setPlatformState(p);
-    localStorage.setItem(PLATFORM_KEY, p);
+  // 当切换登录账号或权限变更时，若当前 platform 不在 allowedPlatforms 内，自动切到首个允许的平台
+  useEffect(() => {
+    if (!allowedPlatforms.includes(platform)) {
+      const fallback = allowedPlatforms[0] || 'zdxlz';
+      setPlatformState(fallback);
+      localStorage.setItem(PLATFORM_KEY, fallback);
+    }
+  }, [allowedPlatforms, platform]);
+
+  const setPlatform = useCallback(
+    (p: Platform) => {
+      if (!allowedPlatforms.includes(p)) return;
+      setPlatformState(p);
+      localStorage.setItem(PLATFORM_KEY, p);
+    },
+    [allowedPlatforms],
+  );
+
+  const setOwnerFilter = useCallback((ownerId: string) => {
+    setOwnerFilterState(ownerId || 'all');
   }, []);
 
-  // 首次进入（没有本地记忆）时，跟随后端「当前启用通道」。
+  // 首次进入（没有本地记忆）时，跟随后端「当前启用通道」（受 allowedPlatforms 约束）。
   useEffect(() => {
     if (localStorage.getItem(PLATFORM_KEY)) return;
     void (async () => {
       try {
-        const res = await fetch('/api/admin/channel-config', { credentials: 'same-origin' });
-        if (!res.ok) return;
-        const data = (await res.json()) as { active_channel?: string };
+        const res = await api.get<{ active_channel?: string }>('/api/admin/channel-config');
         if (!localStorage.getItem(PLATFORM_KEY)) {
-          setPlatformState(data.active_channel === 'wecom' || data.active_channel === 'wecom_aibot' ? 'wecom' : 'zdxlz');
+          const preferred: Platform =
+            res?.active_channel === 'wecom' || res?.active_channel === 'wecom_aibot'
+              ? 'wecom'
+              : 'zdxlz';
+          if (allowedPlatforms.includes(preferred)) {
+            setPlatformState(preferred);
+          }
         }
       } catch {
-        /* 读不到就保持默认 zdxlz */
+        /* 读不到就保持默认 */
       }
     })();
-  }, []);
+  }, [allowedPlatforms]);
+
+  const ownerQuery = isSuperAdmin && ownerFilter ? `&owner_id=${encodeURIComponent(ownerFilter)}` : '';
 
   const refreshTemplates = useCallback(async () => {
-    const ownerQ = ownerFilter ? `&owner_id=${encodeURIComponent(ownerFilter)}` : '';
-    const res = await api.get<{ ok: boolean; items: TemplateItem[] }>(`/api/admin/templates?size=500&platform=${platform}${ownerQ}`);
+    const res = await api.get<{ ok: boolean; items: TemplateItem[] }>(
+      `/api/admin/templates?size=500&platform=${platform}${ownerQuery}`,
+    );
     setTemplates(res.items || []);
-  }, [platform, ownerFilter]);
+  }, [platform, ownerQuery]);
 
   const refreshRoles = useCallback(async () => {
-    const ownerQ = ownerFilter ? `&owner_id=${encodeURIComponent(ownerFilter)}` : '';
-    const res = await api.get<{ ok: boolean; items: RoleItem[] }>(`/api/admin/roles?platform=${platform}${ownerQ}`);
+    const res = await api.get<{ ok: boolean; items: RoleItem[] }>(
+      `/api/admin/roles?platform=${platform}${ownerQuery}`,
+    );
     setRoles(res.items || []);
-  }, [platform, ownerFilter]);
+  }, [platform, ownerQuery]);
 
   const refreshStats = useCallback(async () => {
-    const res = await api.get<InstanceStats>(`/api/admin/instances/stats?platform=${platform}`);
+    const res = await api.get<InstanceStats>(
+      `/api/admin/instances/stats?platform=${platform}${ownerQuery}`,
+    );
     setStats(res);
-  }, [platform]);
+  }, [platform, ownerQuery]);
+
+  const refreshAdminAccounts = useCallback(async () => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>('/api/admin/accounts');
+      setAdminAccounts(res.items || []);
+    } catch {
+      /* ignore */
+    }
+  }, [isSuperAdmin]);
 
   const refreshAll = useCallback(async () => {
     try {
-      const ownerQ = ownerFilter ? `&owner_id=${encodeURIComponent(ownerFilter)}` : '';
       const [tplRes, roleRes, statRes, healthRes] = await Promise.all([
-        api.get<{ ok: boolean; items: TemplateItem[] }>(`/api/admin/templates?size=500&platform=${platform}${ownerQ}`),
-        api.get<{ ok: boolean; items: RoleItem[] }>(`/api/admin/roles?platform=${platform}${ownerQ}`),
-        api.get<InstanceStats>(`/api/admin/instances/stats?platform=${platform}`),
+        api.get<{ ok: boolean; items: TemplateItem[] }>(
+          `/api/admin/templates?size=500&platform=${platform}${ownerQuery}`,
+        ),
+        api.get<{ ok: boolean; items: RoleItem[] }>(
+          `/api/admin/roles?platform=${platform}${ownerQuery}`,
+        ),
+        api.get<InstanceStats>(`/api/admin/instances/stats?platform=${platform}${ownerQuery}`),
         api.get<AdminHealth>('/api/admin/health'),
       ]);
       setTemplates(tplRes.items || []);
       setRoles(roleRes.items || []);
       setStats(statRes);
       setHealth(healthRes);
+      if (isSuperAdmin) {
+        await refreshAdminAccounts();
+      }
     } finally {
       setLoading(false);
     }
-  }, [platform, ownerFilter]);
-
-  /** 2026-11-04：拉管理员账号列表（仅超管有权限，拉不到就静默为空） */
-  const refreshAdminAccounts = useCallback(async () => {
-    try {
-      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>('/api/admin/accounts');
-      setAdminAccounts(res.items || []);
-    } catch {
-      setAdminAccounts([]);
-    }
-  }, []);
+  }, [platform, ownerQuery, isSuperAdmin, refreshAdminAccounts]);
 
   useEffect(() => {
-    refreshAll();
+    void refreshAll();
   }, [refreshAll]);
-
-  // 2026-11-04：读取当前账号档案；授权平台变化时把当前平台夹回授权范围内
-  useEffect(() => {
-    void (async () => {
-      try {
-        const res = await api.get<AdminMe>('/api/admin/me');
-        setMe(res);
-        const allowed = (res.allowed_platforms || []).filter((p): p is Platform => p === 'zdxlz' || p === 'wecom');
-        if (allowed.length) {
-          setAllowedPlatforms(allowed);
-          setPlatformState((prev) => (allowed.includes(prev) ? prev : allowed[0]));
-        }
-      } catch {
-        /* 读不到就按默认双平台处理 */
-      }
-    })();
-  }, []);
 
   return (
     <AppContext.Provider
       value={{
+        me,
+        isSuperAdmin,
+        allowedPlatforms,
+        ownerFilter,
+        setOwnerFilter,
+        adminAccounts,
         templates,
         roles,
         stats,
@@ -153,12 +196,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         refreshTemplates,
         refreshRoles,
         refreshStats,
-        me,
-        isSuperAdmin,
-        allowedPlatforms,
-        adminAccounts,
-        ownerFilter,
-        setOwnerFilter,
         refreshAdminAccounts,
       }}
     >

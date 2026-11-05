@@ -32,6 +32,9 @@ export function plainError(raw: string): string {
   return humanizeMessage(raw, '操作未成功，请稍后重试');
 }
 
+/* 2026-11-04 分级管理员：初始密码常量（与后端 DEFAULT_SUB_ADMIN_PASSWORD 对齐；全角！在登录/改密两侧都已做归一） */
+export const DEFAULT_SUB_ADMIN_PASSWORD = 'Hds22999!';
+
 /* ================================================================== */
 /* IMTask 内存态后端状态机（已清除全部假测试数据，接入市场部春促真实清单） */
 /* ================================================================== */

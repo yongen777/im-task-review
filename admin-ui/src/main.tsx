@@ -9,7 +9,11 @@ import './index.css';
 
 interface MeResponse {
   ok: boolean;
+  id?: number;
   username: string;
+  display_name?: string;
+  role_level?: 'super_admin' | 'sub_admin';
+  allowed_platforms?: Array<'zdxlz' | 'wecom'>;
   must_change_password: boolean;
   csrf_token: string;
 }

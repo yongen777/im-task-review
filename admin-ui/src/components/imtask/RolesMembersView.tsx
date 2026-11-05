@@ -14,39 +14,38 @@ import {
   Phone,
   User,
   ShieldCheck,
-  ArrowRightCircle,
-  UserCheck,
-  UserMinus,
   Search,
-  MessageSquare,
-  Link2Off,
-  AlertTriangle,
   Building2,
-  Globe,
+  RefreshCw,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { AdminScopeHeader } from './AdminScopeHeader';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
-import { GlobalActivatedMemberItem, RoleItem, RoleMemberItem } from '../../lib/types';
+import {
+  GlobalActivatedMemberItem,
+  RoleItem,
+  RoleMemberItem,
+} from '../../lib/types';
 
 export const RolesMembersView: React.FC = () => {
-  const { roles, refreshRoles, platform, isSuperAdmin } = useAppStore();
+  const {
+    roles,
+    refreshRoles,
+    platform,
+    isSuperAdmin,
+    ownerFilter,
+    setOwnerFilter,
+    adminAccounts,
+  } = useAppStore();
   const toast = useToast();
-  /* 2026-11-04 多管理员分级：全局搜索已激活成员（激活关系跨管理员共享，免二次激活） */
-  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
-  const [globalQuery, setGlobalQuery] = useState('');
-  const [globalResults, setGlobalResults] = useState<GlobalActivatedMemberItem[]>([]);
-  const [globalBusy, setGlobalBusy] = useState(false);
 
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
   const [members, setMembers] = useState<RoleMemberItem[]>([]);
   const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberKeyword, setMemberKeyword] = useState('');
 
-  // 2026-11-03 新激活模型（后台先导入才能激活）：「已激活待归纳角色人员」整体下线，
-  // 成员只能从后台 CSV 导入/手动添加进入角色，再由用户自己走 H5 登记比对激活。
-
-  // 从当前角色移除成员的交互确认弹窗（移除=彻底删绑定，用户需重新登记激活）
+  // 从当前角色移除成员交互确认弹窗状态
   const [confirmRemoveRoleMember, setConfirmRemoveRoleMember] = useState<RoleMemberItem | null>(null);
   const [removingRoleMember, setRemovingRoleMember] = useState(false);
 
@@ -70,7 +69,7 @@ export const RolesMembersView: React.FC = () => {
   const [roleNameInput, setRoleNameInput] = useState('');
   const [savingRole, setSavingRole] = useState(false);
 
-  // P2-1: 成员「改名/停用」弹窗（手机号只读不可改，移除所属部门）
+  // P2-1: 成员「改名/停用」弹窗（手机号只读不可改）
   const [editingMember, setEditingMember] = useState<RoleMemberItem | null>(null);
   const [editMemberName, setEditMemberName] = useState('');
   const [editMemberDept, setEditMemberDept] = useState('');
@@ -82,10 +81,30 @@ export const RolesMembersView: React.FC = () => {
   const [memberRoleIds, setMemberRoleIds] = useState<string[]>([]);
   const [savingMember, setSavingMember] = useState(false);
 
-  // CSV 批量导入弹窗（仅手机号与用户名）
+  // CSV 批量导入弹窗（手机号,姓名,部门）
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [csvText, setCsvText] = useState('13900000000,张三,市场部');
   const [importing, setImporting] = useState(false);
+
+  // 跨管理员全局搜索已激活成员弹窗（若其他管理员已激活该成员，直接复用免二次激活）
+  const [globalSearchOpen, setGlobalSearchOpen] = useState(false);
+  const [globalKeyword, setGlobalKeyword] = useState('');
+  const [globalList, setGlobalList] = useState<GlobalActivatedMemberItem[]>([]);
+  const [loadingGlobal, setLoadingGlobal] = useState(false);
+  const [pullingPhone, setPullingPhone] = useState<string | null>(null);
+  const [selectedGlobalPhones, setSelectedGlobalPhones] = useState<string[]>([]);
+  const [batchPulling, setBatchPulling] = useState(false);
+
+  // 自动选中首个角色
+  useEffect(() => {
+    if (!selectedRoleId && roles.length > 0) {
+      setSelectedRoleId(roles[0].role_id);
+      return;
+    }
+    if (selectedRoleId && !roles.some((r) => r.role_id === selectedRoleId)) {
+      setSelectedRoleId(roles[0]?.role_id || '');
+    }
+  }, [selectedRoleId, roles]);
 
   const loadMembers = useCallback(
     async (roleId: string) => {
@@ -198,8 +217,6 @@ export const RolesMembersView: React.FC = () => {
     );
   }, [members, memberKeyword]);
 
-  // 2026-11-03 新激活模型：「已激活待归纳」列表整体下线，相关状态与处理函数一并移除。
-
   const handleOpenCreateRole = () => {
     setEditingRoleId('');
     setRoleNameInput('');
@@ -258,55 +275,20 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  /* 2026-11-04 多管理员分级：全局搜索已激活成员（跨管理员共享激活关系） */
-  const searchGlobalActivated = useCallback(async (keyword: string) => {
-    setGlobalBusy(true);
-    try {
-      const res = await api.get<{ ok: boolean; items: GlobalActivatedMemberItem[] }>(
-        `/api/admin/global-activated-members?q=${encodeURIComponent(keyword.trim())}&platform=${platform}`,
-      );
-      setGlobalResults(res.items || []);
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '全局搜索失败');
-    } finally {
-      setGlobalBusy(false);
-    }
-  }, [platform, toast]);
-
-  const pullGlobalMember = async (item: GlobalActivatedMemberItem) => {
-    if (!selectedRoleId) {
-      toast.warning('请先在左侧选择要拉入的角色分组');
-      return;
-    }
-    setGlobalBusy(true);
-    try {
-      const res = await api.post<{ ok: boolean; global_reused?: boolean }>(
-        `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`,
-        { phone: item.phone, name: item.name || item.phone, dept: item.dept || '' },
-      );
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
-      toast.success(
-        res.global_reused
-          ? `「${item.name || item.phone}」已拉入当前分组（该号码此前已激活，无需二次激活）`
-          : `「${item.name || item.phone}」已拉入当前分组`,
-        '已拉入',
-      );
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '拉入失败');
-    } finally {
-      setGlobalBusy(false);
-    }
-  };
-
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedRoleId) return;
     if (!newName.trim() || !newPhone.trim()) {
       toast.warning('请填写用户名和 11 位手机号');
       return;
-    }    setAddingMember(true);
+    }
+    setAddingMember(true);
     try {
-      await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
+      const res = await api.post<{
+        ok: boolean;
+        global_reused?: boolean;
+        source_owner_name?: string | null;
+      }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
         phone: newPhone.trim(),
         name: newName.trim(),
         dept: newDept,
@@ -316,12 +298,111 @@ export const RolesMembersView: React.FC = () => {
       setNewName('');
       setNewPhone('');
       setNewDept('');
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
-      toast.success(`成员「${addedName}」(${addedPhone}) 已添加至当前角色。`, '添加成功');
+      await Promise.all([
+        loadMembers(selectedRoleId),
+        refreshRoles(),
+        loadDepartments(),
+      ]);
+      if (res?.global_reused) {
+        toast.success(
+          `成员「${addedName}」(${addedPhone}) 已添加至当前角色。全局检测到该手机号已在系统激活，已自动点亮为「已激活」免二次绑定！`,
+          '全局激活自动复用',
+        );
+      } else {
+        toast.success(`成员「${addedName}」(${addedPhone}) 已添加至当前角色。`, '添加成功');
+      }
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '添加成员未成功');
     } finally {
       setAddingMember(false);
+    }
+  };
+
+  const loadGlobalActivated = useCallback(
+    async (q = '') => {
+      setLoadingGlobal(true);
+      try {
+        const res = await api.get<{ ok: boolean; items: GlobalActivatedMemberItem[] }>(
+          `/api/admin/global-activated-members?q=${encodeURIComponent(q)}&platform=${encodeURIComponent(platform)}`,
+        );
+        setGlobalList(res.items || []);
+      } catch (err) {
+        toast.error(err instanceof Error ? plainError(err.message) : '全局检索已激活成员失败');
+      } finally {
+        setLoadingGlobal(false);
+      }
+    },
+    [platform, toast],
+  );
+
+  const openGlobalSearchModal = () => {
+    setGlobalKeyword('');
+    setSelectedGlobalPhones([]);
+    setGlobalSearchOpen(true);
+    void loadGlobalActivated('');
+  };
+
+  const toggleSelectGlobalPhone = (phone: string) => {
+    setSelectedGlobalPhones((prev) =>
+      prev.includes(phone) ? prev.filter((p) => p !== phone) : [...prev, phone],
+    );
+  };
+
+  const handleBatchPullGlobalMembers = async () => {
+    if (!selectedRoleId) {
+      toast.warning('请先选择目标角色分组');
+      return;
+    }
+    const targets = globalList.filter(
+      (g) => selectedGlobalPhones.includes(g.phone) && !members.some((m) => m.phone === g.phone),
+    );
+    if (targets.length === 0) {
+      toast.warning('请先勾选尚未在当前角色中的已激活员工');
+      return;
+    }
+    setBatchPulling(true);
+    try {
+      for (const person of targets) {
+        await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
+          phone: person.phone,
+          name: person.name,
+          dept: person.dept || '',
+        });
+      }
+      setSelectedGlobalPhones([]);
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
+      toast.success(
+        `已批量将 ${targets.length} 名已激活成员拉入角色「${currentRole?.role_name || ''}」，直接保持已激活状态无需二次绑定。`,
+        '批量复用激活成功',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '批量拉入成员失败');
+    } finally {
+      setBatchPulling(false);
+    }
+  };
+
+  const handlePullGlobalMember = async (person: GlobalActivatedMemberItem) => {
+    if (!selectedRoleId) {
+      toast.warning('请先选择目标角色分组');
+      return;
+    }
+    setPullingPhone(person.phone);
+    try {
+      await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
+        phone: person.phone,
+        name: person.name,
+        dept: person.dept || '',
+      });
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
+      toast.success(
+        `已将全局已激活成员「${person.name}」(${person.phone}) 拉入角色「${currentRole?.role_name || ''}」，直接保持已激活状态无需二次绑定。`,
+        '直接复用激活成功',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '拉入成员失败');
+    } finally {
+      setPullingPhone(null);
     }
   };
 
@@ -336,7 +417,7 @@ export const RolesMembersView: React.FC = () => {
       );
       setMemberRoleIds((res.items || []).map((r) => String(r.role_id)));
     } catch {
-      /* 拉不到就不置灰；提交时后端按 DUPLICATE 跳��，不会重复插入 */
+      /* 拉不到就不置灰；提交时后端按 DUPLICATE 跳过，不会重复插入 */
     }
   };
 
@@ -454,7 +535,25 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  // 确认从当前角色移除成员：彻底删除绑定 + 清未完成实例（用户需重新登记激活）
+  const handleToggleRoleStatus = async (r: RoleItem) => {
+    const nextEnabled = r.enabled === false;
+    try {
+      await api.put(`/api/admin/roles/${encodeURIComponent(r.role_id)}`, {
+        enabled: nextEnabled,
+      });
+      await refreshRoles();
+      toast.success(
+        nextEnabled
+          ? `角色分组「${r.role_name}」已启用。`
+          : `角色分组「${r.role_name}」已停用，名下派单将暂停。`,
+        nextEnabled ? '角色已启用' : '角色已停用',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '切换角色状态失败');
+    }
+  };
+
+  // 确认从当前角色移除成员（保留全局激活绑定与其他角色关系）
   const handleConfirmRemoveFromRole = async () => {
     if (!selectedRoleId || !confirmRemoveRoleMember) return;
     const member = confirmRemoveRoleMember;
@@ -467,8 +566,8 @@ export const RolesMembersView: React.FC = () => {
       setConfirmRemoveRoleMember(null);
       await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
-        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」移出（该平台会话绑定已解除；成员需重新完成 H5 登记激活后才能再接收任务）。`,
-        '已移出角色',
+        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」中移除（全局激活绑定状态保留）。`,
+        '已从角色移除',
       );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '移出角色成员失败');
@@ -491,26 +590,30 @@ export const RolesMembersView: React.FC = () => {
         added: number;
         updated: number;
         skipped: number;
+        global_reused?: number;
+        auto_created_depts?: string[];
         errors: Array<{ line: number; reason: string }>;
-        departments_created?: string[];
       }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/import`, {
         csv_text: csvText,
       });
-      /* 导入可能自动新建部门 → 刷新部门列表，否则新部门在下拉/部门管理里看不到 */
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles(), loadDepartments()]);
+      await Promise.all([
+        loadMembers(selectedRoleId),
+        refreshRoles(),
+        loadDepartments(),
+      ]);
       setImportModalOpen(false);
-      const createdDepts = res.departments_created || [];
-      const deptNote = createdDepts.length
-        ? `，并自动新建 ${createdDepts.length} 个部门（${createdDepts.join('、')}）`
-        : '';
+      const reusedNote =
+        res.global_reused && res.global_reused > 0
+          ? `（其中 ${res.global_reused} 人已在全平台激活，自动复用免二次激活）`
+          : '';
       if (res.errors && res.errors.length > 0) {
         toast.warning(
-          `新增 ${res.added} 人、更新 ${res.updated} 人${deptNote}；有 ${res.errors.length} 行格式不符已跳过（第 ${res.errors[0].line} 行：${res.errors[0].reason}）。`,
+          `新增 ${res.added} 人、更新 ${res.updated} 人${reusedNote}；有 ${res.errors.length} 行格式不符已跳过（第 ${res.errors[0].line} 行：${res.errors[0].reason}）。`,
           '导入部分完成',
         );
       } else {
         toast.success(
-          `批量导入成功：新增 ${res.added} 名成员，更新 ${res.updated} 名现有成员${deptNote}。`,
+          `批量导入成功：新增 ${res.added} 名成员，更新 ${res.updated} 名现有成员${reusedNote}。`,
           'CSV 导入完成',
         );
       }
@@ -523,27 +626,23 @@ export const RolesMembersView: React.FC = () => {
 
   return (
     <div className="space-y-5">
-      {/* 顶部区域：页面标题 + 业务角色分组横向导航带 */}
+      {/* 顶部标题与管理员视角（统一标准组件） */}
+      <AdminScopeHeader
+        title="角色与成员名册"
+        badge={`共 ${roles.length} 个角色分组`}
+        description={
+          <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span>管理各业务角色下的成员名单（支持姓名、手机号、部门；跨管理员导入自动匹配复用全局已激活状态）</span>
+            <span aria-hidden="true" className="text-slate-300">·</span>
+            <span>
+              在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{totalRosterCount}</strong> 人
+            </span>
+          </span>
+        }
+      />
+
+      {/* 业务角色分组横向选择卡片带 */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs p-5 space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
-          <div>
-            <h2 className="text-lg font-bold text-slate-900 tracking-tight">角色与成员名册</h2>
-            <p className="text-xs text-slate-500 mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
-              <span>管理各业务角色下的成员名单（支持姓名、手机号、部门）</span>
-              <span aria-hidden="true" className="text-slate-300">·</span>
-              <span>
-                当前共 <strong className="font-semibold text-slate-800 tabular-nums">{roles.length}</strong> 个角色分组
-              </span>
-              <span aria-hidden="true" className="text-slate-300">·</span>
-              <span>
-                在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{totalRosterCount}</strong> 人
-              </span>
-            </p>
-            <p className="text-[11px] text-slate-400 mt-1">
-              激活方式：先把成员导入/添加到角色，成员再给机器人发任意消息 → 点击登记链接完成比对激活；未导入的成员无法激活。
-            </p>
-          </div>
-        </div>
 
         {/* 业务角色分组横向选择卡片带 */}
         <div>
@@ -584,33 +683,48 @@ export const RolesMembersView: React.FC = () => {
                         <div className="font-bold text-slate-900 text-sm truncate">
                           {r.role_name}
                         </div>
-                        {/* 2026-11-04 多管理员分级：超管可见「创建人」 */}
-                        {isSuperAdmin && (
-                          <div className="text-[10px] text-slate-400 font-medium truncate">
-                            创建人：{r.owner_display_name || r.owner_username || '—'}
+                        {isSuperAdmin && r.owner_username && (
+                          <div className="text-[10px] text-slate-400 truncate mt-0.5">
+                            创建人：{r.owner_display_name || r.owner_username}
                           </div>
                         )}
                       </div>
                     </div>
 
                     <div
-                      className="flex items-center gap-0.5 shrink-0"
+                      className="flex items-center gap-1 shrink-0"
                       onClick={(e) => e.stopPropagation()}
                     >
                       <button
-                        onClick={() => handleOpenEditRole(r)}
-                        className="p-1.5 rounded-lg hover:bg-white text-slate-400 hover:text-blue-600 cursor-pointer transition-colors"
-                        title="修改角色名称"
+                        type="button"
+                        onClick={() => void handleToggleRoleStatus(r)}
+                        className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border cursor-pointer transition-colors ${
+                          r.enabled !== false
+                            ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
+                            : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200'
+                        }`}
+                        title={r.enabled !== false ? '点击停用整个角色分组' : '点击启用整个角色分组'}
                       >
-                        <Edit3 className="w-3.5 h-3.5" />
+                        {r.enabled !== false ? '已启用' : '已停用'}
                       </button>
-                      <button
-                        onClick={() => handleDeleteRole(r)}
-                        className="p-1.5 rounded-lg hover:bg-white text-slate-400 hover:text-rose-600 cursor-pointer transition-colors"
-                        title="删除角色"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      {!isSuperAdmin && (
+                        <>
+                          <button
+                            onClick={() => handleOpenEditRole(r)}
+                            className="p-1.5 rounded-lg hover:bg-white text-slate-400 hover:text-blue-600 cursor-pointer transition-colors"
+                            title="修改角色名称"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteRole(r)}
+                            className="p-1.5 rounded-lg hover:bg-white text-slate-400 hover:text-rose-600 cursor-pointer transition-colors"
+                            title="删除角色"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -638,7 +752,7 @@ export const RolesMembersView: React.FC = () => {
               );
             })}
 
-            {/* 快捷新建角色虚线卡片（2026-11-04：超管只读，不显示新建入口） */}
+            {/* 快捷新建角色虚线卡片（仅分级管理员可新建角色） */}
             {!isSuperAdmin && (
               <button
                 type="button"
@@ -653,46 +767,48 @@ export const RolesMembersView: React.FC = () => {
         </div>
       </div>
 
-      {/* 主工作区：当前角色成员名册（新激活模型：待归纳列表已下线，占满整行） */}
+      {/* 下方主工作区：全宽展示当前角色成员名册（已按线上最新版本移除右侧待归纳池面板） */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
-          {currentRole ? (
-            <>
-              {/* 第一层：角色名册标题 + 搜索框 + CSV 批量导入（合一清爽顶栏） */}
-              <div className="p-4 sm:px-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-bold text-slate-900 text-base">
-                      {currentRole.role_name}
-                    </h3>
-                    <span className="text-xs text-slate-400 font-normal tabular-nums">
-                      · {filteredMembers.length} / {members.length} 名成员
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    管理该角色下的派单人员名单；从角色「移除」会同时解除该成员在该平台的会话绑定，需重新登记激活
-                  </p>
+        {currentRole ? (
+          <>
+            {/* 第一层：角色名册标题 + 搜索框 + 全局搜索已激活成员 + CSV 批量导入 */}
+            <div className="p-4 sm:px-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-slate-900 text-base">
+                    {currentRole.role_name}
+                  </h3>
+                  <span className="text-xs text-slate-400 font-normal tabular-nums">
+                    · {filteredMembers.length} / {members.length} 名成员
+                  </span>
                 </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  管理该角色下的派单人员名单；添加或导入手机号时自动全局匹配已激活人员，免二次激活
+                </p>
+              </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <div className="relative">
-                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                    <input
-                      type="text"
-                      value={memberKeyword}
-                      onChange={(e) => setMemberKeyword(e.target.value)}
-                      placeholder="搜索用户名或手机号…"
-                      className="bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-1.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 w-44 sm:w-48 transition-colors"
-                    />
-                  </div>
-                  <button
-                    onClick={() => setGlobalSearchOpen(true)}
-                    className="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-                    title="全局搜索已激活成员：激活关系跨管理员共享，搜到即可直接拉入本分组，无需二次激活"
-                  >
-                    <Globe className="w-3.5 h-3.5" />
-                    <span>全局搜索已激活成员</span>
-                  </button>
-                  {!isSuperAdmin && (
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={memberKeyword}
+                    onChange={(e) => setMemberKeyword(e.target.value)}
+                    placeholder="搜索用户名或手机号…"
+                    className="bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-1.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 w-44 sm:w-52 transition-colors"
+                  />
+                </div>
+                {!isSuperAdmin && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={openGlobalSearchModal}
+                      className="px-3 py-1.5 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                      title="跨管理员全局搜索已在系统激活过的成员，一键拉入当前角色免二次激活"
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>全局搜索已激活成员</span>
+                    </button>
                     <button
                       onClick={() => setImportModalOpen(true)}
                       className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
@@ -700,12 +816,24 @@ export const RolesMembersView: React.FC = () => {
                       <Upload className="w-3.5 h-3.5" />
                       <span>CSV 批量导入</span>
                     </button>
-                  )}
-                </div>
+                  </>
+                )}
+                {isSuperAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => setDeptModalOpen(true)}
+                    className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
+                    title="配置部门选项（成员表单与员工 H5 登记页共用）"
+                  >
+                    <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                    <span>部门管理</span>
+                  </button>
+                )}
               </div>
+            </div>
 
-              {/* 第二层：单行快速添加成员表单（姓名 + 手机号 + 部门）—— 超管只读，不显示 */}
-              {!isSuperAdmin && (
+            {/* 第二层：单行快速添加成员表单（仅分级管理员可添加成员） */}
+            {!isSuperAdmin && (
               <form
                 onSubmit={handleAddMember}
                 className="px-4 sm:px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex flex-col lg:flex-row flex-wrap items-stretch lg:items-center gap-2.5 text-xs"
@@ -766,107 +894,133 @@ export const RolesMembersView: React.FC = () => {
                   <span>部门管理</span>
                 </button>
               </form>
-              )}
+            )}
 
-              {/* 第三层：成员列表表格（宽敞 5 列排版） */}
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
-                      <th className="py-3 pl-5 pr-3">成员姓名</th>
-                      <th className="py-3 px-3">手机号码</th>
-                      <th className="py-3 px-3">部门</th>
-                      <th className="py-3 px-3">激活状态</th>
-                      <th className="py-3 px-3">派单状态</th>
-                      <th className="py-3 pl-3 pr-5 text-right">操作</th>
+            {/* 第三层：成员列表表格 */}
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
+                    <th className="py-3 pl-5 pr-3">成员姓名</th>
+                    <th className="py-3 px-3">手机号码</th>
+                    <th className="py-3 px-3">部门</th>
+                    <th className="py-3 px-3">激活状态</th>
+                    <th className="py-3 px-3">派单状态</th>
+                    <th className="py-3 pl-3 pr-5 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-xs">
+                  {loadingMembers ? (
+                    <tr>
+                      <td colSpan={6} className="py-12 text-center text-slate-400">
+                        正在加载角色成员名册…
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 text-xs">
-                    {loadingMembers ? (
-                      <tr>
-                        <td colSpan={6} className="py-12 text-center text-slate-400">
-                          正在加载角色成员名册…
-                        </td>
-                      </tr>
-                    ) : filteredMembers.length === 0 ? (
-                      <tr>
-                        <td colSpan={6} className="py-12 text-center text-slate-400">
-                          该角色下暂无匹配成员，可在上方直接添加或用「CSV 批量导入」录入。
-                        </td>
-                      </tr>
-                    ) : (
-                      filteredMembers.map((m) => (
-                        <tr
-                          key={m.phone}
-                          className="hover:bg-slate-50/70 transition-colors group"
-                        >
-                          <td className="py-3.5 pl-5 pr-3">
-                            <div className="flex items-center gap-2.5">
-                              <div className="w-7 h-7 rounded-lg bg-slate-100 text-slate-700 font-bold text-xs flex items-center justify-center shrink-0">
-                                {m.name.slice(0, 1)}
-                              </div>
-                              <span className="font-bold text-slate-900">{m.name}</span>
+                  ) : filteredMembers.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-12 text-center text-slate-400">
+                        该角色下暂无匹配成员，可在上方直接添加、CSV 批量导入或点击「全局搜索已激活成员」拉入。
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredMembers.map((m) => (
+                      <tr
+                        key={m.phone}
+                        className="hover:bg-slate-50/70 transition-colors group"
+                      >
+                        <td className="py-3.5 pl-5 pr-3">
+                          <div className="flex items-center gap-2.5">
+                            <div className="w-7 h-7 rounded-lg bg-slate-100 text-slate-700 font-bold text-xs flex items-center justify-center shrink-0">
+                              {m.name.slice(0, 1)}
                             </div>
-                          </td>
-                          <td className="py-3.5 px-3 font-mono font-semibold text-slate-700 tabular-nums">
-                            {m.phone}
-                          </td>
-                          <td className="py-3.5 px-3 text-slate-600">
-                            {m.dept ? (
-                              <span className="inline-flex items-center gap-1">
-                                <Building2 className="w-3 h-3 text-slate-400" />
-                                <span>{m.dept}</span>
+                            <span className="font-bold text-slate-900">{m.name}</span>
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-3 font-mono font-semibold text-slate-700 tabular-nums">
+                          {m.phone}
+                        </td>
+                        <td className="py-3.5 px-3 text-slate-600">
+                          {m.dept ? (
+                            <span className="inline-flex items-center gap-1">
+                              <Building2 className="w-3 h-3 text-slate-400" />
+                              <span>{m.dept}</span>
+                            </span>
+                          ) : (
+                            <span className="text-slate-300">—</span>
+                          )}
+                        </td>
+                        <td className="py-3.5 px-3">
+                          {(() => {
+                            const on = m.activations
+                              ? m.activations[platform]
+                              : m.activation === 'activated';
+                            return on ? (
+                              <span
+                                className={`inline-flex items-center gap-1.5 text-xs font-medium ${
+                                  m.usable === false ? 'text-amber-700' : 'text-emerald-700'
+                                }`}
+                              >
+                                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                <span>{m.usable === false ? '需重激活' : '已激活'}</span>
                               </span>
                             ) : (
-                              <span className="text-slate-300">—</span>
+                              <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
+                                <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+                                <span>未激活</span>
+                              </span>
+                            );
+                          })()}
+                        </td>
+                        <td className="py-3.5 px-3">
+                          <button
+                            type="button"
+                            onClick={() => void handleQuickToggleMemberStatus(m)}
+                            title={isSuperAdmin ? '超级管理员点击快速切换派单状态' : '点击快速切换派单状态'}
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-colors ${
+                              m.status === 'active'
+                                ? 'bg-blue-50/70 text-blue-700 border-blue-200/80 hover:bg-blue-100/70'
+                                : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200/70'
+                            }`}
+                          >
+                            {m.status === 'active' ? (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
+                                <span>正常派单</span>
+                              </>
+                            ) : (
+                              <>
+                                <Ban className="w-3.5 h-3.5 text-slate-400" />
+                                <span>已停用</span>
+                              </>
                             )}
-                          </td>
-                          <td className="py-3.5 px-3">
-                            {(() => {
-                              const on = m.activations
-                                ? m.activations[platform]
-                                : m.activation === 'activated';
-                              return on ? (
-                                <span
-                                  className={`inline-flex items-center gap-1.5 text-xs font-medium ${
-                                    m.usable === false ? 'text-amber-700' : 'text-emerald-700'
-                                  }`}
-                                >
-                                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                  <span>{m.usable === false ? '需重激活' : '已激活'}</span>
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
-                                  <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                                  <span>未激活</span>
-                                </span>
-                              );
-                            })()}
-                          </td>
-                          <td className="py-3.5 px-3">
-                            <button
-                              onClick={() => handleQuickToggleMemberStatus(m)}
-                              title="点击快速切换派单状态"
-                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-colors ${
-                                m.status === 'active'
-                                  ? 'bg-blue-50/70 text-blue-700 border-blue-200/80 hover:bg-blue-100/70'
-                                  : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200/70'
-                              }`}
-                            >
-                              {m.status === 'active' ? (
-                                <>
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
-                                  <span>正常派单</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Ban className="w-3.5 h-3.5 text-slate-400" />
-                                  <span>已停用</span>
-                                </>
-                              )}
-                            </button>
-                          </td>
-                          <td className="py-3.5 pl-3 pr-5 text-right">
+                          </button>
+                        </td>
+                        <td className="py-3.5 pl-3 pr-5 text-right">
+                          {isSuperAdmin ? (
+                            <div className="inline-flex items-center justify-end gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => void handleQuickToggleMemberStatus(m)}
+                                className={`px-2.5 py-1 rounded-lg font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors border ${
+                                  m.status === 'active'
+                                    ? 'bg-rose-50 text-rose-700 hover:bg-rose-100 border-rose-200'
+                                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'
+                                }`}
+                              >
+                                {m.status === 'active' ? (
+                                  <>
+                                    <Ban className="w-3 h-3" />
+                                    <span>停用派单</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    <span>恢复派单</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          ) : (
                             <div className="inline-flex items-center justify-end gap-1.5">
                               <button
                                 onClick={() => void openAssignRolesModal(m)}
@@ -885,27 +1039,32 @@ export const RolesMembersView: React.FC = () => {
                               </button>
                               <button
                                 onClick={() => setConfirmRemoveRoleMember(m)}
-                                title="将该成员移出当前角色：删除其在当前平台的会话绑定并清除未完成任务（需重新登记激活）"
-                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-amber-50 text-slate-600 hover:text-amber-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                                title="将该成员从当前角色分组移除"
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
                               >
                                 <Trash2 className="w-3 h-3" />
                                 <span>移除</span>
                               </button>
                             </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <div className="p-14 text-center text-slate-400 text-xs">
-              请先在上方选择或新建一个业务角色分组。
+                          )}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
-          )}
+          </>
+        ) : (
+          <div className="p-14 text-center text-slate-400 text-xs">
+            请先在上方选择或新建一个业务角色分组。
+          </div>
+        )}
       </div>
+
+      {/* TODO 2026-11-05：全平台已激活成员总览与「停用/恢复派单」管控功能
+           依赖后端 PUT /api/admin/global-activated-members/{phone}/status 端点（当前未实现），
+           后端补齐后可恢复此区块（源码见 Google 交付包 RolesMembersView）。 */}
 
       {/* 2026-11-03 部门管理弹窗：配置部门选项（成员表单与员工 H5 登记页共用） */}
       {deptModalOpen && (
@@ -978,7 +1137,7 @@ export const RolesMembersView: React.FC = () => {
                           取消
                         </button>
                       </>
-                    ) : (
+                    ) : isSuperAdmin ? (
                       <>
                         <button
                           type="button"
@@ -998,7 +1157,7 @@ export const RolesMembersView: React.FC = () => {
                           <span>删除</span>
                         </button>
                       </>
-                    )}
+                    ) : null}
                   </div>
                 ))
               )}
@@ -1007,21 +1166,21 @@ export const RolesMembersView: React.FC = () => {
         </div>
       )}
 
-      {/* 交互确认弹窗：从当前角色移除成员（移除=删角色+清未完成实例+彻底删该平台绑定） */}
+      {/* 交互确认弹窗：从当前角色中移除成员 */}
       {confirmRemoveRoleMember && currentRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
               <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center shrink-0">
-                  <UserMinus className="w-5 h-5" />
+                <div className="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
                 </div>
                 <div>
                   <h3 className="font-bold text-slate-900 text-base">
-                    确认将成员移出该角色分组？
+                    确认将该成员移出当前角色？
                   </h3>
                   <p className="text-[11px] text-slate-500">
-                    移出后该成员将不再接收本角色任务提醒
+                    移出后仅从当前角色分组剔除，保留全平台已激活状态
                   </p>
                 </div>
               </div>
@@ -1043,13 +1202,13 @@ export const RolesMembersView: React.FC = () => {
                 <strong className="font-bold text-blue-700">「{currentRole.role_name}」</strong>{' '}
                 中移除。
               </p>
-              <div className="p-3 rounded-xl bg-amber-50/80 border border-amber-200/80 text-amber-900 space-y-1">
+              <div className="p-3 rounded-xl bg-emerald-50/80 border border-emerald-200/80 text-emerald-900 space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
-                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
-                  <span>将解除该成员在该办公软件的会话绑定</span>
+                  <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
+                  <span>保留全局已激活绑定状态</span>
                 </div>
-                <p className="text-[11px] text-amber-800">
-                  移出后：该角色的未完成任务实例一并清除；若该成员在其它平台仍有角色，其它平台不受影响；其在本平台的激活绑定将被彻底删除，需重新给机器人发消息、点击登记链接完成比对后才可再次接收任务（该成员未在后台导入前无法激活）。
+                <p className="text-[11px] text-emerald-800">
+                  该操作不会解除用户的办公软件会话绑定；后续任何管理员再次添加该手机号时，将自动识别为「已激活」免二次绑定。
                 </p>
               </div>
             </div>
@@ -1066,16 +1225,16 @@ export const RolesMembersView: React.FC = () => {
                 type="button"
                 onClick={handleConfirmRemoveFromRole}
                 disabled={removingRoleMember}
-                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
               >
-                {removingRoleMember ? '正在移出…' : '确认移出并解除绑定'}
+                {removingRoleMember ? '正在移除…' : '确认从当前角色移除'}
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* P2-1: 成员「改名/停用」弹窗（严禁改号，phone 只读，不含所属部门） */}
+      {/* P2-1: 成员「改名/停用」弹窗（严禁改号，phone 只读） */}
       {editingMember && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -1083,7 +1242,7 @@ export const RolesMembersView: React.FC = () => {
               <div>
                 <h3 className="font-bold text-slate-900 text-base">修改成员信息与派单状态</h3>
                 <p className="text-[11px] text-slate-400">
-                  支持修改用户名及启用/停用状态
+                  支持修改用户名、部门及启用/停用状态
                 </p>
               </div>
               <button
@@ -1315,83 +1474,7 @@ export const RolesMembersView: React.FC = () => {
         </div>
       )}
 
-      {/* 2026-11-04 多管理员分级：全局搜索已激活成员（跨管理员共享激活关系，免二次激活） */}
-      {globalSearchOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
-                  <Globe className="w-4 h-4 text-emerald-600" />
-                  <span>全局搜索已激活成员</span>
-                </h3>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  激活关系全平台共享：搜到的人已被激活过，拉入本分组后无需二次激活
-                </p>
-              </div>
-              <button onClick={() => setGlobalSearchOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                void searchGlobalActivated(globalQuery);
-              }}
-              className="flex items-center gap-2"
-            >
-              <div className="relative flex-1">
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                <input
-                  value={globalQuery}
-                  onChange={(e) => setGlobalQuery(e.target.value)}
-                  placeholder="按手机号或姓名搜索（留空看最近激活的）"
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs outline-none focus:bg-white focus:border-blue-500"
-                />
-              </div>
-              <button
-                type="submit"
-                disabled={globalBusy}
-                className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-xl cursor-pointer disabled:opacity-60 shrink-0"
-              >
-                {globalBusy ? '搜索中…' : '搜索'}
-              </button>
-            </form>
-            <div className="max-h-[46vh] overflow-y-auto divide-y divide-slate-100">
-              {globalResults.length === 0 ? (
-                <div className="py-8 text-center text-xs text-slate-400">
-                  {globalBusy ? '搜索中…' : '没有匹配的已激活成员（对方需先在密信/企微给机器人发一句话完成登记）'}
-                </div>
-              ) : (
-                globalResults.map((it) => (
-                  <div key={`${it.platform}-${it.phone}`} className="py-2.5 flex items-center gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-bold text-xs text-slate-800">{it.name || '（未登记姓名）'}</span>
-                        <span className="text-[11px] font-mono text-slate-500">{it.phone}</span>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 border border-slate-200">
-                          {it.platform === 'wecom' ? '企业微信' : '量子密信'}
-                        </span>
-                        {it.dept && <span className="text-[10px] text-slate-400">{it.dept}</span>}
-                      </div>
-                      <div className="text-[10px] text-emerald-600 mt-0.5">已激活 · 无需二次激活</div>
-                    </div>
-                    <button
-                      onClick={() => void pullGlobalMember(it)}
-                      disabled={globalBusy}
-                      className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white font-semibold text-[11px] cursor-pointer disabled:opacity-50 shrink-0"
-                    >
-                      拉入当前分组
-                    </button>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* CSV 批量导入弹窗（仅需手机号与用户名） */}
+      {/* CSV 批量导入弹窗（手机号,姓名,部门；若部门不存在自动创建） */}
       {importModalOpen && currentRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -1401,7 +1484,7 @@ export const RolesMembersView: React.FC = () => {
                   批量导入成员至「{currentRole.role_name}」
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  每行一条记录，格式：手机号,姓名,部门（部门可留空；支持自动跳过表头与去重更新）
+                  每行一条记录，格式：手机号,姓名,部门（新部门将自动建好，已激活手机号自动免二次激活）
                 </p>
               </div>
               <button
@@ -1436,6 +1519,145 @@ export const RolesMembersView: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 跨管理员全局搜索已激活成员弹窗（其他管理员已激活则免二次激活直接拉入） */}
+      {globalSearchOpen && currentRole && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-xl w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                  <span>全局搜索已激活成员 · 拉入「{currentRole.role_name}」</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  若其他管理员或机器人已激活过某位员工，无需员工二次激活，可直接搜索手机号或姓名拉入本角色
+                </p>
+              </div>
+              <button
+                onClick={() => setGlobalSearchOpen(false)}
+                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  autoFocus
+                  value={globalKeyword}
+                  onChange={(e) => {
+                    setGlobalKeyword(e.target.value);
+                    void loadGlobalActivated(e.target.value);
+                  }}
+                  placeholder="输入手机号、姓名或部门全局搜索已激活员工…"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadGlobalActivated(globalKeyword)}
+                className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-xl text-xs cursor-pointer"
+              >
+                检索
+              </button>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto divide-y divide-slate-100 border border-slate-200/80 rounded-xl">
+              {loadingGlobal ? (
+                <div className="py-10 text-center text-xs text-slate-400">
+                  正在检索全平台已激活成员库…
+                </div>
+              ) : globalList.length === 0 ? (
+                <div className="py-10 text-center text-xs text-slate-400">
+                  未检索到匹配的已激活员工，也可直接在单条添加或 CSV 导入中填入手机号。
+                </div>
+              ) : (
+                globalList.map((g) => {
+                  const alreadyInRole = members.some((m) => m.phone === g.phone);
+                  const isPulling = pullingPhone === g.phone;
+                  const checked = selectedGlobalPhones.includes(g.phone);
+                  return (
+                    <div
+                      key={g.phone}
+                      className="p-3.5 flex items-center justify-between gap-3 hover:bg-slate-50/70 text-xs"
+                    >
+                      <label className="flex items-center gap-3 min-w-0 cursor-pointer flex-1">
+                        <input
+                          type="checkbox"
+                          disabled={alreadyInRole}
+                          checked={alreadyInRole || checked}
+                          onChange={() => toggleSelectGlobalPhone(g.phone)}
+                          className="w-3.5 h-3.5 accent-blue-600 shrink-0"
+                        />
+                        <div className="min-w-0 space-y-0.5">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-bold text-slate-900">{g.name}</span>
+                            <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                              {g.phone}
+                            </span>
+                            {g.dept && (
+                              <span className="text-slate-500">· {g.dept}</span>
+                            )}
+                          </div>
+                          <div className="text-[11px] text-slate-400 flex items-center gap-2 flex-wrap">
+                            <span className="text-emerald-700 font-medium inline-flex items-center gap-1">
+                              <ShieldCheck className="w-3 h-3" />
+                              <span>已在系统激活（免二次激活）</span>
+                            </span>
+                          </div>
+                        </div>
+                      </label>
+
+                      {alreadyInRole ? (
+                        <span className="px-2.5 py-1.5 rounded-lg bg-slate-100 text-slate-400 font-semibold text-xs shrink-0">
+                          已在当前角色
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={isPulling || batchPulling}
+                          onClick={() => void handlePullGlobalMember(g)}
+                          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg text-xs inline-flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-60"
+                        >
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>{isPulling ? '拉入中…' : '直接拉入当前角色'}</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="flex items-center justify-between pt-1 text-xs">
+              <span className="text-slate-500">
+                已勾选 <strong className="text-slate-800">{selectedGlobalPhones.length}</strong> 人
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setGlobalSearchOpen(false)}
+                  className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
+                >
+                  关闭
+                </button>
+                <button
+                  type="button"
+                  disabled={batchPulling || selectedGlobalPhones.length === 0}
+                  onClick={() => void handleBatchPullGlobalMembers()}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl cursor-pointer disabled:opacity-50"
+                >
+                  {batchPulling ? '批量拉入中…' : `批量拉入已选成员 (${selectedGlobalPhones.length})`}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

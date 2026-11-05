@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import { PendingReviewItem } from '../../lib/types';
 
@@ -52,6 +53,7 @@ function fmtMD(ts?: string | null): string {
 
 export default function PendingReviewPanel({ refreshToken = 0, platform = '', onOpenDetail, onChanged }: Props) {
   const toast = useToast();
+  const { isSuperAdmin, ownerFilter } = useAppStore();
   const [data, setData] = useState<PendingReviewsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -63,8 +65,12 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
   const load = useCallback(async () => {
     setLoading(true);
     try {
+      const ownerParam =
+        isSuperAdmin && ownerFilter && ownerFilter !== 'all'
+          ? `&owner_id=${encodeURIComponent(ownerFilter)}`
+          : '';
       const res = await api.get<PendingReviewsResponse>(
-        `/api/admin/instances/pending-reviews?days=7${platform ? `&platform=${encodeURIComponent(platform)}` : ''}`,
+        `/api/admin/instances/pending-reviews?days=7${platform ? `&platform=${encodeURIComponent(platform)}` : ''}${ownerParam}`,
       );
       setData(res);
     } catch (err) {
@@ -73,7 +79,7 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
     } finally {
       setLoading(false);
     }
-  }, [platform]);
+  }, [platform, isSuperAdmin, ownerFilter]);
 
   useEffect(() => {
     void load();
@@ -160,6 +166,14 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
           <span className="text-slate-700 font-medium truncate max-w-[200px]" title={item.template_name}>
             {item.template_name}
           </span>
+          {isSuperAdmin && (item.owner_display_name || item.owner_username) && (
+            <>
+              <span className="text-slate-300">·</span>
+              <span className="text-slate-500">
+                创建人：{item.owner_display_name || item.owner_username}
+              </span>
+            </>
+          )}
           <span className="text-slate-300">·</span>
           <span className="text-slate-500 tabular-nums">
             {isResubmit ? '申请于' : '提交于'} {fmtMD(isResubmit ? item.resubmit_req_at : item.submitted_at)}
@@ -180,47 +194,49 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
               <Eye className="w-3 h-3" />
               <span>查看</span>
             </button>
-            {isResubmit ? (
-              <>
-                <button
-                  onClick={() => void approveResubmit(item)}
-                  disabled={busy}
-                  className="px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                >
-                  <Check className="w-3 h-3" />
-                  <span>通过补交</span>
-                </button>
-                <button
-                  onClick={() => void rejectResubmit(item)}
-                  disabled={busy}
-                  className="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                >
-                  <X className="w-3 h-3" />
-                  <span>拒绝补交</span>
-                </button>
-              </>
-            ) : (
-              <>
-                <button
-                  onClick={() => void approve(item)}
-                  disabled={busy}
-                  className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                >
-                  <Check className="w-3 h-3" />
-                  <span>通过</span>
-                </button>
-                <button
-                  onClick={() => {
-                    setRejectingId(rejecting ? null : item.id);
-                    setRejectReason('');
-                  }}
-                  disabled={busy}
-                  className="px-2 py-1 rounded-lg bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                >
-                  <X className="w-3 h-3" />
-                  <span>驳回</span>
-                </button>
-              </>
+            {!isSuperAdmin && (
+              isResubmit ? (
+                <>
+                  <button
+                    onClick={() => void approveResubmit(item)}
+                    disabled={busy}
+                    className="px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                  >
+                    <Check className="w-3 h-3" />
+                    <span>通过补交</span>
+                  </button>
+                  <button
+                    onClick={() => void rejectResubmit(item)}
+                    disabled={busy}
+                    className="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                  >
+                    <X className="w-3 h-3" />
+                    <span>拒绝补交</span>
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => void approve(item)}
+                    disabled={busy}
+                    className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                  >
+                    <Check className="w-3 h-3" />
+                    <span>通过</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setRejectingId(rejecting ? null : item.id);
+                      setRejectReason('');
+                    }}
+                    disabled={busy}
+                    className="px-2 py-1 rounded-lg bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                  >
+                    <X className="w-3 h-3" />
+                    <span>驳回</span>
+                  </button>
+                </>
+              )
             )}
           </span>
         </div>

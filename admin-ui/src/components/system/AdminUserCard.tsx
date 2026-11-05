@@ -1,20 +1,19 @@
 import React, { useEffect, useState } from 'react';
 import {
-  User,
   UserCog,
   Key,
-  Copy,
-  Check,
   LogOut,
   X,
   CheckCircle2,
   Shield,
   ChevronDown,
   AlertCircle,
+  Lock,
 } from 'lucide-react';
-import { api, plainError, setCsrfToken } from '../../lib/api';
+import { api, DEFAULT_SUB_ADMIN_PASSWORD, plainError, setCsrfToken } from '../../lib/api';
 import { useToast } from '../../lib/toast';
 import { useAppStore } from '../../lib/store';
+import { AdminRoleLevel, OfficePlatform } from '../../lib/types';
 
 /**
  * P2-3: 密码输入框统一使用 type="text" + style="-webkit-text-security: disc"
@@ -23,16 +22,16 @@ import { useAppStore } from '../../lib/store';
 const MASKED_INPUT_STYLE = { WebkitTextSecurity: 'disc' } as unknown as React.CSSProperties;
 
 export interface AdminMe {
+  id?: number;
   username: string;
-  must_change_password: boolean;
-  /** 2026-11-04 多管理员分级 */
-  role_level?: 'super_admin' | 'sub_admin';
   display_name?: string;
-  allowed_platforms?: Array<'zdxlz' | 'wecom'>;
-  is_super_admin?: boolean;
+  role_level?: AdminRoleLevel;
+  allowed_platforms?: OfficePlatform[];
+  must_change_password: boolean;
 }
+
 /* ------------------------------------------------------------------ */
-/* 修改密码弹窗（P2-3 & P2-4：改密成功后提示「密码已修改，请用新密码重新登录」并切回登录） */
+/* 修改密码弹窗（支持 forced=true 首次登录强制改密拦截）                   */
 /* ------------------------------------------------------------------ */
 
 interface ChangePasswordModalProps {
@@ -49,7 +48,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
   onChanged,
 }) => {
   const toast = useToast();
-  const [oldPassword, setOldPassword] = useState('');
+  const [oldPassword, setOldPassword] = useState(forced ? DEFAULT_SUB_ADMIN_PASSWORD : '');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -61,7 +60,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
   const submit = async () => {
     setErrorMsg(null);
     if (!oldPassword) {
-      const msg = '请输入当前原密码';
+      const msg = '请输入当前原密码（分级管理员初始密码为 Hds22999!）';
       setErrorMsg(msg);
       toast.warning(msg);
       return;
@@ -72,14 +71,17 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
       toast.warning(msg);
       return;
     }
-    if (newPassword !== confirmPassword) {
-      const msg = '两次输入的新密码不一致，请核对后重试';
+    if (
+      newPassword === oldPassword ||
+      newPassword.replace(/！/g, '!') === DEFAULT_SUB_ADMIN_PASSWORD
+    ) {
+      const msg = '新密码不能与初始密码 Hds22999! 或原密码相同';
       setErrorMsg(msg);
       toast.warning(msg);
       return;
     }
-    if (newPassword === oldPassword) {
-      const msg = '新密码不能与原密码相同';
+    if (newPassword !== confirmPassword) {
+      const msg = '两次输入的新密码不一致，请核对后重试';
       setErrorMsg(msg);
       toast.warning(msg);
       return;
@@ -90,7 +92,6 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
         old_password: oldPassword,
         new_password: newPassword,
       });
-      // P2-4: 改密成功后提示「密码已修改，请用新密码重新登录」，再切回登录视图
       const doneText = '密码已修改，请用新密码重新登录';
       setSuccessMsg(doneText);
       toast.success(doneText, '密码修改成功');
@@ -102,8 +103,10 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
       window.setTimeout(() => {
         setCsrfToken('');
         onChanged();
-        window.location.href = '/login';
-      }, 1200);
+        if (window.location.pathname === '/change-password') {
+          window.history.replaceState(null, '', '/');
+        }
+      }, 900);
     } catch (err) {
       const friendly = err instanceof Error ? plainError(err.message) : '密码修改未成功';
       setErrorMsg(friendly);
@@ -122,7 +125,9 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               <Key className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="font-bold text-slate-900 text-base">修改管理员密码</h3>
+              <h3 className="font-bold text-slate-900 text-base">
+                {forced ? '首次登录 · 强制重设密码' : '修改管理员密码'}
+              </h3>
               <span className="text-[11px] text-slate-400">
                 IMTask 办公任务调度平台 · 身份凭据
               </span>
@@ -139,9 +144,12 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
         </div>
 
         {forced && (
-          <div className="p-2.5 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs flex items-center gap-1.5">
-            <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-            <span>首次登录必须修改初始密码后才能使用后台功能。</span>
+          <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs flex items-start gap-2 leading-relaxed">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
+            <span>
+              当前账号正使用初始密码（<code className="font-mono font-bold">Hds22999!</code>
+              ），出于安全要求，首次登录必须重设为您本人的新密码后才能进入工作台。
+            </span>
           </div>
         )}
 
@@ -160,7 +168,9 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
           )}
 
           <div>
-            <label className="font-semibold text-slate-700 block mb-1">当前原密码</label>
+            <label className="font-semibold text-slate-700 block mb-1">
+              当前原密码 {forced && <span className="text-slate-400 font-normal">（初始密码 Hds22999!）</span>}
+            </label>
             <input
               type="text"
               autoComplete="off"
@@ -175,7 +185,7 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
 
           <div>
             <label className="font-semibold text-slate-700 block mb-1">
-              新密码（至少 8 位，含字母与数字）
+              新密码（至少 8 位，含字母与数字，不可为 Hds22999!）
             </label>
             <input
               type="text"
@@ -199,6 +209,9 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               placeholder="请再次输入新密码"
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void submit();
+              }}
               className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 outline-none focus:border-blue-500 focus:bg-white"
             />
           </div>
@@ -213,11 +226,11 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
               </button>
             )}
             <button
-              onClick={submit}
+              onClick={() => void submit()}
               disabled={busy}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
             >
-              {busy ? '正在提交…' : '确认修改'}
+              {busy ? '正在提交…' : forced ? '确认重设密码并重新登录' : '确认修改'}
             </button>
           </div>
         </div>
@@ -225,11 +238,6 @@ export const ChangePasswordModal: React.FC<ChangePasswordModalProps> = ({
     </div>
   );
 };
-
-/* ------------------------------------------------------------------ */
-/* 事件回调地址查看                                                    */
-/* ------------------------------------------------------------------ */
-
 
 /* ------------------------------------------------------------------ */
 /* 修改管理员账号名                                                     */
@@ -357,7 +365,7 @@ export const ChangeUsernameModal: React.FC<ChangeUsernameModalProps> = ({
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') submit();
+                if (e.key === 'Enter') void submit();
               }}
               className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 outline-none focus:border-blue-500 focus:bg-white"
             />
@@ -370,7 +378,7 @@ export const ChangeUsernameModal: React.FC<ChangeUsernameModalProps> = ({
               取消
             </button>
             <button
-              onClick={submit}
+              onClick={() => void submit()}
               disabled={busy}
               className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
             >
@@ -393,18 +401,17 @@ interface AdminUserCardProps {
 }
 
 export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut }) => {
-  const toast = useToast();
   const { platform, setPlatform, allowedPlatforms, isSuperAdmin } = useAppStore();
   const [open, setOpen] = useState(false);
-  const [modal, setModal] = useState<
-    'none' | 'password' | 'username' | 'logout'
-  >('none');
+  const [modal, setModal] = useState<'none' | 'password' | 'username' | 'logout'>('none');
   const [busy, setBusy] = useState(false);
   const [displayName, setDisplayName] = useState(me.username || '');
   useEffect(() => setDisplayName(me.username || ''), [me.username]);
 
   const display = displayName || '管理员';
   const initial = display.slice(0, 1).toUpperCase();
+  const canUseZdxlz = allowedPlatforms.includes('zdxlz');
+  const canUseWecom = allowedPlatforms.includes('wecom');
 
   const doLogout = async () => {
     setBusy(true);
@@ -425,14 +432,20 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
         className="w-full flex items-center justify-between p-2 rounded-xl bg-slate-50 hover:bg-slate-100 border border-slate-200/80 transition-all cursor-pointer text-left"
       >
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-8 h-8 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0 shadow-xs">
+          <div
+            className={`w-8 h-8 rounded-full text-white font-bold text-xs flex items-center justify-center shrink-0 shadow-xs ${
+              isSuperAdmin ? 'bg-blue-600' : 'bg-indigo-600'
+            }`}
+          >
             {initial}
           </div>
           <div className="truncate">
-            <div className="font-bold text-xs text-slate-800 leading-tight">{display}</div>
-            <div className="text-[10px] text-blue-600 flex items-center gap-1 font-medium">
+            <div className="font-bold text-xs text-slate-800 leading-tight truncate">
+              {me.display_name ? `${me.display_name} (${display})` : display}
+            </div>
+            <div className="text-[10px] text-blue-600 flex items-center gap-1 font-medium mt-0.5">
               <Shield className="w-2.5 h-2.5" />
-              <span>{isSuperAdmin ? '超级管理员' : '分级管理员'}</span>
+              <span>{isSuperAdmin ? '超级管理员 (admin)' : '分级管理员'}</span>
             </div>
           </div>
         </div>
@@ -442,40 +455,66 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
       {open && (
         <div className="absolute left-0 bottom-full mb-2 w-full bg-white rounded-2xl shadow-xl border border-slate-200 p-1.5 z-50 text-xs animate-in fade-in zoom-in-95">
           <div className="px-3 py-2 border-b border-slate-100">
-            <div className="font-bold text-slate-800">{display}</div>
-            <div className="text-[10px] text-slate-400 font-mono">IMTask 调度管理中心</div>
+            <div className="font-bold text-slate-800">
+              {me.display_name ? `${me.display_name} (${display})` : display}
+            </div>
+            <div className="text-[10px] text-slate-400 font-mono">
+              {isSuperAdmin ? '超级管理员 · 全局视图权限' : '分级管理员 · 独立工作台'}
+            </div>
             <div className="text-[10px] text-emerald-600 font-semibold mt-0.5">● 会话已鉴权</div>
           </div>
 
-          {/* 2026-11-02 用户指令：在这里选择当前面板展示哪个办公软件的信息
-              2026-11-04 多管理员分级：只显示本账号被授权的平台 */}
+          {/* 2026-11-02 用户指令：在这里选择当前面板展示哪个办公软件的信息（受超管分配的办公软件权限控制） */}
           <div className="px-3 py-2 border-b border-slate-100">
-            <div className="text-[10px] text-slate-400 font-semibold mb-1.5">当前办公软件</div>
+            <div className="text-[10px] text-slate-400 font-semibold mb-1.5 flex items-center justify-between">
+              <span>当前办公软件</span>
+              {!isSuperAdmin && (
+                <span className="text-[10px] text-slate-400 font-normal">
+                  已开通 {allowedPlatforms.length} 项
+                </span>
+              )}
+            </div>
             <div className="grid grid-cols-2 gap-1">
-              {allowedPlatforms.includes('zdxlz') && (
-                <button
-                  onClick={() => { setPlatform('zdxlz'); setOpen(false); }}
-                  className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
-                    platform === 'zdxlz'
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-                  }`}
-                >
-                  量子密信
-                </button>
-              )}
-              {allowedPlatforms.includes('wecom') && (
-                <button
-                  onClick={() => { setPlatform('wecom'); setOpen(false); }}
-                  className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors ${
-                    platform === 'wecom'
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
-                  }`}
-                >
-                  企业微信
-                </button>
-              )}
+              <button
+                type="button"
+                disabled={!canUseZdxlz}
+                onClick={() => {
+                  if (!canUseZdxlz) return;
+                  setPlatform('zdxlz');
+                  setOpen(false);
+                }}
+                title={canUseZdxlz ? '切换至量子密信' : '未开通量子密信权限，请联系超级管理员'}
+                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors flex items-center justify-center gap-1 ${
+                  !canUseZdxlz
+                    ? 'bg-slate-50 text-slate-300 border-slate-200/60 cursor-not-allowed'
+                    : platform === 'zdxlz'
+                      ? 'bg-blue-600 text-white border-blue-600 cursor-pointer'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 cursor-pointer'
+                }`}
+              >
+                {!canUseZdxlz && <Lock className="w-2.5 h-2.5" />}
+                <span>量子密信</span>
+              </button>
+              <button
+                type="button"
+                disabled={!canUseWecom}
+                onClick={() => {
+                  if (!canUseWecom) return;
+                  setPlatform('wecom');
+                  setOpen(false);
+                }}
+                title={canUseWecom ? '切换至企业微信' : '未开通企业微信权限，请联系超级管理员'}
+                className={`px-2 py-1.5 rounded-lg text-[11px] font-semibold border transition-colors flex items-center justify-center gap-1 ${
+                  !canUseWecom
+                    ? 'bg-slate-50 text-slate-300 border-slate-200/60 cursor-not-allowed'
+                    : platform === 'wecom'
+                      ? 'bg-blue-600 text-white border-blue-600 cursor-pointer'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50 cursor-pointer'
+                }`}
+              >
+                {!canUseWecom && <Lock className="w-2.5 h-2.5" />}
+                <span>企业微信</span>
+              </button>
             </div>
           </div>
 
@@ -491,16 +530,18 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
               <span>修改管理员密码</span>
             </button>
 
-            <button
-              onClick={() => {
-                setOpen(false);
-                setModal('username');
-              }}
-              className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 font-medium flex items-center gap-2 cursor-pointer transition-colors"
-            >
-              <UserCog className="w-3.5 h-3.5 text-slate-500" />
-              <span>修改账号名</span>
-            </button>
+            {!isSuperAdmin && (
+              <button
+                onClick={() => {
+                  setOpen(false);
+                  setModal('username');
+                }}
+                className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-50 text-slate-700 font-medium flex items-center gap-2 cursor-pointer transition-colors"
+              >
+                <UserCog className="w-3.5 h-3.5 text-slate-500" />
+                <span>修改账号名</span>
+              </button>
+            )}
           </div>
 
           <div className="pt-1 border-t border-slate-100">
@@ -526,7 +567,6 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
           onLoggedOut();
         }}
       />
-
 
       <ChangeUsernameModal
         isOpen={modal === 'username'}

@@ -1,5 +1,35 @@
 export type TemplateKind = 'notice' | 'upload' | 'form' | 'image' | 'file';
 export type TemplatePeriod = 'day' | 'week' | 'month';
+export type OfficePlatform = 'zdxlz' | 'wecom';
+export type AdminRoleLevel = 'super_admin' | 'sub_admin';
+
+export interface AdminAccountItem {
+  id: number;
+  username: string;
+  display_name: string;
+  role_level: AdminRoleLevel;
+  enabled: boolean;
+  must_change_password: boolean;
+  allowed_platforms: OfficePlatform[];
+  role_count: number;
+  member_count: number;
+  template_count: number;
+  instance_count: number;
+  last_login_at: string | null;
+  created_at: string;
+}
+
+export interface GlobalActivatedMemberItem {
+  phone: string;
+  name: string;
+  dept: string;
+  activations: { zdxlz: boolean; wecom: boolean };
+  usable: boolean;
+  status?: 'active' | 'disabled';
+  external_id?: string | null;
+  activated_at?: string | null;
+  source_owner_display_name?: string | null;
+}
 
 export interface FormFieldSpec {
   key: string;
@@ -31,7 +61,6 @@ export type UploadH5Module = 'fields' | 'text' | 'image' | 'file';
 export interface TemplateSpec {
   // 纯通知提醒配置
   notice_items?: NoticeMessageItem[];
-
   // 统一上传任务配置（下发提醒文本 + 专属 H5 链接 + 上传完成反馈）
   upload_modules?: UploadH5Module[]; // 选择 H5 链接包含的上传项：字段(报数)、文本、图片、文件
   fields?: FormFieldSpec[]; // 报数字段配置
@@ -66,12 +95,12 @@ export interface TemplateItem {
   attach_image_name?: string | null;
   /* 2026-10-29 执行日：day 周期模板只在选中的周几执行；null/空 = 每天（周一=1…周日=7） */
   exec_weekdays?: number[] | null;
+  owner_id?: number;
+  owner_username?: string;
+  owner_display_name?: string | null;
+  platform?: OfficePlatform;
   created_at: string;
   updated_at?: string;
-  /* 2026-11-04 多管理员分级：归属管理员（超管全局查看时展示「创建人」+ 按管理员筛选） */
-  owner_id?: number;
-  owner_username?: string | null;
-  owner_display_name?: string | null;
 }
 
 export function getTemplateRoleIds(
@@ -101,11 +130,12 @@ export interface RoleItem {
   member_count: number;
   active_count: number;
   activated_count: number;
-  created_at?: string;
-  /* 2026-11-04 多管理员分级：归属管理员（超管全局查看时展示「创建人」+ 按管理员筛选） */
   owner_id?: number;
-  owner_username?: string | null;
+  owner_username?: string;
   owner_display_name?: string | null;
+  platform?: OfficePlatform;
+  enabled?: boolean;
+  created_at?: string;
 }
 
 export interface RoleMemberItem {
@@ -118,6 +148,9 @@ export interface RoleMemberItem {
   usable?: boolean;
   external_id?: string | null;
   activated_at?: string | null;
+  owner_id?: number;
+  owner_username?: string;
+  owner_display_name?: string | null;
   created_at?: string;
 }
 
@@ -126,7 +159,7 @@ export interface UnactivatedMemberItem {
   name: string;
   /* 2026-11-03：H5 登记表单填写的部门（后台配置的选项之一） */
   dept?: string;
-  activation: 'activated';
+  activation: 'activated' | 'pending';
   usable?: boolean;
   external_id?: string;
   activated_at?: string;
@@ -136,7 +169,6 @@ export interface UnactivatedMemberItem {
   updated_at?: string;
   created_at: string;
 }
-
 
 export type InstanceStatus =
   | 'pending'
@@ -155,6 +187,7 @@ export interface TaskInstanceItem {
   period: TemplatePeriod;
   period_key: string;
   role_id: string;
+  role_ids?: string[];
   phone: string;
   member_name_snap: string;
   dept_snap?: string;
@@ -177,6 +210,10 @@ export interface TaskInstanceItem {
   resubmit_status?: 'pending' | 'approved' | 'rejected' | null;
   resubmit_decided_by?: string | null;
   resubmit_decided_at?: string | null;
+  owner_id?: number;
+  owner_username?: string;
+  owner_display_name?: string | null;
+  platform?: OfficePlatform;
   created_at: string;
 }
 
@@ -197,6 +234,9 @@ export interface PendingReviewItem {
   submitted_at?: string | null;
   resubmit_req_at?: string | null;
   resubmit_status?: string | null;
+  owner_id?: number;
+  owner_username?: string;
+  owner_display_name?: string | null;
 }
 
 export interface SubmissionAttachment {
@@ -278,50 +318,6 @@ export interface AdminHealth {
   event_crypto: 'ready' | 'plaintext';
   public_base_url: string;
   is_loopback_public_url: boolean;
-}
-
-/** 2026-11-04 多管理员分级：当前登录管理员档案 */
-export type AdminRoleLevel = 'super_admin' | 'sub_admin';
-
-export interface AdminMe {
-  ok?: boolean;
-  id?: number;
-  username: string;
-  csrf_token?: string;
-  must_change?: boolean;
-  must_change_password?: boolean;
-  role_level: AdminRoleLevel;
-  display_name?: string;
-  allowed_platforms: Array<'zdxlz' | 'wecom'>;
-  is_super_admin?: boolean;
-}
-
-/** 分级管理员账号（超管的账号管理页用） */
-export interface AdminAccountItem {
-  id: number;
-  username: string;
-  display_name: string;
-  role_level: AdminRoleLevel;
-  allowed_platforms: Array<'zdxlz' | 'wecom'>;
-  enabled: number;
-  must_change: number;
-  last_login_at?: string | null;
-  created_at?: string;
-  role_count?: number;
-  member_count?: number;
-  template_count?: number;
-  instance_count?: number;
-}
-
-/** 全局已激活成员（跨管理员共享，免二次激活） */
-export interface GlobalActivatedMemberItem {
-  phone: string;
-  platform: 'zdxlz' | 'wecom';
-  external_id: string;
-  name: string;
-  dept: string;
-  activated_at?: string;
-  last_event_at?: string;
 }
 
 export function isUploadTaskKind(kind: TemplateKind): boolean {

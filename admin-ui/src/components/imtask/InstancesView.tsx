@@ -19,8 +19,10 @@ import {
   Calendar,
   Search,
   ListFilter,
+  ShieldCheck,
 } from 'lucide-react';
 import PendingReviewPanel from './PendingReviewPanel';
+import { AdminScopeHeader } from './AdminScopeHeader';
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
@@ -190,7 +192,8 @@ const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }>
   );
 };
 
-export const InstancesView: React.FC = () => {  const { roles, refreshStats, platform, isSuperAdmin } = useAppStore();
+export const InstancesView: React.FC = () => {
+  const { roles, refreshStats, platform, isSuperAdmin, ownerFilter, setOwnerFilter, adminAccounts } = useAppStore();
   const toast = useToast();
 
   // 筛选条件：按日期（默认今天）、按角色、按任务类型、按执行状态、按用户名/手机号
@@ -285,6 +288,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
         if (ph) qs.set('q', ph);
         if (pk) qs.set('period_key', pk);
         if (tid) qs.set('template_id', tid);
+        if (ownerFilter) qs.set('owner_id', ownerFilter);
         qs.set('platform', platform);
 
         const statsQs = new URLSearchParams();
@@ -294,6 +298,7 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
         if (ph) statsQs.set('q', ph);
         if (pk) statsQs.set('period_key', pk);
         if (tid) statsQs.set('template_id', tid);
+        if (ownerFilter) statsQs.set('owner_id', ownerFilter);
         statsQs.set('platform', platform);
 
         const [listRes, statRes] = await Promise.all([
@@ -312,12 +317,12 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
         setLoading(false);
       }
     },
-    [page, statusFilter, kindFilter, roleFilter, phoneFilter, periodKeyFilter, templateFilter, platform],
+    [page, statusFilter, kindFilter, roleFilter, phoneFilter, periodKeyFilter, templateFilter, ownerFilter, platform],
   );
 
   useEffect(() => {
     loadData(1);
-  }, [statusFilter, kindFilter, roleFilter, periodKeyFilter, templateFilter, platform]);
+  }, [statusFilter, kindFilter, roleFilter, periodKeyFilter, templateFilter, ownerFilter, platform]);
 
   /* 2026-10-28：关键字搜索改为实时（防抖 400ms），取消「查询」按钮 */
   useEffect(() => {
@@ -553,20 +558,12 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
 
   return (
     <div className="space-y-4">
-      {/* 顶部标题 */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-5 rounded-2xl border border-slate-200/90 shadow-2xs">
-        <div>
-          <div className="flex items-center gap-2">
-            <h2 className="text-lg font-bold text-slate-900 tracking-tight">任务实例与审核</h2>
-            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200/60">
-              执行跟踪与上传审核
-            </span>
-          </div>
-          <p className="text-xs text-slate-500 mt-1">
-            支持按任务类型（通知提醒 / 上传任务）筛选查看执行记录，对需审核的上传任务进行通过或驳回。
-          </p>
-        </div>
-      </div>
+      {/* 顶部标题与管理员视角（统一标准组件） */}
+      <AdminScopeHeader
+        title="任务实例与审核"
+        badge="执行跟踪与上传审核"
+        description="支持按任务类型（通知提醒 / 上传任务）筛选查看执行记录，对需审核的上传任务进行通过或驳回。"
+      />
 
       {/* 统计指标卡片 */}
       {localStats && (
@@ -805,9 +802,6 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200/80 text-[11px] font-bold text-slate-500">
                 <th className="py-3.5 px-4 whitespace-nowrap">任务名称</th>
-                {isSuperAdmin && (
-                  <th className="py-3.5 px-3 whitespace-nowrap">创建人</th>
-                )}
                 <th className="py-3.5 px-3 whitespace-nowrap">任务类型</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">所属角色</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">执行人</th>
@@ -849,17 +843,17 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
                     <tr key={inst.id} className="hover:bg-slate-50/60 transition-colors">
                       {/* 1. 任务名称（2026-10-28 去掉前面的实例序号徽标，业务方要求不要） */}
                       <td className="py-4 px-4 whitespace-nowrap">
-                        <span className="font-bold text-slate-900 text-xs">{inst.template_name}</span>
+                        <div>
+                          <span className="font-bold text-slate-900 text-xs">{inst.template_name}</span>
+                          {isSuperAdmin && (inst.owner_display_name || inst.owner_username) && (
+                            <div className="mt-1">
+                              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200/60 text-[10px] font-medium">
+                                创建人：{inst.owner_display_name || inst.owner_username}
+                              </span>
+                            </div>
+                          )}
+                        </div>
                       </td>
-
-                      {/* 1.5 创建人（仅超管可见） */}
-                      {isSuperAdmin && (
-                        <td className="py-4 px-3 whitespace-nowrap">
-                          <span className="text-[11px] text-slate-600 font-semibold">
-                            {(inst as any).owner_display_name || (inst as any).owner_username || '—'}
-                          </span>
-                        </td>
-                      )}
 
                       {/* 2. 任务类型 */}
                       <td className="py-4 px-3 whitespace-nowrap">
@@ -1389,51 +1383,63 @@ export const InstancesView: React.FC = () => {  const { roles, refreshStats, pla
               )}
             </div>
 
-            {/* 弹窗底部：仅需要人工审核的上传任务在待审核时才展示通过/驳回 */}
+            {/* 弹窗底部：仅分级管理员可审核通过/驳回；超管只读查看 */}
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-2">
-                {detailData.instance.kind !== 'notice' &&
-                  detailData.instance.need_review === true &&
-                  detailData.instance.status === 'submitted' && (
-                    <>
-                      <button
-                        onClick={() => handleApprove(detailData.instance)}
-                        className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <Check className="w-3.5 h-3.5" />
-                        <span>审核通过</span>
-                      </button>
-                      <button
-                        onClick={() => {
-                          const target = detailData.instance;
-                          setDetailData(null);
-                          openRejectModal(target);
-                        }}
-                        className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                        <span>驳回重交</span>
-                      </button>
-                    </>
-                  )}
-                {detailData.instance.resubmit_status === 'pending' && (
+                {isSuperAdmin ? (
+                  (detailData.instance.status === 'submitted' ||
+                    detailData.instance.resubmit_status === 'pending') && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-50 border border-violet-200 text-violet-800 text-xs font-semibold">
+                      <ShieldCheck className="w-3.5 h-3.5 text-violet-600 shrink-0" />
+                      <span>超管只读查看（由创建该任务的分级管理员审核）</span>
+                    </span>
+                  )
+                ) : (
                   <>
-                    <button
-                      onClick={() => handleResubmitApprove(detailData.instance)}
-                      disabled={busyId === detailData.instance.id}
-                      className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                    >
-                      <Check className="w-3.5 h-3.5" />
-                      <span>{busyId === detailData.instance.id ? '处理中…' : '通过补交'}</span>
-                    </button>
-                    <button
-                      onClick={() => handleResubmitReject(detailData.instance)}
-                      disabled={busyId === detailData.instance.id}
-                      className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                      <span>拒绝补交</span>
-                    </button>
+                    {detailData.instance.kind !== 'notice' &&
+                      detailData.instance.need_review === true &&
+                      detailData.instance.status === 'submitted' && (
+                        <>
+                          <button
+                            onClick={() => handleApprove(detailData.instance)}
+                            className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>审核通过</span>
+                          </button>
+                          <button
+                            onClick={() => {
+                              const target = detailData.instance;
+                              setDetailData(null);
+                              openRejectModal(target);
+                            }}
+                            className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                            <span>驳回重交</span>
+                          </button>
+                        </>
+                      )}
+                    {detailData.instance.resubmit_status === 'pending' && (
+                      <>
+                        <button
+                          onClick={() => handleResubmitApprove(detailData.instance)}
+                          disabled={busyId === detailData.instance.id}
+                          className="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          <Check className="w-3.5 h-3.5" />
+                          <span>{busyId === detailData.instance.id ? '处理中…' : '通过补交'}</span>
+                        </button>
+                        <button
+                          onClick={() => handleResubmitReject(detailData.instance)}
+                          disabled={busyId === detailData.instance.id}
+                          className="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold rounded-xl inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                          <span>拒绝补交</span>
+                        </button>
+                      </>
+                    )}
                   </>
                 )}
               </div>

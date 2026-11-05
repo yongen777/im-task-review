@@ -28,6 +28,7 @@ import {
   ArrowRight,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { AdminScopeHeader } from './AdminScopeHeader';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import {
@@ -390,7 +391,15 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
 };
 
 export const TemplatesView: React.FC = () => {
-  const { templates, roles, refreshTemplates, isSuperAdmin } = useAppStore();
+  const {
+    templates,
+    roles,
+    refreshTemplates,
+    isSuperAdmin,
+    ownerFilter,
+    setOwnerFilter,
+    adminAccounts,
+  } = useAppStore();
   const toast = useToast();
 
   // 顶部筛选条件：按角色选择 + 按任务类型选择 + 关键词
@@ -496,6 +505,10 @@ export const TemplatesView: React.FC = () => {
   };
 
   const openCreateModal = (defaultKind: 'notice' | 'upload' = 'notice') => {
+    if (isSuperAdmin) {
+      toast.warning('超级管理员仅负责全平台查看与监管，不可创建任务，请登录分级管理员账号创建');
+      return;
+    }
     setEditingTpl(null);
     setName('');
     setKind(defaultKind);
@@ -894,26 +907,13 @@ export const TemplatesView: React.FC = () => {
 
   return (
     <div className="space-y-4">
-      {/* 顶部标题与操作按钮（已移除单独的上传任务H5预览图效果按钮） */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-5 rounded-2xl border border-slate-200/90 shadow-2xs">
-        <div>
-          <div className="flex items-center gap-2">
-            <h2 className="text-lg font-bold text-slate-900 tracking-tight">任务模板管理</h2>
-            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200/60">
-              共 {templates.length} 项任务
-            </span>
-          </div>
-          <p className="text-xs text-slate-500 mt-1">
-            支持「通知提醒」与「上传任务（发送提醒文本 + 专属 H5 上传链接）」两大类任务配置。
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
-          {/* 2026-11-04 多管理员分级：超管只读，不能新建任务（业务数据由分级管理员维护） */}
-          {isSuperAdmin ? (
-            <span className="text-[11px] text-indigo-600 bg-indigo-50 border border-indigo-200/70 px-2.5 py-1.5 rounded-xl font-semibold">
-              超级管理员只读视图 · 任务由分级管理员账号创建
-            </span>
-          ) : (
+      {/* 顶部标题与管理员视角（统一标准组件） */}
+      <AdminScopeHeader
+        title="任务模板管理"
+        badge={`共 ${templates.length} 项任务`}
+        description="支持「通知提醒」与「上传任务（发送提醒文本 + 专属 H5 上传链接）」两大类任务配置。"
+        actions={
+          !isSuperAdmin ? (
             <>
               <button
                 type="button"
@@ -932,14 +932,15 @@ export const TemplatesView: React.FC = () => {
                 <span>新建通知提醒</span>
               </button>
             </>
-          )}
-        </div>
-      </div>
+          ) : null
+        }
+      />
 
       {/* 筛选栏 + 干净对齐的任务列表 */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
         <div className="p-4 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-2.5">
+
             {/* 按照角色选择 */}
             <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
               <Users className="w-3.5 h-3.5 text-slate-400" />
@@ -989,13 +990,11 @@ export const TemplatesView: React.FC = () => {
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200/80 text-[11px] font-bold text-slate-500">
                 <th className="py-3.5 px-4 w-48 whitespace-nowrap">任务名称</th>
-                {isSuperAdmin && (
-                  <th className="py-3.5 px-3 w-28 whitespace-nowrap">创建人</th>
-                )}
                 <th className="py-3.5 px-3 w-36 whitespace-nowrap">所属角色</th>
                 <th className="py-3.5 px-3 w-32 whitespace-nowrap">任务类型</th>
                 <th className="py-3.5 px-3 w-28 whitespace-nowrap">执行时间</th>
-                <th className="py-3.5 px-3">任务内容配置</th>                <th className="py-3.5 px-3 w-28 whitespace-nowrap">状态</th>
+                <th className="py-3.5 px-3">任务内容配置</th>
+                <th className="py-3.5 px-3 w-28 whitespace-nowrap">状态</th>
                 <th className="py-3.5 px-4 w-36 text-right whitespace-nowrap">操作</th>
               </tr>
             </thead>
@@ -1018,17 +1017,13 @@ export const TemplatesView: React.FC = () => {
                     <tr key={tpl.id} className="hover:bg-slate-50/60 transition-colors align-top">
                       {/* 1. 任务名称（2026-10-28 修复：移除 template_id 显示，消除文本遮挡） */}
                       <td className="py-4 px-4 whitespace-nowrap">
-                        <span className="font-bold text-slate-900 text-xs">{tpl.name}</span>
+                        <div className="font-bold text-slate-900 text-xs">{tpl.name}</div>
+                        {isSuperAdmin && tpl.owner_username && (
+                          <div className="text-[10px] text-slate-400 mt-0.5">
+                            创建人：{tpl.owner_display_name || tpl.owner_username}
+                          </div>
+                        )}
                       </td>
-
-                      {/* 1.5 创建人（仅超管可见） */}
-                      {isSuperAdmin && (
-                        <td className="py-4 px-3 whitespace-nowrap">
-                          <span className="text-[11px] text-slate-600 font-semibold">
-                            {tpl.owner_display_name || tpl.owner_username || '—'}
-                          </span>
-                        </td>
-                      )}
 
                       {/* 2. 所属角色（支持多角色展示） */}
                       <td className="py-4 px-3">
@@ -1105,31 +1100,59 @@ export const TemplatesView: React.FC = () => {
                                           {ni.text_content}
                                         </div>
                                       ) : ni.image_path ? (
-                                        /* 2026-10-29：按业务口径改成**上下结构**——上面是图片预览，下面是这张图的名称（描述）。
-                                           不再显示服务器上的文件名（notice_xxxx.png 是内部随机名，对业务没意义）。 */
-                                        <div className="space-y-1">
-                                          <a
-                                            href={`/api/admin/template-assets/${encodeURIComponent(
-                                              String(ni.image_path).split('/').pop() || '',
-                                            )}`}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="inline-block group"
-                                            title="点击查看原图"
-                                          >
-                                            <img
-                                              src={`/api/admin/template-assets/${encodeURIComponent(
+                                        <div className="space-y-2">
+                                          {/* 文件/附件标题胶囊 */}
+                                          <div className="flex flex-wrap items-center gap-2">
+                                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-slate-200 rounded-lg text-[11px] font-semibold text-slate-700 shadow-2xs">
+                                              <ImageIcon className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                                              <span className="truncate max-w-[280px]">
+                                                {ni.file_name || '0815_支局1+1155核心指标完成率与沉淀商机通报.png'}
+                                              </span>
+                                            </span>
+                                            <a
+                                              href={`/api/admin/template-assets/${encodeURIComponent(
                                                 String(ni.image_path).split('/').pop() || '',
                                               )}`}
-                                              alt={ni.file_caption || '数据图片'}
-                                              className="w-12 h-12 rounded-lg object-cover border border-slate-200 group-hover:border-indigo-300"
-                                            />
-                                          </a>
-                                          {ni.file_caption ? (
-                                            <div className="text-[11px] text-slate-600 leading-relaxed whitespace-pre-line max-w-[190px]">
-                                              {ni.file_caption}
-                                            </div>
-                                          ) : null}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="text-[11px] text-blue-600 hover:text-blue-700 inline-flex items-center gap-1 font-medium hover:underline"
+                                            >
+                                              <ExternalLink className="w-3 h-3" />
+                                              <span>查看原图</span>
+                                            </a>
+                                          </div>
+
+                                          {/* 预览缩略图与文字说明上下/图文分栏 */}
+                                          <div className="flex flex-col sm:flex-row items-start gap-3">
+                                            <a
+                                              href={`/api/admin/template-assets/${encodeURIComponent(
+                                                String(ni.image_path).split('/').pop() || '',
+                                              )}`}
+                                              target="_blank"
+                                              rel="noopener noreferrer"
+                                              className="relative group rounded-xl overflow-hidden border border-slate-200 hover:border-indigo-400 shrink-0 shadow-2xs transition-all block bg-slate-900"
+                                              title="点击查看高清图表"
+                                            >
+                                              <img
+                                                src={`/api/admin/template-assets/${encodeURIComponent(
+                                                  String(ni.image_path).split('/').pop() || '',
+                                                )}`}
+                                                alt={ni.file_name || '数据通报图'}
+                                                className="w-36 h-20 object-cover group-hover:scale-105 transition-transform"
+                                              />
+                                              <div className="absolute inset-0 bg-slate-900/30 group-hover:bg-transparent transition-colors flex items-center justify-center">
+                                                <span className="opacity-0 group-hover:opacity-100 bg-black/70 text-white text-[10px] px-2 py-0.5 rounded backdrop-blur-xs transition-opacity font-medium">
+                                                  放大
+                                                </span>
+                                              </div>
+                                            </a>
+
+                                            {ni.file_caption ? (
+                                              <div className="flex-1 min-w-0 bg-white border border-slate-200/80 rounded-xl p-2.5 text-xs text-slate-700 leading-relaxed whitespace-pre-line">
+                                                {ni.file_caption}
+                                              </div>
+                                            ) : null}
+                                          </div>
                                         </div>
                                       ) : (
                                         <div className="text-[11px] text-rose-600 font-semibold">
@@ -1202,6 +1225,7 @@ export const TemplatesView: React.FC = () => {
                         <button
                           onClick={() => handleToggleEnabled(tpl)}
                           disabled={busyId === tpl.id}
+                          title={isSuperAdmin ? '超级管理员可停用或启用此任务模板' : '点击快速切换启用/停用状态'}
                           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-all whitespace-nowrap ${
                             tpl.enabled
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
@@ -1224,23 +1248,29 @@ export const TemplatesView: React.FC = () => {
 
                       {/* 7. 操作 */}
                       <td className="py-4 px-4 text-right whitespace-nowrap">
-                        <div className="inline-flex items-center justify-end gap-2">
-                          <button
-                            onClick={() => openEditModal(tpl)}
-                            className="px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <Edit3 className="w-3.5 h-3.5 shrink-0" />
-                            <span>编辑</span>
-                          </button>
-                          <button
-                            onClick={() => setDeleteConfirmTpl(tpl)}
-                            disabled={busyId === tpl.id}
-                            className="px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
-                          >
-                            <Trash2 className="w-3.5 h-3.5 shrink-0" />
-                            <span>删除</span>
-                          </button>
-                        </div>
+                        {isSuperAdmin ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 font-medium text-xs">
+                            只读查看
+                          </span>
+                        ) : (
+                          <div className="inline-flex items-center justify-end gap-2">
+                            <button
+                              onClick={() => openEditModal(tpl)}
+                              className="px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Edit3 className="w-3.5 h-3.5 shrink-0" />
+                              <span>编辑</span>
+                            </button>
+                            <button
+                              onClick={() => setDeleteConfirmTpl(tpl)}
+                              disabled={busyId === tpl.id}
+                              className="px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                            >
+                              <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                              <span>删除</span>
+                            </button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   );

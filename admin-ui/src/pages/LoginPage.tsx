@@ -110,7 +110,7 @@ export const LoginPage: React.FC = () => {
                 style={MASKED_INPUT_STYLE}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
-                placeholder="请输入密码（演示环境可填 Admin1234）"
+                placeholder="请输入登录密码（新建分级管理员初始密码 Hds22999!）"
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 font-medium"
               />
             </div>
