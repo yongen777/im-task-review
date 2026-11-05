@@ -344,8 +344,11 @@ class StateStore:
         now_s = self.now_str()
         with self.lock, self.conn:
             row = self.conn.execute(
+                # 2026-11-05：会话有效性绑定账号状态 —— 停用账号的会话一律视为无效。
+                # update_admin_account 停用时已主动删会话，这里是查询口的兜底（防其它路径改库绕过）。
                 "SELECT s.sid, s.user_id, s.csrf, s.created_at, s.last_seen, s.expires_at, u.username, u.must_change "
-                "FROM admin_session s JOIN admin_user u ON u.id = s.user_id WHERE s.sid = ?",
+                "FROM admin_session s JOIN admin_user u ON u.id = s.user_id "
+                "WHERE s.sid = ? AND u.enabled = 1",
                 (sid,),
             ).fetchone()
             if not row:
@@ -413,7 +416,7 @@ class StateStore:
         d["allowed_platforms"] = [str(p).strip().lower() for p in plats if str(p).strip()]
         d["enabled"] = int(d.get("enabled") or 0)
         d["must_change"] = int(d.get("must_change") or 0)
-        d["role_level"] = str(d.get("role_level") or self.SUB_ADMIN)
+        d["role_level"] = str(d.get("role_level") or StateStore.SUB_ADMIN)
         return d
 
     def admin_display_name(self, admin_id: int) -> str:

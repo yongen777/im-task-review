@@ -205,6 +205,7 @@ def _clamp_page_size(page: int, size: int) -> tuple[int, int]:
 # ── 2026-10-29 P2-3：登录失败锁定（内存计数，单进程生效；默认 5 次锁 15 分钟）──
 _LOGIN_FAIL_LOCK = threading.Lock()
 _LOGIN_FAILURES: Dict[str, Dict[str, float]] = {}
+_LOGIN_FAIL_MAX_KEYS = 2000  # 2026-11-05：字典容量护栏，超过即淘汰 15 分钟未活跃的条目
 
 
 def _csv_safe(val: Any) -> Any:
@@ -254,10 +255,17 @@ def _login_note_failure(key: str) -> None:
     with _LOGIN_FAIL_LOCK:
         info = _LOGIN_FAILURES.setdefault(key, {"count": 0.0, "locked_until": 0.0})
         info["count"] = float(info.get("count", 0)) + 1
+        info["last_fail"] = now
         if info["count"] >= max_fails:
             info["locked_until"] = now + 900.0
             info["count"] = 0.0
         _LOGIN_FAILURES[key] = info
+        # 2026-11-05 容量护栏：fail_key 含客户端可控的用户名/IP，爆破会不断造新 key。
+        # 超过上限时先淘汰 15 分钟无动静的条目，字典不会随攻击无限膨胀。
+        if len(_LOGIN_FAILURES) > _LOGIN_FAIL_MAX_KEYS:
+            cutoff = now - 900.0
+            for k in [k for k, v in _LOGIN_FAILURES.items() if float(v.get("last_fail") or 0) < cutoff]:
+                _LOGIN_FAILURES.pop(k, None)
 
 
 def _login_clear(key: str) -> None:

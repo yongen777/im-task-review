@@ -11,11 +11,14 @@
   1. 不写 / 不改 .env（现网凭据不动，仅做只读备份）
   2. 不建 / 不重置 admin 管理员密码
   3. 不重写 systemd unit（现网 imtask.service 已正确运行）
-  4. 不删除 /opt/imtask 下任何目录 —— tar 解压只覆盖；data/ 永不打包、永不上传
+  4. 不删除 /opt/imtask 下任何目录 —— tar 解压只覆盖；data/ 永不打包、永不上传（例外：⑨ 清理未被引用的历史构建产物）
   5. 打包强制断言 admin_static/index.html + assets/*.js 存在（缺则中止，防后台白屏）
 
 部署流程：版本库一致性检查 → 打包 → 预检 → 备份(app+.env) → 上传覆盖 → 装依赖 → 重启 → 验收
-（healthz 四项 + echostr 回显 + 后台 200 + 远程 pytest）→ 失败自动回滚。
+（healthz 四项 + echostr 回显 + 后台 200 + 远程 pytest【tests 临时上传，跑完即删】）→ 清理历史构建产物
+→ 失败自动回滚。
+
+生产目录瘦身（2026-11-05）：scripts/tests 不再常驻 /opt/imtask —— 远程验收时临时上传 tests 跑完删除。
 """
 from __future__ import annotations
 
@@ -30,14 +33,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# ── 默认连接参数（本次 219 服务器已确认，可被命令行覆盖）──
-DEFAULT_HOST = "203.0.113.10"
-DEFAULT_PORT = 20401
-DEFAULT_USER = "root"
-DEFAULT_KEY = str(Path.home() / ".ssh" / "imtask_deploy_key")
-REMOTE_DIR = "/opt/imtask"
+# ── 连接参数：优先读环境变量，避免把某一套环境的地址/账号写死（2026-11-05）──
+DEFAULT_HOST = os.environ.get("IMT_DEPLOY_HOST", "203.0.113.10")
+DEFAULT_PORT = int(os.environ.get("IMT_DEPLOY_PORT", "20401"))
+DEFAULT_USER = os.environ.get("IMT_DEPLOY_USER", "root")
+DEFAULT_KEY = os.environ.get("IMT_DEPLOY_KEY", str(Path.home() / ".ssh" / "imtask_deploy_key"))
+REMOTE_DIR = os.environ.get("IMT_DEPLOY_DIR", "/opt/imtask")
 
-INCLUDE = ["app", "scripts", "tests", "requirements.txt", "README.md"]
+# 生产目录只放运行所需的 app/（含前端产物）+ 依赖清单 + 文档；
+# scripts（含部署脚本自身与含真实信息的工作区脚本）与 tests 不常驻生产（2026-11-05）。
+INCLUDE = ["app", "requirements.txt", "README.md"]
 EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "data", "docs", "_legacy"}
 EXCLUDE_SUFFIX = {".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal"}
 BACKUP_KEEP = 3
@@ -211,6 +216,21 @@ def build_tarball() -> tuple[Path, int, list[str]]:
     return tar_path, len(names), names
 
 
+def build_tests_tarball() -> Path:
+    """把本地 tests 打成小包供远程验收用（跑完即删，不常驻生产目录）。"""
+    tar_path = Path(os.environ.get("TEMP", "/tmp")) / "imtask_tests.tar.gz"
+    if tar_path.exists():
+        tar_path.unlink()
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for p in sorted((ROOT / "tests").rglob("*")):
+            if not p.is_file() or p.suffix in EXCLUDE_SUFFIX:
+                continue
+            if any(part in EXCLUDE_DIRS for part in p.parts):
+                continue
+            tar.add(p, arcname=str(p.relative_to(ROOT)).replace("\\", "/"))
+    return tar_path
+
+
 def assert_admin_assets(names: list[str]) -> None:
     """后台是 Vite 构建产物：index.html 缺 → 白屏；CSS 缺 → 无样式裸页面（两次事故都出在这）。
 
@@ -244,7 +264,7 @@ def main() -> int:
     ap.add_argument("--key", default=DEFAULT_KEY)
     ap.add_argument("--dry-run", action="store_true", help="只打包+连通+预检，不改服务器任何状态")
     ap.add_argument("--skip-deps", action="store_true")
-    ap.add_argument("--skip-tests", action="store_true")
+    ap.add_argument("--skip-tests", action="store_true", help="跳过临时上传 tests 的远程 pytest")
     ap.add_argument("--allow-drift", action="store_true",
                     help="允许工作区与版本库不一致（默认会中止，防止线上代码与 git 脱钩）")
     args = ap.parse_args()
@@ -256,7 +276,7 @@ def main() -> int:
     print("⓪ 版本库一致性检查（工作区 vs git）")
     check_repo_sync(args.allow_drift)
 
-    print("① 打包（app/scripts/tests/requirements.txt，排除 data 与缓存）")
+    print("① 打包（app/requirements.txt/README.md，排除 data 与缓存；scripts/tests 不进生产）")
     tar_path, count, names = build_tarball()
     assert_admin_assets(names)
     kb = tar_path.stat().st_size / 1024
@@ -286,7 +306,7 @@ def main() -> int:
     if scp_upload(H, P, U, K, tar_path, "/tmp/imtask_app.tar.gz") != 0:
         return 1
     code, _ = ssh_run(H, P, U, K,
-                      f"cd {REMOTE_DIR} && find app scripts tests -name '__pycache__' -type d -exec rm -rf {{}} + 2>/dev/null; "
+                      f"cd {REMOTE_DIR} && find app -name '__pycache__' -type d -exec rm -rf {{}} + 2>/dev/null; "
                       "tar -xzf /tmp/imtask_app.tar.gz && echo EXTRACT_OK",
                       timeout=180, show=2)
     if "EXTRACT_OK" not in _:
@@ -344,10 +364,31 @@ def main() -> int:
     if ok and asset_refs:
         print(f"    静态资源 {len(asset_refs)} 个全部 200")
     if not args.skip_tests:
-        print("⑧ 远程 pytest")
-        code, _ = ssh_run(H, P, U, K, f"cd {REMOTE_DIR} && .venv/bin/python -m pytest -o addopts=\"\" -q 2>&1 | tail -3", timeout=600, show=4)
-        if "failed" in _ and "0 failed" not in _:
-            print("    ✗ 远程测试有失败"); ok = False
+        print("⑧ 远程 pytest（tests 临时上传，跑完即删，不常驻生产目录）")
+        tests_tar = build_tests_tarball()
+        if scp_upload(H, P, U, K, tests_tar, "/tmp/imtask_tests.tar.gz") != 0:
+            print("    ✗ tests 上传失败"); ok = False
+        else:
+            code, _ = ssh_run(H, P, U, K,
+                              f"cd {REMOTE_DIR} && tar -xzf /tmp/imtask_tests.tar.gz && "
+                              ".venv/bin/python -m pytest -o addopts=\"\" -q 2>&1 | tail -3",
+                              timeout=600, show=4)
+            ssh_run(H, P, U, K, f"rm -rf {REMOTE_DIR}/tests /tmp/imtask_tests.tar.gz", timeout=60, show=1)
+            if "failed" in _ and "0 failed" not in _:
+                print("    ✗ 远程测试有失败"); ok = False
+
+    print("⑨ 清理生产目录：未被引用的历史构建产物 + 遗留 scripts")
+    keep_cmd = (
+        f"cd {REMOTE_DIR} && "
+        "KEEP=$( (cat app/admin_static/index.html; cat app.bak-*/admin_static/index.html 2>/dev/null) "
+        "| grep -o '/assets/[A-Za-z0-9._-]*' | sort -u | sed 's#^/assets/##' ); "
+        "if [ -n \"$KEEP\" ]; then removed=0; for f in app/admin_static/assets/*; do "
+        "[ -f \"$f\" ] || continue; b=$(basename \"$f\"); "
+        "printf '%s\\n' \"$KEEP\" | grep -qx \"$b\" || { rm -f -- \"$f\"; removed=$((removed+1)); }; done; "
+        "echo ASSETS_REMOVED=$removed; else echo ASSETS_KEEP_EMPTY_SKIP; fi; "
+        f"rm -rf {REMOTE_DIR}/scripts"
+    )
+    ssh_run(H, P, U, K, keep_cmd, timeout=120, show=3)
 
     # 清理旧备份（保留最近 BACKUP_KEEP 份）
     ssh_run(H, P, U, K,
