@@ -483,47 +483,97 @@ class StateStore:
         return {"id": admin_id, "username": clean_user, "display_name": clean_disp,
                 "role_level": str(role_level or self.SUB_ADMIN), "allowed_platforms": plats, "enabled": 1}
 
-    def list_admin_accounts(self) -> List[Dict[str, Any]]:
-        """管理员账号列表 + 各自的数据统计（角色/成员/模板/实例）。"""
+    def list_admin_accounts(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """管理员账号列表 + 各自的数据统计。
+
+        2026-11-06 口径（用户拍板「平台视角统一」）：
+          · platform 传入时，角色/成员/模板/今日实例全部按该平台过滤
+            —— 超管卡 = 该平台全局汇总，分级卡 = 该管理员该平台名下（向文晗未开通企微 → 企微视角全 0）；
+          · 任务实例固定只看「今天」，与实例面板默认口径一致（46/47 之争的根因：
+            卡片多算了企微模板那 1 条，平台过滤后自然对齐）；
+          · platform 不传时保持全平台口径（兼容旧调用/测试）；
+          · 成员数按「人」去重（DISTINCT phone，一人多角色只算一次；停用也算在册）。
+        """
+        plat = (platform or "").strip().lower()
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM admin_user ORDER BY CASE role_level WHEN 'super_admin' THEN 0 ELSE 1 END, id ASC"
             ).fetchall()
             out: List[Dict[str, Any]] = []
+            today_key = self.now().strftime("%Y-%m-%d")
             for r in rows:
                 d = self.parse_admin_account(r)
                 aid = int(d["id"])
-                # 2026-11-05 口径（用户拍板）：
-                #   · 超管卡片 = 全平台汇总（超管视角就是全局总览，自己名下永远为空不代表平台没数据）；
-                #   · 分级卡片 = 该管理员名下；
-                #   · 成员数按「人」去重（DISTINCT phone，一人多角色只算一次；停用也算在册）。
                 is_super = str(d["role_level"] or "") == self.SUPER_ADMIN
                 scope = None if is_super else aid
-                d["role_count"] = self._count_by_owner("role", scope)
-                d["member_count"] = self._distinct_member_count(scope)
-                if scope is None:
-                    d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE deleted = 0").fetchone()[0] or 0)
-                else:
-                    d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (scope,)).fetchone()[0] or 0)
-                d["instance_count"] = self._count_by_owner("task_instance", scope)
-                # 2026-11-06 口径注解（用户实测反馈：卡片数字与面板对不上）：
-                #   · 角色面板按「当前办公软件平台」过滤，卡片是全平台总量 —— 角色按平台隔离
-                #     （同名角色在密信/企微各一行），只给总数会让人以为多算了一个；附平台分布。
-                #   · 实例面板默认只看「今天」，卡片是历史累计 —— 附今日数，两个口径都能对上。
-                today_key = self.now().strftime("%Y-%m-%d")
+                # 角色分组平台分布（跨平台全量；仅作悬停注解，不参与卡片主数值）
                 if scope is None:
                     plat_rows = self.conn.execute(
                         "SELECT platform, COUNT(1) AS n FROM role GROUP BY platform").fetchall()
-                    d["instance_count_today"] = int(self.conn.execute(
-                        "SELECT COUNT(1) FROM task_instance WHERE period_key = ?", (today_key,)).fetchone()[0] or 0)
                 else:
                     plat_rows = self.conn.execute(
                         "SELECT platform, COUNT(1) AS n FROM role WHERE owner_id = ? GROUP BY platform",
                         (scope,)).fetchall()
-                    d["instance_count_today"] = int(self.conn.execute(
-                        "SELECT COUNT(1) FROM task_instance WHERE owner_id = ? AND period_key = ?",
-                        (scope, today_key)).fetchone()[0] or 0)
                 d["role_platforms"] = {str(pr["platform"]): int(pr["n"]) for pr in plat_rows}
+
+                if not plat:
+                    d["role_count"] = self._count_by_owner("role", scope)
+                    d["member_count"] = self._distinct_member_count(scope)
+                    if scope is None:
+                        d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE deleted = 0").fetchone()[0] or 0)
+                    else:
+                        d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (scope,)).fetchone()[0] or 0)
+                    d["instance_count"] = self._count_by_owner("task_instance", scope)
+                    if scope is None:
+                        d["instance_count_today"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance WHERE period_key = ?", (today_key,)).fetchone()[0] or 0)
+                    else:
+                        d["instance_count_today"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance WHERE owner_id = ? AND period_key = ?",
+                            (scope, today_key)).fetchone()[0] or 0)
+                else:
+                    # ── 平台口径：模板/实例的平台由其角色归属决定（角色/成员直接按 role.platform）──
+                    if scope is None:
+                        d["role_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM role WHERE platform = ?", (plat,)).fetchone()[0] or 0)
+                        d["member_count"] = int(self.conn.execute(
+                            "SELECT COUNT(DISTINCT m.phone) FROM member m JOIN role r ON r.role_id = m.role_id "
+                            "WHERE r.platform = ?", (plat,)).fetchone()[0] or 0)
+                        d["template_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_template t WHERE t.deleted = 0 AND EXISTS ("
+                            "SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)",
+                            (plat,)).fetchone()[0] or 0)
+                        d["instance_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance i WHERE EXISTS (SELECT 1 FROM task_template t "
+                            "JOIN role r ON instr(t.role_ids, r.role_id) > 0 "
+                            "WHERE t.template_id = i.template_id AND r.platform = ?)",
+                            (plat,)).fetchone()[0] or 0)
+                        d["instance_count_today"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance i WHERE i.period_key = ? AND EXISTS ("
+                            "SELECT 1 FROM task_template t JOIN role r ON instr(t.role_ids, r.role_id) > 0 "
+                            "WHERE t.template_id = i.template_id AND r.platform = ?)",
+                            (today_key, plat)).fetchone()[0] or 0)
+                    else:
+                        d["role_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM role WHERE owner_id = ? AND platform = ?",
+                            (scope, plat)).fetchone()[0] or 0)
+                        d["member_count"] = int(self.conn.execute(
+                            "SELECT COUNT(DISTINCT m.phone) FROM member m JOIN role r ON r.role_id = m.role_id "
+                            "WHERE r.platform = ? AND m.owner_id = ?", (plat, scope)).fetchone()[0] or 0)
+                        d["template_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_template t WHERE t.deleted = 0 AND t.owner_id = ? AND EXISTS ("
+                            "SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)",
+                            (scope, plat)).fetchone()[0] or 0)
+                        d["instance_count"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance i WHERE i.owner_id = ? AND EXISTS ("
+                            "SELECT 1 FROM task_template t JOIN role r ON instr(t.role_ids, r.role_id) > 0 "
+                            "WHERE t.template_id = i.template_id AND r.platform = ?)",
+                            (scope, plat)).fetchone()[0] or 0)
+                        d["instance_count_today"] = int(self.conn.execute(
+                            "SELECT COUNT(1) FROM task_instance i WHERE i.owner_id = ? AND i.period_key = ? AND EXISTS ("
+                            "SELECT 1 FROM task_template t JOIN role r ON instr(t.role_ids, r.role_id) > 0 "
+                            "WHERE t.template_id = i.template_id AND r.platform = ?)",
+                            (scope, today_key, plat)).fetchone()[0] or 0)
                 out.append(d)
         return out
 
@@ -563,35 +613,61 @@ class StateStore:
     POOL_STATUS_PARTIAL = "partial"
     POOL_STATUS_DISABLED = "disabled"
 
-    def list_member_pool(self, q: str = "", size: int = 500) -> List[Dict[str, Any]]:
+    def list_member_pool(self, q: str = "", size: int = 500, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """按「人」去重的成员池聚合。
+
+        2026-11-06 口径（用户拍板「平台视角统一」）：platform 传入时，池内只统计该平台的
+        名册行 —— 张三案例：密信视角下只见密信角色，跨平台部门分叉不再出现、也不再误报
+        「部门不一致」；不传时保持全平台口径（兼容旧调用/测试）。主行取该口径内 MAX(id)。
+        姓名内多行不同名 → name_inconsistent（同一口径内才比，提示同样保留）。
+        """
         clean_q = (q or "").strip()
+        plat = (platform or "").strip().lower()
+        use_plat = bool(plat)
+
+        def pf(alias: str) -> str:
+            return f"AND {alias}.platform = :plat " if use_plat else ""
+
         sql = (
             "SELECT m.phone AS phone, COUNT(1) AS row_count, COUNT(DISTINCT m.role_id) AS role_count, "
             "COUNT(DISTINCT m.owner_id) AS admin_count, SUM(COALESCE(m.enabled, 1)) AS enabled_count, "
             "COUNT(DISTINCT m.name) AS distinct_names, COUNT(DISTINCT COALESCE(m.dept, '')) AS distinct_depts, "
             "p.name AS display_name, p.dept AS display_dept, "
-            "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 JOIN admin_user u ON u.id = m2.owner_id "
-            " WHERE m2.phone = m.phone) AS owner_names, "
-            # 2026-11-06 角色明细（含平台）与首次导入人：角色列展示全部加入角色个数，
-            # 归属列展示第一次被哪个管理员创建导入 —— 解决同名角色双平台造成的困惑（张三案例）。
-            "(SELECT GROUP_CONCAT(r.name || '（' || r.platform || '）', '、') FROM member m3 JOIN role r ON r.role_id = m3.role_id "
-            " WHERE m3.phone = m.phone) AS role_detail, "
-            "(SELECT u.display_name FROM member m4 JOIN admin_user u ON u.id = m4.owner_id "
-            " WHERE m4.phone = m.phone ORDER BY m4.id ASC LIMIT 1) AS first_owner_name, "
-            "(SELECT u.username FROM member m4 JOIN admin_user u ON u.id = m4.owner_id "
-            " WHERE m4.phone = m.phone ORDER BY m4.id ASC LIMIT 1) AS first_owner_username, "
+            "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 "
+            " JOIN role r2 ON r2.role_id = m2.role_id JOIN admin_user u ON u.id = m2.owner_id "
+            f" WHERE m2.phone = m.phone {pf('r2')}) AS owner_names, "
+            "(SELECT GROUP_CONCAT(r.name || '（' || r.platform || '）', '、') FROM member m3 "
+            " JOIN role r ON r.role_id = m3.role_id "
+            f" WHERE m3.phone = m.phone {pf('r')}) AS role_detail, "
+            "(SELECT u.display_name FROM member m4 JOIN role r4 ON r4.role_id = m4.role_id "
+            " JOIN admin_user u ON u.id = m4.owner_id "
+            f" WHERE m4.phone = m.phone {pf('r4')} ORDER BY m4.id ASC LIMIT 1) AS first_owner_name, "
+            "(SELECT u.username FROM member m4 JOIN role r4 ON r4.role_id = m4.role_id "
+            " JOIN admin_user u ON u.id = m4.owner_id "
+            f" WHERE m4.phone = m.phone {pf('r4')} ORDER BY m4.id ASC LIMIT 1) AS first_owner_username, "
             "(SELECT GROUP_CONCAT(DISTINCT dt.platform) FROM delivery_target dt "
             " WHERE dt.phone = m.phone AND dt.usable = 1) AS activated_platforms "
             "FROM member m "
-            "JOIN member p ON p.id = (SELECT MAX(id) FROM member WHERE phone = m.phone) "
+            + ("JOIN role rm ON rm.role_id = m.role_id AND rm.platform = :plat " if use_plat else "")
+            + "JOIN member p ON p.id = (SELECT MAX(p2.id) FROM member p2 "
+            + ("JOIN role pr ON pr.role_id = p2.role_id WHERE p2.phone = m.phone AND pr.platform = :plat "
+               if use_plat else "WHERE p2.phone = m.phone ")
+            + ") "
         )
-        params: List[Any] = []
+        params: Dict[str, Any] = {"size": int(size)}
+        if use_plat:
+            params["plat"] = plat
         if clean_q:
-            sql += ("WHERE EXISTS (SELECT 1 FROM member x WHERE x.phone = m.phone "
-                    "AND (x.name LIKE ? OR x.phone LIKE ?)) ")
-            params += [f"%{clean_q}%", f"%{clean_q}%"]
-        sql += "GROUP BY m.phone ORDER BY display_name ASC, m.phone ASC LIMIT ?"
-        params.append(int(size))
+            if use_plat:
+                sql += ("WHERE EXISTS (SELECT 1 FROM member x JOIN role xr ON xr.role_id = x.role_id "
+                        "WHERE x.phone = m.phone AND xr.platform = :plat "
+                        "AND (x.name LIKE :qname OR x.phone LIKE :qphone)) ")
+            else:
+                sql += ("WHERE EXISTS (SELECT 1 FROM member x WHERE x.phone = m.phone "
+                        "AND (x.name LIKE :qname OR x.phone LIKE :qphone)) ")
+            params["qname"] = f"%{clean_q}%"
+            params["qphone"] = f"%{clean_q}%"
+        sql += "GROUP BY m.phone ORDER BY display_name ASC, m.phone ASC LIMIT :size"
         out: List[Dict[str, Any]] = []
         with self.lock:
             for r in self.conn.execute(sql, params).fetchall():
@@ -618,31 +694,50 @@ class StateStore:
                 })
         return out
 
-    def _pool_require_phone(self, phone: str) -> str:
+    def _pool_require_phone(self, phone: str, platform: Optional[str] = None) -> str:
         clean = (phone or "").strip()
         if not clean:
             raise BizError(400, "VALIDATION_FAILED", "缺少手机号")
+        plat = (platform or "").strip().lower()
         with self.lock:
-            if not self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone():
-                raise BizError(404, "NOT_FOUND", "该手机号不在任何名册中")
+            if plat:
+                hit = self.conn.execute(
+                    "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    "WHERE m.phone = ? AND r.platform = ? LIMIT 1", (clean, plat)).fetchone()
+            else:
+                hit = self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone()
+            if not hit:
+                raise BizError(404, "NOT_FOUND", f"该手机号不在{'该平台' if plat else '任何'}名册中")
         return clean
 
-    def member_pool_set_status(self, phone: str, enabled: bool, actor: str = "system") -> Dict[str, Any]:
-        """全局启停：该手机号在所有管理员名下的 member 行统一 enabled（2026-11-05 用户口径：超管操作全局同步）。"""
-        clean = self._pool_require_phone(phone)
+    def member_pool_set_status(self, phone: str, enabled: bool, actor: str = "system", platform: Optional[str] = None) -> Dict[str, Any]:
+        """启停：作用域内该手机号全部名册行统一 enabled。
+
+        2026-11-05 用户口径：超管操作同步全部管理员；2026-11-06 补平台口径：
+        platform 传入时只作用于该平台的名册行（跨管理员），其它平台不动。
+        """
+        clean = self._pool_require_phone(phone, platform)
+        plat = (platform or "").strip().lower()
         now_s = self.now_str()
         with self.lock, self.conn:
-            cur = self.conn.execute(
-                "UPDATE member SET enabled = ? WHERE phone = ?", (1 if enabled else 0, clean))
+            if plat:
+                cur = self.conn.execute(
+                    "UPDATE member SET enabled = ? WHERE phone = ? "
+                    "AND role_id IN (SELECT role_id FROM role WHERE platform = ?)",
+                    (1 if enabled else 0, clean, plat))
+            else:
+                cur = self.conn.execute(
+                    "UPDATE member SET enabled = ? WHERE phone = ?", (1 if enabled else 0, clean))
             n = int(cur.rowcount or 0)
             self._insert_audit_unlocked(
                 actor, "member_pool.set_status", "member", clean,
-                {"enabled": bool(enabled), "rows": n}, now_s)
+                {"enabled": bool(enabled), "rows": n, "platform": plat or "all"}, now_s)
         return {"ok": True, "phone": clean, "rows": n}
 
-    def member_pool_update_profile(self, phone: str, name: Optional[str], dept: Optional[str], actor: str = "system") -> Dict[str, Any]:
-        """全局改姓名/部门：该手机号全部 member 行同步同一值。⛔ 不收手机号字段，手机号永不可改（用户红线）。"""
-        clean = self._pool_require_phone(phone)
+    def member_pool_update_profile(self, phone: str, name: Optional[str], dept: Optional[str], actor: str = "system", platform: Optional[str] = None) -> Dict[str, Any]:
+        """改姓名/部门：作用域内该手机号全部名册行同步同一值。⛔ 不收手机号字段，手机号永不可改（用户红线）。"""
+        clean = self._pool_require_phone(phone, platform)
+        plat = (platform or "").strip().lower()
         sets, params = [], []
         if name is not None:
             nm = str(name).strip()
@@ -658,29 +753,52 @@ class StateStore:
         now_s = self.now_str()
         with self.lock, self.conn:
             params.append(clean)
-            cur = self.conn.execute(f"UPDATE member SET {', '.join(sets)} WHERE phone = ?", params)
+            if plat:
+                params.append(plat)
+                cur = self.conn.execute(
+                    f"UPDATE member SET {', '.join(sets)} WHERE phone = ? "
+                    "AND role_id IN (SELECT role_id FROM role WHERE platform = ?)", params)
+            else:
+                cur = self.conn.execute(f"UPDATE member SET {', '.join(sets)} WHERE phone = ?", params)
             n = int(cur.rowcount or 0)
             self._insert_audit_unlocked(
                 actor, "member_pool.update_profile", "member", clean,
-                {"name": name, "dept": dept, "rows": n}, now_s)
+                {"name": name, "dept": dept, "rows": n, "platform": plat or "all"}, now_s)
         return {"ok": True, "phone": clean, "rows": n}
 
-    def member_pool_delete(self, phone: str, actor: str = "system") -> Dict[str, Any]:
-        """全局删除：该手机号从所有名册移除；删除后全平台无任何归属时绑定一并删除（激活共享口径）。"""
-        clean = self._pool_require_phone(phone)
+    def member_pool_delete(self, phone: str, actor: str = "system", platform: Optional[str] = None) -> Dict[str, Any]:
+        """删除：作用域内该手机号全部名册行移除；绑定清理与 delete_role_member 同口径。
+
+        platform 传入时只删该平台的行，且仅当该手机号在该平台再无任何角色归属时
+        才清除该平台的激活绑定（人在其它平台的名册/绑定不受影响）。
+        """
+        clean = self._pool_require_phone(phone, platform)
+        plat = (platform or "").strip().lower()
         now_s = self.now_str()
         removed_bindings: List[str] = []
         with self.lock, self.conn:
-            n = int(self.conn.execute("DELETE FROM member WHERE phone = ?", (clean,)).rowcount or 0)
-            if self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone() is None:
-                for dt in self.conn.execute(
-                    "SELECT DISTINCT platform FROM delivery_target WHERE phone = ?", (clean,)
-                ).fetchall():
-                    removed_bindings.append(str(dt["platform"] or ""))
-                self.conn.execute("DELETE FROM delivery_target WHERE phone = ?", (clean,))
+            if plat:
+                n = int(self.conn.execute(
+                    "DELETE FROM member WHERE phone = ? AND role_id IN (SELECT role_id FROM role WHERE platform = ?)",
+                    (clean, plat)).rowcount or 0)
+                still = self.conn.execute(
+                    "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    "WHERE m.phone = ? AND r.platform = ? LIMIT 1", (clean, plat)).fetchone()
+                if still is None:
+                    self.conn.execute(
+                        "DELETE FROM delivery_target WHERE phone = ? AND platform = ?", (clean, plat))
+                    removed_bindings.append(plat)
+            else:
+                n = int(self.conn.execute("DELETE FROM member WHERE phone = ?", (clean,)).rowcount or 0)
+                if self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", (clean,)).fetchone() is None:
+                    for dt in self.conn.execute(
+                        "SELECT DISTINCT platform FROM delivery_target WHERE phone = ?", (clean,)
+                    ).fetchall():
+                        removed_bindings.append(str(dt["platform"] or ""))
+                    self.conn.execute("DELETE FROM delivery_target WHERE phone = ?", (clean,))
             self._insert_audit_unlocked(
                 actor, "member_pool.delete", "member", clean,
-                {"rows": n, "bindings_removed": removed_bindings}, now_s)
+                {"rows": n, "bindings_removed": removed_bindings, "platform": plat or "all"}, now_s)
         return {"ok": True, "phone": clean, "rows": n, "bindings_removed": removed_bindings}
 
     def update_admin_account(
@@ -1914,7 +2032,40 @@ class StateStore:
                 + ("" if include_notice else " AND t.kind != 'notice'")
                 + " ORDER BY t.template_id ASC"
             )
-            return [self._deserialize_template_row(r) for r in self.conn.execute(sql).fetchall()]
+            templates = [self._deserialize_template_row(r) for r in self.conn.execute(sql).fetchall()]
+            if not templates:
+                return []
+            # 2026-11-06 拍板口径：「收回某平台的授权 = 该平台停发」（与停用账号同效，但仅限该平台）。
+            # 模板归属平台由其角色决定；owner 对该平台无授权 → 不进调度列表。
+            allowed_by_owner: Dict[int, set] = {}
+            for au in self.conn.execute("SELECT id, allowed_platforms FROM admin_user").fetchall():
+                try:
+                    allowed_by_owner[int(au["id"])] = {
+                        str(p).strip().lower() for p in json.loads(str(au["allowed_platforms"] or "[]"))
+                        if str(p).strip()
+                    }
+                except Exception:
+                    allowed_by_owner[int(au["id"])] = set(self.ALL_PLATFORMS)
+            role_plat: Dict[str, str] = {
+                str(rr["role_id"]): str(rr["platform"] or "").strip().lower()
+                for rr in self.conn.execute("SELECT role_id, platform FROM role").fetchall()
+            }
+            out: List[Dict[str, Any]] = []
+            for tpl in templates:
+                plats = {
+                    role_plat[str(rid)]
+                    for rid in (tpl.get("role_ids") or [])
+                    if str(rid) in role_plat and role_plat[str(rid)]
+                }
+                owner_id = int(tpl.get("owner_id") or 1)
+                # owner 账号不存在（历史/测试数据）→ 与停用判定同口径（COALESCE 视为启用）：不拦
+                if owner_id not in allowed_by_owner or not plats:
+                    out.append(tpl)
+                    continue
+                if not plats & allowed_by_owner[owner_id]:
+                    continue  # 该模板所属平台的授权已被收回 → 停发
+                out.append(tpl)
+            return out
 
     # ── 已激活待归纳人员（2026-10-28 方案B：用户发任意消息自动录入，管理员后续归纳角色）──
     # ── 部门选项（2026-11-03：后台配置，H5 登记页与成员表单共用）──
@@ -2471,6 +2622,29 @@ class StateStore:
         v = row["enabled"]
         return True if v is None else int(v) == 1
 
+    def _owner_allowed_platforms(self, owner_id: int) -> set:
+        """管理员账号被授权的办公软件平台集合（账号不存在/授权数据坏 → 全平台，fail-open 不误伤）。"""
+        try:
+            aid = int(owner_id or 1)
+        except Exception:
+            return set(self.ALL_PLATFORMS)
+        with self.lock:
+            row = self.conn.execute("SELECT allowed_platforms FROM admin_user WHERE id = ?", (aid,)).fetchone()
+        if row is None:
+            return set(self.ALL_PLATFORMS)
+        try:
+            plats = json.loads(str(row["allowed_platforms"] or "[]"))
+        except Exception:
+            return set(self.ALL_PLATFORMS)
+        return {str(p).strip().lower() for p in plats if str(p).strip()}
+
+    def _template_platform_allowed(self, tpl: Dict[str, Any]) -> bool:
+        """2026-11-06 拍板口径：模板所属平台的授权被收回 → 该平台停发（与停用账号同效，但仅限该平台）。"""
+        plats = self.role_platforms(tpl.get("role_ids") or [])
+        if not plats:
+            return True
+        return bool(plats & self._owner_allowed_platforms(int(tpl.get("owner_id") or 1)))
+
     def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str) -> List[Dict[str, Any]]:
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
@@ -2480,6 +2654,9 @@ class StateStore:
         # 此前只在 list_active_templates 拦（真实调度链只经那里，业务上不漏发），
         # 但直接调用本函数可绕过 → 这里补一道，避免将来新增调用点时静默漏发。
         if not self._template_owner_enabled(int(tpl.get("owner_id") or 1)):
+            return []
+        # 2026-11-06 拍板口径：模板所属平台的授权被收回 → 同样不生成（仅停该平台，其它平台不受影响）。
+        if not self._template_platform_allowed(tpl):
             return []
         members = self.get_dedup_enabled_members_for_roles(tpl["role_ids"])
         now_s = self.now_str()

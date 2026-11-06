@@ -23,7 +23,7 @@ interface MainAppProps {
 }
 
 const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
-  const { loading, templates, roles, stats } = useAppStore();
+  const { loading, templates, roles, stats, platform } = useAppStore();
   const [activeTab, setActiveTab] = useState<TabKey>('instances');
 
   const isSuperAdmin = me.role_level !== 'sub_admin';
@@ -78,6 +78,16 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
                 <span className="text-[10px] text-slate-400 font-mono">im-task</span>
                 <span className="text-[9px] text-blue-600 bg-blue-50 px-1.5 py-0.2 rounded font-medium">
                   管理后台
+                </span>
+                {/* 2026-11-06 用户要求：当前所选办公软件实时渲染在左上角（超管/分级同口径，醒目展示） */}
+                <span
+                  className={`text-[9px] font-bold px-1.5 py-0.5 rounded text-white inline-flex items-center gap-0.5 shrink-0 ${
+                    platform === 'wecom' ? 'bg-blue-600' : 'bg-emerald-600'
+                  }`}
+                  title={`当前展示与操作的是「${platform === 'wecom' ? '企业微信' : '量子密信'}」的数据；可在左下角账户卡片中切换`}
+                >
+                  <Radio className="w-2.5 h-2.5" />
+                  {platform === 'wecom' ? '企业微信' : '量子密信'}
                 </span>
               </div>
             </div>

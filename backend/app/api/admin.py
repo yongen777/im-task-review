@@ -812,7 +812,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return None
 
     @router.get("/accounts")
-    async def list_accounts(request: Request):
+    async def list_accounts(request: Request, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
@@ -820,7 +820,8 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         forbidden = _require_super(state, sess)
         if forbidden is not None:
             return forbidden
-        return {"ok": True, "items": state.list_admin_accounts(),
+        # 2026-11-06 平台口径：传 platform 时卡片统计（角色/成员/模板/今日实例）按该平台过滤
+        return {"ok": True, "items": state.list_admin_accounts(platform=platform),
                 "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD}
 
     @router.post("/accounts")
@@ -1251,7 +1252,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
 
     # ── 全平台成员池（2026-11-05）：超管按「人」管理的全局名册，操作全局同步到所有管理员名下 ──
     @router.get("/member-pool")
-    async def list_member_pool(request: Request, q: Optional[str] = None, size: int = 500):
+    async def list_member_pool(request: Request, q: Optional[str] = None, size: int = 500, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
@@ -1259,10 +1260,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         forbidden = _require_super(state, sess)
         if forbidden is not None:
             return forbidden
-        return {"ok": True, "items": state.list_member_pool(q=q or "", size=size)}
+        return {"ok": True, "items": state.list_member_pool(q=q or "", size=size, platform=platform)}
 
     @router.put("/member-pool/{phone}/status")
-    async def member_pool_set_status(phone: str, request: Request):
+    async def member_pool_set_status(phone: str, request: Request, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1272,14 +1273,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return forbidden
         body = await _read_json_body(request)
         try:
-            res = state.member_pool_set_status(phone, bool(body.get("enabled")), actor=sess["username"])
+            res = state.member_pool_set_status(phone, bool(body.get("enabled")), actor=sess["username"], platform=platform)
         except BizError as exc:
             return biz_error_response(exc)
         return res
 
     @router.put("/member-pool/{phone}")
-    async def member_pool_update_profile(phone: str, request: Request):
-        """全局改姓名/部门。⛔ 接口不收手机号 —— 手机号永不可改（用户红线）。"""
+    async def member_pool_update_profile(phone: str, request: Request, platform: Optional[str] = None):
+        """改姓名/部门（platform 传入时仅同步该平台名册行）。⛔ 接口不收手机号 —— 手机号永不可改（用户红线）。"""
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1290,13 +1291,13 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         body = await _read_json_body(request)
         try:
             res = state.member_pool_update_profile(
-                phone, name=body.get("name"), dept=body.get("dept"), actor=sess["username"])
+                phone, name=body.get("name"), dept=body.get("dept"), actor=sess["username"], platform=platform)
         except BizError as exc:
             return biz_error_response(exc)
         return res
 
     @router.delete("/member-pool/{phone}")
-    async def member_pool_delete(phone: str, request: Request):
+    async def member_pool_delete(phone: str, request: Request, platform: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1305,7 +1306,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if forbidden is not None:
             return forbidden
         try:
-            res = state.member_pool_delete(phone, actor=sess["username"])
+            res = state.member_pool_delete(phone, actor=sess["username"], platform=platform)
         except BizError as exc:
             return biz_error_response(exc)
         return res

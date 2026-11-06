@@ -148,12 +148,15 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
   const refreshAdminAccounts = useCallback(async () => {
     if (!isSuperAdmin) return;
     try {
-      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>('/api/admin/accounts');
+      /* 2026-11-06 平台口径：账号卡片统计（角色/成员/模板/今日实例）按当前办公软件过滤 */
+      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>(
+        `/api/admin/accounts?platform=${platform}`,
+      );
       setAdminAccounts(res.items || []);
-    } catch {
-      /* ignore */
+    } catch (e) {
+      console.warn('刷新管理员账号列表失败', e);
     }
-  }, [isSuperAdmin]);
+  }, [isSuperAdmin, platform]);
 
   const refreshAll = useCallback(async () => {
     const seq = ++refreshSeq.current;

@@ -46,12 +46,7 @@ interface MemberPoolItem {
   dept_inconsistent: boolean;
 }
 
-/* 角色明细文本的后端格式为「名称（zdxlz）、名称（wecom）」，展示时把平台码换成中文 */
-function formatPoolRoleDetail(detail: string): string {
-  return (detail || '')
-    .replace(/（zdxlz）/g, '（密信）')
-    .replace(/（wecom）/g, '（企微）');
-}
+/* 角色列只展示任职个数（2026-11-06 用户指定：具体角色描述不需要） */
 
 /* 成员池分页：每页 10 人（2026-11-06 用户要求，防数据量大时列表过长） */
 const POOL_PAGE_SIZE = 10;
@@ -106,14 +101,17 @@ export const RolesMembersView: React.FC = () => {
     if (!isSuperAdmin) return;
     setPoolLoading(true);
     try {
-      const res = await api.get<{ ok: boolean; items: MemberPoolItem[] }>('/api/admin/member-pool');
+      /* 2026-11-06 平台口径：池内只展示当前办公软件的名册（郑佳案例的双平台部门分叉不再出现） */
+      const res = await api.get<{ ok: boolean; items: MemberPoolItem[] }>(
+        `/api/admin/member-pool?platform=${platform}`,
+      );
       setPoolItems(res.items || []);
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '加载成员池失败');
     } finally {
       setPoolLoading(false);
     }
-  }, [isSuperAdmin]);
+  }, [isSuperAdmin, platform]);
 
   useEffect(() => {
     if (isSuperAdmin) void loadPool();
@@ -127,9 +125,10 @@ export const RolesMembersView: React.FC = () => {
     );
   }, [poolItems, poolKeyword]);
 
-  /* 分页：搜索词变化回到第一页；页码超出总页数时收敛到末页 */
+  /* 分页：搜索词/平台切换回第一页；页码超出总页数时收敛到末页 */
   const [poolPage, setPoolPage] = useState(1);
   useEffect(() => setPoolPage(1), [poolKeyword]);
+  useEffect(() => setPoolPage(1), [platform]);
   const poolTotalPages = Math.max(1, Math.ceil(filteredPoolItems.length / POOL_PAGE_SIZE));
   const poolCurrentPage = Math.min(poolPage, poolTotalPages);
   const pagedPoolItems = useMemo(
@@ -144,13 +143,13 @@ export const RolesMembersView: React.FC = () => {
   const handlePoolToggleStatus = async (p: MemberPoolItem) => {
     setPoolBusyPhone(p.phone);
     try {
-      await api.put(`/api/admin/member-pool/${encodeURIComponent(p.phone)}/status`, {
+      await api.put(`/api/admin/member-pool/${encodeURIComponent(p.phone)}/status?platform=${platform}`, {
         enabled: p.status !== 'active',
       });
       toast.success(
         p.status !== 'active'
-          ? `已全局启用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`
-          : `已全局停用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`,
+          ? `已在当前办公软件下启用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`
+          : `已在当前办公软件下停用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`,
       );
       await Promise.all([loadPool(), refreshRoles()]);
     } catch (err) {
@@ -168,11 +167,11 @@ export const RolesMembersView: React.FC = () => {
     }
     setPoolBusyPhone(poolEditing.phone);
     try {
-      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}`, {
+      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}?platform=${platform}`, {
         name: poolEditName.trim(),
         dept: poolEditDept.trim(),
       });
-      toast.success(`已全局同步「${poolEditName.trim()}」在名下全部 ${poolEditing.row_count} 条名册记录。`);
+      toast.success(`已在当前办公软件下同步「${poolEditName.trim()}」的名下全部 ${poolEditing.row_count} 条名册记录。`);
       setPoolEditing(null);
       await Promise.all([loadPool(), refreshRoles()]);
     } catch (err) {
@@ -187,9 +186,9 @@ export const RolesMembersView: React.FC = () => {
     setPoolBusyPhone(poolDeleting.phone);
     try {
       const res = await api.delete<{ ok: boolean; rows: number }>(
-        `/api/admin/member-pool/${encodeURIComponent(poolDeleting.phone)}`,
+        `/api/admin/member-pool/${encodeURIComponent(poolDeleting.phone)}?platform=${platform}`,
       );
-      toast.success(`已从全部名册删除「${poolDeleting.display_name || poolDeleting.phone}」（${res.rows} 条记录）。`);
+      toast.success(`已在当前办公软件下从全部名册移除「${poolDeleting.display_name || poolDeleting.phone}」（${res.rows} 条记录）。`);
       setPoolDeleting(null);
       await Promise.all([loadPool(), refreshRoles()]);
     } catch (err) {
@@ -1849,18 +1848,18 @@ export const RolesMembersView: React.FC = () => {
       {isSuperAdmin && (
         <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
           <div className="p-4 sm:px-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <div className="flex items-center gap-2">
-                <h3 className="font-bold text-slate-900 text-base">全平台成员池</h3>
-                <span className="text-xs text-slate-400 font-normal tabular-nums">
-                  · {filteredPoolItems.length} / {poolItems.length} 人（按手机号去重）
-                </span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-bold text-slate-900 text-base">成员池（{platform === 'wecom' ? '企业微信' : '量子密信'}）</h3>
+                  <span className="text-xs text-slate-400 font-normal tabular-nums">
+                    · {filteredPoolItems.length} / {poolItems.length} 人（按手机号去重）
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  展示当前所选办公软件下全部分级管理员的在册成员（按手机号去重）；停用 / 修改姓名部门 / 删除
+                  <strong className="text-slate-700">仅作用于该平台下全部管理员名下的名册记录</strong>，其它平台不受影响；手机号不可修改。
+                </p>
               </div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                展示全部分级管理员名下创建的全部成员；停用 / 修改姓名部门 / 删除均<strong className="text-slate-700">全局同步</strong>
-                作用于所有管理员名下该手机号，手机号不可修改。
-              </p>
-            </div>
             <div className="flex flex-wrap items-center gap-2 shrink-0">
               <div className="relative">
                 <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
@@ -1940,15 +1939,9 @@ export const RolesMembersView: React.FC = () => {
                         </div>
                       </td>
                       <td className="px-3 py-3.5 text-xs whitespace-nowrap">
-                        <div
-                          title={formatPoolRoleDetail(p.role_detail)}
-                          className="font-semibold text-slate-700 inline-flex items-center gap-1 cursor-help"
-                        >
+                        <div className="font-semibold text-slate-700 inline-flex items-center gap-1">
                           <Users className="w-3.5 h-3.5 text-slate-400" />
                           <span>{p.role_count} 个</span>
-                        </div>
-                        <div className="text-[10px] text-slate-400 truncate max-w-44" title={formatPoolRoleDetail(p.role_detail)}>
-                          {formatPoolRoleDetail(p.role_detail)}
                         </div>
                       </td>
                       <td className="px-3 py-3.5 text-xs whitespace-nowrap">
@@ -1960,10 +1953,10 @@ export const RolesMembersView: React.FC = () => {
                         </div>
                       </td>
                       <td className="px-3 py-3.5 text-xs whitespace-nowrap">
-                        {p.activated_platforms.length ? (
+                        {p.activated_platforms.includes(platform) ? (
                           <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
                             <ShieldCheck className="w-3.5 h-3.5" />
-                            <span>已激活（{p.activated_platforms.join(' / ')}）</span>
+                            <span>已激活</span>
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1 text-slate-400">
@@ -2073,9 +2066,10 @@ export const RolesMembersView: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
             <div>
-              <h3 className="font-bold text-slate-900 text-base">修改成员信息（全局同步）</h3>
+              <h3 className="font-bold text-slate-900 text-base">修改成员信息（当前办公软件内同步）</h3>
               <p className="text-xs text-slate-500 mt-1">
-                将同步修改该手机号在<strong className="text-slate-700">全部管理员名下 {poolEditing.row_count}</strong> 条名册记录。
+                将同步修改该手机号在当前办公软件（{platform === 'wecom' ? '企业微信' : '量子密信'}）下
+                <strong className="text-slate-700">全部管理员名下 {poolEditing.row_count} 条</strong>名册记录；其它平台不受影响。
               </p>
             </div>
             <div className="space-y-3">
@@ -2137,11 +2131,12 @@ export const RolesMembersView: React.FC = () => {
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
             <div>
-              <h3 className="font-bold text-slate-900 text-base">删除成员（全局）</h3>
+              <h3 className="font-bold text-slate-900 text-base">删除成员（当前办公软件）</h3>
               <p className="text-xs text-slate-600 mt-2 leading-relaxed">
-                将<strong>删除该手机号在全部管理员名下的 {poolDeleting.row_count} 条名册记录</strong>；
-                若该手机号在全平台再无任何归属，其激活绑定也将一并清除（需重新走 H5 登记激活）。
-                已产生的任务实例与提交记录不受影响。
+                将删除该手机号在当前办公软件（{platform === 'wecom' ? '企业微信' : '量子密信'}）下
+                <strong>全部管理员名下的 {poolDeleting.row_count} 条名册记录</strong>；
+                若该手机号在该平台再无任何归属，其该平台的激活绑定也将一并清除（需重新登记）；
+                <strong>其它平台的名册与激活不受影响</strong>。已产生的任务实例与提交记录不受影响。
               </p>
               <p className="text-xs text-rose-600 font-medium mt-2">此操作不可撤销，请确认。</p>
             </div>

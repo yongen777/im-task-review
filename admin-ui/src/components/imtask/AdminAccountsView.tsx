@@ -24,19 +24,18 @@ const PLATFORM_LABELS: Record<OfficePlatform, string> = {
   wecom: '企业微信',
 };
 
-/* 2026-11-06：角色分组的平台分布（"密信 2 · 企微 1"）——
-   角色面板按当前平台过滤，只有密信视图时看不到企微角色，总数注解能让卡片立刻对上账。 */
+/* 角色分组的跨平台分布文本（仅作悬停注解：卡片主数值已是当前平台口径） */
 function formatRolePlatforms(rp?: Record<string, number>): string {
-  if (!rp) return '—';
+  if (!rp) return '';
   const parts = (['zdxlz', 'wecom'] as OfficePlatform[])
     .filter((p) => (rp[p] || 0) > 0)
-    .map((p) => `${PLATFORM_LABELS[p].slice(2)} ${rp[p]}`);
-  return parts.length ? parts.join(' · ') : '—';
+    .map((p) => `${PLATFORM_LABELS[p]} ${rp[p]}`);
+  return parts.join(' · ');
 }
 
 export const AdminAccountsView: React.FC = () => {
   const toast = useToast();
-  const { refreshAdminAccounts } = useAppStore();
+  const { refreshAdminAccounts, platform } = useAppStore();
   const [accounts, setAccounts] = useState<AdminAccountItem[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -67,7 +66,10 @@ export const AdminAccountsView: React.FC = () => {
   const loadAccounts = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>('/api/admin/accounts');
+      /* 2026-11-06 平台口径：卡片统计（角色/成员/模板/今日实例）按当前办公软件过滤 */
+      const res = await api.get<{ ok: boolean; items: AdminAccountItem[] }>(
+        `/api/admin/accounts?platform=${platform}`,
+      );
       setAccounts(res.items || []);
       await refreshAdminAccounts();
     } catch (err) {
@@ -75,7 +77,7 @@ export const AdminAccountsView: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [toast, refreshAdminAccounts]);
+  }, [toast, refreshAdminAccounts, platform]);
 
   useEffect(() => {
     void loadAccounts();
@@ -370,7 +372,7 @@ export const AdminAccountsView: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* 独立工作空间统计（2026-11-06：附口径注解 —— 角色按平台隔离、实例分累计/今日，与各面板对得上） */}
+                  {/* 独立工作空间统计（2026-11-06 平台口径：角色/成员/模板按当前办公软件过滤；实例固定只看今天，与实例面板对齐） */}
                   <div className="grid grid-cols-4 gap-2 pt-0.5">
                     <div className="bg-slate-50/80 border border-slate-100 rounded-xl p-2.5">
                       <div className="text-[11px] text-slate-400 flex items-center gap-1">
@@ -380,8 +382,11 @@ export const AdminAccountsView: React.FC = () => {
                       <div className="text-sm font-bold text-slate-800 font-mono tabular-nums mt-0.5">
                         {acc.role_count}
                       </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5 truncate" title="角色分组按办公软件平台隔离（同名角色在密信/企微各计一行）；角色面板按当前所选平台过滤显示">
-                        {formatRolePlatforms(acc.role_platforms)}
+                      <div
+                        className="text-[10px] text-slate-400 mt-0.5 truncate cursor-help"
+                        title={`各平台角色分布（含未选中的平台）：${formatRolePlatforms(acc.role_platforms) || '—'}`}
+                      >
+                        当前平台
                       </div>
                     </div>
                     <div className="bg-slate-50/80 border border-slate-100 rounded-xl p-2.5">
@@ -409,11 +414,9 @@ export const AdminAccountsView: React.FC = () => {
                         <span>任务实例</span>
                       </div>
                       <div className="text-sm font-bold text-slate-800 font-mono tabular-nums mt-0.5">
-                        {acc.instance_count}
+                        {acc.instance_count_today ?? 0}
                       </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5 truncate" title="累计为全部历史实例；实例面板默认只看「今天」">
-                        累计 · 今日 {acc.instance_count_today ?? 0}
-                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">今日</div>
                     </div>
                   </div>
                 </div>
