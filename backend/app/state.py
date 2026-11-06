@@ -506,6 +506,24 @@ class StateStore:
                 else:
                     d["template_count"] = int(self.conn.execute("SELECT COUNT(1) FROM task_template WHERE owner_id = ? AND deleted = 0", (scope,)).fetchone()[0] or 0)
                 d["instance_count"] = self._count_by_owner("task_instance", scope)
+                # 2026-11-06 口径注解（用户实测反馈：卡片数字与面板对不上）：
+                #   · 角色面板按「当前办公软件平台」过滤，卡片是全平台总量 —— 角色按平台隔离
+                #     （同名角色在密信/企微各一行），只给总数会让人以为多算了一个；附平台分布。
+                #   · 实例面板默认只看「今天」，卡片是历史累计 —— 附今日数，两个口径都能对上。
+                today_key = self.now().strftime("%Y-%m-%d")
+                if scope is None:
+                    plat_rows = self.conn.execute(
+                        "SELECT platform, COUNT(1) AS n FROM role GROUP BY platform").fetchall()
+                    d["instance_count_today"] = int(self.conn.execute(
+                        "SELECT COUNT(1) FROM task_instance WHERE period_key = ?", (today_key,)).fetchone()[0] or 0)
+                else:
+                    plat_rows = self.conn.execute(
+                        "SELECT platform, COUNT(1) AS n FROM role WHERE owner_id = ? GROUP BY platform",
+                        (scope,)).fetchall()
+                    d["instance_count_today"] = int(self.conn.execute(
+                        "SELECT COUNT(1) FROM task_instance WHERE owner_id = ? AND period_key = ?",
+                        (scope, today_key)).fetchone()[0] or 0)
+                d["role_platforms"] = {str(pr["platform"]): int(pr["n"]) for pr in plat_rows}
                 out.append(d)
         return out
 
@@ -554,6 +572,14 @@ class StateStore:
             "p.name AS display_name, p.dept AS display_dept, "
             "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 JOIN admin_user u ON u.id = m2.owner_id "
             " WHERE m2.phone = m.phone) AS owner_names, "
+            # 2026-11-06 角色明细（含平台）与首次导入人：角色列展示全部加入角色个数，
+            # 归属列展示第一次被哪个管理员创建导入 —— 解决同名角色双平台造成的困惑（张三案例）。
+            "(SELECT GROUP_CONCAT(r.name || '（' || r.platform || '）', '、') FROM member m3 JOIN role r ON r.role_id = m3.role_id "
+            " WHERE m3.phone = m.phone) AS role_detail, "
+            "(SELECT u.display_name FROM member m4 JOIN admin_user u ON u.id = m4.owner_id "
+            " WHERE m4.phone = m.phone ORDER BY m4.id ASC LIMIT 1) AS first_owner_name, "
+            "(SELECT u.username FROM member m4 JOIN admin_user u ON u.id = m4.owner_id "
+            " WHERE m4.phone = m.phone ORDER BY m4.id ASC LIMIT 1) AS first_owner_username, "
             "(SELECT GROUP_CONCAT(DISTINCT dt.platform) FROM delivery_target dt "
             " WHERE dt.phone = m.phone AND dt.usable = 1) AS activated_platforms "
             "FROM member m "
@@ -583,7 +609,9 @@ class StateStore:
                     "row_count": rows_n,
                     "role_count": int(r["role_count"] or 0),
                     "admin_count": int(r["admin_count"] or 0),
-                    "owner_names": str(r["owner_names"] or ""),
+                    "role_detail": str(r["role_detail"] or ""),
+                    "first_owner_name": str(r["first_owner_name"] or ""),
+                    "first_owner_username": str(r["first_owner_username"] or ""),
                     "activated_platforms": [p for p in str(r["activated_platforms"] or "").split(",") if p],
                     "name_inconsistent": int(r["distinct_names"] or 0) > 1,
                     "dept_inconsistent": int(r["distinct_depts"] or 0) > 1,

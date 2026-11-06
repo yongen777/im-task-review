@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import {
   AdminAccountItem,
@@ -36,6 +36,7 @@ interface AppContextType {
   loading: boolean;
   platform: Platform;
   setPlatform: (p: Platform) => void;
+  memberDistinctTotal: number;
   refreshAll: () => Promise<void>;
   refreshTemplates: () => Promise<void>;
   refreshRoles: () => Promise<void>;
@@ -59,12 +60,16 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
 
   const [templates, setTemplates] = useState<TemplateItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
+  const [memberDistinctTotal, setMemberDistinctTotal] = useState(0);
   const [stats, setStats] = useState<InstanceStats | null>(null);
   const [health, setHealth] = useState<AdminHealth | null>(null);
   const [adminAccounts, setAdminAccounts] = useState<AdminAccountItem[]>([]);
   const [loading, setLoading] = useState(true);
   // 超管默认看全部管理员 ('all')，也可切换看某个具体管理员 ('1', '2', ...)
   const [ownerFilter, setOwnerFilterState] = useState<string>('all');
+  // 平台/管理员切换会立刻触发新一轮 refreshAll，上一轮的响应可能更慢才回来；
+  // 用自增序号只认最后一轮，避免旧平台的数据覆盖当前平台的列表。
+  const refreshSeq = useRef(0);
 
   const [platform, setPlatformState] = useState<Platform>(() => {
     const saved = (localStorage.getItem(PLATFORM_KEY) || '').trim() as Platform;
@@ -125,10 +130,12 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
   }, [platform, ownerQuery]);
 
   const refreshRoles = useCallback(async () => {
-    const res = await api.get<{ ok: boolean; items: RoleItem[] }>(
+    const res = await api.get<{ ok: boolean; items: RoleItem[]; member_distinct_total?: number }>(
       `/api/admin/roles?platform=${platform}${ownerQuery}`,
     );
     setRoles(res.items || []);
+    /* 2026-11-05：在册人数改用后端按人去重口径（一人多角色只算一次） */
+    setMemberDistinctTotal(Number(res.member_distinct_total || 0));
   }, [platform, ownerQuery]);
 
   const refreshStats = useCallback(async () => {
@@ -149,26 +156,31 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
   }, [isSuperAdmin]);
 
   const refreshAll = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     try {
       const [tplRes, roleRes, statRes, healthRes] = await Promise.all([
         api.get<{ ok: boolean; items: TemplateItem[] }>(
           `/api/admin/templates?size=500&platform=${platform}${ownerQuery}`,
         ),
-        api.get<{ ok: boolean; items: RoleItem[] }>(
+        api.get<{ ok: boolean; items: RoleItem[]; member_distinct_total?: number }>(
           `/api/admin/roles?platform=${platform}${ownerQuery}`,
         ),
         api.get<InstanceStats>(`/api/admin/instances/stats?platform=${platform}${ownerQuery}`),
         api.get<AdminHealth>('/api/admin/health'),
       ]);
+      if (seq !== refreshSeq.current) return;
       setTemplates(tplRes.items || []);
       setRoles(roleRes.items || []);
+      setMemberDistinctTotal(Number(roleRes.member_distinct_total || 0));
       setStats(statRes);
       setHealth(healthRes);
       if (isSuperAdmin) {
         await refreshAdminAccounts();
       }
+    } catch (e) {
+      console.warn('刷新后台数据失败', e);
     } finally {
-      setLoading(false);
+      if (seq === refreshSeq.current) setLoading(false);
     }
   }, [platform, ownerQuery, isSuperAdmin, refreshAdminAccounts]);
 
@@ -192,6 +204,7 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
         loading,
         platform,
         setPlatform,
+        memberDistinctTotal,
         refreshAll,
         refreshTemplates,
         refreshRoles,

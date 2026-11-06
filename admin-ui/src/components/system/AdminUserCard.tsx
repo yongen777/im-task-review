@@ -9,6 +9,8 @@ import {
   ChevronDown,
   AlertCircle,
   Lock,
+  ArrowLeftRight,
+  Undo2,
 } from 'lucide-react';
 import { api, DEFAULT_SUB_ADMIN_PASSWORD, plainError, setCsrfToken } from '../../lib/api';
 import { useToast } from '../../lib/toast';
@@ -28,6 +30,8 @@ export interface AdminMe {
   role_level?: AdminRoleLevel;
   allowed_platforms?: OfficePlatform[];
   must_change_password: boolean;
+  /* 2026-11-05：代登录标识 —— 后端 /me 返回（当前会话是超管 assume 出来的） */
+  assumed?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -401,17 +405,45 @@ interface AdminUserCardProps {
 }
 
 export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut }) => {
-  const { platform, setPlatform, allowedPlatforms, isSuperAdmin } = useAppStore();
+  const { platform, setPlatform, allowedPlatforms, isSuperAdmin, adminAccounts } = useAppStore();
   const [open, setOpen] = useState(false);
   const [modal, setModal] = useState<'none' | 'password' | 'username' | 'logout'>('none');
   const [busy, setBusy] = useState(false);
+  const [assumeBusyId, setAssumeBusyId] = useState<number | null>(null);
   const [displayName, setDisplayName] = useState(me.username || '');
   useEffect(() => setDisplayName(me.username || ''), [me.username]);
+  const toast = useToast();
 
   const display = displayName || '管理员';
   const initial = display.slice(0, 1).toUpperCase();
   const canUseZdxlz = allowedPlatforms.includes('zdxlz');
   const canUseWecom = allowedPlatforms.includes('wecom');
+
+  /* 2026-11-05 切换身份（用户需求：免退出切换到分级管理员账号，代登录后可真实执行其操作）。
+     切回走后端 unassume：HttpOnly Cookie 前端拿不到 sid，原超管会话存在服务端（parent_sid）。 */
+  const handleAssume = async (accId: number, accName: string) => {
+    setAssumeBusyId(accId);
+    try {
+      await api.post(`/api/admin/accounts/${accId}/assume`);
+      toast.success(`已切换到「${accName}」身份，正在刷新界面…`);
+      window.setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '切换身份失败');
+      setAssumeBusyId(null);
+    }
+  };
+
+  const handleUnassume = async () => {
+    setAssumeBusyId(-1);
+    try {
+      await api.post('/api/admin/accounts/unassume');
+      toast.success('已切回超级管理员，正在刷新界面…');
+      window.setTimeout(() => window.location.reload(), 500);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '切回失败');
+      setAssumeBusyId(null);
+    }
+  };
 
   const doLogout = async () => {
     setBusy(true);
@@ -443,10 +475,10 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <div className="font-bold text-xs text-slate-800 leading-tight truncate">
               {me.display_name ? `${me.display_name} (${display})` : display}
             </div>
-            <div className="text-[10px] text-blue-600 flex items-center gap-1 font-medium mt-0.5">
-              <Shield className="w-2.5 h-2.5" />
-              <span>{isSuperAdmin ? '超级管理员 (admin)' : '分级管理员'}</span>
-            </div>
+              <div className="text-[10px] text-blue-600 flex items-center gap-1 font-medium mt-0.5">
+                <Shield className="w-2.5 h-2.5" />
+                <span>{isSuperAdmin ? '超级管理员 (admin)' : me.assumed ? '代管身份（超管代登录）' : '分级管理员'}</span>
+              </div>
           </div>
         </div>
         <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
@@ -458,9 +490,13 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
             <div className="font-bold text-slate-800">
               {me.display_name ? `${me.display_name} (${display})` : display}
             </div>
-            <div className="text-[10px] text-slate-400 font-mono">
-              {isSuperAdmin ? '超级管理员 · 全局视图权限' : '分级管理员 · 独立工作台'}
-            </div>
+                <div className="text-[10px] text-slate-400 font-mono">
+                  {isSuperAdmin
+                    ? '超级管理员 · 全局视图权限'
+                    : me.assumed
+                      ? '代管身份 · 超管代登录，可切回'
+                      : '分级管理员 · 独立工作台'}
+                </div>
             <div className="text-[10px] text-emerald-600 font-semibold mt-0.5">● 会话已鉴权</div>
           </div>
 
@@ -517,6 +553,63 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
               </button>
             </div>
           </div>
+
+          {/* 2026-11-05 切换身份（仅超管）：免退出代登录到任意分级管理员，全程审计 */}
+          {isSuperAdmin && (
+            <div className="px-3 py-2 border-b border-slate-100">
+              <div className="text-[10px] text-slate-400 font-semibold mb-1.5 flex items-center gap-1">
+                <ArrowLeftRight className="w-3 h-3" />
+                <span>切换身份（免退出代登录，全程审计）</span>
+              </div>
+              <div className="space-y-1 max-h-40 overflow-y-auto">
+                {adminAccounts
+                  .filter((a) => a.role_level === 'sub_admin')
+                  .map((a) => {
+                    const switching = assumeBusyId === a.id;
+                    return (
+                      <button
+                        key={a.id}
+                        type="button"
+                        disabled={switching || assumeBusyId !== null}
+                        onClick={() => void handleAssume(a.id, a.display_name || a.username)}
+                        className="w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-blue-50 border border-slate-200/70 hover:border-blue-200 transition-colors group disabled:opacity-60 cursor-pointer"
+                      >
+                        <span className="min-w-0 flex items-center gap-2">
+                          <span className="w-5 h-5 rounded-full bg-indigo-600 text-white text-[10px] font-bold flex items-center justify-center shrink-0">
+                            {(a.display_name || a.username || '?').slice(0, 1)}
+                          </span>
+                          <span className="text-[11px] font-semibold text-slate-700 truncate">
+                            {a.display_name || a.username}
+                            <span className="text-slate-400 font-normal"> (@{a.username})</span>
+                          </span>
+                        </span>
+                        <span className="text-[10px] font-semibold text-blue-600 shrink-0 group-hover:underline">
+                          {switching ? '切换中…' : '以此身份进入'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                {adminAccounts.filter((a) => a.role_level === 'sub_admin').length === 0 && (
+                  <div className="text-[11px] text-slate-400 px-2.5 py-1">暂无分级管理员账号</div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* 代管身份：一键切回原超级管理员（服务端用 parent_sid 恢复原会话） */}
+          {me.assumed && (
+            <div className="pt-1 border-t border-slate-100">
+              <button
+                type="button"
+                disabled={assumeBusyId === -1}
+                onClick={() => void handleUnassume()}
+                className="w-full text-left px-3 py-2 rounded-xl hover:bg-violet-50 text-violet-700 font-semibold flex items-center gap-2 cursor-pointer transition-colors disabled:opacity-60"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                <span>{assumeBusyId === -1 ? '正在切回…' : '切回超级管理员'}</span>
+              </button>
+            </div>
+          )}
 
           <div className="py-1 space-y-0.5">
             <button

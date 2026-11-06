@@ -300,6 +300,11 @@ def test_member_pool_aggregate_and_global_ops() -> None:
         assert pool[PHONE_X]["status"] == "active"
         assert pool[PHONE_X]["activated_platforms"]  # 已激活平台可见
         assert pool[PHONE_Z]["admin_count"] == 1
+        # 2026-11-06 新列口径：首次导入人 + 角色明细（含平台）
+        assert pool[PHONE_X]["first_owner_name"] == "sa"
+        assert pool[PHONE_Z]["first_owner_name"] == "sa"
+        for role_name in ("甲1组", "甲2组", "乙组"):
+            assert role_name in pool[PHONE_X]["role_detail"]
 
         # 全局停用：所有管理员的行一起停 → 三态变 disabled
         store.update_role_member(ra1, PHONE_X, enabled=False, actor="sa")  # 只停一个角色
@@ -387,6 +392,10 @@ def test_member_distinct_total_and_roles_response() -> None:
         sub_card = next(a for a in accounts if a["username"] != "admin")
         assert super_card["member_count"] == 2 and super_card["role_count"] == 2
         assert sub_card["member_count"] == 2
+        # 2026-11-06 口径注解：平台分布 + 今日实例（卡片与面板能互相对账）
+        assert sub_card["role_platforms"] == {"zdxlz": 2}
+        assert super_card["role_platforms"] == {"zdxlz": 2}
+        assert sub_card["instance_count_today"] == 0 and super_card["instance_count_today"] == 0
     finally:
         store.close()
 

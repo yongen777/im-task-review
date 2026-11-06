@@ -28,6 +28,34 @@ import {
   RoleMemberItem,
 } from '../../lib/types';
 
+/* 2026-11-05 全平台成员池条目（按手机号去重聚合；对应后端 GET /api/admin/member-pool） */
+interface MemberPoolItem {
+  phone: string;
+  display_name: string;
+  display_dept: string;
+  status: 'active' | 'partial' | 'disabled';
+  row_count: number;
+  /* 2026-11-06 列口径（用户指定）：角色列=一共加入的全部角色个数；归属列=第一次被哪个管理员创建导入。 */
+  role_count: number;
+  admin_count: number;
+  role_detail: string;
+  first_owner_name: string;
+  first_owner_username: string;
+  activated_platforms: string[];
+  name_inconsistent: boolean;
+  dept_inconsistent: boolean;
+}
+
+/* 角色明细文本的后端格式为「名称（zdxlz）、名称（wecom）」，展示时把平台码换成中文 */
+function formatPoolRoleDetail(detail: string): string {
+  return (detail || '')
+    .replace(/（zdxlz）/g, '（密信）')
+    .replace(/（wecom）/g, '（企微）');
+}
+
+/* 成员池分页：每页 10 人（2026-11-06 用户要求，防数据量大时列表过长） */
+const POOL_PAGE_SIZE = 10;
+
 export const RolesMembersView: React.FC = () => {
   const {
     roles,
@@ -37,6 +65,7 @@ export const RolesMembersView: React.FC = () => {
     ownerFilter,
     setOwnerFilter,
     adminAccounts,
+    memberDistinctTotal,
   } = useAppStore();
   const toast = useToast();
 
@@ -62,6 +91,113 @@ export const RolesMembersView: React.FC = () => {
   const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
   const [editingDeptName, setEditingDeptName] = useState('');
   const [deptBusy, setDeptBusy] = useState(false);
+
+  // 2026-11-05 全平台成员池（仅超管）：按人聚合的全局名册与操作状态
+  const [poolItems, setPoolItems] = useState<MemberPoolItem[]>([]);
+  const [poolLoading, setPoolLoading] = useState(false);
+  const [poolKeyword, setPoolKeyword] = useState('');
+  const [poolBusyPhone, setPoolBusyPhone] = useState('');
+  const [poolEditing, setPoolEditing] = useState<MemberPoolItem | null>(null);
+  const [poolEditName, setPoolEditName] = useState('');
+  const [poolEditDept, setPoolEditDept] = useState('');
+  const [poolDeleting, setPoolDeleting] = useState<MemberPoolItem | null>(null);
+
+  const loadPool = useCallback(async () => {
+    if (!isSuperAdmin) return;
+    setPoolLoading(true);
+    try {
+      const res = await api.get<{ ok: boolean; items: MemberPoolItem[] }>('/api/admin/member-pool');
+      setPoolItems(res.items || []);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '加载成员池失败');
+    } finally {
+      setPoolLoading(false);
+    }
+  }, [isSuperAdmin]);
+
+  useEffect(() => {
+    if (isSuperAdmin) void loadPool();
+  }, [isSuperAdmin, loadPool]);
+
+  const filteredPoolItems = useMemo(() => {
+    if (!poolKeyword.trim()) return poolItems;
+    const kw = poolKeyword.trim().toLowerCase();
+    return poolItems.filter(
+      (p) => p.phone.includes(kw) || (p.display_name || '').toLowerCase().includes(kw),
+    );
+  }, [poolItems, poolKeyword]);
+
+  /* 分页：搜索词变化回到第一页；页码超出总页数时收敛到末页 */
+  const [poolPage, setPoolPage] = useState(1);
+  useEffect(() => setPoolPage(1), [poolKeyword]);
+  const poolTotalPages = Math.max(1, Math.ceil(filteredPoolItems.length / POOL_PAGE_SIZE));
+  const poolCurrentPage = Math.min(poolPage, poolTotalPages);
+  const pagedPoolItems = useMemo(
+    () =>
+      filteredPoolItems.slice(
+        (poolCurrentPage - 1) * POOL_PAGE_SIZE,
+        poolCurrentPage * POOL_PAGE_SIZE,
+      ),
+    [filteredPoolItems, poolCurrentPage],
+  );
+
+  const handlePoolToggleStatus = async (p: MemberPoolItem) => {
+    setPoolBusyPhone(p.phone);
+    try {
+      await api.put(`/api/admin/member-pool/${encodeURIComponent(p.phone)}/status`, {
+        enabled: p.status !== 'active',
+      });
+      toast.success(
+        p.status !== 'active'
+          ? `已全局启用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`
+          : `已全局停用「${p.display_name || p.phone}」的名下全部 ${p.row_count} 条名册记录。`,
+      );
+      await Promise.all([loadPool(), refreshRoles()]);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '操作失败');
+    } finally {
+      setPoolBusyPhone('');
+    }
+  };
+
+  const handlePoolSaveProfile = async () => {
+    if (!poolEditing) return;
+    if (!poolEditName.trim()) {
+      toast.warning('姓名不能为空');
+      return;
+    }
+    setPoolBusyPhone(poolEditing.phone);
+    try {
+      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}`, {
+        name: poolEditName.trim(),
+        dept: poolEditDept.trim(),
+      });
+      toast.success(`已全局同步「${poolEditName.trim()}」在名下全部 ${poolEditing.row_count} 条名册记录。`);
+      setPoolEditing(null);
+      await Promise.all([loadPool(), refreshRoles()]);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '保存失败');
+    } finally {
+      setPoolBusyPhone('');
+    }
+  };
+
+  const handlePoolDelete = async () => {
+    if (!poolDeleting) return;
+    setPoolBusyPhone(poolDeleting.phone);
+    try {
+      const res = await api.delete<{ ok: boolean; rows: number }>(
+        `/api/admin/member-pool/${encodeURIComponent(poolDeleting.phone)}`,
+      );
+      toast.success(`已从全部名册删除「${poolDeleting.display_name || poolDeleting.phone}」（${res.rows} 条记录）。`);
+      setPoolDeleting(null);
+      await Promise.all([loadPool(), refreshRoles()]);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '删除失败');
+    } finally {
+      setPoolBusyPhone('');
+    }
+  };
 
   // 新建/编辑角色弹窗（无需角色编码）
   const [roleModalMode, setRoleModalMode] = useState<'none' | 'create' | 'edit'>('none');
@@ -204,10 +340,26 @@ export const RolesMembersView: React.FC = () => {
     [roles, selectedRoleId],
   );
 
-  const totalRosterCount = useMemo(
-    () => roles.reduce((acc, r) => acc + (r.member_count || 0), 0),
-    [roles],
-  );
+  /* 2026-11-05 拍板：超管在「全部管理员（全局总览）」视角下，角色卡按创建人分组展示；
+     切到具体管理员视角时不分组（数据本来就都是该管理员的）。 */
+  const roleOwnerGroups = useMemo(() => {
+    if (!(isSuperAdmin && ownerFilter === 'all')) return null;
+    const order: string[] = [];
+    const by = new Map<string, { key: string; label: string; items: RoleItem[] }>();
+    for (const r of roles) {
+      const key = String(r.owner_username || '');
+      if (!by.has(key)) {
+        order.push(key);
+        by.set(key, {
+          key,
+          label: `${r.owner_display_name || r.owner_username}（@${r.owner_username || '未知'}）`,
+          items: [],
+        });
+      }
+      by.get(key)!.items.push(r);
+    }
+    return order.map((k) => by.get(k)!);
+  }, [roles, isSuperAdmin, ownerFilter]);
 
   const filteredMembers = useMemo(() => {
     if (!memberKeyword.trim()) return members;
@@ -635,7 +787,8 @@ export const RolesMembersView: React.FC = () => {
             <span>管理各业务角色下的成员名单（支持姓名、手机号、部门；跨管理员导入自动匹配复用全局已激活状态）</span>
             <span aria-hidden="true" className="text-slate-300">·</span>
             <span>
-              在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{totalRosterCount}</strong> 人
+              在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{memberDistinctTotal}</strong> 人
+              <span className="text-slate-400">（按人去重）</span>
             </span>
           </span>
         }
@@ -651,8 +804,18 @@ export const RolesMembersView: React.FC = () => {
               选择业务角色分组（点击卡片切换下方名册）
             </span>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            {roles.map((r) => {
+          {(roleOwnerGroups ?? [{ key: 'all', label: '', items: roles }]).map((group) => (
+          <div key={group.key} className="space-y-2.5">
+            {group.label && (
+              <div className="flex items-center gap-2 mb-1">
+                <User className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                <span className="text-xs font-semibold text-slate-600">创建人：{group.label}</span>
+                <span className="text-[10px] text-slate-400">{group.items.length} 个角色分组</span>
+                <div className="flex-1 h-px bg-slate-200/70" />
+              </div>
+            )}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {group.items.map((r) => {
               const active = r.role_id === selectedRoleId;
               const ratio =
                 r.member_count > 0
@@ -695,6 +858,17 @@ export const RolesMembersView: React.FC = () => {
                       className="flex items-center gap-1 shrink-0"
                       onClick={(e) => e.stopPropagation()}
                     >
+                      {isSuperAdmin ? (
+                        <span
+                          className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+                            r.enabled !== false
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                              : 'bg-slate-100 text-slate-500 border-slate-200'
+                          }`}
+                        >
+                          {r.enabled !== false ? '已启用' : '已停用'}
+                        </span>
+                      ) : (
                       <button
                         type="button"
                         onClick={() => void handleToggleRoleStatus(r)}
@@ -707,6 +881,7 @@ export const RolesMembersView: React.FC = () => {
                       >
                         {r.enabled !== false ? '已启用' : '已停用'}
                       </button>
+                      )}
                       {!isSuperAdmin && (
                         <>
                           <button
@@ -751,9 +926,8 @@ export const RolesMembersView: React.FC = () => {
                 </div>
               );
             })}
-
-            {/* 快捷新建角色虚线卡片（仅分级管理员可新建角色） */}
-            {!isSuperAdmin && (
+            {!group.label && !isSuperAdmin && (
+              /* 快捷新建角色虚线卡片（仅分级管理员可新建角色；不分组场景才渲染） */
               <button
                 type="button"
                 onClick={handleOpenCreateRole}
@@ -763,7 +937,9 @@ export const RolesMembersView: React.FC = () => {
                 <span className="text-xs font-semibold">添加新角色分组</span>
               </button>
             )}
+            </div>
           </div>
+          ))}
         </div>
       </div>
 
@@ -972,10 +1148,33 @@ export const RolesMembersView: React.FC = () => {
                           })()}
                         </td>
                         <td className="py-3.5 px-3">
+                          {isSuperAdmin ? (
+                            /* 2026-11-05 拍板：超管对业务数据只读 —— 原来这里的「快速切换派单状态」
+                               是假入口（后端一律 SUPER_ADMIN_READONLY 403），改为纯状态徽章。 */
+                            <span
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                                m.status === 'active'
+                                  ? 'bg-blue-50/70 text-blue-700 border-blue-200/80'
+                                  : 'bg-slate-100 text-slate-500 border-slate-200'
+                              }`}
+                            >
+                              {m.status === 'active' ? (
+                                <>
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
+                                  <span>正常派单</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Ban className="w-3.5 h-3.5 text-slate-400" />
+                                  <span>已停用</span>
+                                </>
+                              )}
+                            </span>
+                          ) : (
                           <button
                             type="button"
                             onClick={() => void handleQuickToggleMemberStatus(m)}
-                            title={isSuperAdmin ? '超级管理员点击快速切换派单状态' : '点击快速切换派单状态'}
+                            title="点击快速切换派单状态"
                             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-colors ${
                               m.status === 'active'
                                 ? 'bg-blue-50/70 text-blue-700 border-blue-200/80 hover:bg-blue-100/70'
@@ -994,32 +1193,14 @@ export const RolesMembersView: React.FC = () => {
                               </>
                             )}
                           </button>
+                          )}
                         </td>
                         <td className="py-3.5 pl-3 pr-5 text-right">
                           {isSuperAdmin ? (
-                            <div className="inline-flex items-center justify-end gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => void handleQuickToggleMemberStatus(m)}
-                                className={`px-2.5 py-1 rounded-lg font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors border ${
-                                  m.status === 'active'
-                                    ? 'bg-rose-50 text-rose-700 hover:bg-rose-100 border-rose-200'
-                                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'
-                                }`}
-                              >
-                                {m.status === 'active' ? (
-                                  <>
-                                    <Ban className="w-3 h-3" />
-                                    <span>停用派单</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <CheckCircle2 className="w-3 h-3" />
-                                    <span>恢复派单</span>
-                                  </>
-                                )}
-                              </button>
-                            </div>
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 text-xs font-medium border border-slate-200 whitespace-nowrap">
+                              <Lock className="w-3 h-3" />
+                              <span>只读</span>
+                            </span>
                           ) : (
                             <div className="inline-flex items-center justify-end gap-1.5">
                               <button
@@ -1657,6 +1838,329 @@ export const RolesMembersView: React.FC = () => {
                   {batchPulling ? '批量拉入中…' : `批量拉入已选成员 (${selectedGlobalPhones.length})`}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-11-05 全平台成员池（仅超管可见）：按「人」管理的全局名册。同一人在多个管理员/多个
+          角色里是不同的行，这里按手机号聚合成一行；所有操作全局同步到该手机号的全部名册行，
+          与分级管理员在角色内的操作（仅作用于自己名下）相区分。 */}
+      {isSuperAdmin && (
+        <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
+          <div className="p-4 sm:px-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <h3 className="font-bold text-slate-900 text-base">全平台成员池</h3>
+                <span className="text-xs text-slate-400 font-normal tabular-nums">
+                  · {filteredPoolItems.length} / {poolItems.length} 人（按手机号去重）
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                展示全部分级管理员名下创建的全部成员；停用 / 修改姓名部门 / 删除均<strong className="text-slate-700">全局同步</strong>
+                作用于所有管理员名下该手机号，手机号不可修改。
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={poolKeyword}
+                  onChange={(e) => setPoolKeyword(e.target.value)}
+                  placeholder="搜索姓名或手机号…"
+                  className="bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-1.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 w-44 sm:w-52 transition-colors"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadPool()}
+                disabled={poolLoading}
+                className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${poolLoading ? 'animate-spin' : ''}`} />
+                <span>刷新</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-slate-50/70 border-b border-slate-100 text-left">
+                  <th className="px-5 py-2.5 text-xs font-semibold text-slate-500">姓名</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">手机号</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">部门</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">角色</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">归属</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">激活状态</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500">派单状态</th>
+                  <th className="px-3 py-2.5 text-xs font-semibold text-slate-500 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredPoolItems.length === 0 && (
+                  <tr>
+                    <td colSpan={8} className="py-10 text-center text-xs text-slate-400">
+                      {poolLoading ? '正在加载成员池…' : '暂无在册成员（或无匹配搜索的结果）'}
+                    </td>
+                  </tr>
+                )}
+                {pagedPoolItems.map((p) => {
+                  const busy = poolBusyPhone === p.phone;
+                  return (
+                    <tr key={p.phone} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
+                      <td className="px-5 py-3.5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-semibold text-slate-900 whitespace-nowrap">{p.display_name || '—'}</span>
+                          {p.name_inconsistent && (
+                            <span
+                              title={`该手机号在 ${p.row_count} 个角色行中，姓名不一致（点「修改」可统一）`}
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 font-medium whitespace-nowrap"
+                            >
+                              姓名不一致
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3.5 font-mono text-xs text-slate-700 tabular-nums whitespace-nowrap">
+                        {p.phone}
+                      </td>
+                      <td className="px-3 py-3.5 text-xs text-slate-600">
+                        <div className="flex items-center gap-1.5">
+                          <span>{p.display_dept || '—'}</span>
+                          {p.dept_inconsistent && (
+                            <span
+                              title="该手机号在多个角色行中，部门不一致（点「修改」可统一）"
+                              className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 font-medium whitespace-nowrap"
+                            >
+                              部门不一致
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3.5 text-xs whitespace-nowrap">
+                        <div
+                          title={formatPoolRoleDetail(p.role_detail)}
+                          className="font-semibold text-slate-700 inline-flex items-center gap-1 cursor-help"
+                        >
+                          <Users className="w-3.5 h-3.5 text-slate-400" />
+                          <span>{p.role_count} 个</span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 truncate max-w-44" title={formatPoolRoleDetail(p.role_detail)}>
+                          {formatPoolRoleDetail(p.role_detail)}
+                        </div>
+                      </td>
+                      <td className="px-3 py-3.5 text-xs whitespace-nowrap">
+                        <span className="font-semibold text-slate-700">
+                          {p.first_owner_name || '—'}
+                        </span>
+                        <div className="text-[10px] text-slate-400">
+                          @{p.first_owner_username || '—'} 首次导入
+                        </div>
+                      </td>
+                      <td className="px-3 py-3.5 text-xs whitespace-nowrap">
+                        {p.activated_platforms.length ? (
+                          <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                            <ShieldCheck className="w-3.5 h-3.5" />
+                            <span>已激活（{p.activated_platforms.join(' / ')}）</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-slate-400">
+                            <Clock className="w-3.5 h-3.5" />
+                            <span>未激活</span>
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-3.5 whitespace-nowrap">
+                        <span
+                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${
+                            p.status === 'active'
+                              ? 'bg-blue-50/70 text-blue-700 border-blue-200/80'
+                              : p.status === 'partial'
+                                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                                : 'bg-slate-100 text-slate-500 border-slate-200'
+                          }`}
+                        >
+                          {p.status === 'active' ? (
+                            <><CheckCircle2 className="w-3.5 h-3.5" /><span>启用</span></>
+                          ) : p.status === 'partial' ? (
+                            <><Clock className="w-3.5 h-3.5" /><span>部分停用</span></>
+                          ) : (
+                            <><Ban className="w-3.5 h-3.5" /><span>全部停用</span></>
+                          )}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3.5 text-right whitespace-nowrap">
+                        <div className="inline-flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            disabled={busy || poolLoading}
+                            onClick={() => void handlePoolToggleStatus(p)}
+                            className={`px-2.5 py-1 rounded-lg font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors border ${
+                              p.status === 'active'
+                                ? 'bg-rose-50 text-rose-700 hover:bg-rose-100 border-rose-200'
+                                : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-emerald-200'
+                            } disabled:opacity-50`}
+                          >
+                            {p.status === 'active' ? <><Ban className="w-3 h-3" /><span>全部停用</span></> : <><CheckCircle2 className="w-3 h-3" /><span>全部启用</span></>}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => {
+                              setPoolEditing(p);
+                              setPoolEditName(p.display_name);
+                              setPoolEditDept(p.display_dept);
+                            }}
+                            className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                          >
+                            <Edit3 className="w-3 h-3" />
+                            <span>修改</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy}
+                            onClick={() => setPoolDeleting(p)}
+                            className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>删除</span>
+                          </button>
+                        </div>
+                      </td>
+                     </tr>
+                   );
+                 })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* 分页（每页 10 人，2026-11-06）：只有一页时不展示，避免多余控件 */}
+          {poolTotalPages > 1 && (
+            <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between text-xs">
+              <span className="text-slate-500">
+                共 <strong className="text-slate-800 tabular-nums">{filteredPoolItems.length}</strong> 人 · 每页 {POOL_PAGE_SIZE} 人
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={poolCurrentPage <= 1}
+                  onClick={() => setPoolPage((prev) => Math.max(1, prev - 1))}
+                  className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+                >
+                  上一页
+                </button>
+                <span className="text-slate-600 tabular-nums font-semibold">
+                  {poolCurrentPage} / {poolTotalPages} 页
+                </span>
+                <button
+                  type="button"
+                  disabled={poolCurrentPage >= poolTotalPages}
+                  onClick={() => setPoolPage((prev) => Math.min(poolTotalPages, prev + 1))}
+                  className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 font-semibold cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 成员池：修改姓名/部门弹窗（手机号只读，保存即全局同步） */}
+      {poolEditing && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
+            <div>
+              <h3 className="font-bold text-slate-900 text-base">修改成员信息（全局同步）</h3>
+              <p className="text-xs text-slate-500 mt-1">
+                将同步修改该手机号在<strong className="text-slate-700">全部管理员名下 {poolEditing.row_count}</strong> 条名册记录。
+              </p>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">手机号（不可修改）</label>
+                <input
+                  type="text"
+                  value={poolEditing.phone}
+                  disabled
+                  className="w-full px-3 py-2 rounded-xl bg-slate-100 border border-slate-200 text-sm text-slate-500 font-mono tabular-nums"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">姓名</label>
+                <input
+                  type="text"
+                  value={poolEditName}
+                  onChange={(e) => setPoolEditName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-slate-600 mb-1">部门</label>
+                <input
+                  type="text"
+                  value={poolEditDept}
+                  onChange={(e) => setPoolEditDept(e.target.value)}
+                  placeholder="留空表示清除部门"
+                  className="w-full px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                />
+                <div className="text-[11px] text-slate-400 mt-1">
+                  可选：{departments.slice(0, 8).map((d) => d.name).join(' / ')}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setPoolEditing(null)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-sm cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={poolBusyPhone === poolEditing.phone}
+                onClick={() => void handlePoolSaveProfile()}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-sm cursor-pointer disabled:opacity-60"
+              >
+                {poolBusyPhone === poolEditing.phone ? '保存中…' : '保存（全局同步）'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 成员池：删除确认（全局删除所有名册行 + 条件清绑定） */}
+      {poolDeleting && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
+            <div>
+              <h3 className="font-bold text-slate-900 text-base">删除成员（全局）</h3>
+              <p className="text-xs text-slate-600 mt-2 leading-relaxed">
+                将<strong>删除该手机号在全部管理员名下的 {poolDeleting.row_count} 条名册记录</strong>；
+                若该手机号在全平台再无任何归属，其激活绑定也将一并清除（需重新走 H5 登记激活）。
+                已产生的任务实例与提交记录不受影响。
+              </p>
+              <p className="text-xs text-rose-600 font-medium mt-2">此操作不可撤销，请确认。</p>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPoolDeleting(null)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-sm cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={poolBusyPhone === poolDeleting.phone}
+                onClick={() => void handlePoolDelete()}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-xl text-sm cursor-pointer disabled:opacity-60"
+              >
+                {poolBusyPhone === poolDeleting.phone ? '删除中…' : '确认删除'}
+              </button>
             </div>
           </div>
         </div>

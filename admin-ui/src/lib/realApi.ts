@@ -39,7 +39,15 @@ export function setCsrfToken(token: string) {
 }
 
 export function getCsrfToken(): string {
-  return csrfToken;
+  // 令牌是会话级的，同一会话的多个标签页共用一份；内存副本会在别的标签页
+  // 重新登录（换会话）或退出（清令牌）后过期，所以每次都以 localStorage 为准。
+  try {
+    const stored = localStorage.getItem('imt_csrf') || '';
+    csrfToken = stored;
+    return stored;
+  } catch {
+    return csrfToken;
+  }
 }
 
 function clearCsrf() {
@@ -63,7 +71,7 @@ async function rawFetch<T = any>(method: string, url: string, body?: any): Promi
     opt.body = JSON.stringify(body);
   }
   if (method !== 'GET') {
-    (opt.headers as Record<string, string>)['X-CSRF-Token'] = csrfToken;
+    (opt.headers as Record<string, string>)['X-CSRF-Token'] = getCsrfToken();
   }
   const res = await fetch(url, opt);
   let data: any = null;
@@ -93,6 +101,11 @@ function roleToMock(r: any): RoleItem {
     active_count: 0,
     activated_count: 0,
     created_at: r.created_at || '',
+    /* 2026-11-05：创建人字段链路补齐 —— 后端早已返回，此前白名单映射把它丢了，
+       导致超管视角「创建人」标签永不显示（组件侧条件恒 false）。 */
+    owner_id: r.owner_id,
+    owner_username: r.owner_username || '',
+    owner_display_name: r.owner_display_name || '',
   };
 }
 
@@ -201,6 +214,10 @@ function tplToMock(t: any): TemplateItem {
       : null,
     created_at: t.created_at || '',
     updated_at: t.updated_at,
+    /* 2026-11-05：创建人字段链路补齐（同 roleToMock）—— 超管视角列表要显示创建人 */
+    owner_id: t.owner_id,
+    owner_username: t.owner_username || '',
+    owner_display_name: t.owner_display_name || '',
   } as unknown as TemplateItem;
 }
 
@@ -496,7 +513,8 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   if (rawPath === '/api/admin/me') {
     /* 会话恢复：boot 探测时从响应同步 csrf（修复旧 Cookie 直接进站后写操作 403） */
     if (d && d.csrf_token) setCsrfToken(d.csrf_token);
-    /* 2026-11-04 多管理员分级：一并带回角色级别 / 显示名 / 授权平台 */
+    /* 2026-11-04 多管理员分级：一并带回角色级别 / 显示名 / 授权平台
+       2026-11-05：assumed = 当前会话是超管代登录出来的（前端显示代管徽章 + 切回入口） */
     return {
       ok: true,
       id: d.id,
@@ -507,6 +525,7 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
       display_name: d.display_name || d.username,
       allowed_platforms: Array.isArray(d.allowed_platforms) ? d.allowed_platforms : ['zdxlz', 'wecom'],
       is_super_admin: d.role_level === 'super_admin',
+      assumed: !!d.assumed,
       csrf_token: getCsrfToken(),
     } as unknown as T;
   }
@@ -514,7 +533,9 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   if (rawPath === '/api/admin/roles' && method === 'GET') {
     const m = new URLSearchParams(queryText);
     const items = await fillRoleCounts((d.items || []).map(roleToMock), m.get('platform') || '');
-    return { ok: true, items } as unknown as T;
+    /* 2026-11-05：按人去重的在册人数由后端统一口径计算（一人多角色只算一次），
+       替代前端把各角色人数加总的重复统计。 */
+    return { ok: true, items, member_distinct_total: Number(d.member_distinct_total || 0) } as unknown as T;
   }
   if (rawPath.startsWith('/api/admin/roles/') && rawPath.endsWith('/members') && method === 'GET') {
     return { ok: true, items: (d.items || []).map(memberToMock) } as unknown as T;

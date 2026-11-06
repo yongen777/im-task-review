@@ -136,19 +136,29 @@ def check_repo_sync(allow_drift: bool) -> None:
     为什么需要：2026-11-02~03 连续四次出现「线上已跑、代码没入库」——
     改动只落在工作区，git 里还是上一版。事后靠人工补提交，一旦漏掉，
     线上代码就和版本库脱钩，回滚/追责都失去依据。
-    这里做两件事：
-      1. 版本库自身必须 clean（有未提交改动 → 中止）；
-      2. 工作区与版本库逐文件比对（内容不同 → 中止并列出差异文件）。
+    这里做三件事：
+      1. 版本库自身必须 clean（有未提交改动 → 中止）；git 命令本身失败（如对象库损坏）也中止 ——
+         stdout 为空不能当作 clean（2026-11-06 实测事故：坏 .git 时闸门静默失效）；
+      2. 工作区（app/tests/scripts）与版本库逐文件比对；
+      3. 前端源码（D:\\im-task-admin\\src ↔ admin-ui/src）同样逐文件比对
+         （2026-11-05 实测事故：前端源码镜像漏同步 24 小时无人发现）。
     ⛔ 只读检查，不改任何文件；确实要强推时用 --allow-drift。
     """
     if not (REPO_ROOT / ".git").exists():
         print(f"    ⚠ 未找到版本库 {REPO_ROOT}，跳过一致性检查（建议设置 IMT_REPO）")
         return
 
-    dirty = subprocess.run(
+    dirty_proc = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "status", "--porcelain"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout.strip()
+    )
+    if dirty_proc.returncode != 0:
+        print("✗ 版本库状态不可读（git status 失败，仓库可能损坏），中止部署")
+        tip = (dirty_proc.stderr or dirty_proc.stdout or "").strip()
+        if tip:
+            print(f"  {tip[:200]}")
+        raise SystemExit(1)
+    dirty = dirty_proc.stdout.strip()
     diffs: list[str] = []
     for ws_sub, repo_sub in REPO_PAIRS:
         a = _tree_map(ROOT, ws_sub)
@@ -161,6 +171,19 @@ def check_repo_sync(allow_drift: bool) -> None:
                 diffs.append(f"{ws_sub}/{rel}（工作区有、版本库没有）")
             elif not _same_content(fa, fb):
                 diffs.append(f"{ws_sub}/{rel}（内容不同）")
+    # 前端源码镜像比对（admin-ui 的 src 目录对应前端工程工作区）
+    ui_src = Path(os.environ.get("IMT_ADMIN_UI_SRC", r"D:\im-task-admin\src"))
+    if ui_src.is_dir():
+        a = _tree_map(ui_src.parent, "src")
+        b = _tree_map(REPO_ROOT, "admin-ui/src")
+        for rel in sorted(set(a) | set(b)):
+            fa, fb = a.get(rel), b.get(rel)
+            if fa is None:
+                diffs.append(f"admin-ui/src/{rel}（版本库有、前端工作区没有）")
+            elif fb is None:
+                diffs.append(f"admin-ui/src/{rel}（前端有、版本库没有）")
+            elif not _same_content(fa, fb):
+                diffs.append(f"admin-ui/src/{rel}（内容不同）")
     for extra in ("README.md", "requirements.txt"):
         fa, fb = ROOT / extra, REPO_ROOT / "backend" / extra
         if fa.exists() and fb.exists() and not _same_content(fa, fb):

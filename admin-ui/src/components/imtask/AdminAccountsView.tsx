@@ -24,6 +24,16 @@ const PLATFORM_LABELS: Record<OfficePlatform, string> = {
   wecom: '企业微信',
 };
 
+/* 2026-11-06：角色分组的平台分布（"密信 2 · 企微 1"）——
+   角色面板按当前平台过滤，只有密信视图时看不到企微角色，总数注解能让卡片立刻对上账。 */
+function formatRolePlatforms(rp?: Record<string, number>): string {
+  if (!rp) return '—';
+  const parts = (['zdxlz', 'wecom'] as OfficePlatform[])
+    .filter((p) => (rp[p] || 0) > 0)
+    .map((p) => `${PLATFORM_LABELS[p].slice(2)} ${rp[p]}`);
+  return parts.length ? parts.join(' · ') : '—';
+}
+
 export const AdminAccountsView: React.FC = () => {
   const toast = useToast();
   const { refreshAdminAccounts } = useAppStore();
@@ -47,9 +57,12 @@ export const AdminAccountsView: React.FC = () => {
   const [resetTarget, setResetTarget] = useState<AdminAccountItem | null>(null);
   const [resetting, setResetting] = useState(false);
 
-  // 删除确认弹窗
+  // 删除确认弹窗（2026-11-05 改级联语义：可选「先转移再删」；输入用户名确认；自动备份）
   const [deleteTarget, setDeleteTarget] = useState<AdminAccountItem | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deleteMode, setDeleteMode] = useState<'purge' | 'transfer'>('transfer');
+  const [deleteTransferTo, setDeleteTransferTo] = useState<number | null>(null);
+  const [deleteConfirmInput, setDeleteConfirmInput] = useState('');
 
   const loadAccounts = useCallback(async () => {
     setLoading(true);
@@ -187,13 +200,35 @@ export const AdminAccountsView: React.FC = () => {
 
   const handleDeleteSubAdmin = async () => {
     if (!deleteTarget) return;
+    if (deleteConfirmInput.trim() !== deleteTarget.username) {
+      toast.warning('请输入该管理员的账号名以确认删除');
+      return;
+    }
+    if (deleteMode === 'transfer' && !deleteTransferTo) {
+      toast.warning('请选择接收数据的接替管理员');
+      return;
+    }
     setDeleting(true);
     try {
-      await api.delete(`/api/admin/accounts/${deleteTarget.id}`);
       const removed = deleteTarget;
+      if (deleteMode === 'transfer') {
+        await api.post(`/api/admin/accounts/${removed.id}/transfer`, { to_admin_id: deleteTransferTo });
+        await api.delete(`/api/admin/accounts/${removed.id}`);
+        toast.success(`已将名下数据移交后删除分级管理员「${removed.display_name}」(${removed.username})`);
+      } else {
+        const res = await api.delete<{ ok: boolean; deleted?: Record<string, number>; backup?: string }>(
+          `/api/admin/accounts/${removed.id}`,
+        );
+        const moved = res.deleted || {};
+        toast.success(
+          `已级联删除「${removed.display_name}」(${removed.username})：角色 ${moved.role || 0}、成员 ${moved.member || 0}、模板 ${moved.task_template || 0}、实例 ${moved.task_instance || 0}（已自动备份）`,
+        );
+      }
       setDeleteTarget(null);
+      setDeleteConfirmInput('');
+      setDeleteTransferTo(null);
+      setDeleteMode('transfer');
       await loadAccounts();
-      toast.success(`已删除分级管理员「${removed.display_name}」(${removed.username})`);
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '删除失败');
     } finally {
@@ -335,7 +370,7 @@ export const AdminAccountsView: React.FC = () => {
                     </div>
                   </div>
 
-                  {/* 独立工作空间统计 */}
+                  {/* 独立工作空间统计（2026-11-06：附口径注解 —— 角色按平台隔离、实例分累计/今日，与各面板对得上） */}
                   <div className="grid grid-cols-4 gap-2 pt-0.5">
                     <div className="bg-slate-50/80 border border-slate-100 rounded-xl p-2.5">
                       <div className="text-[11px] text-slate-400 flex items-center gap-1">
@@ -344,6 +379,9 @@ export const AdminAccountsView: React.FC = () => {
                       </div>
                       <div className="text-sm font-bold text-slate-800 font-mono tabular-nums mt-0.5">
                         {acc.role_count}
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5 truncate" title="角色分组按办公软件平台隔离（同名角色在密信/企微各计一行）；角色面板按当前所选平台过滤显示">
+                        {formatRolePlatforms(acc.role_platforms)}
                       </div>
                     </div>
                     <div className="bg-slate-50/80 border border-slate-100 rounded-xl p-2.5">
@@ -354,6 +392,7 @@ export const AdminAccountsView: React.FC = () => {
                       <div className="text-sm font-bold text-slate-800 font-mono tabular-nums mt-0.5">
                         {acc.member_count}
                       </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">按人去重</div>
                     </div>
                     <div className="bg-slate-50/80 border border-slate-100 rounded-xl p-2.5">
                       <div className="text-[11px] text-slate-400 flex items-center gap-1">
@@ -371,6 +410,9 @@ export const AdminAccountsView: React.FC = () => {
                       </div>
                       <div className="text-sm font-bold text-slate-800 font-mono tabular-nums mt-0.5">
                         {acc.instance_count}
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5 truncate" title="累计为全部历史实例；实例面板默认只看「今天」">
+                        累计 · 今日 {acc.instance_count_today ?? 0}
                       </div>
                     </div>
                   </div>
@@ -411,6 +453,9 @@ export const AdminAccountsView: React.FC = () => {
                       <button
                         type="button"
                         onClick={() => void handleToggleEnabled(acc)}
+                        title={acc.enabled
+                          ? '停用后：立即踢下线并禁止登录；名下全部模板停止派发（不建实例/不发提醒），数据全保留，重新启用即恢复'
+                          : '重新启用：名下模板恢复调度（可逆操作）'}
                         className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors"
                       >
                         {acc.enabled ? (
@@ -426,28 +471,22 @@ export const AdminAccountsView: React.FC = () => {
                         )}
                       </button>
 
-                      {(() => {
-                        const hasBusinessData =
-                          (acc.role_count || 0) > 0 || (acc.template_count || 0) > 0;
-                        return (
-                          <button
-                            type="button"
-                            disabled={hasBusinessData}
-                            title={
-                              hasBusinessData
-                                ? '名下已有业务数据，请改用停用'
-                                : '删除该分级管理员账号'
-                            }
-                            onClick={() => {
-                              if (!hasBusinessData) setDeleteTarget(acc);
-                            }}
-                            className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-45 disabled:cursor-not-allowed disabled:hover:bg-slate-100 disabled:hover:text-slate-600"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            <span>删除</span>
-                          </button>
-                        );
-                      })()}
+                      <button
+                        type="button"
+                        title="删除该分级管理员：账号与名下全部数据（可选先移交数据）"
+                        onClick={() => {
+                          setDeleteMode('transfer');
+                          setDeleteConfirmInput('');
+                          setDeleteTransferTo(
+                            accounts.find((a) => a.id !== acc.id && a.role_level === 'sub_admin')?.id ?? null,
+                          );
+                          setDeleteTarget(acc);
+                        }}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-rose-50 text-slate-600 hover:text-rose-600 font-semibold inline-flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        <span>删除</span>
+                      </button>
                     </div>
                   )}
                 </div>
@@ -700,12 +739,12 @@ export const AdminAccountsView: React.FC = () => {
         </div>
       )}
 
-      {/* 删除分级管理员弹窗 */}
+      {/* 删除分级管理员弹窗（2026-11-05 级联语义：可选先移交；输入账号名确认；执行前自动备份） */}
       {deleteTarget && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <h3 className="font-bold text-slate-900 text-base">确认删除该分级管理员？</h3>
+              <h3 className="font-bold text-slate-900 text-base">删除分级管理员「{deleteTarget.display_name}」(@{deleteTarget.username})？</h3>
               <button
                 onClick={() => setDeleteTarget(null)}
                 className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
@@ -713,13 +752,76 @@ export const AdminAccountsView: React.FC = () => {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
-              即将删除分级管理员{' '}
-              <strong className="text-slate-900">
-                {deleteTarget.display_name} (@{deleteTarget.username})
-              </strong>{' '}
-              及其名下创建的任务模板与角色分组（底层全局已激活员工的机器人会话绑定不会受影响）。
-            </p>
+
+            <div className="space-y-2">
+              <label className="flex items-start gap-2 p-2.5 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition-colors">
+                <input
+                  type="radio"
+                  checked={deleteMode === 'transfer'}
+                  onChange={() => setDeleteMode('transfer')}
+                  className="mt-0.5 accent-blue-600"
+                />
+                <span className="text-xs">
+                  <strong className="text-slate-800">先移交数据，再删除空账号（推荐）</strong>
+                  <span className="block text-slate-500 mt-0.5">
+                    名下角色/成员/模板/实例整体移交给接替管理员，业务不中断；然后删除账号本身。
+                  </span>
+                </span>
+              </label>
+              {deleteMode === 'transfer' && (
+                <div className="pl-7 pr-2">
+                  <select
+                    value={deleteTransferTo ?? ''}
+                    onChange={(e) => setDeleteTransferTo(Number(e.target.value) || null)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                  >
+                    <option value="">选择接替的管理员…</option>
+                    {accounts
+                      .filter((a) => a.id !== deleteTarget.id && a.role_level === 'sub_admin')
+                      .map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.display_name || a.username} (@{a.username})
+                        </option>
+                      ))}
+                  </select>
+                  {accounts.filter((a) => a.id !== deleteTarget.id && a.role_level === 'sub_admin').length === 0 && (
+                    <div className="text-[11px] text-amber-600 mt-1">
+                      没有其他分级管理员可接替，请改用「直接级联删除」。
+                    </div>
+                  )}
+                </div>
+              )}
+              <label className="flex items-start gap-2 p-2.5 rounded-xl border border-slate-200 cursor-pointer hover:bg-slate-50 transition-colors">
+                <input
+                  type="radio"
+                  checked={deleteMode === 'purge'}
+                  onChange={() => setDeleteMode('purge')}
+                  className="mt-0.5 accent-rose-600"
+                />
+                <span className="text-xs">
+                  <strong className="text-rose-700">直接级联删除（不可恢复）</strong>
+                  <span className="block text-slate-500 mt-0.5">
+                    账号与名下全部数据一并物理删除：角色 {deleteTarget.role_count || 0}、成员 {deleteTarget.member_count || 0}（去重）、模板 {deleteTarget.template_count || 0}、实例 {deleteTarget.instance_count || 0}，含提交记录与附件；
+                    仅当某手机号在全平台再无任何名册归属时，其激活绑定才被一并清除。
+                    执行前系统会自动做一次数据库备份（唯一恢复途径）。
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            <div>
+              <label className="text-xs font-semibold text-slate-700 block mb-1">
+                请输入该管理员账号名 <span className="font-mono text-rose-600">@{deleteTarget.username}</span> 以确认：
+              </label>
+              <input
+                type="text"
+                value={deleteConfirmInput}
+                onChange={(e) => setDeleteConfirmInput(e.target.value)}
+                placeholder={deleteTarget.username}
+                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-rose-500 font-mono"
+              />
+            </div>
+
             <div className="pt-2 flex justify-end gap-2 text-xs">
               <button
                 type="button"
@@ -731,10 +833,19 @@ export const AdminAccountsView: React.FC = () => {
               <button
                 type="button"
                 onClick={() => void handleDeleteSubAdmin()}
-                disabled={deleting}
-                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60"
+                disabled={
+                  deleting ||
+                  deleteConfirmInput.trim() !== deleteTarget.username ||
+                  (deleteMode === 'transfer' &&
+                    accounts.filter((a) => a.id !== deleteTarget.id && a.role_level === 'sub_admin').length === 0)
+                }
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {deleting ? '正在删除…' : '确认删除'}
+                {deleting
+                  ? '正在删除…'
+                  : deleteMode === 'transfer'
+                    ? '移交数据并删除账号'
+                    : '确认级联删除'}
               </button>
             </div>
           </div>

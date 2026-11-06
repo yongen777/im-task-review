@@ -48,7 +48,9 @@ export const AdminScopeHeader: React.FC<AdminScopeHeaderProps> = ({
               onChange={(e) => setOwnerFilter(e.target.value)}
               className="bg-transparent font-bold text-slate-900 outline-none cursor-pointer text-xs"
             >
-              <option value="all">超级管理员</option>
+              {/* 2026-11-05 用户拍板（方案A）：第一项=全部管理员（全局总览，owner_id=all 不过滤），
+                  后面按管理员逐个切换；超管一登录即全局汇总视角。 */}
+              <option value="all">全部管理员（全局总览）</option>
               {subAdmins.map((acc) => (
                 <option key={acc.id} value={String(acc.id)}>
                   {acc.display_name || acc.username} (@{acc.username})

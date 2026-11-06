@@ -1220,12 +1220,33 @@ export const TemplatesView: React.FC = () => {
                         )}
                       </td>
 
-                      {/* 6. 状态 */}
+                      {/* 6. 状态（2026-11-05：超管对业务数据只读 —— 原「快速启停」是假入口，改纯徽章） */}
                       <td className="py-4 px-3 whitespace-nowrap">
+                        {isSuperAdmin ? (
+                          <span
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border whitespace-nowrap ${
+                              tpl.enabled
+                                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                : 'bg-slate-100 text-slate-500 border-slate-200'
+                            }`}
+                          >
+                            {tpl.enabled ? (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                                <span>已启用</span>
+                              </>
+                            ) : (
+                              <>
+                                <PauseCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                <span>已停用</span>
+                              </>
+                            )}
+                          </span>
+                        ) : (
                         <button
                           onClick={() => handleToggleEnabled(tpl)}
                           disabled={busyId === tpl.id}
-                          title={isSuperAdmin ? '超级管理员可停用或启用此任务模板' : '点击快速切换启用/停用状态'}
+                          title="点击快速切换启用/停用状态"
                           className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-all whitespace-nowrap ${
                             tpl.enabled
                               ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'
@@ -1244,6 +1265,7 @@ export const TemplatesView: React.FC = () => {
                             </>
                           )}
                         </button>
+                        )}
                       </td>
 
                       {/* 7. 操作 */}

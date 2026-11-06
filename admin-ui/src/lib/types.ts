@@ -15,6 +15,10 @@ export interface AdminAccountItem {
   member_count: number;
   template_count: number;
   instance_count: number;
+  /* 2026-11-06 口径注解：角色分组按平台隔离（同名角色密信/企微各一行），
+     总数与角色面板（按当前平台过滤）对不上时看这个分布；今日实例对应实例面板的默认过滤（今天）。 */
+  role_platforms?: Record<string, number>;
+  instance_count_today?: number;
   last_login_at: string | null;
   created_at: string;
 }
