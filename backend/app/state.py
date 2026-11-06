@@ -1961,14 +1961,27 @@ class StateStore:
         return {"id": int(dept_id), "name": clean}
 
     def delete_department(self, dept_id: int, actor: str = "system") -> None:
-        """删除部门选项：成员/待归纳里已存的部门是文本快照，不受影响。"""
+        """删除部门选项。
+
+        2026-11-06 修补（workbuddy，分支 1af1f3b）：删除前检查引用。
+        成员表 `member.dept` 存的是**纯文本**（不是外键），所以删掉部门选项后，
+        那些成员在成员表单 / H5 登记页的部门下拉里就**选不到自己当前的部门**。
+        因此：仍有成员挂在该部门名下时拒绝删除，并提示先迁移。
+        """
         now_s = self.now_str()
         with self.lock, self.conn:
             row = self.conn.execute("SELECT id, name FROM dept_option WHERE id = ?", (int(dept_id),)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "部门不存在")
+            dept_name = str(row["name"] or "")
+            # 引用检查：member.dept 是文本快照，按名字统计
+            used = int(self.conn.execute(
+                "SELECT COUNT(1) FROM member WHERE dept = ?", (dept_name,)).fetchone()[0] or 0)
+            if used > 0:
+                raise BizError(400, "DEPT_IN_USE",
+                               f"该部门下还有 {used} 名成员，请先迁移到其它部门再删除")
             self.conn.execute("DELETE FROM dept_option WHERE id = ?", (int(dept_id),))
-            self._insert_audit_unlocked(actor, "dept.delete", "dept_option", str(int(dept_id)), {"name": row["name"]}, now_s)
+            self._insert_audit_unlocked(actor, "dept.delete", "dept_option", str(int(dept_id)), {"name": dept_name}, now_s)
 
     def phone_in_roster(self, phone: str, platform: Optional[str] = None) -> bool:
         """手机号是否在成员名单里。
@@ -2439,10 +2452,34 @@ class StateStore:
             res["created"] = created
             return res
 
+    def _template_owner_enabled(self, owner_id: int) -> bool:
+        """模板所属管理员账号是否处于启用状态。
+
+        2026-11-06（workbuddy，分支 1af1f3b）：账号不存在（历史行 owner_id 指向已删账号）
+        时按**启用**处理，避免误伤孤儿数据 —— 与 list_active_templates 里
+        COALESCE(u.enabled, 1) 的口径一致。
+        """
+        try:
+            aid = int(owner_id or 1)
+        except Exception:
+            return True
+        with self.lock:
+            row = self.conn.execute("SELECT enabled FROM admin_user WHERE id = ?", (aid,)).fetchone()
+        if row is None:
+            return True
+        # ⚠ 不能写 `int(row["enabled"] or 1)`：0（停用）会被 `or` 短路成 1，停用判定整个失效。
+        v = row["enabled"]
+        return True if v is None else int(v) == 1
+
     def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str) -> List[Dict[str, Any]]:
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
         if not tpl or not tpl["enabled"]:
+            return []
+        # 2026-11-06 纵深防御（workbuddy）：模板所属管理员被停用 → 也不生成实例。
+        # 此前只在 list_active_templates 拦（真实调度链只经那里，业务上不漏发），
+        # 但直接调用本函数可绕过 → 这里补一道，避免将来新增调用点时静默漏发。
+        if not self._template_owner_enabled(int(tpl.get("owner_id") or 1)):
             return []
         members = self.get_dedup_enabled_members_for_roles(tpl["role_ids"])
         now_s = self.now_str()
