@@ -46,6 +46,8 @@ INCLUDE = ["app", "requirements.txt", "README.md"]
 EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "data", "docs", "_legacy"}
 EXCLUDE_SUFFIX = {".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal"}
 BACKUP_KEEP = 3
+# DB 备份保留份数（2026-11-06 workbuddy 分支 165a3bc 合入：此前部署脚本完全不备份也不轮转 DB）
+DB_BACKUP_KEEP = 3
 
 
 def ssh_run(host, port, user, key, cmd, timeout=600, show=4):
@@ -317,13 +319,26 @@ def main() -> int:
         return 0
 
     ts = time.strftime("%Y%m%d-%H%M%S")
-    print(f"③ 服务器备份（app → app.bak-{ts}；.env 只备不动）")
+    print(f"③ 服务器备份（app → app.bak-{ts}；DB → im_task.db.bak-{ts}；.env 只备不动）")
     code, _ = ssh_run(H, P, U, K,
                       f"cd {REMOTE_DIR} && rm -rf app.bak-{ts} && cp -a app app.bak-{ts} && cp -a .env .env.bak-{ts} && echo BACKUP_OK",
                       timeout=120, show=2)
     if "BACKUP_OK" not in _:
         print("✗ 备份失败，中止部署")
         return 1
+
+    # DB 一致性快照：用 sqlite3 .backup 而不是 cp（workbuddy 分支 165a3bc 合入）。
+    # 线上库是 WAL 模式，直接 cp 拿到的是「主库 + 未 checkpoint 的 -wal」半一致状态；
+    # .backup 走 SQLite 在线备份 API，产出单文件且已 checkpoint。
+    # 备份失败不阻断部署（DB 内容未变），但必须显式告警。
+    print("   DB 一致性快照（sqlite3 .backup，不用 cp）")
+    db_bak_cmd = (
+        f"cd {REMOTE_DIR}/data && "
+        f"sqlite3 im_task.db \".backup 'im_task.db.bak-{ts}'\" 2>/dev/null && echo DBBAK_OK"
+    )
+    code, _ = ssh_run(H, P, U, K, db_bak_cmd, timeout=180, show=2)
+    if "DBBAK_OK" not in _:
+        print("   ⚠ DB 快照失败（不阻断部署，但本次部署没有新的 DB 回滚点）")
 
     print("④ 上传并覆盖（tar 只覆盖不删除，data/ 不在包内）")
     if scp_upload(H, P, U, K, tar_path, "/tmp/imtask_app.tar.gz") != 0:
@@ -414,12 +429,42 @@ def main() -> int:
     ssh_run(H, P, U, K, keep_cmd, timeout=120, show=3)
 
     # 清理旧备份（保留最近 BACKUP_KEEP 份）
+    # 备份轮转：删除前先把「将被删除的清单」打印出来留痕（workbuddy 分支 165a3bc 合入）。
+    # 2026-11-06 排序修正（teleagent 实测铁证）：轮转一律用「文件名 sort」，不用 mtime 倒序列法
+    #   原因：.env 自 10-29 未改过，cp -a 保留了源 mtime → 全部 .env.bak mtime 相同 →
+    #   mtime 排序退化，历次部署一直在「删新留旧」（实测：mtime 排序删的是
+    #   20261106-121628 最新备份；sort 删的是 20261029 最旧）。备份名含
+    #   时间戳天然单调，业界（Capistrano keep last N）也一律按目录名排序。
+    print("⑩ 备份轮转（删除前先列清单留痕）")
+    for label, pattern, keep in (("app", "app.bak-*", BACKUP_KEEP),
+                                  (".env", ".env.bak-*", BACKUP_KEEP),
+                                  ("DB", "data/im_task.db.bak-*", DB_BACKUP_KEEP)):
+        # 只认「备份本体」：排除 SQLite WAL 模式派生的 -wal/-shm 伴生文件
+        _, out = ssh_run(H, P, U, K,
+                         f"cd {REMOTE_DIR} && ls -1d {pattern} 2>/dev/null "
+                         f"| grep -vE '\\-(wal|shm)$' | sort | "
+                         f"head -n -{keep} | sed 's#^#将删除: #'",
+                         timeout=60, show=40)
+        lines = [x.strip() for x in out.strip().splitlines() if x.strip()]
+        if lines:
+            for line in lines:
+                print(f"   [轮转/{label}] {line}")
+        else:
+            print(f"   [轮转/{label}] 无需删除（保留最近 {keep} 份；按文件名时间戳取最旧）")
+    # 删除命令与清单同口径（sort 排序）
     ssh_run(H, P, U, K,
-            f"cd {REMOTE_DIR} && ls -1dt app.bak-* 2>/dev/null | tail -n +{BACKUP_KEEP + 1} | xargs -r rm -rf; "
-            f"ls -1dt .env.bak-* 2>/dev/null | tail -n +{BACKUP_KEEP + 1} | xargs -r rm -rf", timeout=60, show=1)
+            f"cd {REMOTE_DIR} && ls -1d app.bak-* 2>/dev/null | grep -vE '\\-(wal|shm)$' "
+            f"| sort | head -n -{BACKUP_KEEP} | xargs -r rm -rf; "
+            f"ls -1d .env.bak-* 2>/dev/null | grep -vE '\\-(wal|shm)$' "
+            f"| sort | head -n -{BACKUP_KEEP} | xargs -r rm -f; "
+            f"ls -1d data/im_task.db.bak-* 2>/dev/null | grep -vE '\\-(wal|shm)$' "
+            f"| sort | head -n -{DB_BACKUP_KEEP} | xargs -r rm -f",
+            timeout=60, show=1)
 
     print("\n" + ("✅ 部署完成且验收通过" if ok else "⚠️ 部署完成但有验收项异常，请人工复核"))
     print(f"   备份：{REMOTE_DIR}/app.bak-{ts}（回滚：rm -rf app && mv app.bak-{ts} app && systemctl restart imtask）")
+    print(f"   DB 快照：{REMOTE_DIR}/data/im_task.db.bak-{ts}"
+          f"（回滚：先 systemctl stop imtask，再 cp data/im_task.db.bak-{ts} data/im_task.db，然后 start）")
     return 0 if ok else 2
 
 
