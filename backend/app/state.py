@@ -239,6 +239,19 @@ def _fmt_member(mid: int, role_id: str, phone: str, name: str, dept: Optional[st
     return item
 
 
+def _same_day(a: str, b: str) -> bool:
+    """两个 'YYYY-MM-DD HH:MM:SS' 是否同一天（只看日期部分）。"""
+    return str(a or "")[:10] == str(b or "")[:10] and str(a or "")[:10] != ""
+
+
+def _lt_time(a: str, b: str) -> bool:
+    """a 是否早于 b（'YYYY-MM-DD HH:MM:SS' 字典序即可比）。空值返回 False。"""
+    x, y = str(a or "").strip(), str(b or "").strip()
+    if not x or not y:
+        return False
+    return x < y
+
+
 class StateStore:
     def __init__(self, db_path: Path, now_fn: NowFn = default_now, platform: str = "zdxlz") -> None:
         self._now_fn = now_fn
@@ -1094,7 +1107,15 @@ class StateStore:
         with self.lock:
             return self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", ((phone or "").strip(),)).fetchone() is not None
 
-    def upsert_delivery_target(self, phone: str, external_id: str, platform: Optional[str] = None) -> Dict[str, Any]:
+    def upsert_delivery_target(self, phone: str, external_id: str, platform: Optional[str] = None,
+                                activated_at: Optional[str] = None) -> Dict[str, Any]:
+        """建立/更新平台绑定。
+
+        activated_at：**首次激活时刻**（'YYYY-MM-DD HH:MM:SS'）。
+          · 不传 → 用当前时间；已存在绑定时**保留原值**（首次激活时刻不可被后续事件刷掉）
+          · 传入 → 显式指定（补录历史激活记录 / 迁移历史数据时用）
+        2026-11-09 新口径「当天激活的只创建激活时刻之后的任务」依赖这个字段。
+        """
         platform = self._plat(platform)
         clean_phone, clean_ext = (phone or "").strip(), (external_id or "").strip()
         if not is_valid_phone(clean_phone):
@@ -1102,6 +1123,7 @@ class StateStore:
         if not clean_ext:
             raise BizError(400, "VALIDATION_FAILED", "external_id 不能为空")
         now_s = self.now_str()
+        explicit_act = str(activated_at).strip() if activated_at else ""
         with self.lock, self.conn:
             existing = self.conn.execute("SELECT activated_at FROM delivery_target WHERE platform = ? AND phone = ?", (platform, clean_phone)).fetchone()
             if existing:
@@ -1111,7 +1133,7 @@ class StateStore:
                     (clean_ext, now_s, platform, clean_phone),
                 )
             else:
-                activated_at = now_s
+                activated_at = explicit_act or now_s
                 self.conn.execute(
                     "INSERT INTO delivery_target(platform, phone, external_id, usable, activated_at, last_event_at) VALUES (?, ?, ?, 1, ?, ?)",
                     (platform, clean_phone, clean_ext, activated_at, now_s),
@@ -1445,14 +1467,19 @@ class StateStore:
                 )
                 removed_bindings.append(f"{plat}:{ext_id[-6:]}")
 
-            # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的「未完成任务实例」一并清掉，
+            # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的任务实例一并清掉，
             # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
-            # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留；
-            # 已终结的历史（approved/sent/expired）保留不删，统计与追溯不受影响。
+            # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留。
+            #
+            # 2026-11-09 用户口径（修正）：**移除要删干净**。
+            # 此前只删 status IN ('pending','submitted','overdue','rejected')，
+            # 已 sent/approved/expired 的实例保留 —— 结果「人已从项目经理组移出，
+            # 但模板下仍有她的 sent 实例」，用户看到的即是这个不一致。
+            # 现在：本组模板下的**全部**实例（含已发送/已归档）都清掉；
+            # 其它模板、其它组名下的实例不动。
             removed_instance_ids: List[int] = []
             open_rows = self.conn.execute(
-                "SELECT id, template_id FROM task_instance WHERE phone = ? "
-                "AND status IN ('pending','submitted','overdue','rejected')",
+                "SELECT id, template_id FROM task_instance WHERE phone = ?",
                 (clean_phone,),
             ).fetchall()
             for inst in open_rows:
@@ -1483,8 +1510,19 @@ class StateStore:
                  "removed_instances": len(removed_instance_ids)}, now_s,
             )
 
-    def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
-        """R43 + §9.3：批量导入成员（行解析加 try 保护，非法行进 invalid 列表而不抛 500）。"""
+    def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1,
+                            sync_global_profile: bool = True) -> Dict[str, Any]:
+        """R43 + §9.3：批量导入成员（行解析加 try 保护，非法行进 invalid 列表而不抛 500）。
+
+        2026-11-09 用户口径（三条）：
+        ① 手机号与**已添加成员重复** → 报错提示，**待修复后才全量导入成功**
+           （此前是静默跳过 already_exists，用户看不到哪些行重复了）
+        ② 手机号在**全局**已存在 → 首次导入到本组时允许管理员指定姓名/部门，
+           写库时**同步到全局池**（该号在所有管理员名下的行一起改）
+        ③ **允许重名** —— 判据是手机号唯一，不是姓名唯一
+
+        sync_global_profile=False 时不做全局同步（只在本组建行）。
+        """
         clean_role_id = (role_id or "").strip()
         if not isinstance(csv_rows, list):
             raise BizError(400, "VALIDATION_FAILED", "csv_rows 必须是数组")
@@ -1493,10 +1531,25 @@ class StateStore:
             if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
                 raise BizError(404, "NOT_FOUND", "角色不存在")
             existing_phones = {r["phone"] for r in self.conn.execute("SELECT phone FROM member WHERE role_id = ?", (clean_role_id,)).fetchall()}
+            # 2026-11-09：全局已有的手机号 → 记下它现有的姓名/部门（用于同步与报告）
+            global_rows = self.conn.execute(
+                "SELECT phone, name, dept FROM member WHERE phone IN "
+                f"(SELECT DISTINCT phone FROM member) ORDER BY id ASC"
+            ).fetchall()
+            global_profile: Dict[str, Dict[str, Any]] = {}
+            for gr in global_rows:
+                gp = global_profile.setdefault(gr["phone"], {"name": None, "dept": None, "rows": 0})
+                gp["rows"] = int(gp["rows"]) + 1
+                if gp["name"] is None:
+                    gp["name"] = gr["name"]
+                if gp["dept"] is None and gr["dept"]:
+                    gp["dept"] = gr["dept"]
             will_add, already_exists = 0, 0
             invalid: List[Dict[str, Any]] = []
             to_insert: List[Tuple[int, str, str, Optional[str]]] = []
             batch_seen_phones: set[str] = set()
+            # 2026-11-09：本次导入会改到全局池的记录（姓名/部门与全局不一致的行）
+            global_profile_updates: List[Dict[str, Any]] = []
 
             for idx, raw_row in enumerate(csv_rows, start=1):
                 if not isinstance(raw_row, dict):
@@ -1527,17 +1580,46 @@ class StateStore:
                 # 2026-11-04 用户口径：CSV 里的部门若「部门管理」里没有，**不拦截**——
                 # 自动把该部门建进部门选项（成员表 dept 仍存文本快照），
                 # 这样 H5 登记页/成员表单的下拉立刻能选到，不会出现"名册里有、下拉里没有"的死锁。
-                if phone in existing_phones or phone in batch_seen_phones:
+                # 2026-11-09 用户口径：重复**要报错**，不能静默跳过。
+                # 「待修复后才全量导入成功」= 有任何重复行就整批不写入。
+                if phone in existing_phones:
                     already_exists += 1
+                    invalid.append({"row": row_num, "phone": phone,
+                                    "reason": f"手机号已存在于本角色组的成员名册中（已添加成员重复），请修复后重新导入"})
+                    continue
+                if phone in batch_seen_phones:
+                    already_exists += 1
+                    invalid.append({"row": row_num, "phone": phone,
+                                    "reason": "本次导入内容中手机号重复，请修复后重新导入"})
                     continue
 
                 batch_seen_phones.add(phone)
+                # 2026-11-09：部门名超长在**收集阶段**就判掉（原先在写库前才判，
+                # 导致 will_add 已经累加了不该写入的行，整批拒绝语义下数字对不上）。
+                if dept and len(dept) > 30:
+                    invalid.append({"row": row_num, "phone": phone,
+                                    "reason": f"部门名称过长（最多 30 字）：{dept}"})
+                    continue
+                # 2026-11-09：全局已有该号 → 记录是否与全局一致（不一致的按「同步全局」处理并报告）
+                gp = global_profile.get(phone)
+                if gp is not None:
+                    g_name = str(gp.get("name") or "").strip()
+                    g_dept = str(gp.get("dept") or "").strip()
+                    changed = (g_name != name) or ((dept or "") != g_dept)
+                    if changed:
+                        global_profile_updates.append({
+                            "phone": phone, "row": row_num,
+                            "from_name": g_name, "from_dept": g_dept,
+                            "to_name": name, "to_dept": dept or "",
+                        })
                 will_add += 1
                 to_insert.append((row_num, phone, name, dept))
 
             # 部门自动建档：本次导入用到的、部门管理里还没有的部门，导入时一并建好。
             dept_cache: Dict[str, bool] = {}
             created_depts: List[str] = []
+            # 2026-11-09：本次自动建档的部门 id（整批拒绝时回滚用）
+            created_dept_ids: List[int] = []
             for _row_no, _phone, _name, _dept in to_insert:
                 if not _dept:
                     continue
@@ -1545,7 +1627,7 @@ class StateStore:
                     continue
                 if len(_dept) > 30:
                     dept_cache[_dept] = False
-                    continue
+                    continue  # 超长部门不建档（收集阶段已把该行判为 invalid）
                 if self.department_exists(_dept):
                     dept_cache[_dept] = True
                     continue
@@ -1556,25 +1638,68 @@ class StateStore:
                         (_dept, now_s),
                     )
                     if cur.lastrowid:
+                        # 2026-11-09：记录新建的部门 id —— 整批拒绝时要回滚
+                        created_dept_ids.append(int(cur.lastrowid))
                         self._insert_audit_unlocked(
                             actor, "dept.create", "dept_option", str(int(cur.lastrowid)),
                             {"name": _dept, "source": "member_import"}, now_s,
                         )
                 created_depts.append(_dept)
 
-            if not dry_run:
-                insert_rows: List[Tuple[int, str, str, Optional[str]]] = []
-                for row_no, phone, name, dept in to_insert:
-                    if dept and not dept_cache.get(dept, True):
-                        invalid.append({"row": row_no, "phone": phone, "reason": f"部门名称过长（最多 30 字）：{dept}"})
-                        continue
-                    insert_rows.append((row_no, phone, name, dept))
-                for _row_no, phone, name, dept in insert_rows:
-                    self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, 1, 'import', ?, ?)", (clean_role_id, phone, name, dept, now_s, int(owner_id)))
-                will_add = len(insert_rows)
-                self._insert_audit_unlocked(actor, "member.import", "role", clean_role_id, {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid), "departments_created": created_depts}, now_s)
+            # 2026-11-09 用户口径：「待修复后才全量导入成功」——
+            # 只要有错误行（重复/冲突/格式错），**整批不写入**，把全部错误行返回给用户。
+            # 无错误时才写入，并按需同步全局池的姓名/部门。
+            synced_global_rows = 0
+            blocked = bool(invalid)
+            if not dry_run and not blocked:
+                # 长度等校验已在收集阶段完成，这里不再重复判
+                insert_rows: List[Tuple[int, str, str, Optional[str]]] = list(to_insert)
+                if invalid:
+                    blocked = True
+                else:
+                    for _row_no, phone, name, dept in insert_rows:
+                        self.conn.execute(
+                            "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) "
+                            "VALUES (?, ?, ?, ?, 1, 'import', ?, ?)",
+                            (clean_role_id, phone, name, dept, now_s, int(owner_id)),
+                        )
+                    will_add = len(insert_rows)
+                    # 2026-11-09：把该号在**所有**管理员名下的行同步成这次的姓名/部门（全局池）
+                    if sync_global_profile:
+                        for upd in global_profile_updates:
+                            ph = upd["phone"]
+                            cur = self.conn.execute(
+                                "UPDATE member SET name = ?, dept = ? WHERE phone = ?", (upd["to_name"], upd["to_dept"], ph)
+                            )
+                            synced_global_rows += int(cur.rowcount or 0)
+                            if int(cur.rowcount or 0) > 0:
+                                self._insert_audit_unlocked(
+                                    actor, "member.profile_sync_global", "member", ph,
+                                    {"name": upd["to_name"], "dept": upd["to_dept"],
+                                     "from_name": upd["from_name"], "from_dept": upd["from_dept"],
+                                     "rows": int(cur.rowcount or 0), "via_role": clean_role_id},
+                                    now_s,
+                                )
+                    self._insert_audit_unlocked(
+                        actor, "member.import", "role", clean_role_id,
+                        {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid),
+                         "departments_created": created_depts, "synced_global_rows": synced_global_rows},
+                        now_s,
+                    )
 
-            return {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists, "invalid": invalid, "departments_created": created_depts}
+            if blocked:
+                # 整批拒绝：will_add 归零（没有任何一行被写入）
+                will_add = 0
+                # 回滚本次自动建档的部门 —— 否则会出现「导入没成功，部门却多了几个」
+                for did in created_dept_ids:
+                    self.conn.execute("DELETE FROM dept_option WHERE id = ?", (int(did),))
+                if created_dept_ids:
+                    created_depts = []
+            return {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists,
+                    "invalid": invalid, "departments_created": created_depts,
+                    "blocked": blocked,
+                    "synced_global_rows": synced_global_rows,
+                    "global_profile_updates": global_profile_updates}
 
     def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
@@ -1990,25 +2115,54 @@ class StateStore:
                 return {"phone": r["phone"], "name": r["name"], "dept": r["dept"]}
         return None
 
-    def get_dedup_enabled_members_for_roles(self, role_ids: List[str]) -> List[Dict[str, Any]]:
+    def get_dedup_enabled_members_for_roles(self, role_ids: List[str], only_activated: bool = False,
+                                            platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """取去重后的在册成员。
+
+        only_activated=True 时**只返回已激活的成员**（有可用平台绑定）。
+        2026-11-09 用户口径：停用（enabled=0）与未激活（无绑定）的人都不该进任务实例 ——
+        他们本来就不会收到通知，生成实例只会让「任务实例」列表出现不会实现的噪音
+        （线上 UNACTIVATED 累计 155 条）。
+
+        platform：**按哪个平台判定激活**。
+          · 传 None → 用当前通道（self.platform）
+          · 传具体平台 → 用该平台（如实例生成时传「模板所属角色平台」）
+        ⚠️ 2026-11-09 修正：实例生成必须传「角色所属平台」，否则在密信通道下
+        给企微模板建实例时，企微绑定的人会被判成未激活 → 实例数错。
+
+        activated_at 一并带出：2026-11-09 用户口径「当天激活的只创建后面的任务，
+        之前的任务实例不要，第二天才是完整一天」—— 需要用它和触发时刻比较。
+        """
         clean_ids = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
         if not clean_ids:
             return []
         placeholders = ",".join("?" for _ in clean_ids)
+        plat = self._plat(platform)
         with self.lock:
             rows = self.conn.execute(
-                f"SELECT m.phone, m.name, m.dept, dt.external_id FROM member m "
+                f"SELECT m.phone, m.name, m.dept, dt.external_id, dt.activated_at FROM member m "
                 f"LEFT JOIN delivery_target dt ON dt.platform = ? AND dt.phone = m.phone AND dt.usable = 1 "
                 f"WHERE m.role_id IN ({placeholders}) AND m.enabled = 1 ORDER BY m.id ASC",
-                tuple([self.platform] + clean_ids),
+                tuple([plat] + clean_ids),
             ).fetchall()
             seen: set[str] = set()
             deduped: List[Dict[str, Any]] = []
             for r in rows:
                 ph = r["phone"]
-                if ph not in seen:
-                    seen.add(ph)
-                    deduped.append({"phone": ph, "name": r["name"], "dept": r["dept"], "external_id": r["external_id"], "activated": bool(r["external_id"])})
+                if ph in seen:
+                    continue
+                seen.add(ph)
+                activated = bool(r["external_id"])
+                if only_activated and not activated:
+                    continue
+                deduped.append({
+                    "phone": ph,
+                    "name": r["name"],
+                    "dept": r["dept"],
+                    "external_id": r["external_id"],
+                    "activated": activated,
+                    "activated_at": r["activated_at"],
+                })
             return deduped
 
     def preview_template_targets(self, template_id: str) -> Dict[str, int]:
@@ -2645,7 +2799,22 @@ class StateStore:
             return True
         return bool(plats & self._owner_allowed_platforms(int(tpl.get("owner_id") or 1)))
 
-    def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str) -> List[Dict[str, Any]]:
+    def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str,
+                                  now_str: Optional[str] = None,
+                                  trigger_at: Optional[str] = None) -> List[Dict[str, Any]]:
+        """为模板生成当期实例。
+
+        2026-11-09 用户口径（三条）：
+        ① 停用成员不生成（enabled=0，由取数层过滤）
+        ② 未激活成员不生成（无平台绑定 → 本来就收不到通知，生成只是噪音）
+        ③ 当天激活的成员**只创建激活时刻之后**的任务实例，之前的不要；
+           第二天才是完整一天。
+           → 用 delivery_target.activated_at 与「本次触发时刻」比较：
+             trigger_at 是这次任务的实际触发时刻（notice 用通知时刻，form 用生成时刻）。
+
+        now_str：当前时间（默认取系统时间），用于判定激活时刻是否落在当天。
+        trigger_at：本次触发时刻（默认等于 now_str）。
+        """
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
         if not tpl or not tpl["enabled"]:
@@ -2658,10 +2827,35 @@ class StateStore:
         # 2026-11-06 拍板口径：模板所属平台的授权被收回 → 同样不生成（仅停该平台，其它平台不受影响）。
         if not self._template_platform_allowed(tpl):
             return []
-        members = self.get_dedup_enabled_members_for_roles(tpl["role_ids"])
-        now_s = self.now_str()
+        # 2026-11-09：只取已激活成员（未激活不建实例）。
+        # 平台判据 = **模板所属角色平台**（不是当前通道）——
+        # 否则在密信通道下给企微模板建实例时，企微绑定的人会被判成未激活。
+        # 2026-11-09：激活判定用**模板所属角色平台**，不是当前通道。
+        # 跨平台模板 → 各平台分别取已激活成员，按手机号去重（任一平台已激活即可）。
+        tpl_plats = sorted(self.role_platforms(tpl.get("role_ids") or [])) or [None]
+        members: List[Dict[str, Any]] = []
+        for _p in tpl_plats:
+            for _m in self.get_dedup_enabled_members_for_roles(
+                    tpl["role_ids"], only_activated=True, platform=_p):
+                if not any(x["phone"] == _m["phone"] for x in members):
+                    members.append(_m)
+        now_s = now_str or self.now_str()
+        trigger = trigger_at or now_s
         with self.lock, self.conn:
+            # 2026-11-09：只有「本周期就是今天」时才按激活时刻切分。
+            # period_key 是历史日期（补跑）或跨天周期时不做这个过滤 ——
+            #   · 历史周期：那天该不该有实例由当时的状态决定，现在补跑就补上
+            #   · 第二天：period_key 变了，激活时刻已在前一天 → 完整一天都建
+            #     （对应用户口径「第二天才是刷新完整一天」）
+            period_is_today = _same_day(period_key, now_s)
             for m in members:
+                # 2026-11-09：当天激活的成员只建「激活时刻之后」的实例
+                # 判定：激活时刻**晚于**本次触发时刻 → 这次的任务还没轮到他 → 跳过
+                #   （10:00 激活的人：收不到 09:00 那条，收得到 12:00 那条）
+                act_at = str(m.get("activated_at") or "").strip()
+                if act_at and period_is_today:
+                    if _same_day(act_at, now_s) and _lt_time(trigger, act_at):
+                        continue
                 self.conn.execute(
                     "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                     (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s, int(tpl.get("owner_id") or 1)),

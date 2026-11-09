@@ -1545,6 +1545,26 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
+        # 2026-11-09 用户口径：分级管理员**没有**修改已存在成员姓名/部门的权限
+        # （只有首次导入时能定，且要同步全局池；其余由超管统一维护）。
+        # → 前端已把入口关掉，这里再加一道后端护栏（前端可被绕过、直接调 API）。
+        _admin = _admin_profile(state, sess)
+        if str(_admin.get("role_level") or "") != "super_admin":
+            _cur = state.conn.execute(
+                "SELECT name, dept FROM member WHERE role_id = ? AND phone = ?",
+                ((role_id or "").strip(), (phone or "").strip()),
+            ).fetchone()
+            if _cur is not None:
+                _new_name = body.get("name")
+                _new_dept = body.get("dept")
+                _name_chg = _new_name is not None and str(_new_name).strip() != str(_cur["name"] or "").strip()
+                _dept_chg = _new_dept is not None and str(_new_dept).strip() != str(_cur["dept"] or "").strip()
+                if _name_chg or _dept_chg:
+                    return error_response(
+                        403, "MEMBER_PROFILE_FORBIDDEN",
+                        "分级管理员不能修改成员的姓名/部门（姓名与部门由超管统一维护）；"
+                        "如需变更，请在首次导入时指定，或联系超管处理。",
+                    )
         try:
             member = state.update_role_member(
                 role_id=role_id,

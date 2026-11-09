@@ -76,9 +76,7 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               </h1>
               <div className="flex items-center gap-1.5 mt-0.5">
                 <span className="text-[10px] text-slate-400 font-mono">im-task</span>
-                <span className="text-[9px] text-blue-600 bg-blue-50 px-1.5 py-0.2 rounded font-medium">
-                  管理后台
-                </span>
+                {/* 2026-11-09 用户要求：移除左上角「管理后台」标签（只留平台标签，那是有业务含义的当前办公软件指示） */}
                 {/* 2026-11-06 用户要求：当前所选办公软件实时渲染在左上角（超管/分级同口径，醒目展示） */}
                 <span
                   className={`text-[9px] font-bold px-1.5 py-0.5 rounded text-white inline-flex items-center gap-0.5 shrink-0 ${

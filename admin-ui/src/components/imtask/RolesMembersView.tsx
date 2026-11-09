@@ -22,6 +22,28 @@ import { api, plainError } from '../../lib/api';
 import { AdminScopeHeader } from './AdminScopeHeader';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
+
+/**
+ * 2026-11-09：把 CSV 文本解析成后端要的 csv_rows（数组）。
+ * 格式：每行「手机号,姓名,部门」（逗号或中文逗号皆可）；空行忽略；# 开头为注释。
+ * 第一行若是「手机号/姓名/部门」这类表头，自动跳过。
+ */
+function parseCsvRows(csvText: string): Array<{ row: number; phone: string; name: string; dept: string }> {
+  const out: Array<{ row: number; phone: string; name: string; dept: string }> = [];
+  const lines = (csvText || '').split(/\r?\n/);
+  lines.forEach((raw, idx) => {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) return;
+    const cells = line.split(/[,，\t]/).map((c) => c.trim());
+    const phone = cells[0] || '';
+    const name = cells[1] || '';
+    const dept = cells[2] || '';
+    // 跳过表头（手机号不是纯数字）
+    if (idx === 0 && !/^\d+$/.test(phone.replace(/\D/g, '')) && /手机号|phone/i.test(phone)) return;
+    out.push({ row: out.length + 1, phone, name, dept });
+  });
+  return out;
+}
 import {
   GlobalActivatedMemberItem,
   RoleItem,
@@ -167,7 +189,9 @@ export const RolesMembersView: React.FC = () => {
     }
     setPoolBusyPhone(poolEditing.phone);
     try {
-      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}?platform=${platform}`, {
+      // 2026-11-09 用户口径：超管修改姓名/部门 → **全部分级管理员管理下的该用户同步**
+      // （不传 platform = 全局同步；后端 member_pool_update_profile 无 platform 时按 phone 全表更新）
+      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}`, {
         name: poolEditName.trim(),
         dept: poolEditDept.trim(),
       });
@@ -218,6 +242,8 @@ export const RolesMembersView: React.FC = () => {
 
   // CSV 批量导入弹窗（手机号,姓名,部门）
   const [importModalOpen, setImportModalOpen] = useState(false);
+  // 2026-11-09：导入被拦截时列出全部错误行（等用户修复后再导）
+  const [importErrors, setImportErrors] = useState<Array<{ row: number; phone: string; reason: string }>>([]);
   const [csvText, setCsvText] = useState('13900000000,张三,市场部');
   const [importing, setImporting] = useState(false);
 
@@ -736,38 +762,57 @@ export const RolesMembersView: React.FC = () => {
     }
     setImporting(true);
     try {
+      // 2026-11-09：后端接口收的是 csv_rows（数组），原来这里传 csv_text → 协议不匹配、功能实际不可用。
+      // 现在本地把 CSV 文本解析成行数组再提交。
+      const rows = parseCsvRows(csvText);
       const res = await api.post<{
         ok: boolean;
-        added: number;
-        updated: number;
-        skipped: number;
+        will_add?: number;
+        added?: number;
+        updated?: number;
+        skipped?: number;
+        already_exists?: number;
+        blocked?: boolean;
         global_reused?: number;
         auto_created_depts?: string[];
-        errors: Array<{ line: number; reason: string }>;
+        synced_global_rows?: number;
+        invalid?: Array<{ row: number; phone: string; reason: string }>;
+        errors?: Array<{ line: number; reason: string }>;
       }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/import`, {
-        csv_text: csvText,
+        csv_rows: rows,
+        dry_run: false,
       });
+      const invalid = res.invalid || [];
+      const reusedNote =
+        res.global_reused && res.global_reused > 0
+          ? `（其中 ${res.global_reused} 人已在全平台激活，自动复用免二次激活）`
+          : '';
+      // 2026-11-09 用户口径：「待修复后才全量导入成功」——
+      // 有任何错误行就整批不写入，把**全部**错误行列出来，且**不关窗**（用户改完再导）。
+      if (invalid.length > 0 || res.blocked) {
+        setImportErrors(invalid);
+        toast.error(
+          `导入未执行：${invalid.length} 行有问题，已全部列出（本次一行都没有写入）。请修复后重新导入。`,
+          '导入被拦截',
+        );
+        return;
+      }
       await Promise.all([
         loadMembers(selectedRoleId),
         refreshRoles(),
         loadDepartments(),
       ]);
+      setImportErrors([]);
       setImportModalOpen(false);
-      const reusedNote =
-        res.global_reused && res.global_reused > 0
-          ? `（其中 ${res.global_reused} 人已在全平台激活，自动复用免二次激活）`
+      const addedN = res.added ?? res.will_add ?? 0;
+      const syncNote =
+        res.synced_global_rows && res.synced_global_rows > 0
+          ? `；其中 ${res.synced_global_rows} 条名册记录的姓名/部门已同步到全局`
           : '';
-      if (res.errors && res.errors.length > 0) {
-        toast.warning(
-          `新增 ${res.added} 人、更新 ${res.updated} 人${reusedNote}；有 ${res.errors.length} 行格式不符已跳过（第 ${res.errors[0].line} 行：${res.errors[0].reason}）。`,
-          '导入部分完成',
-        );
-      } else {
-        toast.success(
-          `批量导入成功：新增 ${res.added} 名成员，更新 ${res.updated} 名现有成员${reusedNote}。`,
-          'CSV 导入完成',
-        );
-      }
+      toast.success(
+        `批量导入成功：新增 ${addedN} 名成员${reusedNote}${syncNote}。`,
+        'CSV 导入完成',
+      );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : 'CSV 批量导入未成功', 'CSV 批量导入失败');
     } finally {
@@ -985,7 +1030,7 @@ export const RolesMembersView: React.FC = () => {
                       <span>全局搜索已激活成员</span>
                     </button>
                     <button
-                      onClick={() => setImportModalOpen(true)}
+                      onClick={() => { setImportErrors([]); setImportModalOpen(true); }}
                       className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
                     >
                       <Upload className="w-3.5 h-3.5" />
@@ -1210,12 +1255,17 @@ export const RolesMembersView: React.FC = () => {
                                 <Users className="w-3 h-3" />
                                 <span>加入其他角色</span>
                               </button>
+                              {/* 2026-11-09：分级管理员不能改已存在成员的姓名/部门 →
+                                  只给「停用/启用」（派单状态）；改名能力只留给超管 */}
                               <button
                                 onClick={() => openEditMemberModal(m)}
+                                title={isSuperAdmin
+                                  ? '修改姓名 / 部门 / 派单状态'
+                                  : '调整派单状态（姓名与部门由超管统一维护）'}
                                 className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap"
                               >
                                 <Edit3 className="w-3 h-3" />
-                                <span>改名/停用</span>
+                                <span>{isSuperAdmin ? '改名/停用' : '停用/启用'}</span>
                               </button>
                               <button
                                 onClick={() => setConfirmRemoveRoleMember(m)}
@@ -1420,9 +1470,13 @@ export const RolesMembersView: React.FC = () => {
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
-                <h3 className="font-bold text-slate-900 text-base">修改成员信息与派单状态</h3>
+                <h3 className="font-bold text-slate-900 text-base">
+                  {isSuperAdmin ? '修改成员信息与派单状态' : '调整派单状态'}
+                </h3>
                 <p className="text-[11px] text-slate-400">
-                  支持修改用户名、部门及启用/停用状态
+                  {isSuperAdmin
+                    ? '支持修改用户名、部门及启用/停用状态'
+                    : '分级管理员可调整派单状态；姓名与部门由超管统一维护（首次导入时确定）'}
                 </p>
               </div>
               <button
@@ -1461,7 +1515,11 @@ export const RolesMembersView: React.FC = () => {
                   type="text"
                   value={editMemberName}
                   onChange={(e) => setEditMemberName(e.target.value)}
-                  placeholder="请输入成员真实姓名"
+                  /* 2026-11-09 用户口径：分级管理员不能改已存在成员的姓名/部门
+                     （只有首次导入时能定，且要同步全局池）→ 非超管只读 */
+                  readOnly={!isSuperAdmin}
+                  disabled={!isSuperAdmin}
+                  placeholder={isSuperAdmin ? '请输入成员真实姓名' : '仅超管可修改姓名'}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
                 />
               </div>
@@ -1471,6 +1529,8 @@ export const RolesMembersView: React.FC = () => {
                 <select
                   value={editMemberDept}
                   onChange={(e) => setEditMemberDept(e.target.value)}
+                  /* 2026-11-09：非超管只读（部门同样受全局一致性约束） */
+                  disabled={!isSuperAdmin}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
                 >
                   <option value="">不填部门</option>
@@ -1682,6 +1742,26 @@ export const RolesMembersView: React.FC = () => {
                 placeholder={'手机号,姓名,部门\n13900000000,张三,市场部'}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-mono text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 leading-relaxed"
               />
+              {/* 2026-11-09：导入被拦截 → 列出全部错误行（不关窗，等用户修复后再导） */}
+              {importErrors.length > 0 && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50/70 p-3 text-rose-800">
+                  <div className="font-semibold text-xs mb-1.5">
+                    本次导入未执行（{importErrors.length} 行有问题，一行都没有写入）
+                  </div>
+                  <ul className="space-y-1 max-h-40 overflow-y-auto">
+                    {importErrors.map((e, i) => (
+                      <li key={`${e.row}-${i}`} className="text-[11px] leading-5">
+                        <span className="font-mono font-bold">第 {e.row} 行</span>
+                        {e.phone ? <span className="font-mono">（{e.phone}）</span> : null}
+                        <span>：{e.reason}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-2 text-[11px] text-rose-700">
+                    请按上面的提示修正后再点「开始导入」；修正前不会写入任何一行。
+                  </div>
+                </div>
+              )}
               <div className="flex justify-end gap-2 pt-1">
                 <button
                   type="button"
