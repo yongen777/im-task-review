@@ -123,7 +123,7 @@ export const RolesMembersView: React.FC = () => {
     if (!isSuperAdmin) return;
     setPoolLoading(true);
     try {
-      /* 2026-11-06 平台口径：池内只展示当前办公软件的名册（郑佳案例的双平台部门分叉不再出现） */
+      /* 2026-11-06 平台口径：池内只展示当前办公软件的名册（张三案例的双平台部门分叉不再出现） */
       const res = await api.get<{ ok: boolean; items: MemberPoolItem[] }>(
         `/api/admin/member-pool?platform=${platform}`,
       );

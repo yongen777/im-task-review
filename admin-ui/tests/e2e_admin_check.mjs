@@ -72,11 +72,11 @@ async function runTests() {
       logFail('4. 任务实例与审核-移除已过期状态选项', `状态下拉框仍包含已过期: ${statusOptions}`);
     }
 
-    // 4. 检查郑佳 (17313771297) 的 5 条真实春促任务实例与纯通知无审核按钮
+    // 4. 检查张三 (13900000000) 的 5 条真实春促任务实例与纯通知无审核按钮
     const rows = page.locator('tbody tr');
     const rowCount = await rows.count();
     if (rowCount === 5) {
-      logPass('5. 任务实例与审核-真实春促数据展示', '默认今日展示郑佳(17313771297)的 5 条春促任务实例');
+      logPass('5. 任务实例与审核-真实春促数据展示', '默认今日展示张三(13900000000)的 5 条春促任务实例');
     } else {
       logFail('5. 任务实例与审核-真实春促数据展示', `期望 5 条，实际渲染 ${rowCount} 条`);
     }
@@ -95,11 +95,11 @@ async function runTests() {
     const modalText = await modal.innerText();
     if (
       modalText.includes('接收人（含角色）') &&
-      modalText.includes('郑佳') &&
+      modalText.includes('张三') &&
       modalText.includes('片长/分支局长') &&
-      modalText.includes('郑佳 (17313771297) · 片长/分支局长')
+      modalText.includes('张三 (13900000000) · 片长/分支局长')
     ) {
-      logPass('7. 任务实例详情-接收人带上角色', '详情弹窗头部、基础信息卡片及明细均展示「郑佳 + 片长/分支局长」');
+      logPass('7. 任务实例详情-接收人带上角色', '详情弹窗头部、基础信息卡片及明细均展示「张三 + 片长/分支局长」');
     } else {
       logFail('7. 任务实例详情-接收人带上角色', `详情弹窗内容未完整包含角色: ${modalText.slice(0, 300)}`);
     }
@@ -243,8 +243,8 @@ async function runTests() {
     const memberModal = page.locator('div.fixed.inset-0');
     await memberModal.waitFor({ state: 'visible', timeout: 5000 });
     const phoneReadonly = await memberModal.locator('input[disabled]').inputValue();
-    if (phoneReadonly === '17313771297') {
-      logPass('14. 角色成员改名/停用-手机号只读锁死不可改号', '手机号 17313771297 处于只读锁定状态');
+    if (phoneReadonly === '13900000000') {
+      logPass('14. 角色成员改名/停用-手机号只读锁死不可改号', '手机号 13900000000 处于只读锁定状态');
     } else {
       logFail('14. 角色成员改名/停用-手机号只读锁死不可改号', `手机号锁定异常: ${phoneReadonly}`);
     }
@@ -351,7 +351,7 @@ async function runTests() {
     }
 
     // 测试在角色中添加一名临时测试人员「陈测试」，将其从角色移至「已激活待归纳角色人员」，再从「已激活待归纳角色人员」移除（解除会话绑定）
-    await page.locator('input[placeholder="用户名 (如：郑佳)"]').fill('陈测试');
+    await page.locator('input[placeholder="用户名 (如：张三)"]').fill('陈测试');
     await page.locator('input[placeholder="11位手机号 (必填)"]').fill('13700137000');
     await page.locator('button:has-text("添加成员")').click();
     await page.waitForTimeout(200);
