@@ -355,7 +355,7 @@ class ImageCapableNotifier(FakeNotifier):
 
 def test_notice_image_prefers_native_image_and_stays_once_across_ticks() -> None:
     """通道支持发图时：三轮 tick 只发 1 条图片消息，且不再补发 H5 链接。"""
-    from tests.test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
+    from test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
 
     store = _mk_store()
     try:
@@ -381,7 +381,7 @@ def test_notice_image_prefers_native_image_and_stays_once_across_ticks() -> None
 
 def test_notice_image_falls_back_to_link_when_permanent_failure() -> None:
     """图片发送**永久失败**（不可重试）要降级发链接，不能让用户什么都收不到。"""
-    from tests.test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
+    from test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
 
     store = _mk_store()
     try:
@@ -401,7 +401,7 @@ def test_notice_image_falls_back_to_link_when_permanent_failure() -> None:
 
 def test_notice_image_retryable_failure_does_not_send_link_immediately() -> None:
     """可重试失败（长连接抖动）**不要**立刻补链接 —— 否则下一轮重试成功＝收两条。"""
-    from tests.test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
+    from test_stage_3_chuncu import PKEY, _mk_scheduler, _mk_store, _setup_notice_tpl
 
     store = _mk_store()
     try:
