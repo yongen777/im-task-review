@@ -407,13 +407,23 @@ def main() -> int:
         if scp_upload(H, P, U, K, tests_tar, "/tmp/imtask_tests.tar.gz") != 0:
             print("    ✗ tests 上传失败"); ok = False
         else:
+            # 2026-11-09 修复验收误判（11-09 wb 部署事故实测）：旧写法 grep "failed" 有两个洞——
+            # ① 管道里 tail 恒返 0，ssh 退出码失去意义；② collection error 的文本是 "error(s)"
+            #   不是 "failed"，41 条收集失败照样打印"验收通过"。
+            # 现改用退出码哨兵：pytest 直跑取真实退出码，非 0 一律判失败（断言失败/收集错误/环境崩）。
             code, _ = ssh_run(H, P, U, K,
                               f"cd {REMOTE_DIR} && tar -xzf /tmp/imtask_tests.tar.gz && "
-                              ".venv/bin/python -m pytest -o addopts=\"\" -q 2>&1 | tail -3",
-                              timeout=600, show=4)
+                              ".venv/bin/python -m pytest -o addopts=\"\" -q; rc=$?; "
+                              "echo PYTEST_EXIT_CODE=$rc; exit 0",
+                              timeout=600, show=6)
             ssh_run(H, P, U, K, f"rm -rf {REMOTE_DIR}/tests /tmp/imtask_tests.tar.gz", timeout=60, show=1)
-            if "failed" in _ and "0 failed" not in _:
-                print("    ✗ 远程测试有失败"); ok = False
+            m = re.search(r"PYTEST_EXIT_CODE=(\d+)", _)
+            pytest_rc = int(m.group(1)) if m else 1
+            if pytest_rc != 0:
+                print(f"    ✗ 远程 pytest 失败（退出码 {pytest_rc}，含断言失败/收集错误）"); ok = False
+            else:
+                passed = re.search(r"(\d+) passed", _)
+                print(f"    ✓ 远程 pytest 全绿（{passed.group(1) if passed else '?'} passed）")
 
     print("⑨ 清理生产目录：未被引用的历史构建产物 + 遗留 scripts")
     keep_cmd = (
