@@ -23,6 +23,19 @@ from fastapi.testclient import TestClient
 from app.api.admin import create_admin_router
 from app.state import BizError, StateStore
 
+
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
 PHONE = "13900008001"
 
 
@@ -33,6 +46,7 @@ def _mk_store() -> StateStore:
 def _role(store: StateStore) -> str:
     rid = store.create_role("云中台软研队伍", actor="t")["role_id"]
     store.add_role_member(rid, PHONE, "张三", "市场部", actor="t")
+    bind_activated_at(store, PHONE, "uid_phone")
     return rid
 
 

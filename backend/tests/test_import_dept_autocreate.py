@@ -123,10 +123,13 @@ def test_too_long_department_rejects_only_that_row() -> None:
             [{"row": 1, "phone": PHONE, "name": "张三", "dept": long_dept},
              {"row": 2, "phone": OTHER, "name": "李四", "dept": "正常部"}],
             dry_run=False, actor="t")
-        assert res["will_add"] == 1, res
+        # 2026-11-09 新口径：导入改为**整批拒绝**（有错误行则整批不写入，待修复后再导）
+        assert res["blocked"] is True, res
+        assert res["will_add"] == 0, res
         assert any(x["row"] == 1 and "过长" in x["reason"] for x in res["invalid"]), res
         assert not store.department_exists(long_dept), "非法部门名不应建档"
-        assert store.department_exists("正常部")
+        assert not store.department_exists("正常部"), "整批拒绝 → 合法那行也不该建档"
+        assert not store.list_role_members(rid, size=50)["items"], "整批拒绝 → 一行都不该写入"
     finally:
         store.close()
 

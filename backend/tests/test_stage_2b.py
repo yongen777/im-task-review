@@ -21,6 +21,19 @@ from app.scheduler import FakeNotifier, Scheduler, calc_resubmit_deadline, make_
 from app.state import BizError, StateStore
 
 
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
+
 def make_dt(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
 
@@ -210,8 +223,8 @@ class TestStage2B(unittest.TestCase):
         rid = self.store.create_role("日报组", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13900000011", "甲", "一部", actor="admin")
         self.store.add_role_member(rid, "13900000012", "乙", "二部", actor="admin")
-        self.store.upsert_delivery_target("13900000011", "uid_jia")
-        self.store.upsert_delivery_target("13900000012", "uid_yi")
+        bind_activated_at(self.store, "13900000011", "uid_jia")
+        bind_activated_at(self.store, "13900000012", "uid_yi")
 
         tpl = self.store.create_template(
             {
@@ -264,7 +277,7 @@ class TestStage2B(unittest.TestCase):
 
         rid = self.store.create_role("重交组", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13900000021", "甲", "一部", actor="admin")
-        self.store.upsert_delivery_target("13900000021", "uid_resubmit")
+        bind_activated_at(self.store, "13900000021", "uid_resubmit")
         tpl = self.store.create_template(
             {
                 "name": "重交验证", "kind": "form", "role_ids": [rid],
@@ -312,8 +325,12 @@ class TestStage2B(unittest.TestCase):
     def test_app_events_three_paths_and_three_guardrails(self) -> None:
         rid = self.store.create_role("全员角色", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800008001", "张A", "研发", actor="admin")
+        # 2026-11-09：这条用例要测「未登记 → 走登记路径」，
+        # 所以**不能**预先建绑定（建了就不是"未登记"了）。
         self.store.add_role_member(rid, "13800008002", "李B", "产品", actor="admin")
+        # 2026-11-09：这条用例要测三人都是「未登记」→ 都不预先建绑定
         self.store.add_role_member(rid, "13800008003", "王C", "设计", actor="admin")
+        # 2026-11-09：同上，三人都从「未登记」开始
         # 2026-11-03：H5 登记表单必填部门，先配置部门选项
         self.store.create_department("研发", actor="admin")
         self.store.create_department("产品", actor="admin")
@@ -373,6 +390,9 @@ class TestStage2B(unittest.TestCase):
         reset_bind_rate()
         rid = self.store.create_role("重复绑定角色", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800007001", "重复测", "研发", actor="admin")
+        # 2026-11-09：这条用例要测「**首次**登记 → 再重复登记」，
+        # 所以**不能**预先建绑定（预建了首次登记就会 409）。
+        # 2026-11-09 新口径下实例只给已激活成员建，与本用例无关（它不依赖实例）。
         self.store.create_department("研发", actor="admin")
 
         first = self.pub_client.post("/api/h5/bind", json={"phone": "13800007001", "external_id": "uid_repeat", "name": "重复测", "dept": "研发"})
@@ -406,7 +426,7 @@ class TestStage2B(unittest.TestCase):
         """
         rid = self.store.create_role("片长", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800000011", "王一", "运维部", actor="admin")
-        self.store.upsert_delivery_target("13800000011", "ext_missed_1")
+        bind_activated_at(self.store, "13800000011", "ext_missed_1")
         tpl = self.store.create_template(
             {
                 "name": "外出上门通报", "kind": "form", "role_ids": [rid],
@@ -445,6 +465,7 @@ class TestStage2B(unittest.TestCase):
 
         rid = self.store.create_role("片长", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800000021", "甲一", "一部", actor="admin")
+        bind_activated_at(self.store, "13800000021", "13800000021")
         tpl = self.store.create_template(
             {
                 "name": "机房巡检", "kind": "form", "role_ids": [rid],

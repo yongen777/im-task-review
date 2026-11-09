@@ -155,9 +155,10 @@ def test_submit_feedback_missing_binding_sends_nothing() -> None:
         store.add_role_member(role["role_id"], phone=PHONE, name=NAME)  # 不建立绑定
         tpl_id = _form_template(store, role["role_id"])
 
-        z = FakeNotifier()
-        code, _body = _submit_once(store, tpl_id, fields={"visit_count": 1}, notifier=z)
-        assert code == 200
-        assert z.sent_messages == [], "未激活绑定的成员不回推，提交本身照常成功"
+        # 2026-11-09 新口径：未激活成员**根本不生成任务实例**（比"不回推"更靠前一道）
+        now = store.now().replace(tzinfo=None, microsecond=0)
+        pkey = format_dt(now)[:10]
+        insts = store.ensure_template_instances(tpl_id, pkey, format_dt(now + timedelta(hours=8)))
+        assert insts == [], "未激活成员不生成任务实例"
     finally:
         store.close()

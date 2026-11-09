@@ -24,6 +24,19 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
+
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
 PWD = StateStore.DEFAULT_SUB_ADMIN_PASSWORD
 PHONE = "13600001234"
 
@@ -192,6 +205,7 @@ def test_global_activation_is_shared_across_admins() -> None:
         role = cc.post("/api/admin/roles", json={"name": "甲组", "platform": "zdxlz"}).json()["role_id"]
         # 加成员 → 已激活（全局复用），无需二次激活
         resp = cc.post(f"/api/admin/roles/{role}/members", json={"phone": PHONE, "name": "张三"}).json()
+        store.upsert_delivery_target(PHONE, "zdxlz_uid_multi_admin", platform="zdxlz")
         assert resp["member"]["activated"] is True, resp
         assert resp["global_reused"] is True, resp
         # 全局搜索能搜到
@@ -250,6 +264,7 @@ def test_owner_filter_applies_to_templates_and_instances() -> None:
         assert len(c.get("/api/admin/templates?owner_id=999").json()["items"]) == 0
         # 实例归属继承模板（先生成实例：模板要有成员才会建实例）
         cc.post(f"/api/admin/roles/{role}/members", json={"phone": PHONE, "name": "张三", "dept": "市场部"})
+        store.upsert_delivery_target(PHONE, "zdxlz_uid_multi_admin", platform="zdxlz")
         inst = store.ensure_template_instances(tpl_id, "2026-11-04", "2026-11-04 23:59:00")
         assert inst and int(inst[0]["owner_id"]) == a_id, inst
     finally:
@@ -265,6 +280,7 @@ def test_transfer_owner_moves_history() -> None:
         # 历史数据用 state 直建（模拟"多管理员体系之前就有的数据"），归属默认落在 admin(id=1)
         role = store.create_role("历史组", platform="zdxlz")["role_id"]
         store.add_role_member(role, PHONE, "老成员", "市场部")
+        bind_activated_at(store, PHONE, "uid_phone")
         assert c.post(f"/api/admin/roles/{role}/members", json={"phone": PHONE, "name": "老成员"}).status_code == 403  # 超管不能写
         res = store.transfer_owner(acct["id"], actor="admin")
         assert res["ok"] is True

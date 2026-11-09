@@ -223,7 +223,12 @@ def test_notice_image_sender_none_still_sends_link():
     kinds = [r["kind"] for r in store.list_reminder_logs(tpl_id)]
     assert kinds == ["notice", "notice_img_link"]
 
-def test_notice_unactivated_member_skipped_and_image_skipped():
+def test_notice_unactivated_member_not_generated_at_all():
+    """2026-11-09 新口径：未激活成员**不生成任务实例**（旧口径是「建实例 + 记 skipped」）。
+
+    用户拍板原话：「张三和马玲一个停用一个未激活。所以在任务实例中就不要存在
+    这两个不会实现的任务实例」→ 噪音挡在源头，不只是发送时跳过。
+    """
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=True)
     store.upsert_data_snapshot(tpl_id, "2026-10-28", {"completion_rate": "86.5"})
@@ -233,10 +238,11 @@ def test_notice_unactivated_member_skipped_and_image_skipped():
     scheduler = _mk_scheduler(store, notifier=notifier, image_sender=img_sender)
     stats = scheduler.run_once()
 
-    # 成员未激活（无 delivery_target）-> 文本 skipped，图片直接跳过不记录
-    assert stats["skipped"] == 1
+    # 成员未激活（无 delivery_target）→ 不建实例 → 没有 skipped、没发送、没图片
+    assert stats["skipped"] == 0
     assert stats["sent"] == 0
     assert len(img_sender.sent) == 0
+    assert store.list_instances_for_period(tpl_id, PKEY) == [], "未激活成员不生成任务实例"
 
 
 # ── 5. 2026-10-28 方案A：notice 也生成任务实例（pending → sent） ──────────────
@@ -326,8 +332,11 @@ def test_notice_instance_sent_with_image_link_only():
     assert instances[0]["status"] == "sent"
     assert len(img_sender.sent) == 0, "⛔ 不再发送图片消息"
 
-def test_notice_instance_stays_pending_for_unactivated_member():
-    """未绑定成员的实例要建出来，但状态保持 pending（发送记录为 skipped）。"""
+def test_notice_instance_not_created_for_unactivated_member():
+    """2026-11-09 新口径：未绑定成员**不生成实例**（旧口径是「建实例、状态 pending、记 skipped」）。
+
+    用户拍板：不会实现的任务实例不要存在 → 连实例都不建。
+    """
     store = _mk_store()
     tpl_id = _setup_notice_tpl(store, attach_image=False)
 
@@ -335,11 +344,9 @@ def test_notice_instance_stays_pending_for_unactivated_member():
     scheduler = _mk_scheduler(store, notifier=notifier, image_sender=None)
     stats = scheduler.run_once()
 
-    assert stats["skipped"] == 1
-    instances = store.list_instances_for_period(tpl_id, PKEY)
-    assert len(instances) == 1
-    assert instances[0]["status"] == "pending"
-    assert [r["result"] for r in store.list_reminder_logs(tpl_id)] == ["skipped"]
+    assert stats["skipped"] == 0
+    assert store.list_instances_for_period(tpl_id, PKEY) == [], "未激活成员不生成任务实例"
+    assert store.list_reminder_logs(tpl_id) == [], "没有实例就不该有发送日志"
 
 
 def test_notice_instance_not_advanced_to_overdue():

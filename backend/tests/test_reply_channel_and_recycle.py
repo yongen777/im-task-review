@@ -25,6 +25,19 @@ from app.main import _channel_notifier  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
+
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
 PHONE = "13800000222"
 NAME = "测试员"
 DEPT = "云中台"
@@ -110,7 +123,9 @@ def test_remove_member_purges_open_instances_of_that_role() -> None:
         ra = store.create_role("密信A组", actor="t", platform="zdxlz")["role_id"]
         rb = store.create_role("密信B组", actor="t", platform="zdxlz")["role_id"]
         store.add_role_member(ra, PHONE, NAME, DEPT, actor="t")
+        bind_activated_at(store, PHONE, "uid_phone")
         store.add_role_member(rb, PHONE, NAME, DEPT, actor="t")
+        bind_activated_at(store, PHONE, "uid_phone")
 
         exclusive_tpl = _notice_tpl(store, [ra], "仅A组任务")
         shared_tpl = _notice_tpl(store, [ra, rb], "A+B共用任务")
@@ -127,7 +142,7 @@ def test_remove_member_purges_open_instances_of_that_role() -> None:
         store.delete_role_member(ra, PHONE, actor="t")
         assert store.get_instance_by_key(exclusive_tpl, PHONE, pkey) is None, "仅A组任务的未完成实例应删除"
         assert store.get_instance_by_key(shared_tpl, PHONE, pkey) is not None, "还在B组，共用模板实例不得删"
-        assert store.get_instance(done["id"]) is not None, "已完成历史不得删除"
+        assert store.get_instance(done["id"]) is None, "移除成员后本组模板下的已完成实例也应删除（2026-11-09 新口径：移除要删干净）"
 
         # 再退出 B 组：共用模板实例也删除
         store.delete_role_member(rb, PHONE, actor="t")
@@ -141,6 +156,7 @@ def test_remove_member_keeps_terminal_instances() -> None:
     try:
         ra = store.create_role("密信C组", actor="t", platform="zdxlz")["role_id"]
         store.add_role_member(ra, PHONE, NAME, DEPT, actor="t")
+        bind_activated_at(store, PHONE, "uid_phone")
         tid = _notice_tpl(store, [ra], "通知任务")
         pkey = "2026-11-03"
         store.ensure_template_instances(tid, pkey, "2026-11-03 23:59:00")
@@ -149,6 +165,6 @@ def test_remove_member_keeps_terminal_instances() -> None:
         store.conn.commit()
 
         store.delete_role_member(ra, PHONE, actor="t")
-        assert store.get_instance(inst["id"]) is not None, "已发送的通知实例是历史，不得删除"
+        assert store.get_instance(inst["id"]) is None, "移除成员后本组模板下的已发送实例也应删除（2026-11-09 新口径）"
     finally:
         store.close()

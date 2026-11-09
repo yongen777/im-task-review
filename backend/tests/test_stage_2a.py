@@ -15,6 +15,19 @@ from app.scheduler import FakeNotifier, Scheduler, calc_deadline_at, effective_m
 from app.state import BizError, StateStore
 
 
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
+
 def make_dt(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=SHANGHAI_TZ)
 
@@ -203,6 +216,7 @@ class TestStage2A(unittest.TestCase):
     def test_r43_member_import_dry_run_and_commit(self) -> None:
         rid = self.store.create_role("渠道经理", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800138001", "张三", "一部", actor="admin")
+        bind_activated_at(self.store, "13800138001", "13800138001")
         # 2026-11-03：部门必须命中后台配置的部门选项
         for dept in ("一部", "二部", "三部", "四部", "五部"):
             self.store.create_department(dept, actor="admin")
@@ -218,15 +232,25 @@ class TestStage2A(unittest.TestCase):
         ]
 
         diff = self.store.import_role_members(rid, csv_rows, dry_run=True, actor="admin")
-        self.assertEqual((diff["ok"], diff["dry_run"], diff["will_add"], diff["already_exists"]), (True, True, 2, 2))
-        self.assertEqual(len(diff["invalid"]), 3)
-        self.assertEqual((diff["invalid"][0]["row"], diff["invalid"][0]["phone"], diff["invalid"][0]["reason"]), (4, "12345", "手机号格式不正确"))
-        self.assertEqual((diff["invalid"][1]["row"], diff["invalid"][2]["row"]), (5, 7))
+        # 2026-11-09 新口径：与已添加成员重复的手机号**要报错**（不再静默跳过），
+        # 且「待修复后才全量导入成功」= 有错误行就整批不写入。
+        self.assertEqual((diff["ok"], diff["dry_run"]), (True, True))
+        self.assertEqual(diff["will_add"], 0, diff)          # 2026-11-09 新口径：整批拒绝 → will_add 归零
+        self.assertEqual(diff["already_exists"], 2, diff)     # 张三（名册已有）+ 李四重复（批次内重复）
+        self.assertEqual(len(diff["invalid"]), 5, diff)       # 与名册重复 + 手机号格式 + 姓名空 + 批次内重复 + None 行
+        # 2026-11-09：invalid 列表的**顺序变了**（新增的「与名册重复」检测在收集阶段，
+        # 排在格式错误之前）→ 按**行号**取断言，不依赖下标顺序。
+        _by_row = {x["row"]: x for x in diff["invalid"]}
+        self.assertEqual((_by_row[4]["phone"], _by_row[4]["reason"]), ("12345", "手机号格式不正确"))
+        self.assertEqual((_by_row[5]["row"], _by_row[7]["row"]), (5, 7))
+        self.assertTrue(any(x["row"] == 1 and "重复" in x["reason"] for x in diff["invalid"]), diff["invalid"])
         self.assertEqual(self.store.list_role_members(rid)["total"], 1)
 
+        # 有错误行 → 整批不写入（待修复后再导）
         commit_res = self.store.import_role_members(rid, csv_rows, dry_run=False, actor="admin")
-        self.assertEqual((commit_res["dry_run"], commit_res["will_add"]), (False, 2))
-        self.assertEqual(self.store.list_role_members(rid)["total"], 3)
+        self.assertEqual((commit_res["dry_run"], commit_res["will_add"]), (False, 0))
+        self.assertTrue(commit_res["blocked"], commit_res)
+        self.assertEqual(self.store.list_role_members(rid)["total"], 1)  # 一行都没写入
 
     def test_r19_unique_instance_across_roles_and_scheduler(self) -> None:
         r1 = self.store.create_role("部门长", actor="admin")["role_id"]
@@ -235,7 +259,7 @@ class TestStage2A(unittest.TestCase):
         self.store.add_role_member(r1, "13900139001", "陈一", "研发部", actor="admin")
         self.store.add_role_member(r2, "13900139001", "陈一", "研发部", actor="admin")
         self.store.add_role_member(r2, "13900139002", "林二", "产品部", actor="admin")
-        self.store.upsert_delivery_target("13900139001", "3000000000000000001")
+        bind_activated_at(self.store, "13900139001", "3000000000000000001")
 
         tpl = self.store.create_template(
             {
@@ -253,18 +277,18 @@ class TestStage2A(unittest.TestCase):
 
         self.current_dt = make_dt("2026-10-25 17:00:00")
         # 2026-10-29：上传任务也改为「当天一进来就按人预生成实例」，未到点只建行不发送
-        self.assertEqual(scheduler.run_once()["generated_instances"], 2)
+        self.assertEqual(scheduler.run_once()["generated_instances"], 1)  # 2026-11-09 新口径：未激活成员不生成实例
         self.assertEqual(len(notifier.sent_messages), 0)
 
         self.current_dt = make_dt("2026-10-25 17:30:00")
         s2 = scheduler.run_once()
-        self.assertEqual((s2["generated_instances"], s2["sent"], s2["skipped"]), (0, 1, 1))
+        self.assertEqual((s2["generated_instances"], s2["sent"], s2["skipped"]), (0, 1, 0))  # 2026-11-09 新口径：未激活不建实例 → 无 skipped
         self.assertEqual(len(notifier.sent_messages), 1)
         self.assertIn("陈一（研发部）", notifier.sent_messages[0].text)
         self.assertIn("今天 18:00", notifier.sent_messages[0].text)
         self.assertIn("https://task.example.com/h5/task#t=", notifier.sent_messages[0].text)
         self.assertNotIn("#t=preview", notifier.sent_messages[0].text)
-        self.assertEqual(len(self.store.list_instances_for_period(tid, "2026-10-25")), 2)
+        self.assertEqual(len(self.store.list_instances_for_period(tid, "2026-10-25")), 1)  # 2026-11-09 新口径
 
         self.current_dt = make_dt("2026-10-25 17:31:00")
         self.assertEqual(scheduler.run_once()["sent"], 0)

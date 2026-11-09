@@ -127,8 +127,11 @@ def test_wecom_task_member_only_zdxlz_bound_sends_none() -> None:
 
         assert len(z.sent_messages) == 0
         assert len(w.sent_messages) == 0
+        # 2026-11-09 新口径：该成员在**企微平台未激活** → 根本不生成实例 → 也没有 skipped 日志
+        # （旧口径是「建实例、发送时记 skipped」；新口径把噪音挡在源头）
+        assert store.list_instances_for_period(tpl_id, store.now().strftime("%Y-%m-%d")) == [], "未在企微激活的成员不生成实例"
         logs = [r for r in store.list_reminder_logs(tpl_id) if r["kind"] == "notice"]
-        assert len(logs) == 1 and logs[0]["result"] == "skipped", logs
+        assert logs == [], "没有实例就不该有发送日志"
     finally:
         store.close()
 

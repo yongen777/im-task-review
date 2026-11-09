@@ -25,6 +25,19 @@ from app.config import SHANGHAI_TZ, format_dt
 from app.state import BizError, StateStore
 
 
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
+
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp()
     return StateStore(Path(tmp) / "im.db")
@@ -444,6 +457,7 @@ def test_instance_list_exposes_template_time():
         # 通知类：带多个时点
         rid = store.create_role("多时点组", actor="t")["role_id"]
         store.add_role_member(rid, "13900006001", "乙", "二部", actor="t")
+        bind_activated_at(store, "13900006001", "13900006001")
         n_tpl = store.create_template(
             {
                 "name": "双时段提醒", "kind": "notice", "role_ids": [rid],
@@ -640,6 +654,7 @@ def test_member_can_join_multiple_roles():
 
         # 加入第二个角色：不报错，且第一个角色的成员关系保持
         store.add_role_member(r2, "13900008001", "张三", "市场部", actor="t")
+        bind_activated_at(store, "13900008001", "13900008001")
         assert store.list_role_members(r1)["total"] == 1
         assert store.list_role_members(r2)["total"] == 1
 
@@ -649,6 +664,7 @@ def test_member_can_join_multiple_roles():
         # 同一角色内重复添加仍应被拦（避免一条角色两条记录）
         with pytest.raises(BizError) as err:
             store.add_role_member(r2, "13900008001", "张三", actor="t")
+            bind_activated_at(store, "13900008001", "13900008001")
         assert err.value.code == "DUPLICATE"
 
         # 从其中一个角色移出：另一角色与推送绑定都必须保留

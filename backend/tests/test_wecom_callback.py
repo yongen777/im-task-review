@@ -101,7 +101,9 @@ def _mk_store() -> StateStore:
 
 def _mk_overdue(store: StateStore, *, hours_late: float = 2.0) -> Dict[str, Any]:
     """建一个已逾期实例（用于验证「申请补交」分支）。"""
-    rid = store.create_role("执行组", actor="t")["role_id"]
+    # 2026-11-09：激活按**角色所属平台**判定 → 角色与绑定平台要一致（都是 wecom），
+    # 否则成员在角色所属平台算未激活 → 不生成实例（下面 ensure 就会取不到）。
+    rid = store.create_role("执行组", actor="t", platform="wecom")["role_id"]
     store.add_role_member(rid, PHONE, "张三", "市场部", actor="t")
     store.upsert_delivery_target(PHONE, USERID, platform="wecom")  # 企微 userid 作为推送 ID（绑定在 wecom 平台）
     tpl = store.create_template(

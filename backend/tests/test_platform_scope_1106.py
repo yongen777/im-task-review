@@ -25,6 +25,19 @@ from app.api.admin import create_admin_router, register_admin_guard  # noqa: E40
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
+
+def bind_activated_at(store, phone: str, external_id: str, activated_at: str = "2000-01-01 00:00:00", platform: str = "zdxlz") -> None:
+    """建立平台绑定并**指定首次激活时刻**。
+
+    2026-11-09 新口径「当天激活的只创建激活时刻之后的任务，第二天才是刷新完整一天」：
+    实例生成会拿 delivery_target.activated_at 与 period_key 比 ——
+      · 激活时刻早于 period_key 那天 → 建实例
+      · 激活时刻晚于 period_key 那天 → 不建（那天他还没激活）
+
+    历史 period_key 的测试场景必须把激活时刻设在那天之前，
+    否则语义上「那天他还没激活」→ 不该有实例，断言就会对不上。
+    """
+    store.upsert_delivery_target(phone, external_id, platform=platform, activated_at=activated_at)
 PHONE_X = "13700001001"
 PHONE_Y = "13700001002"
 
@@ -132,9 +145,13 @@ def test_accounts_stats_platform_scoped() -> None:
         rz2 = store.create_role("密信组2", actor="sa", platform="zdxlz", owner_id=s1)["role_id"]
         rw = store.create_role("企微组", actor="sa", platform="wecom", owner_id=s1)["role_id"]
         store.add_role_member(rz1, PHONE_X, "张三", "市场部", actor="sa", owner_id=s1)
+        bind_activated_at(store, PHONE_X, "uid_phone_x")
         store.add_role_member(rz1, PHONE_Y, "李四", "渠道部", actor="sa", owner_id=s1)
+        bind_activated_at(store, PHONE_Y, "uid_phone_y")
         store.add_role_member(rz2, PHONE_X, "张三", "市场部", actor="sa", owner_id=s1)  # X 双角色，去重只算 1 人
         store.add_role_member(rw, PHONE_X, "张三", "市场部", actor="sa", owner_id=s1)
+        # PHONE_X 在企微组也要有企微绑定（2026-11-09：激活按**角色所属平台**判定）
+        bind_activated_at(store, PHONE_X, "uid_phone_x_w", platform="wecom")
         tz = store.create_template(_notice([rz1, rz2], "密信通知"), actor="sa", owner_id=s1)
         tw = store.create_template(_notice(rw, "企微通知"), actor="sa", owner_id=s1)
         today = store.now().strftime("%Y-%m-%d")
@@ -206,6 +223,7 @@ def test_member_pool_platform_scoped_and_ops() -> None:
         # 同平台内多行不同姓名 → 姓名不一致提醒保留
         rz2 = store.create_role("密信组2", actor="sa", platform="zdxlz", owner_id=s1)["role_id"]
         store.add_role_member(rz2, PHONE_X, "张三丰", "云中台", actor="sa", owner_id=s1)
+        bind_activated_at(store, PHONE_X, "uid_phone_x")
         pz2 = store.list_member_pool(platform="zdxlz")
         assert pz2[0]["row_count"] == 2 and pz2[0]["role_count"] == 2
         assert pz2[0]["name_inconsistent"] is True
