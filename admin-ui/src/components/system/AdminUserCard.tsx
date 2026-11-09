@@ -419,12 +419,26 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
   const canUseZdxlz = allowedPlatforms.includes('zdxlz');
   const canUseWecom = allowedPlatforms.includes('wecom');
 
+  /* 2026-11-09 用户口径：「没开放当前办公软件的分级管理员直接隐藏」。
+     超管当前选中企业微信时，未授权 wecom 的分级管理员（如仅 zdxlz 的向文晗）不显示，
+     避免点进去才发现无权限。allowed_platforms 为空时按 ['zdxlz'] 处理，
+     与 store.tsx 里 allowedPlatforms 的兜底口径保持一致。 */
+  const switchableAccounts = adminAccounts.filter((a) => {
+    if (a.role_level !== 'sub_admin') return false;
+    const plats =
+      Array.isArray(a.allowed_platforms) && a.allowed_platforms.length > 0
+        ? a.allowed_platforms
+        : (['zdxlz'] as OfficePlatform[]);
+    return plats.includes(platform);
+  });
+
   /* 2026-11-05 切换身份（用户需求：免退出切换到分级管理员账号，代登录后可真实执行其操作）。
      切回走后端 unassume：HttpOnly Cookie 前端拿不到 sid，原超管会话存在服务端（parent_sid）。 */
   const handleAssume = async (accId: number, accName: string) => {
     setAssumeBusyId(accId);
     try {
-      await api.post(`/api/admin/accounts/${accId}/assume`);
+      // 带上当前办公软件，后端据此校验目标账号是否有该平台授权（前端已隐藏未授权的，这里是兜底）
+      await api.post(`/api/admin/accounts/${accId}/assume?platform=${encodeURIComponent(platform)}`);
       toast.success(`已切换到「${accName}」身份，正在刷新界面…`);
       window.setTimeout(() => window.location.reload(), 500);
     } catch (err) {
@@ -562,9 +576,7 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
                 <span>切换身份（免退出代登录，全程审计）</span>
               </div>
               <div className="space-y-1 max-h-40 overflow-y-auto">
-                {adminAccounts
-                  .filter((a) => a.role_level === 'sub_admin')
-                  .map((a) => {
+                {switchableAccounts.map((a) => {
                     const switching = assumeBusyId === a.id;
                     return (
                       <button
@@ -589,8 +601,10 @@ export const AdminUserCard: React.FC<AdminUserCardProps> = ({ me, onLoggedOut })
                       </button>
                     );
                   })}
-                {adminAccounts.filter((a) => a.role_level === 'sub_admin').length === 0 && (
-                  <div className="text-[11px] text-slate-400 px-2.5 py-1">暂无分级管理员账号</div>
+                {switchableAccounts.length === 0 && (
+                  <div className="text-[11px] text-slate-400 px-2.5 py-1">
+                    当前办公软件下暂无分级管理员账号
+                  </div>
                 )}
               </div>
             </div>

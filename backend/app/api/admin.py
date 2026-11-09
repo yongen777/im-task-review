@@ -886,11 +886,15 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return {"ok": True, **res, "default_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD}
 
     @router.post("/accounts/{admin_id}/assume")
-    async def assume_account(admin_id: int, request: Request):
+    async def assume_account(admin_id: int, request: Request, platform: Optional[str] = None):
         """超管免退出切换身份（2026-11-05 用户需求）：以超管权限为目标分级管理员签发新会话。
 
         切换后即以目标身份操作（可建模板/发消息），全程审计 admin.assume；
         目标须启用、不能代超管；切回由前端用保存的原超管会话，不走本接口（代管身份是 sub_admin，重复调自然 403）。
+
+        2026-11-09：加 platform 参数护栏 —— 超管当前选中的办公软件若**未授权给目标分级管理员**，
+        则拒绝代登录（前端也按同一口径把这类账号隐藏了；这里做后端兜底，防绕过前端直接调接口）。
+        不传 platform 时不校验（保持旧调用兼容）。
         """
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
@@ -906,6 +910,20 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return error_response(400, "VALIDATION_FAILED", "不能代超级管理员账号登录")
         if not int(target.get("enabled") or 0):
             return error_response(400, "VALIDATION_FAILED", "目标账号已被停用，不能代登录")
+        _tplat = (platform or "").strip().lower()
+        if _tplat:
+            # ⚠️ get_admin_by_id 返回的是**原始行**，allowed_platforms 存的是 JSON 字符串
+            # （'["zdxlz"]'），必须用 parse_admin_account 解析成数组，否则迭代出来的是
+            # 单个字符，判定恒失效（2026-11-09 修）。
+            _tprof = state.parse_admin_account(target)
+            _tplats = [str(p).lower() for p in (_tprof.get("allowed_platforms") or [])]
+            if not _tplats:
+                _tplats = ["zdxlz"]  # 与前端/store 一致：未配平台默认只有量子密信
+            if _tplat not in _tplats:
+                return error_response(
+                    403, "PLATFORM_NOT_ALLOWED",
+                    f"目标账号未授权当前办公软件（{_tplat}），不能代登录",
+                )
         new_sess = state.create_admin_session(int(target["id"]), parent_sid=str(sess["sid"]))
         prof = state.parse_admin_account(target)
         state.write_audit(

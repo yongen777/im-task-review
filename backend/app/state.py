@@ -1029,7 +1029,12 @@ class StateStore:
     def search_global_activated(self, q: str = "", platform: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
         """全局搜索**已激活**（delivery_target 有绑定）的成员 —— 跨管理员共享，免二次激活。
 
-        姓名/部门取该手机号在 member 表里的任一条（优先最近插入），供"一键拉入我的分组"时带出。
+        2026-11-09 修正（用户口径「全量池也要做办公软件隔离」）：
+        激活关系是**按平台分行**的（delivery_target.platform），所以查询主体按 platform 过滤；
+        但**姓名/部门必须也从该平台的 member 行取**，否则会出现「企微视角下显示密信那条的
+        姓名/部门」的串台（实测：企微视角搜到「郑佳 / 云中台」，而那条信息属于量子密信）。
+        现在 name/dept 一律按 `member JOIN role ON role.platform = 平台` 取；
+        按姓名搜索的 EXISTS 子查询同样按平台收口，避免搜到别的平台的名字。
         """
         plat = (platform or "").strip().lower()
         like = f"%{(q or '').strip()}%"
@@ -1039,8 +1044,16 @@ class StateStore:
             where.append("dt.platform = ?")
             params.append(plat)
         if (q or "").strip():
-            where.append("(dt.phone LIKE ? OR EXISTS (SELECT 1 FROM member m WHERE m.phone = dt.phone AND m.name LIKE ?))")
-            params.extend([like, like])
+            if plat:
+                # 姓名匹配收口到本平台的名册（否则密信的名字能被企微搜到）
+                where.append(
+                    "(dt.phone LIKE ? OR EXISTS (SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    "WHERE m.phone = dt.phone AND r.platform = ? AND m.name LIKE ?))"
+                )
+                params.extend([like, plat, like])
+            else:
+                where.append("(dt.phone LIKE ? OR EXISTS (SELECT 1 FROM member m WHERE m.phone = dt.phone AND m.name LIKE ?))")
+                params.extend([like, like])
         sql = (
             "SELECT dt.platform, dt.phone, dt.external_id, dt.activated_at, dt.last_event_at "
             "FROM delivery_target dt WHERE " + " AND ".join(where) +
@@ -1050,9 +1063,17 @@ class StateStore:
             rows = self.conn.execute(sql, tuple(params + [int(limit)])).fetchall()
             out: List[Dict[str, Any]] = []
             for r in rows:
-                m = self.conn.execute(
-                    "SELECT name, dept FROM member WHERE phone = ? ORDER BY id DESC LIMIT 1", (r["phone"],)
-                ).fetchone()
+                if plat:
+                    # 姓名/部门取**本平台**的名册行（不串台到别的平台）
+                    m = self.conn.execute(
+                        "SELECT m.name, m.dept FROM member m JOIN role r ON r.role_id = m.role_id "
+                        "WHERE m.phone = ? AND r.platform = ? ORDER BY m.id DESC LIMIT 1",
+                        (r["phone"], plat),
+                    ).fetchone()
+                else:
+                    m = self.conn.execute(
+                        "SELECT name, dept FROM member WHERE phone = ? ORDER BY id DESC LIMIT 1", (r["phone"],)
+                    ).fetchone()
                 out.append({
                     "phone": r["phone"], "platform": r["platform"], "external_id": r["external_id"],
                     "name": (m["name"] if m else "") or "", "dept": (m["dept"] if m else "") or "",
