@@ -138,14 +138,18 @@ def test_resubmit_returns_admin_disabled_when_owner_disabled() -> None:
         store.upsert_delivery_target(PHONE_X, "uid_x")
         tpl = store.create_template(_tpl_payload(rid, name="甲的上报", kind="form"),
                                     actor="sa", owner_id=a_id)
-        # 造一个逾期实例（昨日截止、今天在 24h 申请窗口内）
+        # 造一个逾期实例（截止取「2 小时前」——与真实运行时刻无关，永远落在 24h 申请窗口内。
+        # ⛔ 原实现用「昨日 18:00」，窗口=截止+24h=当天 18:00 整点到期，一过 18:00 跑必挂
+        # （2026-11-10 18:04 远程 pytest 实锤：17:46 本地绿、18:04 远程红，纯时间炸弹））
         now = store.now()
-        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        overdue_dt = now - timedelta(hours=2)
+        overdue_day = overdue_dt.strftime("%Y-%m-%d")
         store.conn.execute(
             "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, "
             "deadline_at, created_at, owner_id) VALUES (?, ?, '张三', '市场部', ?, 'overdue', ?, ?, ?)",
-            (tpl["template_id"], PHONE_X, yesterday,
-             f"{yesterday} 18:00:00", f"{yesterday} 09:00:00", a_id),
+            (tpl["template_id"], PHONE_X, overdue_day,
+             overdue_dt.strftime("%Y-%m-%d %H:%M:%S"),
+             (overdue_dt - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S"), a_id),
         )
         store.conn.commit()
 
