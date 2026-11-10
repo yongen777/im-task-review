@@ -274,7 +274,9 @@ class WecomNotifier:
                 " 需要在 .env 里补 IMT_WECOM_CORPID / IMT_WECOM_AGENTID / IMT_WECOM_SECRET"
             )
 
-    def send_text(self, receive_id: str, text: str, idem_key: str) -> SendResult:
+    def send_text(self, receive_id: str, text: str, idem_key: str, receive_type: str = "user") -> SendResult:
+        # 2026-11-10 方案A：receive_type 为 zdxlz union_id 机制专属参数，企微一律按 userid 投递，忽略。
+        del receive_type
         try:
             return self.client.send_text(receive_id, text, idem_key=idem_key)
         except WecomError as exc:

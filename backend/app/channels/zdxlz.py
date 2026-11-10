@@ -251,13 +251,17 @@ class ZdxlzChannel:
             self._token_expires_at = now_mono + max(expires_in, 60)
             return token
 
-    def send_text(self, receive_id: str, text: str, idem_key: str) -> SendResult:
+    def send_text(self, receive_id: str, text: str, idem_key: str, receive_type: str = "user") -> SendResult:
         """§7.2 + §16 P4 发送单聊文本消息：
         - POST /open-apis/v1/messages/v1/send
         - 头同时带 Authorization: Bearer <token> 与 X-Client-Id: <AppID>
         - body: receive_id / msg_type=text / content(JSON 字符串) / idem_key
         - HTTP 200 且 (success==true || code==0 || code==200) -> SendResult(True, "sent", 200, ...)
-        - HTTP 500（无会话） -> SendResult(False, "failed", 500, need_activate=True, retryable=False, error="NO_SESSION_500: ...")
+
+        2026-11-10 方案A（union_id 直连）：receive_type 支持 "user"（默认，IM userId）
+        与 "union_id"（通讯录 union_id，官方口径：不要求用户先给机器人发过消息）。
+        receive_type="user" 时**不写该字段**（保持历史 wire 格式逐字节一致，存量 636 条
+        发送记录不受影响）；"union_id" 时显式传 —— 官方文档：省略时默认按 user 解析。
         """
         if not self.configured:
             return SendResult(
@@ -294,6 +298,9 @@ class ZdxlzChannel:
                 "content": json.dumps({"content": text}, ensure_ascii=False),
                 "idem_key": str(idem_key),
             }
+            # 2026-11-10 方案A：union_id 绑定显式声明 receive_type；user 保持旧格式不带该字段
+            if (receive_type or "user").strip().lower() == "union_id":
+                body["receive_type"] = "union_id"
 
             try:
                 resp = self._client.post(url, headers=headers, json=body)

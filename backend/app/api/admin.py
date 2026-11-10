@@ -1952,11 +1952,13 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             else state.get_delivery_target(inst["phone"])
         )
         ext_id = (target or {}).get("external_id")
+        # 2026-11-10 方案A：union_id 绑定按 receive_type="union_id" 投递（不依赖会话）
+        ext_type = str((target or {}).get("external_type") or "user").strip().lower() or "user"
         if nt is None or not ext_id:
             logger.warning("补交审核通知未发送（notifier 或 external_id 缺失） instance=%s", inst.get("id"))
             return False
         try:
-            res = nt.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}")
+            res = nt.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}", receive_type=ext_type)
             return bool(getattr(res, "ok", False))
         except Exception as exc:  # noqa: BLE001
             logger.warning("补交审核通知发送失败 instance=%s: %s", inst.get("id"), exc)
@@ -1980,18 +1982,21 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         text = str(body.get("text") or "这是一条测试消息").strip()
         userid = str(body.get("userid") or "").strip()
         phone = str(body.get("phone") or "").strip()
+        ext_type = "user"
 
         if not userid and phone:
             target = state.get_delivery_target(phone)
             userid = str((target or {}).get("external_id") or "").strip()
+            ext_type = str((target or {}).get("external_type") or "user").strip().lower() or "user"
         if not userid:
             with state.lock:
                 row = state.conn.execute(
-                    "SELECT external_id FROM delivery_target WHERE platform = ? AND usable = 1 "
+                    "SELECT external_id, external_type FROM delivery_target WHERE platform = ? AND usable = 1 "
                     "ORDER BY activated_at DESC LIMIT 1",
                     (state.platform,),
                 ).fetchone()
             userid = str(row["external_id"] if row else "")
+            ext_type = str((row["external_type"] if row else "") or "user").strip().lower() or "user"
         if not userid:
             return error_response(400, "NO_TARGET", "没有可用的投递绑定：请先在机器人里发送「姓名 手机号」完成激活")
 
@@ -2019,9 +2024,9 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             detail = f"图片消息已发送（{img_path.name}，{img_path.stat().st_size} 字节）" if res.ok else f"发送失败：{res.error}"
             return {"ok": bool(res.ok), "kind": "image", "to": userid, "file": img_path.name, "detail": detail}
 
-        res = _notifier.send_text(userid, text, "test_send_text")
+        res = _notifier.send_text(userid, text, "test_send_text", receive_type=ext_type)
         return {
-            "ok": bool(res.ok), "kind": "text", "to": userid,
+            "ok": bool(res.ok), "kind": "text", "to": userid, "receive_type": ext_type,
             "detail": "文本已发送" if res.ok else f"发送失败：{res.error}",
         }
 

@@ -2,6 +2,7 @@
 """数据访问层（唯一允许写 SQL 的模块，覆盖阶段一 + 2A + 2B）。"""
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -258,6 +259,9 @@ class StateStore:
         # 当前通道（zdxlz / wecom）：投递绑定按通道分开存，读写默认都走它。
         self.platform = (platform or "zdxlz").strip().lower()
         self.db = Database(db_path, self.now_str)
+        # 2026-11-10 方案A：通讯录查询客户端（导入即激活 / 首条消息自动识别）。
+        # 由 main.create_apps 在生产装配；测试/降级环境为 None → 所有自动激活路径静默跳过。
+        self.contacts = None
 
     def _plat(self, platform: Optional[str] = None) -> str:
         """显式传了就用传的，否则用当前通道（store.platform）。
@@ -1129,16 +1133,20 @@ class StateStore:
             return self.conn.execute("SELECT 1 FROM member WHERE phone = ? LIMIT 1", ((phone or "").strip(),)).fetchone() is not None
 
     def upsert_delivery_target(self, phone: str, external_id: str, platform: Optional[str] = None,
-                                activated_at: Optional[str] = None) -> Dict[str, Any]:
+                                activated_at: Optional[str] = None, external_type: str = "user") -> Dict[str, Any]:
         """建立/更新平台绑定。
 
         activated_at：**首次激活时刻**（'YYYY-MM-DD HH:MM:SS'）。
           · 不传 → 用当前时间；已存在绑定时**保留原值**（首次激活时刻不可被后续事件刷掉）
           · 传入 → 显式指定（补录历史激活记录 / 迁移历史数据时用）
         2026-11-09 新口径「当天激活的只创建激活时刻之后的任务」依赖这个字段。
+
+        external_type：'user'（默认，IM 会话 userId）/ 'union_id'（通讯录键，官方口径可不建会话
+        直接投递）。2026-11-10 方案A 起由导入/识别路径写入 'union_id'；存量行保持 'user'。
         """
         platform = self._plat(platform)
         clean_phone, clean_ext = (phone or "").strip(), (external_id or "").strip()
+        type_key = str(external_type or "user").strip().lower() or "user"
         if not is_valid_phone(clean_phone):
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
         if not clean_ext:
@@ -1150,23 +1158,30 @@ class StateStore:
             if existing:
                 activated_at = existing["activated_at"]
                 self.conn.execute(
-                    "UPDATE delivery_target SET external_id = ?, usable = 1, last_event_at = ? WHERE platform = ? AND phone = ?",
-                    (clean_ext, now_s, platform, clean_phone),
+                    "UPDATE delivery_target SET external_id = ?, external_type = ?, usable = 1, last_event_at = ? "
+                    "WHERE platform = ? AND phone = ?",
+                    (clean_ext, type_key, now_s, platform, clean_phone),
                 )
             else:
                 activated_at = explicit_act or now_s
                 self.conn.execute(
-                    "INSERT INTO delivery_target(platform, phone, external_id, usable, activated_at, last_event_at) VALUES (?, ?, ?, 1, ?, ?)",
-                    (platform, clean_phone, clean_ext, activated_at, now_s),
+                    "INSERT INTO delivery_target(platform, phone, external_id, external_type, usable, activated_at, last_event_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (platform, clean_phone, clean_ext, type_key, activated_at, now_s),
                 )
-            return {"platform": platform, "phone": clean_phone, "external_id": clean_ext, "usable": 1, "activated_at": activated_at, "last_event_at": now_s}
+            return {"platform": platform, "phone": clean_phone, "external_id": clean_ext,
+                    "external_type": type_key, "usable": 1, "activated_at": activated_at, "last_event_at": now_s}
 
-    def bind_member_with_guardrails(self, phone: str, external_id: str, path: str, platform: Optional[str] = None) -> Dict[str, Any]:
-        """v1.1 激活绑定（路径 A/B/C）与三条护栏：在册校验 + 防覆盖校验 + 脱敏回执与审计。
+    def bind_member_with_guardrails(self, phone: str, external_id: str, path: str, platform: Optional[str] = None,
+                                    external_type: str = "user") -> Dict[str, Any]:
+        """v1.1 激活绑定（路径 A/B/C/U）与三条护栏：在册校验 + 防覆盖校验 + 脱敏回执与审计。
         若原记录因 500 无会话被置为 usable=0，重新绑定成功时恢复 usable=1 并保留原 activated_at。
+
+        2026-11-10 方案A：external_type 随绑定写入（路径 U = 首条消息按 union_id 自动识别）。
         """
         platform = self._plat(platform)
         clean_phone, clean_ext, path_code = (phone or "").strip(), (external_id or "").strip(), (path or "B").strip().upper()
+        type_key = str(external_type or "user").strip().lower() or "user"
         if not is_valid_phone(clean_phone):
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
         if not clean_ext:
@@ -1187,18 +1202,21 @@ class StateStore:
 
                 # usable == 0（曾因 500 无会话标记不可用）：恢复 usable=1，保留原 activated_at
                 self.conn.execute(
-                    "UPDATE delivery_target SET external_id = ?, usable = 1, last_event_at = ? WHERE platform = ? AND phone = ?",
-                    (clean_ext, now_s, platform, clean_phone),
+                    "UPDATE delivery_target SET external_id = ?, external_type = ?, usable = 1, last_event_at = ? "
+                    "WHERE platform = ? AND phone = ?",
+                    (clean_ext, type_key, now_s, platform, clean_phone),
                 )
             else:
                 self.conn.execute(
-                    "INSERT INTO delivery_target(platform, phone, external_id, usable, activated_at, last_event_at) VALUES (?, ?, ?, 1, ?, ?)",
-                    (platform, clean_phone, clean_ext, now_s, now_s),
+                    "INSERT INTO delivery_target(platform, phone, external_id, external_type, usable, activated_at, last_event_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (platform, clean_phone, clean_ext, type_key, now_s, now_s),
                 )
 
             masked = mask_phone(clean_phone)
             receipt = f"绑定成功：当前账号已关联手机号 {masked}。如非本人操作，请立即联系管理员申诉处理。"
-            self._insert_audit_unlocked("system", f"target.bind_{path_code.lower()}", "delivery_target", clean_phone, {"masked_phone": masked, "external_id": clean_ext, "path": path_code}, now_s)
+            self._insert_audit_unlocked("system", f"target.bind_{path_code.lower()}", "delivery_target", clean_phone,
+                                        {"masked_phone": masked, "external_id": clean_ext, "external_type": type_key, "path": path_code}, now_s)
             return {"ok": True, "already_same": False, "phone": clean_phone, "masked_phone": masked, "external_id": clean_ext, "receipt": receipt}
 
     def touch_delivery_target_by_external_id(self, external_id: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -1437,7 +1455,11 @@ class StateStore:
             _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
             _ext = self.external_id_for(clean_phone, _plat_key)
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "source": source}, now_s)
-            return _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
+            member = _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
+
+        # 2026-11-10 方案A：单个加人也自动激活（zdxlz 专属；查不到/未装配时静默跳过，不影响加人）
+        self._auto_activate_imported([clean_phone], platform=_plat_key, actor=actor)
+        return member
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
         clean_role_id, clean_phone, now_s = (role_id or "").strip(), (phone or "").strip(), self.now_str()
@@ -1552,8 +1574,11 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "csv_rows 必须是数组")
         now_s = self.now_str()
         with self.lock, self.conn:
-            if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
+            # 2026-11-10 方案A：顺带取角色平台（导入即激活只对 zdxlz 生效）
+            role_row = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+            if role_row is None:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
+            role_platform = str(role_row["platform"] or "zdxlz").strip().lower() or "zdxlz"
             existing_phones = {r["phone"] for r in self.conn.execute("SELECT phone FROM member WHERE role_id = ?", (clean_role_id,)).fetchall()}
             # 2026-11-09：全局已有的手机号 → 记下它现有的姓名/部门（用于同步与报告）
             global_rows = self.conn.execute(
@@ -1719,11 +1744,82 @@ class StateStore:
                     self.conn.execute("DELETE FROM dept_option WHERE id = ?", (int(did),))
                 if created_dept_ids:
                     created_depts = []
-            return {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists,
-                    "invalid": invalid, "departments_created": created_depts,
-                    "blocked": blocked,
-                    "synced_global_rows": synced_global_rows,
-                    "global_profile_updates": global_profile_updates}
+            result = {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists,
+                      "invalid": invalid, "departments_created": created_depts,
+                      "blocked": blocked,
+                      "synced_global_rows": synced_global_rows,
+                      "global_profile_updates": global_profile_updates}
+            # 2026-11-10 方案A：本批真实写入的手机号（事务提交后再做通讯录解析，不持锁跑网络）
+            imported_phones = [str(row[1]).strip() for row in to_insert] if (not dry_run and not blocked) else []
+
+        # ── 导入即激活：事务外把手机号解析成 union_id 并写绑定（fail-open，不影响导入结果）──
+        result["auto_activation"] = self._auto_activate_imported(imported_phones, platform=role_platform, actor=actor)
+        return result
+
+    def _auto_activate_imported(self, phones: List[str], platform: str = "zdxlz", actor: str = "system") -> Dict[str, Any]:
+        """2026-11-10 方案A：导入即激活 —— 用官方通讯录把「手机号 → union_id」落成绑定。
+
+        · 只对 zdxlz 生效（union_id 是量子密信专属机制；企微 userid 体系不适用）；
+        · contacts 未装配（测试/降级环境）→ enabled=False，行为与旧版完全一致；
+        · 已有可用绑定的手机号跳过（不重复打接口、不覆盖）；
+        · usable=0 的旧行用 union_id 复活（首次激活时刻保留）；
+        · 通讯录查不到（不在读取范围/离职）计入 failed，不阻塞导入。
+        """
+        base: Dict[str, Any] = {"enabled": False, "activated": 0, "failed": 0, "skipped": 0, "failed_phones": []}
+        contacts = getattr(self, "contacts", None)
+        if not phones or contacts is None:
+            return base
+        if (platform or "").strip().lower() != "zdxlz":
+            return base
+        base["enabled"] = True
+
+        unique_phones: List[str] = []
+        seen: set = set()
+        for p in phones:
+            clean = str(p or "").strip()
+            if clean and clean not in seen:
+                seen.add(clean)
+                unique_phones.append(clean)
+
+        to_resolve: List[str] = []
+        for p in unique_phones:
+            existing = self.get_delivery_target(p, platform="zdxlz")
+            if existing and int(existing.get("usable") or 0) == 1:
+                base["skipped"] += 1
+                continue
+            to_resolve.append(p)
+        if not to_resolve:
+            return base
+
+        def _resolve(phone: str):
+            user = contacts.search_by_phone(phone)
+            return phone, str((user or {}).get("union_id") or "").strip() or None
+
+        activated = failed = 0
+        failed_phones: List[str] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            outcomes = list(pool.map(_resolve, to_resolve))
+        for phone, uid in outcomes:
+            if not uid:
+                failed += 1
+                failed_phones.append(phone)
+                continue
+            try:
+                self.upsert_delivery_target(phone, uid, platform="zdxlz", external_type="union_id")
+                activated += 1
+            except BizError:
+                failed += 1
+                failed_phones.append(phone)
+        base.update({
+            "activated": activated,
+            "failed": failed,
+            "failed_phones": [mask_phone(p) for p in failed_phones],
+        })
+        self.write_audit(actor, "target.auto_import", "delivery_target", "zdxlz", {
+            "activated": activated, "failed": failed, "skipped": base["skipped"],
+            "failed_phones_masked": [mask_phone(p) for p in failed_phones],
+        })
+        return base
 
     def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)

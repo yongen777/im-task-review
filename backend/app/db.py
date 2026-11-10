@@ -56,10 +56,13 @@ CREATE TABLE IF NOT EXISTS member (
   UNIQUE(role_id, phone)
 );
 
+-- 2026-11-10 方案A：external_id 的 id 体系 —— 'user'=IM 会话 userId（历史值，存量绑定不动）
+-- / 'union_id'=通讯录 union_id（官方口径：可不建会话直接投递，receive_type="union_id"）。
 CREATE TABLE IF NOT EXISTS delivery_target (
   platform      TEXT NOT NULL DEFAULT 'zdxlz',
   phone         TEXT NOT NULL,
   external_id   TEXT NOT NULL,
+  external_type TEXT NOT NULL DEFAULT 'user',
   usable        INTEGER NOT NULL DEFAULT 1,
   activated_at  TEXT NOT NULL,
   last_event_at TEXT NOT NULL,
@@ -366,6 +369,8 @@ class Database:
             _ensure_column(self.conn, "task_template", "anchor_dom", "INTEGER")
             _ensure_column(self.conn, "task_template", "deadline_offset", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(self.conn, "delivery_target", "usable", "INTEGER NOT NULL DEFAULT 1")
+            # 2026-11-10 方案A：绑定补 external_type（'user' | 'union_id'）；存量行默认 'user'，行为不变
+            _ensure_column(self.conn, "delivery_target", "external_type", "TEXT NOT NULL DEFAULT 'user'")
             _migrate_reminder_log_unique(self.conn)
             _ensure_column(self.conn, "reminder_log", "attempted_at", "TEXT")
             # 2026-10-27 春促数据看板：模板附带数据图开关 + 依赖的数据变量清单

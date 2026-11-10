@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import functools
 import hashlib
 import json
 import logging
@@ -215,7 +216,10 @@ def make_idem_key(template_id: str, phone: str, period_key_val: str, kind: str, 
 
 
 class NotifierProtocol(Protocol):
-    def send_text(self, receive_id: str, text: str, idem_key: str) -> SendResult: ...
+    """2026-11-10 方案A：receive_type 标识 receive_id 的体系（user=IM userId / union_id=通讯录键）。
+    企微通道忽略该参数；zdxlz 通道仅对 union_id 显式传 receive_type="union_id"。"""
+
+    def send_text(self, receive_id: str, text: str, idem_key: str, receive_type: str = "user") -> SendResult: ...
 
 
 class ImageSenderProtocol(Protocol):
@@ -318,6 +322,7 @@ class SentMessageRecord:
     text: str
     idem_key: str
     sent_at: str
+    receive_type: str = "user"  # 2026-11-10 方案A：记录该消息按哪个 id 体系发出
 
 
 class FakeNotifier:
@@ -329,13 +334,14 @@ class FakeNotifier:
         self.fail_receive_ids: set[str] = set()
         self.no_session_receive_ids: set[str] = set()
 
-    def send_text(self, receive_id: str, text: str, idem_key: str) -> SendResult:
+    def send_text(self, receive_id: str, text: str, idem_key: str, receive_type: str = "user") -> SendResult:
         rec_id = str(receive_id)
+        rt = (receive_type or "user").strip().lower() or "user"
         if rec_id in self.no_session_receive_ids:
             return SendResult(False, "failed", 500, need_activate=True, retryable=False, error="NO_SESSION_500: simulated no session")
         if rec_id in self.fail_receive_ids:
             return SendResult(False, "failed", 400, need_activate=False, retryable=True, error="SIMULATED_SEND_ERROR")
-        self.sent_messages.append(SentMessageRecord(rec_id, text, idem_key, format_dt(self._now_fn())))
+        self.sent_messages.append(SentMessageRecord(rec_id, text, idem_key, format_dt(self._now_fn()), rt))
         return SendResult(True, "sent", 200, need_activate=False, retryable=False, error=None)
 
 
@@ -366,25 +372,29 @@ class Scheduler:
         self.notifiers: Dict[str, NotifierProtocol] = dict(notifiers or {})
         self.image_sender = image_sender  # None 时跳过图片投递（文本照发，不阻塞主链路）
 
-    def _targets_for(self, phone: str, only_platform: Optional[str] = None) -> List[Tuple[str, Optional[str], NotifierProtocol]]:
-        """该成员可用的投递目标 [(platform, external_id, notifier)]。
+    def _targets_for(self, phone: str, only_platform: Optional[str] = None) -> List[Tuple[str, Optional[str], str, NotifierProtocol]]:
+        """该成员可用的投递目标 [(platform, external_id, external_type, notifier)]。
 
         · 2026-11-03 用户口径（取代 11-02 的「双绑定双发」）：任务属于哪个办公软件，就只往那个
           办公软件发 ——密信的任务不再串到企微，企微的任务也不串到密信；
           · only_platform 传任务归属平台：只查该平台绑定；
           · only_platform 为 None（任务平台判断不出来）时 fail-open 查全部启用通道。
         · 单通道/测试（notifiers 为空）：退回旧逻辑（当前 store.platform + self.notifier）。
+        · 2026-11-10 方案A：external_type 取绑定的 external_type（user/union_id），
+          发送时交给 notifier 决定 receive_type；空值一律按 user（向后兼容历史行）。
         """
         if not self.notifiers:
             t = self.state.get_delivery_target(phone)
-            return [("", (t or {}).get("external_id"), self.notifier)]
+            ext_type = str((t or {}).get("external_type") or "user").strip().lower() or "user"
+            return [("", (t or {}).get("external_id"), ext_type, self.notifier)]
         want = (only_platform or "").strip().lower()
-        out: List[Tuple[str, Optional[str], NotifierProtocol]] = []
+        out: List[Tuple[str, Optional[str], str, NotifierProtocol]] = []
         for platform, nt in self.notifiers.items():
             if want and platform != want:
                 continue
             t = self.state.get_delivery_target(phone, platform=platform)
-            out.append((platform, (t or {}).get("external_id"), nt))
+            ext_type = str((t or {}).get("external_type") or "user").strip().lower() or "user"
+            out.append((platform, (t or {}).get("external_id"), ext_type, nt))
         return out
 
     def _template_platform(self, tpl: Dict[str, Any]) -> Optional[str]:
@@ -549,11 +559,12 @@ class Scheduler:
     def _send_image_link(self, external_id: str, image_url: str, image_name: Optional[str], base_idem: str,
                          template_id: str, instance_id: Optional[int], phone: str,
                          planned_str: str, now_s: str, stats: Dict[str, int],
-                         notifier: Optional[NotifierProtocol] = None) -> None:
+                         notifier: Optional[NotifierProtocol] = None, external_type: str = "user") -> None:
         """附图唯一发送通道：发一条含直链的短文本（图片消息在手机端打不开，2026-10-30 起不再发）。失败只记日志，绝不影响主链路。
 
         2026-10-29 H5.5：文本改为「{图片名称}（点击查看）：\n{链接}」，
         名称由管理员在模板编辑时填写（attach_image_name），无名称时回退「数据图片」。
+        2026-11-10 方案A：external_type 转为 receive_type（union_id 绑定不依赖会话）。
         """
         try:
             link_idem = self._link_idem(base_idem)
@@ -564,7 +575,7 @@ class Scheduler:
                 return
             display = (image_name or "").strip() or "数据图片"
             text = f"{display}（点击查看）：\n{image_url}"
-            res = (notifier or self.notifier).send_text(external_id, text, link_idem)
+            res = (notifier or self.notifier).send_text(external_id, text, link_idem, receive_type=external_type)
             self.state.record_reminder_log(
                 template_id=template_id, instance_id=instance_id, phone=phone, kind="notice_img_link",
                 planned_at=planned_str, attempted_at=now_s,
@@ -657,9 +668,10 @@ class Scheduler:
         msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n请在 {resubmit_disp} 前重新提交。\n👉 重新提交：{h5_url}"
 
         # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+        # 2026-11-10 方案A：按绑定的 external_type 传 receive_type（union_id 不依赖会话）。
         last_res: Optional[SendResult] = None
         any_target = False
-        for platform, ext_id, nt in self._targets_for(instance["phone"], only_platform=self._template_platform(tpl)):
+        for platform, ext_id, ext_type, nt in self._targets_for(instance["phone"], only_platform=self._template_platform(tpl)):
             any_target = True
             idem = self._idem_for(base_idem, platform)
             if not ext_id:
@@ -672,7 +684,7 @@ class Scheduler:
             # 发送前查重：重复触发（重复点驳回、重放）不会二次打扰提交人。
             if self.state.has_sent_reminder(idem):
                 continue
-            send_res = nt.send_text(ext_id, msg_text, idem)
+            send_res = nt.send_text(ext_id, msg_text, idem, receive_type=ext_type)
             last_res = send_res
             self.state.record_reminder_log(
                 template_id=instance["template_id"], instance_id=int(instance["id"]), phone=instance["phone"],
@@ -758,7 +770,7 @@ class Scheduler:
 
                         # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
                         sent_any = False
-                        for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                        for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                             idem = self._idem_for(
                                 make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str),
                                 platform,
@@ -767,7 +779,7 @@ class Scheduler:
                                 template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                                 external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
                                 idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                                send_fn=nt.send_text,
+                                send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                             )
                             sent_any = sent_any or ok
                         if sent_any:
@@ -827,7 +839,7 @@ class Scheduler:
                             # 先筛「本轮真正还需要发的人」：一个人都不需要就既不发布副本、也不发消息。
                             pending: List[tuple] = []
                             for inst in instances:
-                                for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                                     idem_link = self._idem_for(make_idem_key(
                                         tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str
                                     ), platform)
@@ -840,10 +852,10 @@ class Scheduler:
                                         continue
                                     if not ext_id:
                                         continue  # 未激活成员文本链路已记 skipped，附图同样跳过
-                                    pending.append((inst, ext_id, nt, platform, idem_link, idem_media))
+                                    pending.append((inst, ext_id, ext_type, nt, platform, idem_link, idem_media))
                             if pending:
                                 link_url: Optional[str] = None
-                                for inst, ext_id, nt, platform, idem_link, idem_media in pending:
+                                for inst, ext_id, ext_type, nt, platform, idem_link, idem_media in pending:
                                     handled = False
                                     # 2026-11-03：量子密信永远不发原生图片（手机端点不开，10-29 实测口径），
                                     # 直接走 H5 链接。此前密信侧 send_image 签名不匹配，每次靠 TypeError
@@ -867,7 +879,7 @@ class Scheduler:
                                         base_idem=idem_link,
                                         template_id=tpl["template_id"], instance_id=int(inst["id"]),
                                         phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
-                                        notifier=nt,
+                                        notifier=nt, external_type=ext_type,
                                     )
                 continue
 
@@ -910,7 +922,7 @@ class Scheduler:
                     )
 
                 # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-                for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                     idem = self._idem_for(
                         make_idem_key(tpl["template_id"], inst["phone"], p_key, "remind", 1, planned_str),
                         platform,
@@ -919,7 +931,7 @@ class Scheduler:
                         template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
                         kind="remind", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem,
                         msg_text_fn=_make_remind_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                        send_fn=nt.send_text,
+                        send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                     )
 
         adv = self.state.advance_instance_statuses(cur_dt)
@@ -949,7 +961,7 @@ class Scheduler:
                 )
 
             # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-            for platform, ext_id, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+            for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                 idem_platform = self._idem_for(
                     make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
                     platform,
@@ -958,7 +970,7 @@ class Scheduler:
                     template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
                     kind="overdue", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_platform,
                     msg_text_fn=_make_overdue_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                    send_fn=nt.send_text,
+                    send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                 )
 
         return stats

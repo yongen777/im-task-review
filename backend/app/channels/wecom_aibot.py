@@ -477,7 +477,9 @@ class WecomAibotNotifier:
         elif auto_start:
             self.bridge.start()
 
-    def send_text(self, receive_id: str, text: str, idem_key: str) -> SendResult:
+    def send_text(self, receive_id: str, text: str, idem_key: str, receive_type: str = "user") -> SendResult:
+        # 2026-11-10 方案A：receive_type 为 zdxlz union_id 机制专属参数，企微一律按 userid 投递，忽略。
+        del receive_type
         """用 markdown 承载纯文本（企微机器人主动推送支持 markdown，纯文本原样即可）。"""
         try:
             return self.bridge.send_markdown(receive_id, text)

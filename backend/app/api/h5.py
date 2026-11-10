@@ -143,6 +143,7 @@ def process_h5_bind(
     *, state: StateStore, data: Any,
     notifier: Optional[NotifierProtocol] = None,
     notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+    contacts: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """§3.2 路径 C：H5 提交 11 位手机号完成绑定（严格执行三条护栏 + 审计 + 回执）。
 
@@ -206,13 +207,25 @@ def process_h5_bind(
         return 400, {"code": "ROSTER_MISMATCH",
                     "message": "你填写的信息与后台导入的信息不一致，请核对姓名与手机号后重新提交"}
 
-    # 比对通过：完成绑定
+    # 比对通过：完成绑定（H5 链接里的 uid 是 IM userId，先按旧口径写入）
     try:
         res = state.bind_member_with_guardrails(
             phone=phone, external_id=external_id, path="C", platform=platform
         )
     except BizError as exc:
         return exc.status_code, {"code": exc.code, "message": exc.message}
+
+    # 2026-11-10 方案A：官方通讯录能按手机号查到 union_id 时，改写为 union_id 绑定
+    # （此后推送不再要求该用户先跟机器人说过话）；查不到则保持 IM 绑定
+    # （外部人员 / 通讯录降级时仍可用 —— 但依赖会话，行为同旧版）。
+    if contacts is not None and platform == "zdxlz":
+        try:
+            user = contacts.search_by_phone(phone)
+            union_id = str((user or {}).get("union_id") or "").strip()
+            if union_id:
+                state.upsert_delivery_target(phone, union_id, platform="zdxlz", external_type="union_id")
+        except Exception:  # noqa: BLE001 - 改写失败不影响登记结果（上一行已按 IM 绑定成功）
+            pass
 
     # 回执通道 = 绑定平台对应的通道；没配该通道时才退回传入的单 notifier
     nt = (notifiers or {}).get(platform) or notifier
@@ -414,6 +427,7 @@ def _push_submit_feedback(
             else state.get_delivery_target(str(inst.get("phone") or ""))
         )
         ext_id = str((target or {}).get("external_id") or "")
+        ext_type = str((target or {}).get("external_type") or "user").strip().lower() or "user"
         if not ext_id:
             logger.warning("提交反馈未发送（成员未激活绑定）instance=%s", inst.get("id"))
             return
@@ -421,7 +435,7 @@ def _push_submit_feedback(
         idem = hashlib.sha1(f"submit_ack|{inst.get('id')}|{submission_id}".encode("utf-8")).hexdigest()
         if state.has_sent_reminder(idem):
             return
-        res = nt.send_text(ext_id, f"【{tpl.get('name') or '任务'}】提交成功", idem)
+        res = nt.send_text(ext_id, f"【{tpl.get('name') or '任务'}】提交成功", idem, receive_type=ext_type)
         state.record_reminder_log(
             template_id=str(inst.get("template_id") or ""), instance_id=int(inst["id"]),
             phone=str(inst.get("phone") or ""), kind="submit_ack", planned_at=now_s,
@@ -469,6 +483,7 @@ def create_h5_router(
     state: StateStore, uploads_dir: Path,
     notifier: Optional[NotifierProtocol] = None,
     notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+    contacts: Optional[Any] = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -581,7 +596,7 @@ def create_h5_router(
             data = await request.json()
         except Exception:
             return JSONResponse(status_code=400, content={"code": "VALIDATION_FAILED", "message": "请求体必须为合法 JSON"})
-        status_code, content = process_h5_bind(state=state, data=data, notifier=notifier, notifiers=notifiers)
+        status_code, content = process_h5_bind(state=state, data=data, notifier=notifier, notifiers=notifiers, contacts=contacts)
         return JSONResponse(status_code=status_code, content=content)
 
     @router.post("/api/h5/task/info")

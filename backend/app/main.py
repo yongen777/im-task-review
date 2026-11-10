@@ -132,6 +132,15 @@ def create_apps(
     if channel is None and state is None:
         cfg = apply_db_channel_config(cfg, store)
     chan = channel or ZdxlzChannel(cfg)
+    # 2026-11-10 方案A（导入即激活）：装配官方通讯录客户端（phone→union_id 反查）。
+    # ⛔ 只在**生产引导路径**（未注入 state/channel）装配，避免测试/联调环境意外发起真实网络请求；
+    #    通道未配置时 contacts=None —— 导入/加人/首条消息识别全部静默回退旧行为（H5 登记兜底）。
+    contacts = None
+    if channel is None and state is None and chan.configured:
+        from .channels.zdxlz_contacts import ZdxlzContacts  # noqa: PLC0415
+
+        contacts = ZdxlzContacts(cfg, chan)
+    store.contacts = contacts
     _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
 
     # 2026-11-02 多通道并行（用户拍板 B：双绑定双发）：
@@ -238,6 +247,7 @@ def create_apps(
             channel=chan,
             public_base_url=cfg.public_base_url,
             notifier=_channel_notifier(notifiers, "zdxlz", chan),
+            contacts=contacts,
         )
     )
     public_app.include_router(
@@ -247,6 +257,7 @@ def create_apps(
             notifier=active_notifier,
             # 2026-11-03：H5 绑定回执要按「绑定的那个平台」选通道，否则企微用户收不到回执
             notifiers=notifiers,
+            contacts=contacts,
         )
     )
     # 2026-10-30 企业微信自建应用接收回调（独立于量子密信的 /api/app-events）：

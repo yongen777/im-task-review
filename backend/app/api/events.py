@@ -75,6 +75,27 @@ def _extract_user_id(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _extract_union_id(payload: Dict[str, Any]) -> str:
+    """2026-11-10 方案A：从回调事件 JSON 中提取发送方 union_id（通讯录键）。
+
+    官方《机器人接收消息事件》：单聊事件同时保留 userId 与 union_id。
+    union_id 是同一用户在单位内的唯一键 —— 可直接反查通讯录拿到手机号（自动识别），
+    也可作为 receive_id + receive_type="union_id" 主动投递（不要求用户先说过话）。
+    """
+    for key in ("union_id", "unionId", "unionid"):
+        val = payload.get(key)
+        if isinstance(val, (str, int)) and str(val).strip():
+            return str(val).strip()
+    for nested_key in ("sender", "user", "from", "data", "event"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            for key in ("union_id", "unionId", "unionid"):
+                val = nested.get(key)
+                if isinstance(val, (str, int)) and str(val).strip():
+                    return str(val).strip()
+    return ""
+
+
 def _extract_user_name(payload: Dict[str, Any]) -> str:
     """事件里若平台带发送人姓名就取出来（不同平台字段名不一）。
 
@@ -154,6 +175,8 @@ def handle_inbound_text(
     platform: str = "",
     user_name: str = "",
     base_url: str = "",
+    user_union_id: str = "",
+    contacts: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
 
@@ -164,6 +187,10 @@ def handle_inbound_text(
 
     2026-11-03 用户口径：激活登记一律走 H5 表单（姓名/手机号/部门），
     「对话里发姓名手机号」的文字激活路径彻底停用。
+
+    2026-11-10 方案A（路径 U）：事件带 union_id 且未绑定时，先按 union_id 反查官方通讯录
+    拿手机号 → 在册即自动绑定（external_type='union_id'）→ 之后所有推送不再依赖会话。
+    通讯录查不到 / 不在名册 → 回落 H5 登记链接（白名单语义不变）。
     """
 
     # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
@@ -179,7 +206,14 @@ def handle_inbound_text(
             send(exc.message, f"bind_A_err_{event_phone}")
             return exc.status_code, {"ok": False, "path": "A", "bound": False, "code": exc.code, "message": exc.message}
 
-    bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
+    # 2026-11-10 方案A：绑定可能是 union_id（导入即激活/路径U）或 IM userId（历史/H5）两种形态，
+    # 两种都试（touch 命中即说明该人已绑定；查不到不落库不复活）。
+    bound_member = (
+        state.touch_delivery_target_by_external_id(user_union_id, platform=platform or None)
+        if user_union_id else None
+    )
+    if bound_member is None:
+        bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
     if bound_member is not None:
         # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
         # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
@@ -223,6 +257,36 @@ def handle_inbound_text(
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
 
+    # ── 2026-11-10 方案A 路径 U：事件带 union_id → 官方通讯录反查手机号 → 在册即自动绑定 ──
+    # 平台保证 union_id 是该用户在本单位的唯一键；手机号来自官方通讯录（非用户自报），
+    # 因此「在名册中」即视为身份核验通过（强度不低于 H5 自报+姓名比对）。
+    if user_union_id and contacts is not None:
+        try:
+            user_info = contacts.get_by_union_id(user_union_id)
+        except Exception as exc:  # noqa: BLE001 - 通讯录异常不阻塞登记引导
+            logger.warning("路径U 通讯录查询异常 union=%s: %s", user_union_id[:8], exc)
+            user_info = None
+        phone = str((user_info or {}).get("phone") or "").strip()
+        if phone and is_valid_phone(phone) and state.phone_in_roster(phone, platform=platform or None):
+            try:
+                res = state.bind_member_with_guardrails(
+                    phone=phone, external_id=user_union_id, path="U",
+                    platform=platform or None, external_type="union_id",
+                )
+                send(res["receipt"], f"bind_U_{user_union_id[:8]}")
+                return 200, {
+                    "ok": True, "path": "U", "bound": True,
+                    "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"],
+                    "message": res["receipt"],
+                }
+            except BizError as exc:
+                # 该手机号已以别的 id 绑定（历史 H5 行/并发）→ 不覆盖，按已绑定回执处理
+                if exc.code == "DUPLICATE":
+                    send("你的账号已绑定，请直接发送任务指令。", f"bind_U_dup_{user_union_id[:8]}")
+                    return 200, {"ok": True, "path": "U", "bound": True, "message": exc.message}
+                logger.warning("路径U 绑定失败 union=%s: %s", user_union_id[:8], exc)
+        # 通讯录查不到 / 不在名册 → 继续走下面的登记链接（白名单语义不变）
+
     # ── 2026-11-03 新激活模型（组长口径）：后台先导入，用户才能激活 ──
     # 未绑定用户发任何文本 → 统一回登记链接（填表时与后台名册比对，未导入会被拦）。
     # ⛔ 不再写待归纳池；不存在"提交后等待分配"的中间状态。
@@ -246,6 +310,7 @@ def process_app_event(
     signature: str,
     body_text: str,
     notifier: Optional[NotifierProtocol] = None,
+    contacts: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """§3.2 & §7.3 核心处理逻辑，返回 (status_code, body_dict)：
     - 验签失败一律返回 401，绝不进入绑定逻辑；
@@ -335,6 +400,8 @@ def process_app_event(
 
     event_phone = _extract_event_phone(event_payload)
     msg_text = _extract_message_text(event_payload).strip()
+    # 2026-11-10 方案A：官方事件同时带 userId 与 union_id，两种形态都往业务层送
+    user_union_id = _extract_union_id(event_payload)
 
 
     # 业务分支统一走 handle_inbound_text（两通道共用，见函数注释）
@@ -342,11 +409,13 @@ def process_app_event(
         state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
         platform="zdxlz", user_name=user_name, base_url=base_url,
+        user_union_id=user_union_id, contacts=contacts,
     )
 
 
 def create_events_router(
-    state: StateStore, channel: ZdxlzChannel, public_base_url: str, notifier: Optional[NotifierProtocol] = None
+    state: StateStore, channel: ZdxlzChannel, public_base_url: str, notifier: Optional[NotifierProtocol] = None,
+    contacts: Optional[Any] = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -359,7 +428,8 @@ def create_events_router(
         body_text = raw_bytes.decode("utf-8", errors="replace")
         status_code, content = process_app_event(
             state=state, channel=channel, public_base_url=public_base_url,
-            timestamp=timestamp, nonce=nonce, signature=signature, body_text=body_text, notifier=notifier,
+            timestamp=timestamp, nonce=nonce, signature=signature, body_text=body_text,
+            notifier=notifier, contacts=contacts,
         )
         return JSONResponse(status_code=status_code, content=content)
 
