@@ -1459,8 +1459,8 @@ class StateStore:
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "source": source}, now_s)
             member = _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
 
-        # 2026-11-10 方案A：单个加人也自动激活（zdxlz 专属；查不到/未装配时静默跳过，不影响加人）
-        self._auto_activate_imported([clean_phone], platform=_plat_key, actor=actor)
+        # 2026-11-10 方案A：单个加人也自动激活（zdxlz/企微均适用；查不到/未装配时静默跳过）
+        self._auto_activate_imported([(clean_phone, clean_name, clean_dept)], platform=_plat_key, actor=actor)
         return member
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
@@ -1751,27 +1751,33 @@ class StateStore:
                       "blocked": blocked,
                       "synced_global_rows": synced_global_rows,
                       "global_profile_updates": global_profile_updates}
-            # 2026-11-10 方案A：本批真实写入的手机号（事务提交后再做通讯录解析，不持锁跑网络）
-            imported_phones = [str(row[1]).strip() for row in to_insert] if (not dry_run and not blocked) else []
+            # 2026-11-10 方案A：本批真实写入的成员（事务提交后再做通讯录解析，不持锁跑网络）
+            imported_members = (
+                [(str(row[1]).strip(), str(row[2]).strip(), row[3]) for row in to_insert]
+                if (not dry_run and not blocked) else []
+            )
 
-        # ── 导入即激活：事务外把手机号解析成 union_id 并写绑定（fail-open，不影响导入结果）──
-        result["auto_activation"] = self._auto_activate_imported(imported_phones, platform=role_platform, actor=actor)
+        # ── 导入即激活：事务外把名册成员反查成平台 id 并写绑定（fail-open，不影响导入结果）──
+        result["auto_activation"] = self._auto_activate_imported(imported_members, platform=role_platform, actor=actor)
         return result
 
-    def _auto_activate_imported(self, phones: List[str], platform: str = "zdxlz", actor: str = "system") -> Dict[str, Any]:
-        """2026-11-10 方案A：导入即激活 —— 用官方通讯录把「手机号 → 平台 id」落成绑定。
+    def _auto_activate_imported(self, members: List[Tuple[str, str, Optional[str]]],
+                                platform: str = "zdxlz", actor: str = "system") -> Dict[str, Any]:
+        """2026-11-10 方案A：导入即激活 —— 用官方通讯录把名册成员反查成平台 id 并落绑定。
+
+        入参 members：[(phone, name, dept), ...]（zdxlz 只用手机号；企微 MCP 需要 姓名+部门）。
 
         平台分发（两通道镜像对接，用户 2026-11-10 拍板）：
           · zdxlz → self.contacts.search_by_phone（官方响应 decryptV2 解密后取 union_id，
             external_type='union_id'，发送用 receive_type="union_id"）；
-          · wecom  → self.wecom_contacts.resolve_userid_by_phone（官方 95402
-            /cgi-bin/user/getuserid，external_type='user'，aibot 直接按 userid 投递）。
+          · wecom  → self.wecom_contacts.resolve_userid（①自建应用 getuserid 手机号精确反查；
+            ②MCP 通讯录按归一化姓名+部门匹配。external_type='user'，aibot 直接按 userid 投递）。
 
         约定：
         · resolver 未装配（测试/降级环境）→ enabled=False，行为与旧版完全一致；
         · 已有可用绑定的手机号跳过（不重复打接口、不覆盖绑定）；
         · usable=0 的旧行用新 id 复活（首次激活时刻保留）；
-        · 查不到（不在读取范围/离职/无权限）计入 failed，不阻塞导入。
+        · 查不到（不在读取范围/离职/重名消歧失败）计入 failed，不阻塞导入。
         """
         base: Dict[str, Any] = {"enabled": False, "activated": 0, "failed": 0, "skipped": 0, "failed_phones": []}
         plat = (platform or "").strip().lower()
@@ -1779,41 +1785,44 @@ class StateStore:
             resolver = getattr(self, "contacts", None)
             ext_type = "union_id"
 
-            def _resolve_one(phone: str) -> Optional[str]:
+            def _resolve_one(phone: str, name: str, dept: str) -> Optional[str]:
                 user = resolver.search_by_phone(phone)
                 return str((user or {}).get("union_id") or "").strip() or None
         elif plat == "wecom":
             resolver = getattr(self, "wecom_contacts", None)
             ext_type = "user"
 
-            def _resolve_one(phone: str) -> Optional[str]:
-                return str(resolver.resolve_userid_by_phone(phone) or "").strip() or None
+            def _resolve_one(phone: str, name: str, dept: str) -> Optional[str]:
+                uid = resolver.resolve_userid(phone, name, dept)
+                return str(uid or "").strip() or None
         else:
             return base
-        if not phones or resolver is None:
+        if not members or resolver is None:
             return base
         base["enabled"] = True
 
-        unique_phones: List[str] = []
+        unique: List[Tuple[str, str, str]] = []
         seen: set = set()
-        for p in phones:
-            clean = str(p or "").strip()
-            if clean and clean not in seen:
-                seen.add(clean)
-                unique_phones.append(clean)
+        for phone, name, dept in members:
+            p = str(phone or "").strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            unique.append((p, str(name or "").strip(), str(dept or "").strip() if dept else ""))
 
-        to_resolve: List[str] = []
-        for p in unique_phones:
+        to_resolve: List[Tuple[str, str, str]] = []
+        for p, name, dept in unique:
             existing = self.get_delivery_target(p, platform=plat)
             if existing and int(existing.get("usable") or 0) == 1:
                 base["skipped"] += 1
                 continue
-            to_resolve.append(p)
+            to_resolve.append((p, name, dept))
         if not to_resolve:
             return base
 
-        def _resolve(phone: str):
-            return phone, _resolve_one(phone)
+        def _resolve(item: Tuple[str, str, str]):
+            phone, name, dept = item
+            return phone, _resolve_one(phone, name, dept)
 
         activated = failed = 0
         failed_phones: List[str] = []

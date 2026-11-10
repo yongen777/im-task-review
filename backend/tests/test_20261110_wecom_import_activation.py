@@ -37,13 +37,18 @@ NAME_B = "企微乙"
 
 
 class FakeWecomContacts:
-    """内存版企微反查：只映射显式登记过的手机号；记录调用次数。"""
+    """内存版企微反查（手机号→userid，便于 state 插桩测试；MCP 姓名+部门语义在新文件覆盖）。"""
 
     def __init__(self, mapping: dict | None = None):
-        self.mapping = mapping or {}
+        self.mapping = mapping or {}  # phone → userid
         self.calls = 0
 
     def resolve_userid_by_phone(self, phone: str):
+        self.calls += 1
+        return self.mapping.get((phone or "").strip())
+
+    def resolve_userid(self, phone: str, name: str = "", dept: str = ""):
+        # 2026-11-10 方案A 后 state 走本签名；假件保持 phone 键以便导入流程测试
         self.calls += 1
         return self.mapping.get((phone or "").strip())
 

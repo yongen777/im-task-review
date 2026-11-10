@@ -141,10 +141,12 @@ def create_apps(
 
         contacts = ZdxlzContacts(cfg, chan)
     store.contacts = contacts
-    # 2026-11-10 企微镜像（导入即激活）：corpid+secret 齐备才装配（agentid 对反查非必需）。
-    # ⚠️ 只走 HTTP（gettoken/getuserid），绝不建 WebSocket —— 不会抢生产 aibot 的长连接。
+    # 2026-11-10 企微镜像（导入即激活）：自建应用凭证 或 智能机器人 MCP apikey 任一齐备即装配。
+    # ⚠️ 只走 HTTP（gettoken/getuserid/MCP 通讯录），绝不建 WebSocket —— 不会抢生产 aibot 的长连接。
     wecom_contacts = None
-    if channel is None and state is None and cfg.wecom_corpid.strip() and cfg.wecom_secret.strip():
+    if channel is None and state is None and (
+        (cfg.wecom_corpid.strip() and cfg.wecom_secret.strip()) or cfg.wecom_mcp_apikey.strip()
+    ):
         from .channels.wecom_contacts import WecomContacts  # noqa: PLC0415
 
         wecom_contacts = WecomContacts(cfg)

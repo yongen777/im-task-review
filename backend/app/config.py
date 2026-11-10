@@ -123,6 +123,9 @@ class Config:
     # 凭证只有 BotID + Secret 两样；同一机器人只能有一条长连接。
     wecom_bot_id: str = ""
     wecom_bot_secret: str = ""
+    # 2026-11-10 企微「导入即激活」：智能机器人 MCP 通讯录 apikey（后台-机器人-MCP 配置；
+    # 关联机器人+授权用户个人信息，只进 env，不落日志）。缺省时 MCP 反查关闭。
+    wecom_mcp_apikey: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -223,6 +226,7 @@ class Config:
             wecom_oauth_redirect=os.environ.get("IMT_WECOM_OAUTH_REDIRECT", "").strip(),
             wecom_bot_id=os.environ.get("IMT_WECOM_BOT_ID", "").strip(),
             wecom_bot_secret=os.environ.get("IMT_WECOM_BOT_SECRET", "").strip(),
+            wecom_mcp_apikey=os.environ.get("IMT_WECOM_MCP_APIKEY", "").strip(),
         )
 
 
