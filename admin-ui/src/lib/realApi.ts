@@ -430,29 +430,32 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   let reqBody = body;
   if (method !== 'GET') {
     if (rawPath.endsWith('/members/import')) {
-      /* 前端 csv_text → 后端 csv_rows
-         2026-10-29 P0-2：后端 import_role_members 要求 dict 行（row/phone/name/dept），
-         原来发的是二维字符串数组，每一行都被判成“行数据格式错误” → 导入 100% 失败。
-         2026-11-03 修复：本分支必须放在 roles 分支**之前**——roles 分支
-         （startsWith('/api/admin/roles/')）会把 /roles/{id}/members/import 一起吃掉，
-         导致这里永远不可达、csv_rows 永远不生成 → 生产导入 100% 400。 */
+      /* csv_text → csv_rows 兼容转换（仅当调用方还在发 csv_text 时才做）
+         2026-11-10 修复「批量导入失败」：组件层已改为 parseCsvRows 直发 csv_rows
+         （11-09 wb 改动），但本分支原先无条件用 body.csv_text 重算 csv_rows ——
+         csv_text 不存在时 String(undefined || '') = ''，把组件构造好的行**覆盖成空数组**。
+         实测链路：组件正确发 rows → 此处覆盖为 [] → 后端 will_add=0 / invalid=[] 且
+         前端读不到任何错误行 → 用户看到「导入了但什么都没发生」。 */
       reqBody = { ...(body || {}) };
-      const text = String(reqBody.csv_text || '');
-      delete reqBody.csv_text;
-      const HEADER_WORDS = /^(手机号?|电话|号码|phone|mobile|tel|姓名|名字|name|部门|dept|department)$/i;
-      reqBody.csv_rows = text
-        .split(/\r?\n/)
-        .map((l: string) => l.trim())
-        .filter(Boolean)
-        .map((line: string, idx: number) => {
-          const parts = line.split(/[,，\t]/).map((c: string) => c.trim());
-          return { row: idx + 1, phone: parts[0] || '', name: parts[1] || '', dept: parts[2] || '' };
-        })
-        /* 顺手跳过表头行，避免把“手机号,姓名,部门”当成一条错行 */
-        .filter((r: { row: number; phone: string; name: string; dept: string }) => {
-          const isHeader = HEADER_WORDS.test(r.phone) || HEADER_WORDS.test(r.name);
-          return !isHeader && (r.phone || r.name);
-        });
+      if (reqBody.csv_text !== undefined) {
+        const text = String(reqBody.csv_text || '');
+        delete reqBody.csv_text;
+        const HEADER_WORDS = /^(手机号?|电话|号码|phone|mobile|tel|姓名|名字|name|部门|dept|department)$/i;
+        reqBody.csv_rows = text
+          .split(/\r?\n/)
+          .map((l: string) => l.trim())
+          .filter(Boolean)
+          .map((line: string, idx: number) => {
+            const parts = line.split(/[,，\t]/).map((c: string) => c.trim());
+            return { row: idx + 1, phone: parts[0] || '', name: parts[1] || '', dept: parts[2] || '' };
+          })
+          /* 顺手跳过表头行，避免把“手机号,姓名,部门”当成一条错行 */
+          .filter((r: { row: number; phone: string; name: string; dept: string }) => {
+            const isHeader = HEADER_WORDS.test(r.phone) || HEADER_WORDS.test(r.name);
+            return !isHeader && (r.phone || r.name);
+          });
+      }
+      /* body 已带 csv_rows（组件新通道）→ 原样透传 */
       if (reqBody.dry_run === undefined) reqBody.dry_run = false;
     } else if (rawPath === '/api/admin/templates' || rawPath.startsWith('/api/admin/templates/')) {
       /* 编辑（PUT/DELETE 带模板 id）走 partial：只发显式字段，绝不臆造 kind/period，
@@ -494,21 +497,14 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   const d = await rawFetch<any>(method, url, reqBody);
 
   /* 响应映射（后端结构 → 前端结构） */
-  /* 2026-10-29 P0-2：导入接口字段名对齐（will_add/already_exists/invalid → added/updated/skipped/errors） */
+  /* 2026-11-10 修复「批量导入失败」的第二处：导入接口旧映射把后端返回
+     （will_add/invalid/blocked/global_reused_count/synced_global_rows）换成
+     added/skipped/errors 旧字段 —— 而组件（11-09 新口径）读的全是后端原字段。
+     后果：即使请求侧修好，组件仍读不到 invalid/blocked → 错误行永不显示。
+     已核实全库无其它消费者依赖旧字段（added/skipped/errors 映射仅此处产出），
+     故直接透传后端响应。 */
   if (rawPath.endsWith('/members/import')) {
-    const invalid = Array.isArray(d?.invalid) ? d.invalid : [];
-    return {
-      ok: true,
-      added: Number(d?.will_add || 0),
-      updated: 0,
-      skipped: Number(d?.already_exists || 0),
-      errors: invalid.map((x: any) => ({
-        line: Number(x?.row || 0),
-        reason: String(x?.reason || '格式不符'),
-      })),
-      /* 2026-11-04：CSV 里的新部门会被自动建进「部门管理」，把建了哪些部门回传给前端提示 */
-      departments_created: Array.isArray(d?.departments_created) ? d.departments_created.map((x: any) => String(x)) : [],
-    } as unknown as T;
+    return { ok: true, ...d } as unknown as T;
   }
   if (rawPath === '/api/admin/me') {
     /* 会话恢复：boot 探测时从响应同步 csrf（修复旧 Cookie 直接进站后写操作 403） */

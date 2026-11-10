@@ -769,23 +769,24 @@ export const RolesMembersView: React.FC = () => {
         ok: boolean;
         will_add?: number;
         added?: number;
-        updated?: number;
-        skipped?: number;
         already_exists?: number;
         blocked?: boolean;
-        global_reused?: number;
-        auto_created_depts?: string[];
+        /* 2026-11-10 对齐后端实际返回：global_reused 是布尔、数字在 global_reused_count；
+           departments_created 是后端字段（此前误读成 auto_created_depts） */
+        global_reused?: boolean;
+        global_reused_count?: number;
+        departments_created?: string[];
         synced_global_rows?: number;
         invalid?: Array<{ row: number; phone: string; reason: string }>;
-        errors?: Array<{ line: number; reason: string }>;
       }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/import`, {
         csv_rows: rows,
         dry_run: false,
       });
       const invalid = res.invalid || [];
+      const reusedN = res.global_reused_count || 0;
       const reusedNote =
-        res.global_reused && res.global_reused > 0
-          ? `（其中 ${res.global_reused} 人已在全平台激活，自动复用免二次激活）`
+        reusedN > 0
+          ? `（其中 ${reusedN} 人已在全平台激活，自动复用免二次激活）`
           : '';
       // 2026-11-09 用户口径：「待修复后才全量导入成功」——
       // 有任何错误行就整批不写入，把**全部**错误行列出来，且**不关窗**（用户改完再导）。
