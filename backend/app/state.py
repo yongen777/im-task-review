@@ -262,6 +262,8 @@ class StateStore:
         # 2026-11-10 方案A：通讯录查询客户端（导入即激活 / 首条消息自动识别）。
         # 由 main.create_apps 在生产装配；测试/降级环境为 None → 所有自动激活路径静默跳过。
         self.contacts = None
+        # 2026-11-10 企微镜像：手机号→userid 反查（官方 95402，corpid+secret，仅 HTTP，不碰长连接）
+        self.wecom_contacts = None
 
     def _plat(self, platform: Optional[str] = None) -> str:
         """显式传了就用传的，否则用当前通道（store.platform）。
@@ -1757,19 +1759,38 @@ class StateStore:
         return result
 
     def _auto_activate_imported(self, phones: List[str], platform: str = "zdxlz", actor: str = "system") -> Dict[str, Any]:
-        """2026-11-10 方案A：导入即激活 —— 用官方通讯录把「手机号 → union_id」落成绑定。
+        """2026-11-10 方案A：导入即激活 —— 用官方通讯录把「手机号 → 平台 id」落成绑定。
 
-        · 只对 zdxlz 生效（union_id 是量子密信专属机制；企微 userid 体系不适用）；
-        · contacts 未装配（测试/降级环境）→ enabled=False，行为与旧版完全一致；
-        · 已有可用绑定的手机号跳过（不重复打接口、不覆盖）；
-        · usable=0 的旧行用 union_id 复活（首次激活时刻保留）；
-        · 通讯录查不到（不在读取范围/离职）计入 failed，不阻塞导入。
+        平台分发（两通道镜像对接，用户 2026-11-10 拍板）：
+          · zdxlz → self.contacts.search_by_phone（官方响应 decryptV2 解密后取 union_id，
+            external_type='union_id'，发送用 receive_type="union_id"）；
+          · wecom  → self.wecom_contacts.resolve_userid_by_phone（官方 95402
+            /cgi-bin/user/getuserid，external_type='user'，aibot 直接按 userid 投递）。
+
+        约定：
+        · resolver 未装配（测试/降级环境）→ enabled=False，行为与旧版完全一致；
+        · 已有可用绑定的手机号跳过（不重复打接口、不覆盖绑定）；
+        · usable=0 的旧行用新 id 复活（首次激活时刻保留）；
+        · 查不到（不在读取范围/离职/无权限）计入 failed，不阻塞导入。
         """
         base: Dict[str, Any] = {"enabled": False, "activated": 0, "failed": 0, "skipped": 0, "failed_phones": []}
-        contacts = getattr(self, "contacts", None)
-        if not phones or contacts is None:
+        plat = (platform or "").strip().lower()
+        if plat == "zdxlz":
+            resolver = getattr(self, "contacts", None)
+            ext_type = "union_id"
+
+            def _resolve_one(phone: str) -> Optional[str]:
+                user = resolver.search_by_phone(phone)
+                return str((user or {}).get("union_id") or "").strip() or None
+        elif plat == "wecom":
+            resolver = getattr(self, "wecom_contacts", None)
+            ext_type = "user"
+
+            def _resolve_one(phone: str) -> Optional[str]:
+                return str(resolver.resolve_userid_by_phone(phone) or "").strip() or None
+        else:
             return base
-        if (platform or "").strip().lower() != "zdxlz":
+        if not phones or resolver is None:
             return base
         base["enabled"] = True
 
@@ -1783,7 +1804,7 @@ class StateStore:
 
         to_resolve: List[str] = []
         for p in unique_phones:
-            existing = self.get_delivery_target(p, platform="zdxlz")
+            existing = self.get_delivery_target(p, platform=plat)
             if existing and int(existing.get("usable") or 0) == 1:
                 base["skipped"] += 1
                 continue
@@ -1792,8 +1813,7 @@ class StateStore:
             return base
 
         def _resolve(phone: str):
-            user = contacts.search_by_phone(phone)
-            return phone, str((user or {}).get("union_id") or "").strip() or None
+            return phone, _resolve_one(phone)
 
         activated = failed = 0
         failed_phones: List[str] = []
@@ -1805,7 +1825,7 @@ class StateStore:
                 failed_phones.append(phone)
                 continue
             try:
-                self.upsert_delivery_target(phone, uid, platform="zdxlz", external_type="union_id")
+                self.upsert_delivery_target(phone, uid, platform=plat, external_type=ext_type)
                 activated += 1
             except BizError:
                 failed += 1
@@ -1815,7 +1835,7 @@ class StateStore:
             "failed": failed,
             "failed_phones": [mask_phone(p) for p in failed_phones],
         })
-        self.write_audit(actor, "target.auto_import", "delivery_target", "zdxlz", {
+        self.write_audit(actor, "target.auto_import", "delivery_target", plat, {
             "activated": activated, "failed": failed, "skipped": base["skipped"],
             "failed_phones_masked": [mask_phone(p) for p in failed_phones],
         })

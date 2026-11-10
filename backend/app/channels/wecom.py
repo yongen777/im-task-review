@@ -203,6 +203,48 @@ class WecomClient:
         )
 
     # ── 网页授权（P3 预留）─────────────────────────────────────────
+    def get_userid_by_mobile(self, mobile: str) -> Optional[str]:
+        """手机号反查成员 userid（官方文档 95402：POST /cgi-bin/user/getuserid）。
+
+        2026-11-10 企微通道对齐方案A（导入即激活）的核心反查接口：
+        - 入参 {"mobile": "13800000000"}，access_token 走自建应用凭证（corpid + secret）；
+        - 成功返回 {"errcode":0,"errmsg":"ok","userid":"zhangsan"}（明文，无信封）；
+        - 需要该应用具备**通讯录读取**权限（60011 = 无权限）。
+
+        返回 None = 查不到 / 无权限 / 网络异常（调用方按 fail-open 降级，绝不抛异常拖垮导入）。
+        ⚠️ access_token 与 aibot 长连接凭证**互不相干**：本方法只走 HTTP，绝不触碰长连接。
+        """
+        clean = (mobile or "").strip()
+        if not clean:
+            return None
+        try:
+            data = self._request(
+                "POST",
+                "/cgi-bin/user/getuserid",
+                params={"access_token": self.get_token()},
+                json={"mobile": clean},
+            )
+            errcode = int(data.get("errcode") or 0)
+            # token 失效：强制刷新后重试一次（与 send_text 同策略）
+            if errcode in _TOKEN_INVALID_CODES:
+                data = self._request(
+                    "POST",
+                    "/cgi-bin/user/getuserid",
+                    params={"access_token": self.get_token(force=True)},
+                    json={"mobile": clean},
+                )
+                errcode = int(data.get("errcode") or 0)
+        except WecomError as exc:
+            logger.warning("user/getuserid 调用失败 errcode=%s: %s", exc.errcode, exc.errmsg[:120])
+            return None
+        if errcode != 0:
+            # 60011=应用无通讯录权限；40003/60111=手机号对应用户不存在/不在可见范围
+            logger.warning("user/getuserid 失败手机号=%s: %s %s",
+                           clean[:3] + "****" + clean[7:], errcode, str(data.get("errmsg") or "")[:120])
+            return None
+        userid = str(data.get("userid") or "").strip()
+        return userid or None
+
     def get_userid_by_code(self, code: str) -> Optional[str]:
         """用 OAuth2 的 code 换成员 userid（静默授权，不弹窗）。
 

@@ -221,7 +221,11 @@ def test_import_without_contacts_falls_back_silently() -> None:
 
 
 def test_import_wecom_platform_never_calls_contacts() -> None:
-    """企微角色：union_id 机制只属于量子密信，企微导入不得打通讯录。"""
+    """resolver 隔离：企微角色导入**不得误用 union_id 解析器**（store.contacts）。
+
+    2026-11-10 企微镜像后：wecom 走独立的 store.wecom_contacts（见
+    test_20261110_wecom_import_activation.py）；本用例守住「跨平台解析器不串用」。
+    """
     store = _store()
     try:
         rid = store.create_role("W组", actor="t", platform="wecom")["role_id"]
