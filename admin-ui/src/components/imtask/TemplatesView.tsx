@@ -419,6 +419,13 @@ export const TemplatesView: React.FC = () => {
   /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null）。
      2026-11-02 用户口径：去掉「执行周期」下拉，只按这里选的星期几触发。 */
   const [execWeekdays, setExecWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
+  /* 2026-11-10 月度执行日：每月几号（1~31 多选）；null=未启用（每周模式）。
+     execMode 仅是弹窗内的 UI 态（'weekly' | 'monthly'），实际生效看提交的 exec_dom_days。 */
+  const [execMode, setExecMode] = useState<'weekly' | 'monthly'>('weekly');
+  const [execDomDays, setExecDomDays] = useState<number[]>([]);
+  const toggleExecDomDay = (d: number) => {
+    setExecDomDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
+  };
   const [roleIds, setRoleIds] = useState<string[]>([]);
   const [remindAt, setRemindAt] = useState('08:15');
   const [deadline, setDeadline] = useState('18:00');
@@ -513,6 +520,8 @@ export const TemplatesView: React.FC = () => {
     setName('');
     setKind(defaultKind);
     setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
+    setExecMode('weekly');
+    setExecDomDays([]);
     const defaultRoleId = roleFilter || roles[0]?.role_id || 'role_branch_chief';
     setRoleIds(defaultRoleId ? [defaultRoleId] : []);
     setRemindAt(defaultKind === 'notice' ? '08:15' : '16:30');
@@ -543,6 +552,14 @@ export const TemplatesView: React.FC = () => {
         ? tpl.exec_weekdays.map(Number)
         : [1, 2, 3, 4, 5, 6, 7],
     );
+    /* 2026-11-10 月度执行日回显：数据库有 exec_dom_days → 月度模式 */
+    if (Array.isArray(tpl.exec_dom_days) && tpl.exec_dom_days.length) {
+      setExecMode('monthly');
+      setExecDomDays(tpl.exec_dom_days.map(Number).filter((n) => n >= 1 && n <= 31));
+    } else {
+      setExecMode('weekly');
+      setExecDomDays([]);
+    }
     const tplRoles = getTemplateRoleIds(tpl);
     setRoleIds(
       tplRoles.length > 0 ? tplRoles : [roles[0]?.role_id || 'role_branch_chief'],
@@ -682,6 +699,8 @@ export const TemplatesView: React.FC = () => {
         attach_image_name: tpl.attach_image_name ?? null,
         /* 2026-10-29 执行日：启停路径同样带上，避免把执行日冲回全周 */
         exec_weekdays: tpl.exec_weekdays ?? null,
+        /* 2026-11-10 月度执行日：启停同样带上，避免把月度配置冲掉 */
+        exec_dom_days: tpl.exec_dom_days ?? null,
       });
       await refreshTemplates();
       toast.success(
@@ -709,9 +728,14 @@ export const TemplatesView: React.FC = () => {
       toast.warning('请填写执行时间');
       return;
     }
-    /* 2026-10-29 执行日：必须至少选一天，否则永远不会执行（2026-11-02 起周期固定按周） */
-    if (execWeekdays.length === 0) {
+    /* 2026-10-29 执行日：必须至少选一天，否则永远不会执行（2026-11-02 起周期固定按周）*/
+    /* 2026-11-10 月度模式：切换为「每月执行」时必须至少选一个日期 */
+    if (execMode === 'weekly' && execWeekdays.length === 0) {
       toast.warning('请至少选择一天「执行日」', '缺少执行日');
+      return;
+    }
+    if (execMode === 'monthly' && execDomDays.length === 0) {
+      toast.warning('每月执行至少选择一个日期（或点「每月月底」快捷）', '缺少执行日');
       return;
     }
 
@@ -818,8 +842,11 @@ export const TemplatesView: React.FC = () => {
           text_tpl: finalTextTpl,
           spec,
           enabled,
-          /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
+          /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null
+             2026-11-10：月度模式时 exec_dom_days 带选中几号（每周字段随 UI 状态一并提交，
+             后端以 exec_dom_days 非空优先判定）；切回每周时显式 [] 清空月度 */
           exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: execMode === 'monthly' ? execDomDays : [],
           /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
              导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
           need_review: kind === 'notice' ? false : requireReview,
@@ -849,6 +876,7 @@ export const TemplatesView: React.FC = () => {
           enabled,
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
           exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: execMode === 'monthly' ? execDomDays : [],
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
@@ -1459,13 +1487,43 @@ export const TemplatesView: React.FC = () => {
                     </div>
 
                     {/* 2026-11-02 用户口径：去掉「执行周期」概念 —— 管理员只选星期几，固定在每周选中的那几天触发 */}
+                    {/* 2026-11-10 双模式：每周（周几）/ 每月（几号）；月底=31（调度自动适配小月/闰年） */}
                     <div>
                       <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
                         <span>执行日</span>
                         <span className="text-[10px] text-slate-400 font-normal">
-                          只在这些星期生成任务；没选的日子不提醒、不产生逾期
+                          {execMode === 'weekly'
+                            ? '只在这些星期生成任务；没选的日子不提醒、不产生逾期'
+                            : '只在每月选中的日期生成任务；选中 31 号时小月/闰月自动按当月最后一天执行'}
                         </span>
                       </label>
+                      {/* 模式切换 */}
+                      <div className="inline-flex rounded-lg border border-slate-200 overflow-hidden mb-2">
+                        <button
+                          type="button"
+                          onClick={() => setExecMode('weekly')}
+                          className={`px-3.5 py-1.5 text-xs font-semibold cursor-pointer transition-colors ${
+                            execMode === 'weekly'
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-white text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          每周执行
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setExecMode('monthly')}
+                          className={`px-3.5 py-1.5 text-xs font-semibold cursor-pointer transition-colors ${
+                            execMode === 'monthly'
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-white text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          每月执行
+                        </button>
+                      </div>
+
+                      {execMode === 'weekly' ? (
                       <div className="flex flex-wrap items-center gap-1.5">
                         {WEEKDAY_LABELS.map((label, i) => {
                           const d = i + 1;
@@ -1503,6 +1561,40 @@ export const TemplatesView: React.FC = () => {
                           {describeExecWeekdays(execWeekdays)}
                         </span>
                       </div>
+                      ) : (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => {
+                          const on = execDomDays.includes(d);
+                          return (
+                            <button
+                              key={d}
+                              type="button"
+                              onClick={() => toggleExecDomDay(d)}
+                              className={`w-8 py-1.5 rounded-lg text-xs font-semibold border transition-colors cursor-pointer tabular-nums ${
+                                on
+                                  ? 'bg-blue-600 text-white border-blue-600'
+                                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:border-blue-300'
+                              }`}
+                            >
+                              {d}
+                            </button>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setExecDomDays([31])}
+                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-slate-500 bg-white border border-slate-200 hover:border-blue-300 cursor-pointer"
+                          title="每月最后一天（2月28/29日、小月30日、大月31日自动适配）"
+                        >
+                          每月月底
+                        </button>
+                        <span className="text-[11px] text-slate-500 ml-1 w-full">
+                          {execDomDays.length === 0
+                            ? '尚未选择'
+                            : `每月 ${execDomDays.map((d) => (d === 31 ? '31（含月底）' : String(d))).join('、')} 号执行`}
+                        </span>
+                      </div>
+                      )}
                     </div>
 
                     {/* 执行时间 & 截止时间（2026-10-28 重排版：时间字段并列一行 + 原生时间选择器） */}

@@ -99,6 +99,9 @@ export interface TemplateItem {
   attach_image_name?: string | null;
   /* 2026-10-29 执行日：day 周期模板只在选中的周几执行；null/空 = 每天（周一=1…周日=7） */
   exec_weekdays?: number[] | null;
+  /* 2026-11-10 月度执行日：每月几号执行（1~31 多选）；null/空 = 未启用月度（回落每周判定）。
+     选中 31 = 当月最后一天也执行（自动适配 2 月 28/29、小月 30） */
+  exec_dom_days?: number[] | null;
   owner_id?: number;
   owner_username?: string;
   owner_display_name?: string | null;

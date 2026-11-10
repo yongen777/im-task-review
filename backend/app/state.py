@@ -1392,11 +1392,14 @@ class StateStore:
                     "wecom": bool(r["ext_wecom"]),
                 }
                 activated = act.get(plat, act["zdxlz"] or act["wecom"])
-                items.append(_fmt_member(
+                items.append({**_fmt_member(
                     r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"],
                     r["source"], r["created_at"], activated, activations=act,
-                ))
-            return {"total": total, "items": items}
+                ), "owner_id": int(r["owner_id"] or 1)})
+            # 2026-11-10：附带角色归属 owner，前端据此判定「我是否为该成员的创建者」
+            # （姓名/部门修改权限矩阵：超管 或 创建者可改）。
+            _role_row = self.conn.execute("SELECT owner_id FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+            return {"total": total, "items": items, "role_owner_id": int(_role_row["owner_id"] or 1) if _role_row is not None else None}
 
     def list_roles_of_phone(self, phone: str) -> List[Dict[str, Any]]:
         """2026-10-29：某手机号当前所在的所有角色（一人多角色场景，前端用来置灰「已加入」的角色）。"""
@@ -1752,6 +1755,17 @@ class StateStore:
                 exec_weekdays = None
         except Exception:
             exec_weekdays = None
+        # 2026-11-10 月度执行日：同口径解析 exec_dom_days（1~31）；NULL/空 = 不启用月度模式
+        try:
+            _ed_raw = d.get("exec_dom_days")
+            exec_dom_days = json.loads(_ed_raw) if _ed_raw else None
+            if isinstance(exec_dom_days, list):
+                exec_dom_days = [int(x) for x in exec_dom_days if str(x).strip().isdigit()]
+                exec_dom_days = sorted({w for w in exec_dom_days if 1 <= w <= 31}) or None
+            else:
+                exec_dom_days = None
+        except Exception:
+            exec_dom_days = None
         return {
             "template_id": d["template_id"], "name": d["name"], "kind": d["kind"], "role_ids": role_ids,
             "owner_id": d["owner_id"],
@@ -1766,6 +1780,7 @@ class StateStore:
             "attach_image": bool(d.get("attach_image", 0)), "attach_image_path": d.get("attach_image_path"),
             "attach_image_name": d.get("attach_image_name"),
             "exec_weekdays": exec_weekdays,
+            "exec_dom_days": exec_dom_days,
             "data_keys": data_keys, "spec_json": spec_json,
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
@@ -1966,6 +1981,34 @@ class StateStore:
         else:
             exec_weekdays_norm = (existing or {}).get("exec_weekdays")
 
+        # 2026-11-10 月度执行日：同一套部分更新语义。None = 未提交（更新保留原值）；
+        # [] = 显式清空（切回每周模式）；非空 = 每月几号（1~31，选中 31 含每月最后一天）。
+        if "exec_dom_days" in payload:
+            raw_ed = payload.get("exec_dom_days")
+            if raw_ed is None:
+                exec_dom_days_norm: Optional[List[int]] = None
+            else:
+                if not isinstance(raw_ed, list):
+                    raise BizError(400, "VALIDATION_FAILED", "exec_dom_days 必须是数组")
+                clean_ed: List[int] = []
+                for x in raw_ed:
+                    try:
+                        dm = int(str(x).strip())
+                    except Exception:
+                        raise BizError(400, "VALIDATION_FAILED", "每月执行日只能是 1~31")
+                    if not (1 <= dm <= 31):
+                        raise BizError(400, "VALIDATION_FAILED", "每月执行日只能是 1~31")
+                    clean_ed.append(dm)
+                clean_ed = sorted(set(clean_ed))
+                if not clean_ed:
+                    exec_dom_days_norm = None  # 显式空数组 = 清空，回落每周模式
+                else:
+                    if period != "day":
+                        raise BizError(400, "VALIDATION_FAILED", "仅每日周期支持执行日")
+                    exec_dom_days_norm = clean_ed
+        else:
+            exec_dom_days_norm = (existing or {}).get("exec_dom_days")
+
         # 2026-10-29 修复：前端提交的键是 `spec`（notice_items 里带上传时的**原始文件名**
         # 与管理员填的描述），后端一直只读 `spec_json` → 这些配置从来没落库，
         # 每次重新打开模板都被前端按 attach_image_path 重建，于是名字/描述回到默认值。
@@ -2001,6 +2044,7 @@ class StateStore:
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "attach_image_name": attach_image_name,
             "exec_weekdays": json.dumps(exec_weekdays_norm, ensure_ascii=False) if exec_weekdays_norm else None,
+            "exec_dom_days": json.dumps(exec_dom_days_norm, ensure_ascii=False) if exec_dom_days_norm else None,
             "data_keys": data_keys_str,
             "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
@@ -2011,14 +2055,14 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
-                    norm["attach_image_name"], norm["exec_weekdays"], norm["data_keys"], norm["spec_json"],
+                    norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], actor, now_s, now_s, int(owner_id),
                 ),
             )
@@ -2075,12 +2119,12 @@ class StateStore:
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
                     norm["anchor_dom"], norm["deadline_offset"], norm["need_review"], norm["max_file_mb"],
-                    norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["data_keys"], norm["spec_json"],
+                    norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], now_s, clean_id,
                 ),
             )

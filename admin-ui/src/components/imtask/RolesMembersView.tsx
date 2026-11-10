@@ -83,6 +83,7 @@ export const RolesMembersView: React.FC = () => {
     setOwnerFilter,
     adminAccounts,
     memberDistinctTotal,
+    me,
   } = useAppStore();
   const toast = useToast();
 
@@ -648,13 +649,20 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  // P2-1: 打开成员「改名/停用」弹窗
+  // P2-1: 打开成员「修改」弹窗
   const openEditMemberModal = (m: RoleMemberItem) => {
     setEditingMember(m);
     setEditMemberName(m.name);
     setEditMemberDept(m.dept || '');
     setEditMemberStatus(m.status);
   };
+
+  /* 2026-11-10 权限矩阵（用户口径）：姓名/部门 = 超管 或 该成员行的创建者（owner_id）可改；
+     派单状态 = 所有管理员可改。与后端护栏同口径（后端防直接调 API 绕过）。 */
+  const canEditProfile =
+    isSuperAdmin ||
+    (editingMember?.owner_id != null && editingMember.owner_id === me?.id) ||
+    (editingMember?.owner_id == null && !isSuperAdmin); // 老数据无 owner：按创建者可改处理
 
   // P2-1: 提交 PUT /api/admin/roles/{role_id}/members/{phone}
   const handleSaveMemberEdit = async (e: React.FormEvent) => {
@@ -1202,6 +1210,7 @@ export const RolesMembersView: React.FC = () => {
                                   ? 'bg-blue-50/70 text-blue-700 border-blue-200/80'
                                   : 'bg-slate-100 text-slate-500 border-slate-200'
                               }`}
+                              title="派单状态在右侧「修改」里调整"
                             >
                               {m.status === 'active' ? (
                                 <>
@@ -1216,15 +1225,14 @@ export const RolesMembersView: React.FC = () => {
                               )}
                             </span>
                           ) : (
-                          <button
-                            type="button"
-                            onClick={() => void handleQuickToggleMemberStatus(m)}
-                            title="点击快速切换派单状态"
-                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border cursor-pointer transition-colors ${
+                          /* 2026-11-10 用户口径：移除点击快速切换（能力统一收进「修改」弹窗），改纯徽章 */
+                          <span
+                            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold border ${
                               m.status === 'active'
-                                ? 'bg-blue-50/70 text-blue-700 border-blue-200/80 hover:bg-blue-100/70'
-                                : 'bg-slate-100 text-slate-500 border-slate-200 hover:bg-slate-200/70'
+                                ? 'bg-blue-50/70 text-blue-700 border-blue-200/80'
+                                : 'bg-slate-100 text-slate-500 border-slate-200'
                             }`}
+                            title="派单状态在右侧「修改」里调整"
                           >
                             {m.status === 'active' ? (
                               <>
@@ -1237,7 +1245,7 @@ export const RolesMembersView: React.FC = () => {
                                 <span>已停用</span>
                               </>
                             )}
-                          </button>
+                          </span>
                           )}
                         </td>
                         <td className="py-3.5 pl-3 pr-5 text-right">
@@ -1256,17 +1264,16 @@ export const RolesMembersView: React.FC = () => {
                                 <Users className="w-3 h-3" />
                                 <span>加入其他角色</span>
                               </button>
-                              {/* 2026-11-09：分级管理员不能改已存在成员的姓名/部门 →
-                                  只给「停用/启用」（派单状态）；改名能力只留给超管 */}
+                              {/* 2026-11-10 用户口径： 操作统一为「修改」弹窗——
+                                  姓名/部门（超管或创建者可改，改后同步该办公软件全量池）+
+                                  派单状态（所有管理员可改） */}
                               <button
                                 onClick={() => openEditMemberModal(m)}
-                                title={isSuperAdmin
-                                  ? '修改姓名 / 部门 / 派单状态'
-                                  : '调整派单状态（姓名与部门由超管统一维护）'}
+                                title="修改姓名 / 部门（需创建者或超管）/ 派单状态（所有人可调）"
                                 className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap"
                               >
                                 <Edit3 className="w-3 h-3" />
-                                <span>{isSuperAdmin ? '改名/停用' : '停用/启用'}</span>
+                                <span>修改</span>
                               </button>
                               <button
                                 onClick={() => setConfirmRemoveRoleMember(m)}
@@ -1471,13 +1478,11 @@ export const RolesMembersView: React.FC = () => {
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
-                <h3 className="font-bold text-slate-900 text-base">
-                  {isSuperAdmin ? '修改成员信息与派单状态' : '调整派单状态'}
-                </h3>
+                <h3 className="font-bold text-slate-900 text-base">修改成员信息</h3>
                 <p className="text-[11px] text-slate-400">
-                  {isSuperAdmin
-                    ? '支持修改用户名、部门及启用/停用状态'
-                    : '分级管理员可调整派单状态；姓名与部门由超管统一维护（首次导入时确定）'}
+                  {canEditProfile
+                    ? '可修改姓名/部门（同步该办公软件下全部管理员的名册）与派单状态'
+                    : '仅创建者或超管可改姓名/部门；派单状态可正常调整'}
                 </p>
               </div>
               <button
@@ -1510,18 +1515,17 @@ export const RolesMembersView: React.FC = () => {
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  用户名 / 姓名 <span className="text-rose-500">*</span>
+                  用户名 / 姓名 {canEditProfile && <span className="text-rose-500">*</span>}
                 </label>
                 <input
                   type="text"
                   value={editMemberName}
                   onChange={(e) => setEditMemberName(e.target.value)}
-                  /* 2026-11-09 用户口径：分级管理员不能改已存在成员的姓名/部门
-                     （只有首次导入时能定，且要同步全局池）→ 非超管只读 */
-                  readOnly={!isSuperAdmin}
-                  disabled={!isSuperAdmin}
-                  placeholder={isSuperAdmin ? '请输入成员真实姓名' : '仅超管可修改姓名'}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                  /* 2026-11-10 权限矩阵：超管或创建者可改；非创建者只读灰显（后端同口径护栏） */
+                  readOnly={!canEditProfile}
+                  disabled={!canEditProfile}
+                  placeholder={canEditProfile ? '请输入成员真实姓名' : '仅创建者或超管可修改姓名'}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                 />
               </div>
 
@@ -1530,9 +1534,9 @@ export const RolesMembersView: React.FC = () => {
                 <select
                   value={editMemberDept}
                   onChange={(e) => setEditMemberDept(e.target.value)}
-                  /* 2026-11-09：非超管只读（部门同样受全局一致性约束） */
-                  disabled={!isSuperAdmin}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
+                  /* 2026-11-10 部门全量池下拉（用户口径）：与超管成员池同款数据源；非创建者只读 */
+                  disabled={!canEditProfile}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 cursor-pointer disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
                 >
                   <option value="">不填部门</option>
                   {departments.map((d) => (

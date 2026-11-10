@@ -1563,26 +1563,28 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
-        # 2026-11-09 用户口径：分级管理员**没有**修改已存在成员姓名/部门的权限
-        # （只有首次导入时能定，且要同步全局池；其余由超管统一维护）。
-        # → 前端已把入口关掉，这里再加一道后端护栏（前端可被绕过、直接调 API）。
+        # 2026-11-10 用户口径（取代 11-09 的「分级一律禁改」）：
+        #   · 姓名/部门：超管 或 **创建该成员行的管理员**可改，改后同步到当前办公软件
+        #     全量池（该手机号在该平台下所有管理员名下的行一起改）；非创建者 → 403。
+        #   · 派单状态（enabled）：所有有该成员行的管理员都可改（仅作用于自己名下行）。
+        # → 前端按此矩阵灰显，后端护栏防直接调 API 绕过。
         _admin = _admin_profile(state, sess)
-        if str(_admin.get("role_level") or "") != "super_admin":
-            _cur = state.conn.execute(
-                "SELECT name, dept FROM member WHERE role_id = ? AND phone = ?",
-                ((role_id or "").strip(), (phone or "").strip()),
-            ).fetchone()
-            if _cur is not None:
-                _new_name = body.get("name")
-                _new_dept = body.get("dept")
-                _name_chg = _new_name is not None and str(_new_name).strip() != str(_cur["name"] or "").strip()
-                _dept_chg = _new_dept is not None and str(_new_dept).strip() != str(_cur["dept"] or "").strip()
-                if _name_chg or _dept_chg:
-                    return error_response(
-                        403, "MEMBER_PROFILE_FORBIDDEN",
-                        "分级管理员不能修改成员的姓名/部门（姓名与部门由超管统一维护）；"
-                        "如需变更，请在首次导入时指定，或联系超管处理。",
-                    )
+        _is_super = str(_admin.get("role_level") or "") == "super_admin"
+        _new_name = body.get("name")
+        _new_dept = body.get("dept")
+        _cur = state.conn.execute(
+            "SELECT name, dept, owner_id FROM member WHERE role_id = ? AND phone = ?",
+            ((role_id or "").strip(), (phone or "").strip()),
+        ).fetchone()
+        _cur_owner = int(_cur["owner_id"] or 1) if _cur is not None else None
+        _name_chg = _cur is not None and _new_name is not None and str(_new_name).strip() != str(_cur["name"] or "").strip()
+        _dept_chg = _cur is not None and _new_dept is not None and str(_new_dept).strip() != str(_cur["dept"] or "").strip()
+        if not _is_super and _cur is not None and _cur_owner != int(_admin.get("id") or 0):
+            if _name_chg or _dept_chg:
+                return error_response(
+                    403, "MEMBER_PROFILE_FORBIDDEN",
+                    "仅超级管理员或该成员的创建者可修改姓名/部门；派单状态可正常调整。",
+                )
         try:
             member = state.update_role_member(
                 role_id=role_id,
@@ -1592,6 +1594,21 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 enabled=body.get("enabled"),
                 actor=sess["username"],
             )
+            # 创建者/超管改了姓名或部门 → 按用户口径同步当前办公软件全量池
+            # （该手机号在该平台下所有管理员名下的 member 行统一改，与超管成员池同口径）。
+            if _name_chg or _dept_chg:
+                _role_row = state.conn.execute(
+                    "SELECT platform FROM role WHERE role_id = ?", ((role_id or "").strip(),)
+                ).fetchone()
+                _plat = str(_role_row["platform"] or "") if _role_row is not None else ""
+                if _plat:
+                    state.member_pool_update_profile(
+                        phone,
+                        name=_new_name if _name_chg else None,
+                        dept=_new_dept if _dept_chg else None,
+                        actor=sess["username"],
+                        platform=_plat,
+                    )
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "member": member}

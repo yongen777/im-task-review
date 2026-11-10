@@ -142,6 +142,8 @@ function memberToMock(m: any): RoleMemberItem {
     external_id: m.external_id,
     activated_at: m.activated_at,
     created_at: m.created_at,
+    /* 2026-11-10：创建者判定（姓名/部门权限矩阵：超管或创建者可改） */
+    owner_id: m.owner_id,
   } as RoleMemberItem;
 }
 
@@ -212,6 +214,10 @@ function tplToMock(t: any): TemplateItem {
     exec_weekdays: Array.isArray(t.exec_weekdays) && t.exec_weekdays.length
       ? t.exec_weekdays.map((n: unknown) => Number(n)).filter((n: number) => n >= 1 && n <= 7)
       : null,
+    /* 2026-11-10 月度执行日：null/空 = 未启用月度模式（回落每周判定） */
+    exec_dom_days: Array.isArray(t.exec_dom_days) && t.exec_dom_days.length
+      ? t.exec_dom_days.map((n: unknown) => Number(n)).filter((n: number) => n >= 1 && n <= 31)
+      : null,
     created_at: t.created_at || '',
     updated_at: t.updated_at,
     /* 2026-11-05：创建人字段链路补齐（同 roleToMock）—— 超管视角列表要显示创建人 */
@@ -231,7 +237,10 @@ function tplToMock(t: any): TemplateItem {
  * 旧实现无条件补 kind='notice'、period='day'、notice_times=[remind_at]、attach_image=false，
  * 于是编辑任何上传类模板都会报「模板类型创建后不可修改」，
  * 还会顺手把「多提醒时刻 / 附件开关 / 数字指标」冲成默认值。
- */
+  * 2026-11-10 修复执行日保存不生效：partial 分支是白名单构造，此前漏了
+  * exec_weekdays / exec_dom_days —— 组件提交了但字段被丢弃，后端按「部分更新
+  * 保留原值」处理 → 保存「工作日」重开弹窗回到「每天」。
+  */
 function tplFromMock(t: any, partial = false) {
   t = t || {};
   let text = t.text_tpl || '';
@@ -282,6 +291,10 @@ function tplFromMock(t: any, partial = false) {
     if (t.attach_image_name !== undefined) out.attach_image_name = t.attach_image_name || null;
     if (t.need_review !== undefined) out.need_review = !!t.need_review;
     if (t.data_keys !== undefined) out.data_keys = t.data_keys;
+    /* 2026-11-10 执行日保存 bug：白名单补上这两个字段（只透传调用方显式给的值，
+       与 partial 语义一致；编辑时组件总会显式带上） */
+    if (t.exec_weekdays !== undefined) out.exec_weekdays = t.exec_weekdays;
+    if (t.exec_dom_days !== undefined) out.exec_dom_days = t.exec_dom_days;
     applySpec();
     return out;
   }
@@ -309,6 +322,10 @@ function tplFromMock(t: any, partial = false) {
   out.need_review = t.need_review !== undefined ? !!t.need_review : false;
   out.data_keys = t.data_keys || [];
   out.enabled = t.enabled !== false;
+  /* 2026-11-10 新建模板同样带上执行日（此前新建分支也漏）：每周七天全选存 null（=每天），
+     每月模式存选中的几号 */
+  out.exec_weekdays = Array.isArray(t.exec_weekdays) ? t.exec_weekdays : null;
+  out.exec_dom_days = Array.isArray(t.exec_dom_days) && t.exec_dom_days.length ? t.exec_dom_days : null;
   applySpec();
   return out;
 }

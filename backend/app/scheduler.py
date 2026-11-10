@@ -100,10 +100,36 @@ def is_template_anchor_day(template: Dict[str, Any], dt: DateLike) -> bool:
 
     2026-10-29 执行日：period=="day" 时按 exec_weekdays（1=周一…7=周日）判断；
     未配置 / 解析失败 / 空数组 → **全周执行**（fail-open：宁可多催一天，⛔ 不许业务静默失联）。
+    2026-11-10 月度执行日：exec_dom_days 非空时**优先**按每月几号判定（1~31 多选）；
+    选中 31 = 当月最后一天也执行（自动适配 2 月 28/29、小月 30、大月 31）。
     ⛔ 这是唯一的执行日判定点：run_once 循环顶部已调用，非执行日 continue 后
     实例生成、发送、missed、逾期流转全部天然跳过，禁止在别处再开第二个判定。
     """
     if (template.get("period") or "") == "day":
+        # ── 月度模式（优先）──
+        raw_dom = template.get("exec_dom_days")
+        dom_days: Optional[List[int]] = None
+        if isinstance(raw_dom, list):
+            dom_days = [int(x) for x in raw_dom if str(x).strip().isdigit() and 1 <= int(x) <= 31]
+        elif isinstance(raw_dom, str) and raw_dom.strip():
+            try:
+                parsed_dom = json.loads(raw_dom)
+                if isinstance(parsed_dom, list):
+                    dom_days = [int(x) for x in parsed_dom if str(x).strip().isdigit() and 1 <= int(x) <= 31]
+            except Exception:
+                dom_days = None
+        if dom_days:
+            today = _to_date(dt)
+            dom_set = set(dom_days)
+            if today.day in dom_set:
+                return True
+            # 月底适配：31 在列表且今天恰为当月最后一天（next 月 1 号 - 1 天）
+            if 31 in dom_set:
+                last_day = (today.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+                if today == last_day:
+                    return True
+            return False
+        # ── 每周模式（既有）──
         raw = template.get("exec_weekdays")
         days: Optional[List[int]] = None
         if isinstance(raw, list):

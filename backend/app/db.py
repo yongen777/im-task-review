@@ -380,6 +380,10 @@ class Database:
             # 2026-10-29 执行日：day 周期模板可指定「只在周几执行」（JSON 数组，1=周一…7=周日）；
             # 空/NULL = 全周执行（调度层 fail-open）。
             _ensure_column(self.conn, "task_template", "exec_weekdays", "TEXT")
+            # 2026-11-10 月度执行日：day 周期模板可指定「每月几号执行」（JSON 数组，1~31 多选）；
+            # NULL/空 = 不启用月度模式（回落每周 exec_weekdays 判定）。选中 31 = 当月最后一天
+            # 也执行（调度层自动适配 2 月 28/29、4/6/9/11 月 30、大月 31）。
+            _ensure_column(self.conn, "task_template", "exec_dom_days", "TEXT")
             # 2026-11-02 多通道并行：待归纳池记录来源通道（zdxlz/wecom），
             # 提示管理员「这个人从哪个办公软件来」。唯一键暂不变（后续单独重建表）。
             _ensure_column(self.conn, "pending_member", "platform", "TEXT")
