@@ -52,6 +52,12 @@ class FakeWecomContacts:
         self.calls += 1
         return self.mapping.get((phone or "").strip())
 
+    def resolve_user(self, phone: str, name: str = "", dept: str = ""):
+        # 2026-11-11 部门口径：state 现走 resolve_user（uid+部门回填）；假件仍按 phone 键
+        self.calls += 1
+        uid = self.mapping.get((phone or "").strip())
+        return {"external_id": uid, "department": "", "dept_path": ""} if uid else None
+
 
 def _store() -> StateStore:
     # 企微通道：单通道调度按 store.platform 查绑定
