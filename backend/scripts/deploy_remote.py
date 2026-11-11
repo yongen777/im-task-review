@@ -5,20 +5,22 @@
   python scripts/deploy_remote.py               # 一键部署（默认参数已内置）
   python scripts/deploy_remote.py --dry-run     # 只打包+连通+预检，不覆盖不重启
   python scripts/deploy_remote.py --skip-deps   # 跳过 pip install
-  python scripts/deploy_remote.py --skip-tests  # 跳过远程 pytest
 
 ⛔ 本脚本明确不做的事（2026-10-27 workbuddy 复核约定的安全边界）：
   1. 不写 / 不改 .env（现网凭据不动，仅做只读备份）
   2. 不建 / 不重置 admin 管理员密码
   3. 不重写 systemd unit（现网 imtask.service 已正确运行）
-  4. 不删除 /opt/imtask 下任何目录 —— tar 解压只覆盖；data/ 永不打包、永不上传（例外：⑨ 清理未被引用的历史构建产物）
+  4. 不删除 /opt/imtask 下任何目录 —— tar 解压只覆盖；data/ 永不打包、永不上传（例外：⑧ 清理未被引用的历史构建产物与 tests/scripts 残留）
   5. 打包强制断言 admin_static/index.html + assets/*.js 存在（缺则中止，防后台白屏）
+  6. ⛔ **tests/ 与任何 .db 永不进生产包**（2026-11-11 用户拍板的部署原则）——
+     打包后硬性断言（assert_no_tests），生产机上也不再跑任何测试套件。
 
-部署流程：版本库一致性检查 → 打包 → 预检 → 备份(app+.env) → 上传覆盖 → 装依赖 → 重启 → 验收
-（healthz 四项 + echostr 回显 + 后台 200 + 远程 pytest【tests 临时上传，跑完即删】）→ 清理历史构建产物
-→ 失败自动回滚。
+部署流程：版本库一致性检查 → 打包 → 预检 → 备份(app+.env+DB快照) → 上传覆盖 → 装依赖
+→ 重启 → 验收（healthz 四项 + echostr 回显 + 后台 200 + 静态资源逐个 200）→ 清理 → 失败自动回滚。
 
-生产目录瘦身（2026-11-05）：scripts/tests 不再常驻 /opt/imtask —— 远程验收时临时上传 tests 跑完删除。
+测试口径（2026-11-11）：tests/ 只在**本地与 CI**跑；部署前的测试闸门 = 本地全量 pytest。
+（历史版本曾把「远程 pytest」作为验收步骤【tests 临时上传跑完即删】，2026-11-11 起彻底移除 ——
+ 测试套件会对生产机做真实文件读写，风险与收益不匹配。）
 """
 from __future__ import annotations
 
@@ -241,19 +243,20 @@ def build_tarball() -> tuple[Path, int, list[str]]:
     return tar_path, len(names), names
 
 
-def build_tests_tarball() -> Path:
-    """把本地 tests 打成小包供远程验收用（跑完即删，不常驻生产目录）。"""
-    tar_path = Path(os.environ.get("TEMP", "/tmp")) / "imtask_tests.tar.gz"
-    if tar_path.exists():
-        tar_path.unlink()
-    with tarfile.open(tar_path, "w:gz") as tar:
-        for p in sorted((ROOT / "tests").rglob("*")):
-            if not p.is_file() or p.suffix in EXCLUDE_SUFFIX:
-                continue
-            if any(part in EXCLUDE_DIRS for part in p.parts):
-                continue
-            tar.add(p, arcname=str(p.relative_to(ROOT)).replace("\\", "/"))
-    return tar_path
+def assert_no_tests(names: list[str]) -> None:
+    """⛔ 2026-11-11 部署原则（用户拍板）：tests/ 与任何数据库文件坚决不进生产包。
+
+    INCLUDE 白名单本身就不含 tests，这里做**第二道硬断言**（防御纵深）：
+    任何 tests 路径、任何 .db/-wal/-shm 文件混进包内（未来有人改 INCLUDE 或打包逻辑
+    出错）都会在打包阶段直接中止，而不是等到生产机上发现。
+    """
+    bad_tests = [n for n in names if n == "tests" or n.startswith("tests/")
+                 or n.startswith("app/tests/") or "/tests/" in n]
+    if bad_tests:
+        raise SystemExit(f"✗ 打包混入测试文件（违反「tests 不上生产」原则）：{bad_tests[:5]}，中止")
+    bad_db = [n for n in names if n.endswith((".db", ".db-shm", ".db-wal"))]
+    if bad_db:
+        raise SystemExit(f"✗ 打包混入数据库文件：{bad_db[:5]}，中止")
 
 
 def assert_admin_assets(names: list[str]) -> None:
@@ -289,7 +292,6 @@ def main() -> int:
     ap.add_argument("--key", default=DEFAULT_KEY)
     ap.add_argument("--dry-run", action="store_true", help="只打包+连通+预检，不改服务器任何状态")
     ap.add_argument("--skip-deps", action="store_true")
-    ap.add_argument("--skip-tests", action="store_true", help="跳过临时上传 tests 的远程 pytest")
     ap.add_argument("--allow-drift", action="store_true",
                     help="允许工作区与版本库不一致（默认会中止，防止线上代码与 git 脱钩）")
     args = ap.parse_args()
@@ -301,8 +303,9 @@ def main() -> int:
     print("⓪ 版本库一致性检查（工作区 vs git）")
     check_repo_sync(args.allow_drift)
 
-    print("① 打包（app/requirements.txt/README.md，排除 data 与缓存；scripts/tests 不进生产）")
+    print("① 打包（app/requirements.txt/README.md，排除 data 与缓存；⛔ tests 与 .db 永不进包）")
     tar_path, count, names = build_tarball()
+    assert_no_tests(names)
     assert_admin_assets(names)
     kb = tar_path.stat().st_size / 1024
     print(f"    {count} 个文件，{kb:.0f} KB；admin_static 断言通过（index.html + assets/*.js 在包内）")
@@ -401,31 +404,11 @@ def main() -> int:
             print(f"    ✗ 静态资源不可用：{ref} → {out.strip()}"); ok = False
     if ok and asset_refs:
         print(f"    静态资源 {len(asset_refs)} 个全部 200")
-    if not args.skip_tests:
-        print("⑧ 远程 pytest（tests 临时上传，跑完即删，不常驻生产目录）")
-        tests_tar = build_tests_tarball()
-        if scp_upload(H, P, U, K, tests_tar, "/tmp/imtask_tests.tar.gz") != 0:
-            print("    ✗ tests 上传失败"); ok = False
-        else:
-            # 2026-11-09 修复验收误判（11-09 wb 部署事故实测）：旧写法 grep "failed" 有两个洞——
-            # ① 管道里 tail 恒返 0，ssh 退出码失去意义；② collection error 的文本是 "error(s)"
-            #   不是 "failed"，41 条收集失败照样打印"验收通过"。
-            # 现改用退出码哨兵：pytest 直跑取真实退出码，非 0 一律判失败（断言失败/收集错误/环境崩）。
-            code, _ = ssh_run(H, P, U, K,
-                              f"cd {REMOTE_DIR} && tar -xzf /tmp/imtask_tests.tar.gz && "
-                              ".venv/bin/python -m pytest -o addopts=\"\" -q; rc=$?; "
-                              "echo PYTEST_EXIT_CODE=$rc; exit 0",
-                              timeout=600, show=6)
-            ssh_run(H, P, U, K, f"rm -rf {REMOTE_DIR}/tests /tmp/imtask_tests.tar.gz", timeout=60, show=1)
-            m = re.search(r"PYTEST_EXIT_CODE=(\d+)", _)
-            pytest_rc = int(m.group(1)) if m else 1
-            if pytest_rc != 0:
-                print(f"    ✗ 远程 pytest 失败（退出码 {pytest_rc}，含断言失败/收集错误）"); ok = False
-            else:
-                passed = re.search(r"(\d+) passed", _)
-                print(f"    ✓ 远程 pytest 全绿（{passed.group(1) if passed else '?'} passed）")
+    # ⛔ 2026-11-11 用户拍板：远程 pytest 已从部署流程**彻底移除**。
+    #    测试只在本地/CI 跑（部署前本地全量 = 唯一测试闸门）；生产机不接受任何测试套件
+    #    —— 测试会真实读写文件/建库，对生产是纯数据风险。打包阶段另有 assert_no_tests 硬断言。
 
-    print("⑨ 清理生产目录：未被引用的历史构建产物 + 遗留 scripts")
+    print("⑧ 清理生产目录：未被引用的历史构建产物 + tests/scripts 残留")
     keep_cmd = (
         f"cd {REMOTE_DIR} && "
         "KEEP=$( (cat app/admin_static/index.html; cat app.bak-*/admin_static/index.html 2>/dev/null) "
@@ -434,7 +417,7 @@ def main() -> int:
         "[ -f \"$f\" ] || continue; b=$(basename \"$f\"); "
         "printf '%s\\n' \"$KEEP\" | grep -qx \"$b\" || { rm -f -- \"$f\"; removed=$((removed+1)); }; done; "
         "echo ASSETS_REMOVED=$removed; else echo ASSETS_KEEP_EMPTY_SKIP; fi; "
-        f"rm -rf {REMOTE_DIR}/scripts"
+        f"rm -rf {REMOTE_DIR}/scripts {REMOTE_DIR}/tests /tmp/imtask_tests.tar.gz 2>/dev/null; echo CLEAN_DONE"
     )
     ssh_run(H, P, U, K, keep_cmd, timeout=120, show=3)
 
@@ -445,7 +428,7 @@ def main() -> int:
     #   mtime 排序退化，历次部署一直在「删新留旧」（实测：mtime 排序删的是
     #   20261106-121628 最新备份；sort 删的是 20261029 最旧）。备份名含
     #   时间戳天然单调，业界（Capistrano keep last N）也一律按目录名排序。
-    print("⑩ 备份轮转（删除前先列清单留痕）")
+    print("⑨ 备份轮转（删除前先列清单留痕）")
     for label, pattern, keep in (("app", "app.bak-*", BACKUP_KEEP),
                                   (".env", ".env.bak-*", BACKUP_KEEP),
                                   ("DB", "data/im_task.db.bak-*", DB_BACKUP_KEEP)):
