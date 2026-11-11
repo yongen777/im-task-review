@@ -33,6 +33,10 @@ def _mask(text: str) -> str:
     return _PHONE_RE.sub(lambda m: m.group(0)[:3] + "****" + m.group(0)[7:], str(text or ""))
 
 
+# 2026-11-11 实测：官方 dept 接口 page_size 上限 32（传 100 返回 422006「page_size最大32」）
+DEPT_PAGE_SIZE = 32
+
+
 class ZdxlzContacts:
     """通讯录查询门面。所有方法失败一律返回 None/[]，不向业务层抛异常。"""
 
@@ -187,14 +191,14 @@ class ZdxlzContacts:
         德阳分公司截掉（2026-11-11 生产实测），必须循环拉全。
         """
         obj = self._call("/open/v2/dept/children",
-                         {"dept_id": str(dept_id or "").strip(), "page_num": 1, "page_size": 100})
+                         {"dept_id": str(dept_id or "").strip(), "page_num": 1, "page_size": DEPT_PAGE_SIZE})
         if not obj:
             return []
         total_pages = max(1, int(obj.get("total_pages") or 1))
         rows: List[Dict[str, Any]] = list(obj.get("departments") or [])
         for page in range(2, min(total_pages, 50) + 1):
             more = self._call("/open/v2/dept/children",
-                              {"dept_id": str(dept_id or "").strip(), "page_num": page, "page_size": 100})
+                              {"dept_id": str(dept_id or "").strip(), "page_num": page, "page_size": DEPT_PAGE_SIZE})
             if not more:
                 break
             rows.extend(more.get("departments") or [])
@@ -228,7 +232,7 @@ class ZdxlzContacts:
             })
         return out
 
-    def dept_users_all(self, dept_id: str, page_size: int = 100, max_pages: int = 50) -> List[Dict[str, Any]]:
+    def dept_users_all(self, dept_id: str, page_size: int = DEPT_PAGE_SIZE, max_pages: int = 50) -> List[Dict[str, Any]]:
         """某部门**直属**成员全量（自动翻页；失败/超页上限返回已取部分）。"""
         all_users: List[Dict[str, Any]] = []
         for page in range(1, max_pages + 1):
