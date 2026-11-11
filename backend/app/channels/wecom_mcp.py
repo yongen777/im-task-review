@@ -180,6 +180,15 @@ class WecomMcpContacts:
 
     def resolve_userid(self, phone: str, name: str, dept: str = "") -> Optional[str]:
         """名册（姓名+部门）→ 企微 userid。唯一命中才返回，其余一律 None。"""
+        info = self.resolve_user(phone, name, dept)
+        return str((info or {}).get("external_id") or "").strip() or None
+
+    def resolve_user(self, phone: str, name: str, dept: str = "") -> Optional[Dict[str, Any]]:
+        """名册（姓名+部门）→ {external_id, department, dept_path}。
+
+        2026-11-11 部门口径：MCP 返回 departments 全路径 → 末级部门进 department，
+        全路径（"/" 分隔）进 dept_path，供 member 回填与层级统计归集。
+        """
         del phone  # MCP 不支持手机号搜索（保留参数与双通道接口对齐）
         target = normalize_name(name)
         if not target:
@@ -188,13 +197,29 @@ class WecomMcpContacts:
         exact = [u for u in users if normalize_name(u.get("name")) == target]
         if not exact:
             return None
+        picked: Optional[Dict[str, Any]] = None
         if len(exact) == 1:
-            return str(exact[0].get("userid") or "").strip() or None
-        clean_dept = str(dept or "").strip()
-        if clean_dept:
-            hits = [u for u in exact if _dept_hit(u.get("departments") or [], clean_dept)]
-            if len(hits) == 1:
-                return str(hits[0].get("userid") or "").strip() or None
-        logger.warning("MCP 重名且部门消歧失败 name=%s dept=%s 候选=%d",
-                       target, clean_dept, len(exact))
-        return None
+            picked = exact[0]
+        else:
+            clean_dept = str(dept or "").strip()
+            if clean_dept:
+                hits = [u for u in exact if _dept_hit(u.get("departments") or [], clean_dept)]
+                if len(hits) == 1:
+                    picked = hits[0]
+        if picked is None:
+            logger.warning("MCP 重名且部门消歧失败 name=%s dept=%s 候选=%d",
+                           target, dept, len(exact))
+            return None
+        depts = picked.get("departments") or []
+        full = ""
+        for p in depts:
+            path = str(p or "").strip()
+            if path:
+                full = path.replace("|", "/")
+                break
+        leaf = normalize_dept(full.split("/")[-1]) if full else ""
+        return {
+            "external_id": str(picked.get("userid") or "").strip(),
+            "department": leaf,
+            "dept_path": full,
+        }

@@ -54,6 +54,14 @@ class WecomContacts:
 
     def resolve_userid(self, phone: str, name: str = "", dept: str = "") -> Optional[str]:
         """名册成员 → 企微 userid。查不到/无凭证/异常 → None，绝不抛异常。"""
+        return str((self.resolve_user(phone, name, dept) or {}).get("external_id") or "").strip() or None
+
+    def resolve_user(self, phone: str, name: str = "", dept: str = "") -> Optional[Dict[str, str]]:
+        """名册成员 → {external_id, department(末级), dept_path(全路径)}。
+
+        2026-11-11 部门口径：① getuserid 手机号精确反查（不带部门信息，路径留空）；
+        ② MCP 姓名匹配兜底（departments 全路径 → 末级 + 全路径）。
+        """
         clean_phone = str(phone or "").strip()
         if not clean_phone:
             return None
@@ -62,13 +70,13 @@ class WecomContacts:
             try:
                 uid = self.client.get_userid_by_mobile(clean_phone)
                 if uid:
-                    return str(uid).strip()
+                    return {"external_id": str(uid).strip(), "department": "", "dept_path": ""}
             except Exception as exc:  # noqa: BLE001
                 logger.warning("企微 userid 反查（getuserid）异常 phone=%s: %s",
                                _mask(clean_phone), _mask(str(exc))[:160])
         # ② MCP 姓名匹配（apikey 授权时兜底；查不到返回 None）
         if self.mcp is not None:
-            return self.mcp.resolve_userid(clean_phone, name, dept)
+            return self.mcp.resolve_user(clean_phone, name, dept)
         return None
 
     def resolve_userid_by_phone(self, phone: str) -> Optional[str]:
@@ -112,3 +120,22 @@ class WecomContacts:
         if not self.org_available():
             return []
         return self.client.department_users(str(dept_id or "").strip())
+
+    def dept_path(self, dept_id: str) -> str:
+        """部门完整路径（企微 department/list 全量 + parentid 上溯；段分隔 "/"）。"""
+        if not self.org_available():
+            return ""
+        all_depts = {d["dept_id"]: d for d in self.client.department_list()}
+        cur = all_depts.get(str(dept_id or "").strip())
+        if not cur:
+            return ""
+        segs = [cur["name"]]
+        parent = cur.get("parent_id") or "0"
+        for _ in range(20):
+            if parent == "0" or parent not in all_depts:
+                break
+            node = all_depts[parent]
+            segs.append(node["name"])
+            parent = node.get("parent_id") or "0"
+        segs.reverse()
+        return "/".join(segs)

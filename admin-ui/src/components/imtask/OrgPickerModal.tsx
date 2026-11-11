@@ -28,6 +28,7 @@ interface OrgUser {
   masked_phone: string;
   external_id: string;
   department: string;
+  dept_path: string;
   already_in_role: boolean;
 }
 
@@ -182,7 +183,13 @@ export const OrgPickerModal: React.FC<Props> = ({ open, roleId, roleName, platfo
     try {
       const res = await api.post<{ ok: boolean; added: number; activated: number; skipped: number; invalid?: { reason: string }[] }>(
         `/api/admin/roles/${encodeURIComponent(roleId)}/import-from-org`,
-        { selected_users: usersToImport.map((u) => ({ name: u.name, phone: u.phone, external_id: u.external_id, department: currentDeptId ? crumbs[crumbs.length - 1].name : (u.department || '') })) },
+        { selected_users: usersToImport.map((u) => ({
+            name: u.name,
+            phone: u.phone,
+            external_id: u.external_id,
+            department: u.department || (currentDeptId ? crumbs[crumbs.length - 1].name : ''),
+            dept_path: u.dept_path || '',
+          })) },
       );
       onImported({ added: res.added, activated: res.activated, skipped: res.skipped });
       onClose();

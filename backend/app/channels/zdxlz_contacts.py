@@ -88,6 +88,12 @@ class ZdxlzContacts:
             return None
         union_id = str(row.get("union_id") or "").strip()
         phone = str(row.get("phone") or "").strip()
+        # 2026-11-11 部门口径（用户拍板）：末级部门=展示用；dept_path=官方全路径（统计归集用，
+        # 「云中台」要把直属与下级部门成员都卷进来，靠路径段匹配实现）
+        depts = row.get("user_departments") if isinstance(row.get("user_departments"), list) else []
+        primary = depts[0] if depts and isinstance(depts[0], dict) else {}
+        full_path = str(primary.get("full_name") or "").strip()
+        last_name = str(primary.get("name") or "").strip()
         if not union_id and not phone:
             return None
         return {
@@ -95,7 +101,9 @@ class ZdxlzContacts:
             "phone": phone,
             "name": str(row.get("name") or "").strip(),
             "customer_id": str(row.get("customer_id") or "").strip(),
-            "departments": row.get("user_departments") or [],
+            "department": last_name,
+            "dept_path": full_path.replace("|", "/") if full_path else "",
+            "departments": depts,
         }
 
     # ── 对外 ────────────────────────────────────────────────────────
@@ -173,15 +181,30 @@ class ZdxlzContacts:
         }
 
     def department_children(self, dept_id: str) -> List[Dict[str, Any]]:
-        """子部门列表（条目自带 count=子树人数；失败/无子级返回空）。"""
-        obj = self._call("/open/v2/dept/children", {"dept_id": str(dept_id or "").strip()})
+        """子部门列表（自动翻页拉全量；条目自带 count=子树人数）。
+
+        ⚠️ 官方默认 page_size=20 —— 四川省分公司直属子部门 >20 个，不翻页会把
+        德阳分公司截掉（2026-11-11 生产实测），必须循环拉全。
+        """
+        obj = self._call("/open/v2/dept/children",
+                         {"dept_id": str(dept_id or "").strip(), "page_num": 1, "page_size": 100})
+        if not obj:
+            return []
+        total_pages = max(1, int(obj.get("total_pages") or 1))
+        rows: List[Dict[str, Any]] = list(obj.get("departments") or [])
+        for page in range(2, min(total_pages, 50) + 1):
+            more = self._call("/open/v2/dept/children",
+                              {"dept_id": str(dept_id or "").strip(), "page_num": page, "page_size": 100})
+            if not more:
+                break
+            rows.extend(more.get("departments") or [])
         out: List[Dict[str, Any]] = []
-        for row in (obj or {}).get("departments") or []:
-            dept_id_clean = str(row.get("dept_id") or "").strip()
-            if not dept_id_clean:
+        for row in rows:
+            did = str(row.get("dept_id") or "").strip()
+            if not did:
                 continue
             out.append({
-                "dept_id": dept_id_clean,
+                "dept_id": did,
                 "name": str(row.get("name") or "").strip(),
                 "user_count": int(row.get("count") or 0),
                 "index": int(row.get("index") or 0),

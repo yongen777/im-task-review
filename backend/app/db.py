@@ -246,6 +246,16 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: s
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 
+def _ensure_member_columns(conn: sqlite3.Connection) -> None:
+    """2026-11-11 用户拍板：member.dept_path —— 官方通讯录完整组织路径（层级统计归集）。
+
+    · dept 仍存**末级部门名**（激活列表展示口径不变）；
+    · dept_path 存官方全路径（段分隔 "/"，如 四川/德阳/市公司本部/云中台（…）/产数支撑中心）——
+      统计「云中台」时按路径段归一化匹配，直属（周艳）与下级部门（郑佳）都能卷进来。
+    """
+    _ensure_column(conn, "member", "dept_path", "TEXT")
+
+
 def _migrate_multi_admin(conn: sqlite3.Connection) -> None:
     """2026-11-04 多管理员分级：超级管理员（只读+账号管理）+ 分级管理员（数据按 owner_id 隔离）。
 
@@ -404,6 +414,8 @@ class Database:
             _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
             # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
             _migrate_role_platform(self.conn)
+            # 2026-11-11：member.dept_path（官方通讯录完整组织路径，层级统计归集）
+            _ensure_member_columns(self.conn)
             # 2026-11-04 多管理员分级（超级管理员 + 分级管理员，数据按 owner_id 隔离）
             _migrate_multi_admin(self.conn)
 

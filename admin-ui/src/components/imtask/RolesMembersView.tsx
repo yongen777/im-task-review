@@ -473,7 +473,7 @@ export const RolesMembersView: React.FC = () => {
       }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
         phone: newPhone.trim(),
         name: newName.trim(),
-        dept: newDept,
+        // 2026-11-11 用户拍板：部门不再手填——留空由后端官方通讯录反查回填官方部门
       });
       const addedName = newName.trim();
       const addedPhone = newPhone.trim();
@@ -1042,13 +1042,8 @@ export const RolesMembersView: React.FC = () => {
                       <ShieldCheck className="w-3.5 h-3.5" />
                       <span>全局搜索已激活成员</span>
                     </button>
-                    <button
-                      onClick={() => { setImportErrors([]); setImportModalOpen(true); }}
-                      className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-                    >
-                      <Upload className="w-3.5 h-3.5" />
-                      <span>CSV 批量导入</span>
-                    </button>
+                    {/* 2026-11-11 用户拍板：CSV 批量导入已下线（组织架构选择器/快速添加替代，
+                        部门由官方通讯录反查回填）；如需批量可改用「从组织架构添加 → 选全员」 */}
                     {/* 2026-11-11 任务二：组织架构选择器——按部门下钻直接选人，淘汰 CSV 来回导出 */}
                     <button
                       onClick={() => setOrgPickerOpen(true)}
@@ -1104,20 +1099,7 @@ export const RolesMembersView: React.FC = () => {
                     className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 font-mono text-xs text-slate-800 outline-none focus:border-blue-500 tabular-nums"
                   />
                 </div>
-                <div className="relative flex-1 min-w-[180px]">
-                  <Building2 className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                  <select
-                    value={newDept}
-                    onChange={(e) => setNewDept(e.target.value)}
-                    className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs text-slate-800 outline-none focus:border-blue-500 appearance-none cursor-pointer"
-                    title="部门可不选；选项由「部门管理」维护，也是 H5 登记页的下拉内容"
-                  >
-                    <option value="">部门（选填）</option>
-                    {departments.map((d) => (
-                      <option key={d.id} value={d.name}>{d.name}</option>
-                    ))}
-                  </select>
-                </div>
+                {/* 2026-11-11 用户拍板：部门不再手填——填入姓名+手机号后由官方通讯录反查回填官方部门 */}
                 <button
                   type="submit"
                   disabled={addingMember}

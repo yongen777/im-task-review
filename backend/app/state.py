@@ -1438,29 +1438,46 @@ class StateStore:
         ]
 
     def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
+        """2026-11-11 用户拍板：快速添加**只收姓名+手机号**，部门由官方通讯录反查回填
+        （末级部门进 dept 展示列、全路径进 dept_path 供层级统计归集）；
+        显式传 dept 的旧调用方仍兼容（dept_path 反查补全）。"""
         clean_role_id, clean_phone, clean_name = (role_id or "").strip(), (phone or "").strip(), (name or "").strip()
         clean_dept = str(dept).strip() if dept is not None and str(dept).strip() else None
+        clean_path: Optional[str] = None
         if not is_valid_phone(clean_phone):
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
         if not clean_name:
             raise BizError(400, "VALIDATION_FAILED", "姓名不能为空")
         now_s = self.now_str()
+        # 2026-11-11：官方通讯录反查官方部门（锁外做网络查询）——只在调用方没给部门时反查
+        _role_plat_pre = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+        _plat_key_pre = str((_role_plat_pre["platform"] if _role_plat_pre else "") or self.platform).lower()
+        if clean_dept is None and _plat_key_pre == "zdxlz":
+            zdxlz_c = getattr(self, "contacts", None)
+            if zdxlz_c is not None:
+                try:
+                    _u = zdxlz_c.search_by_phone(clean_phone)
+                except Exception:  # noqa: BLE001 - 反查失败不阻塞加人
+                    _u = None
+                if _u:
+                    clean_dept = str(_u.get("department") or "").strip() or None
+                    clean_path = str(_u.get("dept_path") or "").strip() or None
         with self.lock, self.conn:
             if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
                 raise BizError(404, "NOT_FOUND", "角色不存在")
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
-            cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, 1, ?, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, source, now_s, int(owner_id)))
+            cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, dept_path, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, clean_path, source, now_s, int(owner_id)))
             # 2026-11-04：这里原来跟随「当前通道」(self.platform)，导致在企微面板给密信角色
             # 加成员时取错通道 → 「激活状态」显示不对。改按**角色所属平台**判定（业务语义）。
             _role_plat = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
             _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
             _ext = self.external_id_for(clean_phone, _plat_key)
-            self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "source": source}, now_s)
+            self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "dept_path": clean_path, "source": source}, now_s)
             member = _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
 
         # 2026-11-10 方案A：单个加人也自动激活（zdxlz/企微均适用；查不到/未装配时静默跳过）
-        self._auto_activate_imported([(clean_phone, clean_name, clean_dept)], platform=_plat_key, actor=actor)
+        self._auto_activate_imported([(clean_phone, clean_name, clean_dept, clean_path)], platform=_plat_key, actor=actor)
         return member
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
@@ -1714,6 +1731,7 @@ class StateStore:
                             "VALUES (?, ?, ?, ?, 1, 'import', ?, ?)",
                             (clean_role_id, phone, name, dept, now_s, int(owner_id)),
                         )
+                        # 2026-11-11：CSV/导入路径的部门由反查回填 dept_path（_auto_activate_imported 负责）
                     will_add = len(insert_rows)
                     # 2026-11-09：把该号在**所有**管理员名下的行同步成这次的姓名/部门（全局池）
                     if sync_global_profile:
@@ -1753,25 +1771,32 @@ class StateStore:
                       "global_profile_updates": global_profile_updates}
             # 2026-11-10 方案A：本批真实写入的成员（事务提交后再做通讯录解析，不持锁跑网络）
             imported_members = (
-                [(str(row[1]).strip(), str(row[2]).strip(), row[3]) for row in to_insert]
+                [(str(row[1]).strip(), str(row[2]).strip(), row[3], None) for row in to_insert]
                 if (not dry_run and not blocked) else []
             )
 
         # ── 导入即激活：事务外把名册成员反查成平台 id 并写绑定（fail-open，不影响导入结果）──
-        result["auto_activation"] = self._auto_activate_imported(imported_members, platform=role_platform, actor=actor)
+        result["auto_activation"] = self._auto_activate_imported(
+            imported_members, platform=role_platform, actor=actor, role_id=clean_role_id)
         return result
 
-    def _auto_activate_imported(self, members: List[Tuple[str, str, Optional[str]]],
-                                platform: str = "zdxlz", actor: str = "system") -> Dict[str, Any]:
+    def _auto_activate_imported(self, members: List[Tuple[str, str, str, Optional[str]]],
+                                platform: str = "zdxlz", actor: str = "system",
+                                role_id: Optional[str] = None) -> Dict[str, Any]:
         """2026-11-10 方案A：导入即激活 —— 用官方通讯录把名册成员反查成平台 id 并落绑定。
 
-        入参 members：[(phone, name, dept), ...]（zdxlz 只用手机号；企微 MCP 需要 姓名+部门）。
+        入参 members：[(phone, name, dept, dept_path), ...]
+        （zdxlz 只用手机号；企微 MCP 需要 姓名+部门；dept_path 可空，反查成功会回填）。
 
         平台分发（两通道镜像对接，用户 2026-11-10 拍板）：
           · zdxlz → self.contacts.search_by_phone（官方响应 decryptV2 解密后取 union_id，
             external_type='union_id'，发送用 receive_type="union_id"）；
           · wecom  → self.wecom_contacts.resolve_userid（①自建应用 getuserid 手机号精确反查；
             ②MCP 通讯录按归一化姓名+部门匹配。external_type='user'，aibot 直接按 userid 投递）。
+
+        2026-11-11 部门口径（用户拍板）：反查成功后把**官方末级部门**回填 member.dept、
+        **官方全路径**回填 member.dept_path（层级统计归集：统计「云中台」要把直属与
+        下级部门成员都卷进来）。role_id 提供时才回填（member 行按角色隔离）。
 
         约定：
         · resolver 未装配（测试/降级环境）→ enabled=False，行为与旧版完全一致；
@@ -1785,56 +1810,72 @@ class StateStore:
             resolver = getattr(self, "contacts", None)
             ext_type = "union_id"
 
-            def _resolve_one(phone: str, name: str, dept: str) -> Optional[str]:
-                user = resolver.search_by_phone(phone)
-                return str((user or {}).get("union_id") or "").strip() or None
+            def _resolve_one(phone: str, name: str, dept: str, path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+                user = resolver.search_by_phone(phone) or {}
+                uid = str(user.get("union_id") or "").strip() or None
+                leaf = str(user.get("department") or "").strip() or None
+                full = str(user.get("dept_path") or "").strip() or None
+                return uid, leaf, full
         elif plat == "wecom":
             resolver = getattr(self, "wecom_contacts", None)
             ext_type = "user"
 
-            def _resolve_one(phone: str, name: str, dept: str) -> Optional[str]:
-                uid = resolver.resolve_userid(phone, name, dept)
-                return str(uid or "").strip() or None
+            def _resolve_one(phone: str, name: str, dept: str, path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+                info = resolver.resolve_user(phone, name, dept) or {}
+                uid = str(info.get("external_id") or "").strip() or None
+                leaf = str(info.get("department") or "").strip() or None
+                full = str(info.get("dept_path") or "").strip() or None
+                return uid, leaf, full
         else:
             return base
         if not members or resolver is None:
             return base
         base["enabled"] = True
 
-        unique: List[Tuple[str, str, str]] = []
+        unique: List[Tuple[str, str, str, Optional[str]]] = []
         seen: set = set()
-        for phone, name, dept in members:
+        for phone, name, dept, path in members:
             p = str(phone or "").strip()
             if not p or p in seen:
                 continue
             seen.add(p)
-            unique.append((p, str(name or "").strip(), str(dept or "").strip() if dept else ""))
+            unique.append((p, str(name or "").strip(), str(dept or "").strip() if dept else "",
+                           str(path or "").strip() if path else None))
 
-        to_resolve: List[Tuple[str, str, str]] = []
-        for p, name, dept in unique:
+        to_resolve: List[Tuple[str, str, str, Optional[str]]] = []
+        for item in unique:
+            p = item[0]
             existing = self.get_delivery_target(p, platform=plat)
             if existing and int(existing.get("usable") or 0) == 1:
                 base["skipped"] += 1
                 continue
-            to_resolve.append((p, name, dept))
+            to_resolve.append(item)
         if not to_resolve:
             return base
 
-        def _resolve(item: Tuple[str, str, str]):
-            phone, name, dept = item
-            return phone, _resolve_one(phone, name, dept)
+        def _resolve(item: Tuple[str, str, str, Optional[str]]):
+            phone, name, dept, path = item
+            uid, leaf, full = _resolve_one(phone, name, dept, path)
+            return phone, uid, leaf, full
 
         activated = failed = 0
         failed_phones: List[str] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             outcomes = list(pool.map(_resolve, to_resolve))
-        for phone, uid in outcomes:
+        for phone, uid, leaf, full in outcomes:
             if not uid:
                 failed += 1
                 failed_phones.append(phone)
                 continue
             try:
                 self.upsert_delivery_target(phone, uid, platform=plat, external_type=ext_type)
+                # 2026-11-11 部门口径：官方末级部门 + 全路径回填 member（层级统计归集）
+                if role_id and (leaf or full):
+                    with self.lock, self.conn:
+                        self.conn.execute(
+                            "UPDATE member SET dept = COALESCE(?, dept), dept_path = COALESCE(?, dept_path) "
+                            "WHERE role_id = ? AND phone = ?",
+                            (leaf, full, str(role_id), phone))
                 activated += 1
             except BizError:
                 failed += 1
@@ -1854,8 +1895,8 @@ class StateStore:
                                 actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
         """2026-11-11 任务二：组织架构选人入册 + 同步激活绑定（单事务）。
 
-        users: [{name, phone, external_id, department}]（external_id 来自官方组织树明细：
-        密信=union_id / 企微=userid）。
+        users: [{name, phone, external_id, department, dept_path}]（external_id 来自官方组织树明细：
+        密信=union_id / 企微=userid；department=官方末级部门名，dept_path=官方全路径〈层级统计归集〉）。
         · 整个写入在 `with self.lock, self.conn` 一个事务内：成员行 + delivery_target 同生同死；
         · 已在该角色的手机号跳过（skipped），不重复插入、不覆盖既有绑定；
         · 绑定沿用 upsert 语义：存量行保留 activated_at、usable 恢复为 1；
@@ -1881,6 +1922,7 @@ class StateStore:
                 phone = str(raw.get("phone") or "").strip()
                 name = str(raw.get("name") or "").strip()
                 dept = str(raw.get("department") or raw.get("dept") or "").strip() or None
+                dept_path = str(raw.get("dept_path") or "").strip() or None
                 ext_id = str(raw.get("external_id") or "").strip()
                 if not is_valid_phone(phone):
                     result["invalid"].append({"row": idx, "phone": phone, "reason": "手机号格式不正确"})
@@ -1901,9 +1943,9 @@ class StateStore:
                     self.conn.execute(
                         "INSERT OR IGNORE INTO dept_option(name, created_at) VALUES (?, ?)", (dept, now_s))
                 self.conn.execute(
-                    "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) "
-                    "VALUES (?, ?, ?, ?, 1, 'org', ?, ?)",
-                    (clean_role_id, phone, name, dept, now_s, int(owner_id)),
+                    "INSERT INTO member(role_id, phone, name, dept, dept_path, enabled, source, created_at, owner_id) "
+                    "VALUES (?, ?, ?, ?, ?, 1, 'org', ?, ?)",
+                    (clean_role_id, phone, name, dept, dept_path, now_s, int(owner_id)),
                 )
                 result["added"] += 1
                 if not ext_id:

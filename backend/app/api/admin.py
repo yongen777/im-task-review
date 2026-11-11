@@ -1762,9 +1762,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 return {"ok": True, "platform": plat, "configured": False, "items": [],
                         "message": "企微组织架构需要自建应用凭证（corpid+secret，通讯录权限）；当前未配置"}
             raw = wecom_c.org_department_users(dept)
+            dept_path = wecom_c.dept_path(dept)
             items = [{"name": u.get("name"), "title": u.get("title"),
                       "phone": u.get("phone"), "masked_phone": _mask_phone_value(u.get("phone")),
                       "external_id": u.get("external_id"), "department": label,
+                      "dept_path": dept_path,
                       "already_in_role": str(u.get("phone") or "").strip() in role_phones}
                      for u in raw]
             return {"ok": True, "platform": plat, "configured": True, "items": items, "total": len(items)}
@@ -1774,9 +1776,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return {"ok": True, "platform": plat, "configured": False, "items": [],
                     "message": "密信通讯录客户端未装配（检查通道凭证）"}
         raw = zdxlz_c.dept_users_all(dept)
+        # 2026-11-11 部门口径：dept_path = 官方完整组织路径（dept/get.full_name，段分隔统一 "/"）；
+        # 末级部门（department）用于展示，全路径用于层级统计归集（「云中台」要把直属+下级都卷进来）
+        dept_info = zdxlz_c.get_department(dept) or {}
+        dept_path = str(dept_info.get("full_name") or "").replace("|", "/").strip()
         items = [{"name": u.get("name"), "title": u.get("title"),
                   "phone": u.get("phone"), "masked_phone": _mask_phone_value(u.get("phone")),
                   "external_id": u.get("union_id"), "department": label,
+                  "dept_path": dept_path,
                   "already_in_role": str(u.get("phone") or "").strip() in role_phones}
                  for u in raw]
         items.sort(key=lambda x: str(x.get("name") or ""))
@@ -1800,24 +1807,29 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return error_response(403, "FORBIDDEN", f"当前账号未授权 {plat} 平台")
 
         dept_id = str(body.get("dept_id") or "").strip()
+        dept_name = str(body.get("dept_name") or "").strip()
         users: List[Dict[str, Any]] = []
         if dept_id:
             # 方式 B：整部门打包 —— 网络取人在事务外完成，写库在 state 单事务内
+            dept_path = ""
             if plat == "wecom":
                 wecom_c = getattr(state, "wecom_contacts", None)
                 if wecom_c is None or not wecom_c.org_available():
                     return error_response(400, "NOT_CONFIGURED",
                                           "企微组织架构需要自建应用凭证（corpid+secret）；当前未配置")
                 raw = wecom_c.org_department_users(dept_id)
+                dept_path = wecom_c.dept_path(dept_id)
             else:
                 zdxlz_c = getattr(state, "contacts", None)
                 if zdxlz_c is None:
                     return error_response(400, "NOT_CONFIGURED", "密信通讯录客户端未装配")
                 raw = zdxlz_c.dept_users_all(dept_id)
+                dept_path = str((zdxlz_c.get_department(dept_id) or {}).get("full_name") or "").replace("|", "/")
             for u in raw:
                 users.append({"name": u.get("name"), "phone": u.get("phone"),
                               "external_id": u.get("external_id") if "external_id" in (u or {}) else u.get("union_id"),
-                              "department": str(body.get("dept_name") or "").strip() or plat})
+                              "department": dept_name or plat,
+                              "dept_path": dept_path})
         else:
             selected = body.get("selected_users")
             if not isinstance(selected, list) or not selected:
