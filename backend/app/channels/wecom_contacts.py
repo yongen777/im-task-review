@@ -74,3 +74,41 @@ class WecomContacts:
     def resolve_userid_by_phone(self, phone: str) -> Optional[str]:
         """兼容旧签名（等价于不带姓名/部门的反查：只有 getuserid 路径生效）。"""
         return self.resolve_userid(phone, name="", dept="")
+
+    # ── 组织架构（2026-11-11 任务二：Org Picker 后端数据源）──────────────
+    def org_available(self) -> bool:
+        """组织树数据源是否可用（目前仅自建应用凭证形态；MCP 无部门树能力）。"""
+        return bool(self.corpid and self.secret)
+
+    def org_departments(self, parent_id: str = "") -> List[Dict[str, Any]]:
+        """指定父部门下的子部门列表（含 has_children 计算）。
+
+        parent_id 空 → 返回根部门。WeCom department/list 一次拉全量，本地过滤 parentid，
+        has_children 由「是否存在以其为 parentid 的条目」直接得出（零额外请求）。
+        """
+        if not self.org_available():
+            return []
+        all_depts = self.client.department_list()
+        if not all_depts:
+            return []
+        pid = str(parent_id or "0").strip() or "0"
+        if pid == "0":
+            # 企微树根约定 parentid=0；上层可能给根 dept_id，此处兼容
+            return [{"dept_id": d["dept_id"], "name": d["name"],
+                     "has_children": any(x["parent_id"] == d["dept_id"] for x in all_depts),
+                     "user_count": 0}
+                    for d in all_depts if d["parent_id"] == "0"]
+        children = [d for d in all_depts if d["parent_id"] == pid]
+        if not children:
+            return []
+        ids = {d["dept_id"] for d in all_depts}
+        return [{"dept_id": d["dept_id"], "name": d["name"],
+                 "has_children": d["dept_id"] in ids,
+                 "user_count": 0}
+                for d in children]
+
+    def org_department_users(self, dept_id: str) -> List[Dict[str, Any]]:
+        """部门**直属**成员明细（与量子密信 dept/users/list 同口径）。"""
+        if not self.org_available():
+            return []
+        return self.client.department_users(str(dept_id or "").strip())

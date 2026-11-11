@@ -6,7 +6,8 @@
 2. 导入成员 / 单个加成员时，自动查通讯录 phone→union_id 并写绑定
    （external_type='union_id'），zdxlz 平台专属；contacts 不可用时静默回退旧行为；
 3. 发送时按绑定的 external_type 传 receive_type（union_id 行不再依赖 IM userId/会话）；
-4. 回调事件带 union_id：未绑定用户发消息可按 union_id 反查通讯录自动绑定（路径 U）；
+4. **私聊零激活（2026-11-11 任务一收口）**：未绑定用户发消息 → 统一提醒「尚未录入业务权限」
+   + 零落库；唯一激活入口 = 管理端导入/选人；已绑定用户的补交/ack 不受影响；
 5. H5 登记保留为兜底；查得到通讯录时优先改写为 union_id 绑定。
 
 ⚠️ 全部用 FakeContacts / MockTransport，测试绝不发起真实网络请求。
@@ -286,76 +287,60 @@ def test_scheduler_sends_receive_type_union_id_and_user() -> None:
         store.close()
 
 
-# ── 4. 首条消息自动识别（路径 U）────────────────────────────────────
-def test_events_auto_bind_by_union_id() -> None:
-    """未绑定用户发消息：union_id 反查通讯录 → 名册比对 → 自动绑定（union_id 形态）。"""
+# ── 4. 私聊自激活已废除（2026-11-11 任务一：收归管理权）──────────────
+def test_events_unbound_gets_guide_and_zero_writes() -> None:
+    """未绑定用户（含带 union_id）发任意文本：统一提醒 + 零落库零绑定。"""
     store = _store()
     try:
         rid = store.create_role("A组", actor="t", platform="zdxlz")["role_id"]
         store.add_role_member(rid, P_A, NAME_A, actor="t")
-        fake = FakeContacts(union_to_user={"union_X": _user("union_X", P_A, NAME_A)})
         sent: list[tuple[str, str]] = []
 
         code, body = handle_inbound_text(
             state=store, user_id="im_user_X", msg_text="你好",
             send=lambda text, tag: sent.append((text, tag)),
             platform="zdxlz", base_url="http://e.com",
-            user_union_id="union_X", contacts=fake,
+            user_union_id="union_X",
         )
-        assert code == 200 and body.get("path") == "U" and body.get("bound") is True, body
-        row = store.get_delivery_target(P_A, platform="zdxlz")
-        assert row["external_id"] == "union_X" and row["external_type"] == "union_id", row
-        assert any("绑定成功" in t for t, _ in sent), sent
+        assert code == 200 and body.get("bound") is False, body
+        assert "尚未录入您的业务权限" in body["message"], body
+        assert "bind_url" not in body, "⛔ 不再发登记链接（激活唯一入口=管理端录入）"
+        assert any("尚未录入" in t and tag == "not_registered" for t, tag in sent), sent
+        # ⛔ 私聊零落库：不建绑定、不写名册、不落待归纳池
+        assert store.get_delivery_target(P_A, platform="zdxlz") is None
+        with store.lock:
+            pending = store.conn.execute("SELECT COUNT(*) FROM pending_member").fetchone()[0]
+        assert pending == 0
 
-        # 第二条消息：已绑定 → 走 ack（不再重复绑定）
-        sent.clear()
+        # 在册但未绑定的人发消息 → 同样拦截（激活只能来自管理端导入/选人）
         code2, body2 = handle_inbound_text(
+            state=store, user_id="im_user_X2", msg_text=f"{NAME_A} {P_A}",
+            send=lambda text, tag: sent.append((text, tag)),
+            platform="zdxlz", base_url="http://e.com",
+        )
+        assert code2 == 200 and body2.get("bound") is False, body2
+        assert "尚未录入您的业务权限" in body2["message"], body2
+        assert store.get_delivery_target(P_A, platform="zdxlz") is None, "⛔ 在册未绑定不得经私聊补绑"
+    finally:
+        store.close()
+
+
+def test_events_bound_user_still_gets_resubmit_and_ack() -> None:
+    """已绑定用户不受影响：union_id 绑定（管理端导入）消息可正常命中 → 补交/ack 照旧。"""
+    store = _store()
+    try:
+        rid = store.create_role("A组", actor="t", platform="zdxlz")["role_id"]
+        store.upsert_delivery_target(P_A, "union_X", platform="zdxlz", external_type="union_id")
+        store.add_role_member(rid, P_A, NAME_A, actor="t")
+        sent: list[tuple[str, str]] = []
+        code, body = handle_inbound_text(
             state=store, user_id="im_user_X", msg_text="再发一句",
             send=lambda text, tag: sent.append((text, tag)),
             platform="zdxlz", base_url="http://e.com",
-            user_union_id="union_X", contacts=fake,
+            user_union_id="union_X",
         )
-        assert code2 == 200 and body2.get("bound") is True and body2.get("path") != "U", body2
+        assert code == 200 and body.get("bound") is True, body
         assert any("消息已收到" in t for t, _ in sent), sent
-    finally:
-        store.close()
-
-
-def test_events_union_id_not_in_roster_falls_back_to_link() -> None:
-    """union_id 反查到的人不在名册 → 仍然只回登记链接（白名单语义不变）。"""
-    store = _store()
-    try:
-        rid = store.create_role("A组", actor="t", platform="zdxlz")["role_id"]
-        store.add_role_member(rid, P_A, NAME_A, actor="t")
-        fake = FakeContacts(union_to_user={"union_Y": _user("union_Y", P_C, "路人")})
-        sent: list[tuple[str, str]] = []
-        code, body = handle_inbound_text(
-            state=store, user_id="im_user_Y", msg_text="你好",
-            send=lambda text, tag: sent.append((text, tag)),
-            platform="zdxlz", base_url="http://e.com",
-            user_union_id="union_Y", contacts=fake,
-        )
-        assert code == 200 and body.get("bound") is False, body
-        assert body.get("bind_url", "").startswith("http://e.com/h5/bind"), body
-        assert store.get_delivery_target(P_C, platform="zdxlz") is None
-    finally:
-        store.close()
-
-
-def test_events_without_contacts_keeps_register_prompt() -> None:
-    """旧环境（无 contacts）：未绑定用户照旧回登记链接。"""
-    store = _store()
-    try:
-        rid = store.create_role("A组", actor="t", platform="zdxlz")["role_id"]
-        store.add_role_member(rid, P_A, NAME_A, actor="t")
-        sent: list[tuple[str, str]] = []
-        code, body = handle_inbound_text(
-            state=store, user_id="im_user_Z", msg_text="你好",
-            send=lambda text, tag: sent.append((text, tag)),
-            platform="zdxlz", base_url="http://e.com",
-            user_union_id="union_Z",
-        )
-        assert code == 200 and body.get("bound") is False and body.get("bind_url"), body
     finally:
         store.close()
 

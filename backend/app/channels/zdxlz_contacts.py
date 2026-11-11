@@ -149,6 +149,68 @@ class ZdxlzContacts:
         for row in obj.get("users") or []:
             picked = self._pick_user(row)
             if picked:
+                picked["title"] = str((row.get("extension") or {}).get("job_level") or "").strip()
                 users.append(picked)
         return {"total": int(obj.get("total") or 0), "total_pages": int(obj.get("total_pages") or 0),
                 "page_num": int(obj.get("page_num") or page_num), "users": users}
+
+    # ── 部门树（2026-11-11 任务二：后台组织架构选择器）───────────────────
+    # 实测定档（2026-11-11 探针）：
+    #   dept/get      {dept_id,parent_id,name,full_name,count(子树人数),index,hide_count}
+    #   dept/children {total,departments:[{dept_id,name,count(子树人数),index}]}（参数名 dept_id；0/空=400001）
+    #   dept/parents  {parents:[直接父 … 根]}（根的 parent_id="0"）
+    #   dept/users/list 只含**直属**成员（非子树）；count 才是子树总数
+    def get_department(self, dept_id: str) -> Optional[Dict[str, Any]]:
+        obj = self._call("/open/v2/dept/get", {"dept_id": str(dept_id or "").strip()})
+        if not obj or not str(obj.get("dept_id") or "").strip():
+            return None
+        return {
+            "dept_id": str(obj.get("dept_id") or "").strip(),
+            "parent_id": str(obj.get("parent_id") or "").strip(),
+            "name": str(obj.get("name") or "").strip(),
+            "full_name": str(obj.get("full_name") or "").strip(),
+            "user_count": int(obj.get("count") or 0),  # 官方口径：含全部下级的子树人数
+        }
+
+    def department_children(self, dept_id: str) -> List[Dict[str, Any]]:
+        """子部门列表（条目自带 count=子树人数；失败/无子级返回空）。"""
+        obj = self._call("/open/v2/dept/children", {"dept_id": str(dept_id or "").strip()})
+        out: List[Dict[str, Any]] = []
+        for row in (obj or {}).get("departments") or []:
+            dept_id_clean = str(row.get("dept_id") or "").strip()
+            if not dept_id_clean:
+                continue
+            out.append({
+                "dept_id": dept_id_clean,
+                "name": str(row.get("name") or "").strip(),
+                "user_count": int(row.get("count") or 0),
+                "index": int(row.get("index") or 0),
+            })
+        out.sort(key=lambda d: d["index"])
+        return out
+
+    def department_parents(self, dept_id: str) -> List[Dict[str, Any]]:
+        """祖先链（官方返回顺序：直接父 → … → 根；失败返回空）。"""
+        obj = self._call("/open/v2/dept/parents", {"dept_id": str(dept_id or "").strip()})
+        out: List[Dict[str, Any]] = []
+        for row in (obj or {}).get("parents") or []:
+            dept_id_clean = str(row.get("dept_id") or "").strip()
+            if not dept_id_clean:
+                continue
+            out.append({
+                "dept_id": dept_id_clean,
+                "parent_id": str(row.get("parent_id") or "").strip(),
+                "name": str(row.get("name") or "").strip(),
+                "full_name": str(row.get("full_name") or "").strip(),
+            })
+        return out
+
+    def dept_users_all(self, dept_id: str, page_size: int = 100, max_pages: int = 50) -> List[Dict[str, Any]]:
+        """某部门**直属**成员全量（自动翻页；失败/超页上限返回已取部分）。"""
+        all_users: List[Dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            batch = self.dept_users_list(dept_id, page_num=page, page_size=page_size)
+            all_users.extend(batch.get("users") or [])
+            if page >= max(1, int(batch.get("total_pages") or 1)):
+                break
+        return all_users

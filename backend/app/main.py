@@ -257,7 +257,6 @@ def create_apps(
             channel=chan,
             public_base_url=cfg.public_base_url,
             notifier=_channel_notifier(notifiers, "zdxlz", chan),
-            contacts=contacts,
         )
     )
     public_app.include_router(

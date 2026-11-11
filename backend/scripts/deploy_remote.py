@@ -42,9 +42,10 @@ DEFAULT_USER = os.environ.get("IMT_DEPLOY_USER", "root")
 DEFAULT_KEY = os.environ.get("IMT_DEPLOY_KEY", str(Path.home() / ".ssh" / "imtask_deploy_key"))
 REMOTE_DIR = os.environ.get("IMT_DEPLOY_DIR", "/opt/imtask")
 
-# 生产目录只放运行所需的 app/（含前端产物）+ 依赖清单 + 文档；
+# 生产目录只放运行所需的 app/（含前端产物）+ 依赖清单；
 # scripts（含部署脚本自身与含真实信息的工作区脚本）与 tests 不常驻生产（2026-11-05）。
-INCLUDE = ["app", "requirements.txt", "README.md"]
+# 2026-11-11 任务三：README.md 移出生产包（生产机不需要文档）。
+INCLUDE = ["app", "requirements.txt"]
 EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "data", "docs", "_legacy"}
 EXCLUDE_SUFFIX = {".pyc", ".pyo", ".log", ".db", ".db-shm", ".db-wal"}
 BACKUP_KEEP = 3

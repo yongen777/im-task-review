@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import csv
 import hmac
 import io
@@ -1658,6 +1659,185 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         res["global_reused_count"] = len(_reused_phones)
         res["global_reused_phones"] = _reused_phones
         return res
+
+    # ==================================================================
+    # 2026-11-11 任务二：组织架构选择器（Org Picker）
+    # 数据源：密信 dept/get|children|parents|users/list（官方信封解密，实测定档）；
+    #        企微 department/list + user/list（自建应用凭证；缺凭证时 configured=False）。
+    # ==================================================================
+    def _mask_phone_value(raw: Any) -> str:
+        """手机号脱敏预览（173****1297）：列表展示用；全量 phone 仍随响应下发供导入。"""
+        v = str(raw or "").strip()
+        return (v[:3] + "****" + v[7:]) if len(v) == 11 else v
+
+    def _org_platform(requested: Optional[str]) -> str:
+        return (requested or "zdxlz").strip().lower()
+
+    def _org_allowed_platform(admin: Dict[str, Any], plat: str) -> bool:
+        plats = admin.get("allowed_platforms") or []
+        return (not plats) or (plat in plats)
+
+    @router.get("/org/departments")
+    async def org_departments(request: Request, platform: Optional[str] = None,
+                              parent_id: Optional[str] = None):
+        """下钻子部门列表。parent_id 为空 → 返回根部门（密信走 IMT_ORG_ROOT_DEPT_ID）。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        plat = _org_platform(platform)
+        if plat not in ("zdxlz", "wecom"):
+            return error_response(400, "VALIDATION_FAILED", "platform 只能是 zdxlz 或 wecom")
+        if not _org_allowed_platform(_admin, plat):
+            return error_response(403, "FORBIDDEN", f"当前账号未授权 {plat} 平台")
+        parent = str(parent_id or "").strip()
+
+        if plat == "wecom":
+            wecom_c = getattr(state, "wecom_contacts", None)
+            if wecom_c is None or not wecom_c.org_available():
+                return {"ok": True, "platform": plat, "configured": False, "items": [],
+                        "message": "企微组织架构需要自建应用凭证（corpid+secret，通讯录权限）；当前未配置"}
+            return {"ok": True, "platform": plat, "configured": True, "items": wecom_c.org_departments(parent)}
+
+        zdxlz_c = getattr(state, "contacts", None)
+        if zdxlz_c is None:
+            return {"ok": True, "platform": plat, "configured": False, "items": [],
+                    "message": "密信通讯录客户端未装配（检查通道凭证）"}
+        if not parent:
+            root_id = os.environ.get("IMT_ORG_ROOT_DEPT_ID", "").strip()
+            if not root_id:
+                return {"ok": True, "platform": plat, "configured": True, "items": [],
+                        "message": "未配置根部门：请在 .env 增加 IMT_ORG_ROOT_DEPT_ID"
+                                   "（可从任意部门的 dept/parents 链末尾取根 id）"}
+            root = zdxlz_c.get_department(root_id)
+            if not root:
+                return {"ok": True, "platform": plat, "configured": True, "items": [],
+                        "message": "根部门查询失败，请核对 IMT_ORG_ROOT_DEPT_ID"}
+            return {"ok": True, "platform": plat, "configured": True,
+                    "items": [{"dept_id": root["dept_id"], "name": root["name"],
+                               "has_children": True, "user_count": root["user_count"]}]}
+        children = zdxlz_c.department_children(parent)
+        # has_children：子部门 ≤30 个时并行探一层；超过则返回 None（前端下钻时判定）
+        def _has_children(did: str) -> Optional[bool]:
+            try:
+                return bool(zdxlz_c.department_children(did))
+            except Exception:  # noqa: BLE001
+                return None
+        has_map: Dict[str, Optional[bool]] = {}
+        if children and len(children) <= 30:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                for d, flag in zip(children, pool.map(_has_children, [c["dept_id"] for c in children])):
+                    has_map[d["dept_id"]] = flag
+        items = [{"dept_id": c["dept_id"], "name": c["name"],
+                  "has_children": has_map.get(c["dept_id"]),
+                  "user_count": c["user_count"]} for c in children]
+        return {"ok": True, "platform": plat, "configured": True, "items": items}
+
+    @router.get("/org/department-users")
+    async def org_department_users(request: Request, platform: Optional[str] = None,
+                                   dept_id: Optional[str] = None,
+                                   role_id: Optional[str] = None,
+                                   dept_name: Optional[str] = None):
+        """部门直属成员明细（含 already_in_role 判定；手机号给全量供导入，前端展示脱敏）。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        plat = _org_platform(platform)
+        if plat not in ("zdxlz", "wecom"):
+            return error_response(400, "VALIDATION_FAILED", "platform 只能是 zdxlz 或 wecom")
+        if not _org_allowed_platform(_admin, plat):
+            return error_response(403, "FORBIDDEN", f"当前账号未授权 {plat} 平台")
+        dept = str(dept_id or "").strip()
+        if not dept:
+            return error_response(400, "VALIDATION_FAILED", "dept_id 必填")
+        role_phones = state.role_member_phones(role_id) if role_id else set()
+        label = str(dept_name or "").strip()
+
+        if plat == "wecom":
+            wecom_c = getattr(state, "wecom_contacts", None)
+            if wecom_c is None or not wecom_c.org_available():
+                return {"ok": True, "platform": plat, "configured": False, "items": [],
+                        "message": "企微组织架构需要自建应用凭证（corpid+secret，通讯录权限）；当前未配置"}
+            raw = wecom_c.org_department_users(dept)
+            items = [{"name": u.get("name"), "title": u.get("title"),
+                      "phone": u.get("phone"), "masked_phone": _mask_phone_value(u.get("phone")),
+                      "external_id": u.get("external_id"), "department": label,
+                      "already_in_role": str(u.get("phone") or "").strip() in role_phones}
+                     for u in raw]
+            return {"ok": True, "platform": plat, "configured": True, "items": items, "total": len(items)}
+
+        zdxlz_c = getattr(state, "contacts", None)
+        if zdxlz_c is None:
+            return {"ok": True, "platform": plat, "configured": False, "items": [],
+                    "message": "密信通讯录客户端未装配（检查通道凭证）"}
+        raw = zdxlz_c.dept_users_all(dept)
+        items = [{"name": u.get("name"), "title": u.get("title"),
+                  "phone": u.get("phone"), "masked_phone": _mask_phone_value(u.get("phone")),
+                  "external_id": u.get("union_id"), "department": label,
+                  "already_in_role": str(u.get("phone") or "").strip() in role_phones}
+                 for u in raw]
+        items.sort(key=lambda x: str(x.get("name") or ""))
+        return {"ok": True, "platform": plat, "configured": True, "items": items, "total": len(items)}
+
+    @router.post("/roles/{role_id}/import-from-org")
+    async def import_from_org(role_id: str, request: Request):
+        """方式 A（勾选人员）/ 方式 B（整部门打包）→ 成员入册 + 同步激活绑定（单事务）。"""
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        _admin = _admin_profile(state, sess)
+        role = state.get_role(role_id)
+        if not role:
+            return error_response(404, "NOT_FOUND", "角色不存在")
+        plat = str(role.get("platform") or "zdxlz").strip().lower()
+        if not _org_allowed_platform(_admin, plat):
+            return error_response(403, "FORBIDDEN", f"当前账号未授权 {plat} 平台")
+
+        dept_id = str(body.get("dept_id") or "").strip()
+        users: List[Dict[str, Any]] = []
+        if dept_id:
+            # 方式 B：整部门打包 —— 网络取人在事务外完成，写库在 state 单事务内
+            if plat == "wecom":
+                wecom_c = getattr(state, "wecom_contacts", None)
+                if wecom_c is None or not wecom_c.org_available():
+                    return error_response(400, "NOT_CONFIGURED",
+                                          "企微组织架构需要自建应用凭证（corpid+secret）；当前未配置")
+                raw = wecom_c.org_department_users(dept_id)
+            else:
+                zdxlz_c = getattr(state, "contacts", None)
+                if zdxlz_c is None:
+                    return error_response(400, "NOT_CONFIGURED", "密信通讯录客户端未装配")
+                raw = zdxlz_c.dept_users_all(dept_id)
+            for u in raw:
+                users.append({"name": u.get("name"), "phone": u.get("phone"),
+                              "external_id": u.get("external_id") if "external_id" in (u or {}) else u.get("union_id"),
+                              "department": str(body.get("dept_name") or "").strip() or plat})
+        else:
+            selected = body.get("selected_users")
+            if not isinstance(selected, list) or not selected:
+                return error_response(400, "VALIDATION_FAILED", "请选择成员或指定部门")
+            if len(selected) > 500:
+                return error_response(400, "VALIDATION_FAILED", "单次最多导入 500 人（超出请分批）")
+            users = selected  # type: ignore[assignment]
+            if not isinstance(users, list) or not all(isinstance(u, dict) for u in users):
+                return error_response(400, "VALIDATION_FAILED", "selected_users 必须是对象数组")
+
+        try:
+            res = state.import_members_from_org(
+                role_id=role_id,
+                users=users,  # type: ignore[arg-type]
+                actor=sess["username"],
+                owner_id=int(_admin.get("id") or 0),
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, **res}
 
     # ==================================================================
     # §9.4 任务实例、审核与附件查看接口

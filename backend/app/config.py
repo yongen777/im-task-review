@@ -126,6 +126,9 @@ class Config:
     # 2026-11-10 企微「导入即激活」：智能机器人 MCP 通讯录 apikey（后台-机器人-MCP 配置；
     # 关联机器人+授权用户个人信息，只进 env，不落日志）。缺省时 MCP 反查关闭。
     wecom_mcp_apikey: str = ""
+    # 2026-11-11 密信组织架构选择器：根部门 id（从任意部门 dept/parents 链末尾取；
+    # 当前组织实测 = 中国电信股份有限公司四川分公司）。未配置时 /org/departments 返回明确提示。
+    org_root_dept_id: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.public_port, int) or isinstance(self.public_port, bool):
@@ -227,6 +230,7 @@ class Config:
             wecom_bot_id=os.environ.get("IMT_WECOM_BOT_ID", "").strip(),
             wecom_bot_secret=os.environ.get("IMT_WECOM_BOT_SECRET", "").strip(),
             wecom_mcp_apikey=os.environ.get("IMT_WECOM_MCP_APIKEY", "").strip(),
+            org_root_dept_id=os.environ.get("IMT_ORG_ROOT_DEPT_ID", "").strip(),
         )
 
 

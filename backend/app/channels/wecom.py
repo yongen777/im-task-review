@@ -202,6 +202,78 @@ class WecomClient:
             json=body,
         )
 
+    # ── 通讯录组织架构（2026-11-11 任务二：Org Picker）────────────────
+    def department_list(self) -> List[Dict[str, Any]]:
+        """全量部门列表（官方 /cgi-bin/department/list；自建应用凭证）。
+
+        返回 [{dept_id(id), name, parent_id(parentid)}]；无凭证/无权限返回 []（不抛异常）。
+        ⚠️ 需要自建应用的通讯录读取权限；aibot 凭证调不了（2026-11-11 实测 40001）。
+        """
+        if not (self.corpid and self.secret):
+            return []
+        try:
+            data = self._request("GET", "/cgi-bin/department/list",
+                                 params={"access_token": self.get_token()})
+            errcode = int(data.get("errcode") or 0)
+            if errcode in _TOKEN_INVALID_CODES:
+                data = self._request("GET", "/cgi-bin/department/list",
+                                     params={"access_token": self.get_token(force=True)})
+                errcode = int(data.get("errcode") or 0)
+        except WecomError as exc:
+            logger.warning("department/list 失败 errcode=%s: %s", exc.errcode, exc.errmsg[:120])
+            return []
+        if errcode != 0:
+            logger.warning("department/list 失败: %s %s", errcode, str(data.get("errmsg") or "")[:120])
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in data.get("department") or []:
+            out.append({
+                "dept_id": str(row.get("id") or "").strip(),
+                "name": str(row.get("name") or "").strip(),
+                "parent_id": str(row.get("parentid") or "0").strip() or "0",
+            })
+        return out
+
+    def department_users(self, dept_id: str) -> List[Dict[str, Any]]:
+        """部门直属成员（官方 /cgi-bin/user/list；返回 [{userid,name,phone,title}]）。
+
+        ⚠️ user/list 拉全量字段（含 mobile），需要应用通讯录读取权限；
+        无权限时返回 []（fail-open，与 department_list 同口径）。
+        """
+        if not (self.corpid and self.secret):
+            return []
+        clean = str(dept_id or "").strip()
+        if not clean:
+            return []
+        try:
+            data = self._request("GET", "/cgi-bin/user/list",
+                                 params={"access_token": self.get_token(),
+                                         "department_id": clean, "fetch_child": 0})
+            errcode = int(data.get("errcode") or 0)
+            if errcode in _TOKEN_INVALID_CODES:
+                data = self._request("GET", "/cgi-bin/user/list",
+                                     params={"access_token": self.get_token(force=True),
+                                             "department_id": clean, "fetch_child": 0})
+                errcode = int(data.get("errcode") or 0)
+        except WecomError as exc:
+            logger.warning("user/list 失败 errcode=%s: %s", exc.errcode, exc.errmsg[:120])
+            return []
+        if errcode != 0:
+            logger.warning("user/list 失败 dept=%s: %s %s", clean, errcode, str(data.get("errmsg") or "")[:120])
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in data.get("userlist") or []:
+            userid = str(row.get("userid") or "").strip()
+            if not userid:
+                continue
+            out.append({
+                "external_id": userid,
+                "name": str(row.get("name") or "").strip(),
+                "phone": str(row.get("mobile") or "").strip(),
+                "title": str(row.get("position") or row.get("title") or "").strip(),
+            })
+        return out
+
     # ── 网页授权（P3 预留）─────────────────────────────────────────
     def get_userid_by_mobile(self, mobile: str) -> Optional[str]:
         """手机号反查成员 userid（官方文档 95402：POST /cgi-bin/user/getuserid）。

@@ -17,9 +17,11 @@ import {
   Search,
   Building2,
   RefreshCw,
+  Network,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { AdminScopeHeader } from './AdminScopeHeader';
+import { OrgPickerModal } from './OrgPickerModal';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 
@@ -243,6 +245,8 @@ export const RolesMembersView: React.FC = () => {
 
   // CSV 批量导入弹窗（手机号,姓名,部门）
   const [importModalOpen, setImportModalOpen] = useState(false);
+  // 2026-11-11 任务二：组织架构选择器弹窗
+  const [orgPickerOpen, setOrgPickerOpen] = useState(false);
   // 2026-11-09：导入被拦截时列出全部错误行（等用户修复后再导）
   const [importErrors, setImportErrors] = useState<Array<{ row: number; phone: string; reason: string }>>([]);
   const [csvText, setCsvText] = useState('13900000000,张三,市场部');
@@ -1044,6 +1048,15 @@ export const RolesMembersView: React.FC = () => {
                     >
                       <Upload className="w-3.5 h-3.5" />
                       <span>CSV 批量导入</span>
+                    </button>
+                    {/* 2026-11-11 任务二：组织架构选择器——按部门下钻直接选人，淘汰 CSV 来回导出 */}
+                    <button
+                      onClick={() => setOrgPickerOpen(true)}
+                      className="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                      title="从官方通讯录组织架构按部门/人员勾选拉入，入册即自动激活"
+                    >
+                      <Network className="w-3.5 h-3.5" />
+                      <span>从组织架构添加</span>
                     </button>
                   </>
                 )}
@@ -2244,6 +2257,25 @@ export const RolesMembersView: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {/* 2026-11-11 任务二：组织架构选择器弹窗（面包屑下钻 + 部门/人员勾选 + 入册即激活） */}
+      {orgPickerOpen && currentRole && (
+        <OrgPickerModal
+          open={orgPickerOpen}
+          roleId={currentRole.role_id}
+          roleName={currentRole.role_name}
+          platform={platform}
+          onClose={() => setOrgPickerOpen(false)}
+          onImported={(summary) => {
+            const extra = summary.skipped > 0 ? `，${summary.skipped} 人已在册跳过` : '';
+            toast.success(
+              `从组织架构加入 ${summary.added} 人，自动激活 ${summary.activated} 人${extra}。`,
+              '组织架构导入完成',
+            );
+            void loadMembers(currentRole.role_id);
+          }}
+        />
       )}
     </div>
   );

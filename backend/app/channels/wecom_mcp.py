@@ -84,6 +84,9 @@ class WecomMcpContacts:
     """智能机器人 MCP 通讯录门面。所有失败一律空结果/None，不向业务层抛异常。"""
 
     TOOL_NAME = "contact_users_search"
+    # 2026-11-11 实测：list 模式返回上限约 50 条（「张」在全公司命中远超 50，
+    # 返回被截断且无 total 字段可判全量）—— 做选择器时必须按关键词分批拉，不能假设列表完整。
+    LIST_MODE_TRUNCATION = 50
 
     def __init__(self, apikey: str, *, http_client: Optional[Any] = None,
                  timeout: float = 12.0, base_url: str = "https://qyapi.weixin.qq.com") -> None:

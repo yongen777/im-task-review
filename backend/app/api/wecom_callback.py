@@ -91,7 +91,7 @@ def handle_wecom_event(
     if msg_type == "text":
         content = str(fields.get("Content") or "")
         return handle_inbound_text(
-            state=state, user_id=userid, msg_text=content, event_phone="", send=_send,
+            state=state, user_id=userid, msg_text=content, send=_send,
             platform="wecom", base_url=public_base_url,
         )
 

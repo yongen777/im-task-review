@@ -323,6 +323,7 @@ class TestStage2B(unittest.TestCase):
             self.store.submit_h5_task(raw_token=tok3, fields={"summary": "超期了"})
 
     def test_app_events_three_paths_and_three_guardrails(self) -> None:
+        reset_bind_rate()  # 2026-11-11：本用例新增一次 H5 兜底绑定，先清绑定限流（5 次/分）防 429
         rid = self.store.create_role("全员角色", actor="admin")["role_id"]
         self.store.add_role_member(rid, "13800008001", "张A", "研发", actor="admin")
         # 2026-11-09：这条用例要测「未登记 → 走登记路径」，
@@ -347,22 +348,26 @@ class TestStage2B(unittest.TestCase):
 
         body_a, sig_a = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_zhang_a", "phone": "13800008001"})
         resp_a = self.pub_client.post("/api/app-events", content=body_a, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_a})
-        self.assertEqual((resp_a.status_code, resp_a.json()["path"]), (200, "A"))
-        self.assertEqual(self.store.get_delivery_target("13800008001")["external_id"], "uid_zhang_a")
+        # 2026-11-11 任务一：私聊零激活 —— 平台带 phone 的路径 A 也废除，统一提醒不落库
+        self.assertEqual(resp_a.status_code, 200)
+        self.assertIn("尚未录入您的业务权限", resp_a.json()["message"])
+        self.assertIsNone(self.store.get_delivery_target("13800008001"), "⛔ 私聊事件不得再建绑定")
 
-        # ⭐ 2026-11-03 新激活模型：后台先导入才能激活。
-        #   未绑定用户发任何文本（含手机号）→ 统一回登记链接，不解析手机号、不落待归纳池。
+        # ⭐ 2026-11-11 任务一：未绑定用户发任何文本（含手机号）→ 统一提醒，不解析、不落库、不发登记链接。
         body_stranger, sig_str = build_encrypted_event(self.cfg.encrypt_key, self.cfg.verify_token, ts, nonce, {"userId": "uid_stranger", "text": "13999999999"})
         resp_str = self.pub_client.post("/api/app-events", content=body_stranger, headers={"X-CTQ-Timestamp": ts, "X-CTQ-Nonce": nonce, "X-CTQ-Signature": sig_str})
         self.assertEqual(resp_str.status_code, 200)
-        self.assertIn("你还未完成信息登记", resp_str.json()["message"])
-        self.assertIn("/h5/bind#uid=uid_stranger&plat=zdxlz", resp_str.json()["bind_url"])
+        self.assertIn("尚未录入您的业务权限", resp_str.json()["message"])
+        self.assertNotIn("bind_url", resp_str.json(), "⛔ 不再发登记链接")
         with self.store.lock:
             pending_cnt = self.store.conn.execute("SELECT COUNT(*) FROM pending_member").fetchone()[0]
         self.assertEqual(pending_cnt, 0, "⛔ 不再有待归纳池")
         self.assertIsNone(self.store.get_delivery_target("13999999999"))
 
         self.assertEqual(self.pub_client.get("/h5/bind").status_code, 200)
+        # 2026-11-11：路径 A 已废除，改用 H5 兜底先把 13800008001 绑到 uid_zhang_a
+        resp_c_first = self.pub_client.post("/api/h5/bind", json={"phone": "13800008001", "external_id": "uid_zhang_a", "name": "张A", "dept": "研发"})
+        self.assertEqual(resp_c_first.status_code, 200)
         # 护栏：已绑定的手机号不能被别的账号覆盖（409）
         resp_c_dup = self.pub_client.post("/api/h5/bind", json={"phone": "13800008001", "external_id": "uid_attacker", "name": "攻", "dept": "研发"})
         self.assertEqual((resp_c_dup.status_code, resp_c_dup.json()["code"]), (409, "DUPLICATE"))
@@ -374,6 +379,9 @@ class TestStage2B(unittest.TestCase):
         self.assertEqual(self.store.get_delivery_target("13800008003")["external_id"], "uid_wang_c")
 
         # 姓名与后台不一致 → 拒绝（2026-11-03 新模型比对规则）
+        # 2026-11-11：本用例 H5 POST 已有 4 次（首绑/冒绑/王C/假名），再清一次限流计数
+        # （5 次/分上限会卡住后面的字段校验调用——这里测的是护栏不是限流器）
+        reset_bind_rate()
         resp_name_bad = self.pub_client.post("/api/h5/bind", json={"phone": "13800008002", "external_id": "uid_li_b", "name": "假李B", "dept": "产品"})
         self.assertEqual((resp_name_bad.status_code, resp_name_bad.json().get("code")), (400, "ROSTER_MISMATCH"))
         # 登记表单字段校验：缺部门 / 缺姓名直接 400
@@ -382,8 +390,10 @@ class TestStage2B(unittest.TestCase):
         resp_no_name = self.pub_client.post("/api/h5/bind", json={"phone": "13800008002", "external_id": "uid_li_b", "name": "", "dept": "产品"})
         self.assertEqual(resp_no_name.status_code, 400)
 
+        # 2026-11-11：路径 A 已废除；两次 H5 兜底绑定（张A + 王C）→ 两条 bind_c 审计
         audits = self.store.conn.execute("SELECT * FROM admin_audit WHERE action LIKE 'target.bind_%' ORDER BY id ASC").fetchall()
         self.assertEqual(len(audits), 2)
+        self.assertTrue(all(a["action"] == "target.bind_c" for a in audits))
 
     def test_rebind_same_phone_returns_already_same(self) -> None:
         """同一账号重复提交登记表单：返回「已登记」，不再抛 409（2026-11-03 改为 H5 登记表单）。"""

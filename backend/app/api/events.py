@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover
 
 from ..channels.zdxlz import SignatureVerificationError, ZdxlzChannel, is_event_timestamp_fresh
 from ..scheduler import NotifierProtocol
-from ..state import BizError, StateStore, is_valid_phone
+from ..state import StateStore
 
 logger = logging.getLogger(__name__)
 
@@ -115,24 +115,9 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _extract_event_phone(payload: Dict[str, Any]) -> str:
-    """提取平台随事件显式下发的手机号（路径 A 仅在平台下发手机号时生效；真实事件通常只有 loginId/userId/toUserId，绝不猜字段）。"""
-    for key in ("phone", "mobile"):
-        val = payload.get(key)
-        if isinstance(val, (str, int)) and is_valid_phone(str(val).strip()):
-            return str(val).strip()
-    for nested_key in ("sender", "user"):
-        nested = payload.get(nested_key)
-        if isinstance(nested, dict):
-            for key in ("phone", "mobile"):
-                val = nested.get(key)
-                if isinstance(val, (str, int)) and is_valid_phone(str(val).strip()):
-                    return str(val).strip()
-    return ""
-
-
 def _extract_message_text(payload: Dict[str, Any]) -> str:
-    """从回调事件 JSON 中提取发送方文本内容（未登记用户统一回登记链接；已绑定用户用于「申请补交」等指令）。"""
+    """从回调事件 JSON 中提取发送方文本内容（已绑定用户用于「申请补交」等指令）。
+    2026-11-11 任务一后，未绑定用户不再解析手机号/不再走任何绑定分支。"""
     candidates = [payload.get("text"), payload.get("content")]
     for nested_key in ("message", "msg", "data", "event"):
         nested = payload.get(nested_key)
@@ -170,44 +155,27 @@ def handle_inbound_text(
     state: StateStore,
     user_id: str,
     msg_text: str,
-    event_phone: str = "",
     send: Callable[[str, str], None],
     platform: str = "",
     user_name: str = "",
     base_url: str = "",
     user_union_id: str = "",
-    contacts: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
 
-    2026-10-30 企微自建应用接入时抽出：
+    2026-11-10 企微自建应用接入时抽出：
       · 量子密信：process_app_event 验签+解密后调用本函数；
       · 企业微信：/api/wecom/callback 解出 XML 明文后调用本函数。
-    ⛔ 业务规则（登记引导 / 待归纳 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
+    ⛔ 业务规则（登记引导 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
 
-    2026-11-03 用户口径：激活登记一律走 H5 表单（姓名/手机号/部门），
-    「对话里发姓名手机号」的文字激活路径彻底停用。
-
-    2026-11-10 方案A（路径 U）：事件带 union_id 且未绑定时，先按 union_id 反查官方通讯录
-    拿手机号 → 在册即自动绑定（external_type='union_id'）→ 之后所有推送不再依赖会话。
-    通讯录查不到 / 不在名册 → 回落 H5 登记链接（白名单语义不变）。
+    2026-11-11 任务一（用户拍板，收归管理权）：
+      · **废除私聊自激活**：未绑定用户发任意文本一律「不落库、不绑定、不反查」，
+        统一回复固定提醒「尚未录入业务权限，请联系管理员录入激活」；
+      · 唯一激活路径 = 管理后台导入/选入成员（组织架构选择器 / CSV 导入）时自动反查绑定；
+      · 历史「路径 A/C/U」（对话文字、H5 链接、union_id 自动识别）全部停用；
+      · 已绑定用户不受影响（申请补交 / ack 照旧）。
     """
 
-    # 路径 A（仅在平台下发手机号时生效；常规事件仅有 loginId/userId/toUserId 不会进入此分支）
-    if event_phone:
-        try:
-            res = state.bind_member_with_guardrails(phone=event_phone, external_id=user_id, path="A", platform=platform or None)
-            send(res["receipt"], f"bind_A_{event_phone}")
-            return 200, {
-                "ok": True, "path": "A", "bound": True, "already_same": res.get("already_same", False),
-                "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"], "message": res["receipt"],
-            }
-        except BizError as exc:
-            send(exc.message, f"bind_A_err_{event_phone}")
-            return exc.status_code, {"ok": False, "path": "A", "bound": False, "code": exc.code, "message": exc.message}
-
-    # 2026-11-10 方案A：绑定可能是 union_id（导入即激活/路径U）或 IM userId（历史/H5）两种形态，
-    # 两种都试（touch 命中即说明该人已绑定；查不到不落库不复活）。
     bound_member = (
         state.touch_delivery_target_by_external_id(user_union_id, platform=platform or None)
         if user_union_id else None
@@ -257,47 +225,15 @@ def handle_inbound_text(
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
 
-    # ── 2026-11-10 方案A 路径 U：事件带 union_id → 官方通讯录反查手机号 → 在册即自动绑定 ──
-    # 平台保证 union_id 是该用户在本单位的唯一键；手机号来自官方通讯录（非用户自报），
-    # 因此「在名册中」即视为身份核验通过（强度不低于 H5 自报+姓名比对）。
-    if user_union_id and contacts is not None:
-        try:
-            user_info = contacts.get_by_union_id(user_union_id)
-        except Exception as exc:  # noqa: BLE001 - 通讯录异常不阻塞登记引导
-            logger.warning("路径U 通讯录查询异常 union=%s: %s", user_union_id[:8], exc)
-            user_info = None
-        phone = str((user_info or {}).get("phone") or "").strip()
-        if phone and is_valid_phone(phone) and state.phone_in_roster(phone, platform=platform or None):
-            try:
-                res = state.bind_member_with_guardrails(
-                    phone=phone, external_id=user_union_id, path="U",
-                    platform=platform or None, external_type="union_id",
-                )
-                send(res["receipt"], f"bind_U_{user_union_id[:8]}")
-                return 200, {
-                    "ok": True, "path": "U", "bound": True,
-                    "masked_phone": res["masked_phone"], "phone_masked": res["masked_phone"],
-                    "message": res["receipt"],
-                }
-            except BizError as exc:
-                # 该手机号已以别的 id 绑定（历史 H5 行/并发）→ 不覆盖，按已绑定回执处理
-                if exc.code == "DUPLICATE":
-                    send("你的账号已绑定，请直接发送任务指令。", f"bind_U_dup_{user_union_id[:8]}")
-                    return 200, {"ok": True, "path": "U", "bound": True, "message": exc.message}
-                logger.warning("路径U 绑定失败 union=%s: %s", user_union_id[:8], exc)
-        # 通讯录查不到 / 不在名册 → 继续走下面的登记链接（白名单语义不变）
-
-    # ── 2026-11-03 新激活模型（组长口径）：后台先导入，用户才能激活 ──
-    # 未绑定用户发任何文本 → 统一回登记链接（填表时与后台名册比对，未导入会被拦）。
-    # ⛔ 不再写待归纳池；不存在"提交后等待分配"的中间状态。
-    bind_url = f"{base_url.rstrip('/')}/h5/bind#uid={user_id}" + (f"&plat={platform}" if platform else "")
-    prompt_text = (
+    # ── 2026-11-11 任务一（用户拍板）：私聊零落库，统一拦截引导 ──
+    # 未绑定用户 = 管理后台尚未录入/激活（member 无此人 → 绑定也不存在）。
+    # ⛔ 不解析手机号、不反查通讯录、不写任何表 —— 唯一激活路径是管理端录入。
+    plain_prompt = (
         "【OPS任务调度助手】\n"
-        "你还未完成信息登记。请点击下方链接填写【姓名、手机号、部门】，完成后即可接收任务提醒：\n"
-        f"{bind_url}"
+        "您好，当前系统尚未录入您的业务权限，请联系管理员在管理后台录入激活后使用。"
     )
-    send(prompt_text, "register_prompt")
-    return 200, {"ok": True, "bound": False, "bind_url": bind_url, "message": prompt_text}
+    send(plain_prompt, "not_registered")
+    return 200, {"ok": True, "bound": False, "message": plain_prompt}
 
 
 def process_app_event(
@@ -310,13 +246,11 @@ def process_app_event(
     signature: str,
     body_text: str,
     notifier: Optional[NotifierProtocol] = None,
-    contacts: Optional[Any] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """§3.2 & §7.3 核心处理逻辑，返回 (status_code, body_dict)：
     - 验签失败一律返回 401，绝不进入绑定逻辑；
-    - 路径 A（仅在平台下发手机号时生效）：平台真实事件仅有 loginId/userId/toUserId 不含手机号；
-    - 路径 C（主导路径）：未绑定用户回统一提示文本 + /h5/bind 登记链接（填写姓名/手机号/部门，
-      后台先导入才能通过比对）；已绑定用户支持「申请补交」指令与固定 ack。
+    - 2026-11-11 任务一：未绑定用户统一回「尚未录入业务权限」提醒，**零落库零绑定**；
+    - 已绑定用户支持「申请补交」指令与固定 ack。
     """
     base_url = public_base_url.rstrip("/")
     active_notifier: NotifierProtocol = notifier if notifier is not None else channel
@@ -398,24 +332,22 @@ def process_app_event(
             return 200, {"ok": True, "test": True, "message": "callback test acknowledged"}
         return 400, {"code": "VALIDATION_FAILED", "message": "事件缺失 userId"}
 
-    event_phone = _extract_event_phone(event_payload)
     msg_text = _extract_message_text(event_payload).strip()
-    # 2026-11-10 方案A：官方事件同时带 userId 与 union_id，两种形态都往业务层送
+    # 2026-11-10 方案A：官方事件同时带 userId 与 union_id（已绑定用户的 touch 命中要用 union_id）
     user_union_id = _extract_union_id(event_payload)
 
 
     # 业务分支统一走 handle_inbound_text（两通道共用，见函数注释）
     return handle_inbound_text(
-        state=state, user_id=user_id, msg_text=msg_text, event_phone=event_phone,
+        state=state, user_id=user_id, msg_text=msg_text,
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
         platform="zdxlz", user_name=user_name, base_url=base_url,
-        user_union_id=user_union_id, contacts=contacts,
+        user_union_id=user_union_id,
     )
 
 
 def create_events_router(
     state: StateStore, channel: ZdxlzChannel, public_base_url: str, notifier: Optional[NotifierProtocol] = None,
-    contacts: Optional[Any] = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -429,7 +361,7 @@ def create_events_router(
         status_code, content = process_app_event(
             state=state, channel=channel, public_base_url=public_base_url,
             timestamp=timestamp, nonce=nonce, signature=signature, body_text=body_text,
-            notifier=notifier, contacts=contacts,
+            notifier=notifier,
         )
         return JSONResponse(status_code=status_code, content=content)
 

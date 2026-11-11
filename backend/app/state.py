@@ -1850,6 +1850,92 @@ class StateStore:
         })
         return base
 
+    def import_members_from_org(self, role_id: str, users: List[Dict[str, Any]],
+                                actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
+        """2026-11-11 任务二：组织架构选人入册 + 同步激活绑定（单事务）。
+
+        users: [{name, phone, external_id, department}]（external_id 来自官方组织树明细：
+        密信=union_id / 企微=userid）。
+        · 整个写入在 `with self.lock, self.conn` 一个事务内：成员行 + delivery_target 同生同死；
+        · 已在该角色的手机号跳过（skipped），不重复插入、不覆盖既有绑定；
+        · 绑定沿用 upsert 语义：存量行保留 activated_at、usable 恢复为 1；
+        · external_id 缺失时仍入册但不绑定（activated 不计数），由后续导入/反查补。
+        """
+        clean_role_id = (role_id or "").strip()
+        now_s = self.now_str()
+        result: Dict[str, Any] = {"added": 0, "skipped": 0, "activated": 0, "invalid": []}
+        with self.lock, self.conn:
+            role_row = self.conn.execute(
+                "SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
+            if role_row is None:
+                raise BizError(404, "NOT_FOUND", "角色不存在")
+            plat = str(role_row["platform"] or "zdxlz").strip().lower() or "zdxlz"
+            ext_type = "union_id" if plat == "zdxlz" else "user"
+            existing = {r["phone"] for r in self.conn.execute(
+                "SELECT phone FROM member WHERE role_id = ?", (clean_role_id,)).fetchall()}
+            seen_batch: set = set()
+            for idx, raw in enumerate(users or [], start=1):
+                if not isinstance(raw, dict):
+                    result["invalid"].append({"row": idx, "phone": "", "reason": "行格式错误"})
+                    continue
+                phone = str(raw.get("phone") or "").strip()
+                name = str(raw.get("name") or "").strip()
+                dept = str(raw.get("department") or raw.get("dept") or "").strip() or None
+                ext_id = str(raw.get("external_id") or "").strip()
+                if not is_valid_phone(phone):
+                    result["invalid"].append({"row": idx, "phone": phone, "reason": "手机号格式不正确"})
+                    continue
+                if not name:
+                    result["invalid"].append({"row": idx, "phone": phone, "reason": "姓名不能为空"})
+                    continue
+                if dept and len(dept) > 30:
+                    result["invalid"].append({"row": idx, "phone": phone, "reason": "部门名称过长（最多 30 字）"})
+                    continue
+                if phone in existing or phone in seen_batch:
+                    result["skipped"] += 1
+                    continue
+                seen_batch.add(phone)
+                # 部门自动建档（与 CSV 导入同口径：名册里出现、部门选项里没有 → 一并建好）
+                if dept and not self.conn.execute(
+                        "SELECT 1 FROM dept_option WHERE name = ? LIMIT 1", (dept,)).fetchone():
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO dept_option(name, created_at) VALUES (?, ?)", (dept, now_s))
+                self.conn.execute(
+                    "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) "
+                    "VALUES (?, ?, ?, ?, 1, 'org', ?, ?)",
+                    (clean_role_id, phone, name, dept, now_s, int(owner_id)),
+                )
+                result["added"] += 1
+                if not ext_id:
+                    continue
+                # 绑定（upsert 语义；同一事务内直接写 SQL，避免嵌套事务破坏原子性）
+                old = self.conn.execute(
+                    "SELECT activated_at FROM delivery_target WHERE platform = ? AND phone = ?",
+                    (plat, phone)).fetchone()
+                if old:
+                    self.conn.execute(
+                        "UPDATE delivery_target SET external_id = ?, external_type = ?, usable = 1, last_event_at = ? "
+                        "WHERE platform = ? AND phone = ?",
+                        (ext_id, ext_type, now_s, plat, phone))
+                else:
+                    self.conn.execute(
+                        "INSERT INTO delivery_target(platform, phone, external_id, external_type, usable, activated_at, last_event_at) "
+                        "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                        (plat, phone, ext_id, ext_type, now_s, now_s))
+                result["activated"] += 1
+            self._insert_audit_unlocked(
+                actor, "member.org_import", "role", clean_role_id,
+                {"added": result["added"], "skipped": result["skipped"],
+                 "activated": result["activated"], "invalid": len(result["invalid"]), "platform": plat},
+                now_s)
+        return result
+
+    def role_member_phones(self, role_id: str) -> set:
+        """该角色下在册手机号集合（Org Picker 的「已在册」判定）。"""
+        with self.lock:
+            return {str(r["phone"]) for r in self.conn.execute(
+                "SELECT phone FROM member WHERE role_id = ?", ((role_id or "").strip(),)).fetchall()}
+
     def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
         # 2026-11-04 多管理员分级：模板归属（owner_id）随模板一起带出，调度建实例时继承

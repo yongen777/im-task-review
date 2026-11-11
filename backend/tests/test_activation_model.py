@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-"""2026-11-03 新激活模型回归（组长口径）：后台先导入，用户才能激活。
+"""2026-11-03 新激活模型回归（2026-11-11 任务一收口后）：
 
 规则：
-1. H5 登记比对「手机号+姓名」与本平台名册（部门必填但不拦截比对）；
+1. 私聊零激活：未绑定用户任何文本 → 统一提醒「尚未录入业务权限」，零落库
+   （2026-11-11 用户拍板：唯一激活路径 = 管理后台导入/选入成员自动反查绑定）；
+2. H5 登记保留为兜底：比对「手机号+姓名」与本平台名册（部门必填但不拦截比对）；
    · 未导入手机号 → 400 提示「管理员尚未在后台导入你的信息，请联系管理员」；
    · 在册但姓名不符 → 400 提示核对重填；
    · 一致 → 绑定成功（回执走绑定平台通道）。
-2. 未绑定用户发任何文本 → 只回登记链接；⛔ 不落任何池子。
 3. 从角色移除 → 彻底删除该平台绑定（不再有停用态、无待归纳回收），未完成实例照旧清除。
 """
 
@@ -178,7 +179,8 @@ def test_bind_receipt_goes_to_bound_platform() -> None:
 
 
 # ── 2. 未绑定用户任何文本 → 只回登记链接 ───────────────────────────
-def test_unbound_text_only_returns_register_link_no_pool() -> None:
+def test_unbound_text_gets_guide_and_no_activation() -> None:
+    """2026-11-11 任务一：未绑定用户任何文本 → 统一提醒「尚未录入业务权限」，零落库零激活。"""
     store = _store()
     try:
         sent: list[tuple] = []
@@ -188,8 +190,9 @@ def test_unbound_text_only_returns_register_link_no_pool() -> None:
                 platform="zdxlz", base_url="http://t.example.com",
             )
             assert code == 200 and body.get("bound") is False, (text, body)
-            assert "你还未完成信息登记" in body["message"], text
-        # ⛔ 不再有待归纳记录
+            assert "尚未录入您的业务权限" in body["message"], text
+            assert "bind_url" not in body, "⛔ 不再发登记链接"
+        # ⛔ 私聊零落库：不写绑定、不落待归纳池
         with store.lock:
             cnt = store.conn.execute("SELECT COUNT(*) FROM pending_member").fetchone()[0]
         assert cnt == 0
