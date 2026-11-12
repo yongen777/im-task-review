@@ -20,6 +20,18 @@ PBKDF2_ITERATIONS = 260_000
 SESSION_TTL_HOURS = 24 * 7
 H5_TOKEN_TTL_HOURS = 72
 
+# ── 2026-11-12 任务E1：截止与 Token 有效期口径（用户拍板） ──────────────
+# 无截止模板的实例截止时间哨兵：deadline_at 列 NOT NULL 不动，存该哨兵后
+# 所有「now > deadline_at」的字符串比较天然永不为真 → 永不过期；
+# 展示层（H5/后台/消息文案）统一特判显示「不限」。
+NO_DEADLINE_SENTINEL = "9999-12-31 23:59:59"
+# Token 有效期保守策略：有截止 = min(截止后 24h, 720h)；无截止 = 720h（30 天）。
+H5_TOKEN_TTL_CAP_HOURS = 720
+H5_TOKEN_TTL_GRACE_HOURS = 24
+# 有效期下限（小时）：截止已过等极端场景仍保证链接能打开看到「任务已过期」提示，
+# 而不是「链接无效」；提交侧另有窗口硬拦截，这里只管链接寿命。
+H5_TOKEN_TTL_FLOOR_HOURS = 1.0
+
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 FIELD_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -28,6 +40,11 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 VALID_TEMPLATE_KINDS = ("form", "image", "file", "notice")
 VALID_PERIODS = ("day", "week", "month")
 VALID_FIELD_TYPES = ("text", "number", "date", "select")
+# 任务E1：截止类型枚举（same_day=当天 / weekend=本周日 / month_end=本月最后一天）
+VALID_DEADLINE_TYPES = ("same_day", "weekend", "month_end")
+# 2026-11-12 下午：部门名长度上限放开到 200（官方通讯录部门名常超 30 字；
+# 原 30 字上限会让「树节点加入部门选项 / 成员部门下拉」无法创建与回填）。
+MAX_DEPT_NAME_LEN = 200
 
 
 class BizError(Exception):
@@ -55,11 +72,75 @@ def is_valid_hhmm(value: str) -> bool:
 
 
 def calc_resubmit_deadline(deadline_at: str, reviewed_at: Optional[str]) -> str:
-    """R27：驳回重交窗口 = max(原截止 + 72h, 驳回时刻 + 24h)。"""
+    """R27：驳回重交窗口 = max(原截止 + 72h, 驳回时刻 + 24h)。
+
+    2026-11-12 任务E1：无截止（哨兵）模板的实例被驳回时没有「截止」概念，
+    重交窗口同样取哨兵（长期有效），避免 9999 年 +72h 溢出。
+    """
+    if is_no_deadline(deadline_at):
+        return NO_DEADLINE_SENTINEL
     orig_end = parse_dt(deadline_at) + timedelta(hours=72)
     if not reviewed_at:
         return format_dt(orig_end)
     return format_dt(max(orig_end, parse_dt(reviewed_at) + timedelta(hours=24)))
+
+
+def effective_instance_deadline(instance: Dict[str, Any]) -> str:
+    """该实例对用户「还能不能交」真正生效的截止时刻。
+
+    · rejected（驳回重交）：重交截止 = max(原截止 + 72h, 驳回 + 24h)；
+    · 其余：实例自身的 deadline_at（无截止模板 = 哨兵，永不过期）。
+    """
+    deadline_at = str(instance.get("deadline_at") or "")
+    if str(instance.get("status") or "") == "rejected":
+        return calc_resubmit_deadline(deadline_at, instance.get("reviewed_at"))
+    return deadline_at
+
+
+def is_no_deadline(deadline_at: Optional[str]) -> bool:
+    """是否是「无截止」哨兵（9999-12-31 23:59:59）。"""
+    return str(deadline_at or "").strip() >= NO_DEADLINE_SENTINEL
+
+
+def submission_expired_message(instance: Dict[str, Any]) -> str:
+    """2026-11-12 任务E2/E3：到点后的统一提示（用户拍板，不区分链接过期与任务截止）。
+
+    例：当前任务已过期（截止时间：2026-11-12 18:00:00），无法提交
+    """
+    deadline_at = effective_instance_deadline(instance)
+    if is_no_deadline(deadline_at):
+        deadline_at = "不限"
+    return f"当前任务已过期（截止时间：{deadline_at}），无法提交"
+
+
+def calc_h5_token_ttl_hours(instance: Optional[Dict[str, Any]], now_dt: Optional[datetime] = None) -> float:
+    """2026-11-12 任务E1：H5 Token 动态有效期（小时）。
+
+    用户拍板口径（保守策略）：
+      · 无截止时间（哨兵）→ 720h（30 天）；
+      · 有截止时间 → min(截止 + 24h, 720h)；
+      · 驳回重交 → 以「重交截止」为基准同样 + 24h 再封顶（保证重交链接覆盖整个
+        rejected 重交窗口，否则早期驳回的实例链接会在窗口关闭前先失效）。
+    从「签发时刻」起算；已过期场景保底 1h，让用户能打开页面看到过期提示。
+    """
+    if not instance:
+        return float(H5_TOKEN_TTL_HOURS)
+    now_dt = now_dt or default_now()
+    deadline_at = effective_instance_deadline(instance)
+    if is_no_deadline(deadline_at):
+        return float(H5_TOKEN_TTL_CAP_HOURS)
+    try:
+        end_dt = parse_dt(deadline_at) + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)
+    except Exception:
+        return float(H5_TOKEN_TTL_HOURS)
+    # parse_dt 返回带 Asia/Shanghai 时区的 datetime；测试注入的 now 可能是 naive，统一对齐
+    ref_dt = now_dt
+    if end_dt.tzinfo is not None and ref_dt.tzinfo is None:
+        ref_dt = ref_dt.replace(tzinfo=end_dt.tzinfo)
+    elif end_dt.tzinfo is None and ref_dt.tzinfo is not None:
+        end_dt = end_dt.replace(tzinfo=ref_dt.tzinfo)
+    hours = (end_dt - ref_dt).total_seconds() / 3600.0
+    return float(min(max(hours, H5_TOKEN_TTL_FLOOR_HOURS), H5_TOKEN_TTL_CAP_HOURS))
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -1379,23 +1460,56 @@ class StateStore:
             self._insert_audit_unlocked(actor, "role.update", "role", clean_id, {"name": clean_name, "note": clean_note}, now_s)
             return {"role_id": clean_id, "name": clean_name, "note": clean_note, "platform": existing["platform"], "created_at": existing["created_at"], "member_count": cnt}
 
-    def delete_role(self, role_id: str, actor: str = "system") -> None:
+    def delete_role(self, role_id: str, actor: str = "system") -> Dict[str, Any]:
+        """2026-11-12 下午（用户拍板）：删除角色分组 = **组内全部成员一并清除**。
+
+        旧实现在「组里还有成员」时 409 拦截，用户必须逐个删成员才能删组——不符合
+        「删分组即清全组」的预期（且清库迁移前这轮就是要整组清掉）。
+        新口径：
+        · 组内每个成员按 `delete_role_member` 同款语义处理：名册行物理删除、
+          绑定条件删（该平台已无其它角色归属才删）、该模板实例按 C 口径处置、逐条审计；
+        · ⛔ 若该角色仍被**任务模板引用** → 仍然 409 拦下（提示先删模板），
+          避免删组连带毁掉别的角色的模板/实例（模板删除走独立的物理清除口径）。
+        · 返回删除明细（成员数、绑定数、实例数），前端可提示「需重新导入」。
+        """
         clean_id, now_s = (role_id or "").strip(), self.now_str()
         with self.lock, self.conn:
             existing = self.conn.execute("SELECT * FROM role WHERE role_id = ?", (clean_id,)).fetchone()
             if not existing:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
-            if int(self.conn.execute("SELECT COUNT(1) AS cnt FROM member WHERE role_id = ?", (clean_id,)).fetchone()["cnt"] or 0) > 0:
-                raise BizError(409, "ROLE_IN_USE", "该角色下仍有成员，无法删除")
             for trow in self.conn.execute("SELECT role_ids FROM task_template WHERE deleted = 0").fetchall():
                 try:
                     rids = json.loads(trow["role_ids"] or "[]")
                 except Exception:
                     rids = []
                 if clean_id in rids:
-                    raise BizError(409, "ROLE_IN_USE", "该角色已被任务模板引用，无法删除")
+                    raise BizError(409, "ROLE_IN_USE", "该角色已被任务模板引用，请先删除相关任务模板")
+            phones = [str(r[0]) for r in self.conn.execute(
+                "SELECT phone FROM member WHERE role_id = ? ORDER BY id ASC", (clean_id,)).fetchall()]
+            deleted_members = 0
+            removed_bindings: List[str] = []
+            cancelled_instances = 0
+            removed_instances = 0
+            for ph in phones:
+                res = self._delete_role_member_unlocked(clean_id, ph, actor, now_s, write_audit=False)
+                deleted_members += 1
+                removed_bindings.extend(res.get("removed_bindings") or [])
+                cancelled_instances += int(res.get("cancelled_instances") or 0)
+                removed_instances += int(res.get("removed_instances") or 0)
             self.conn.execute("DELETE FROM role WHERE role_id = ?", (clean_id,))
-            self._insert_audit_unlocked(actor, "role.delete", "role", clean_id, {"name": existing["name"]}, now_s)
+            self._insert_audit_unlocked(
+                actor, "role.purge", "role", clean_id,
+                {"name": existing["name"], "deleted_members": deleted_members,
+                 "bindings_removed": removed_bindings,
+                 "cancelled_instances": cancelled_instances,
+                 "removed_instances": removed_instances}, now_s,
+            )
+        return {
+            "ok": True, "name": existing["name"], "deleted_members": deleted_members,
+            "bindings_removed": removed_bindings,
+            "cancelled_instances": cancelled_instances,
+            "removed_instances": removed_instances,
+        }
 
     def list_role_members(self, role_id: str, q: Optional[str] = None, page: int = 1, size: int = 20, platform: Optional[str] = None) -> Dict[str, Any]:
         clean_role_id = (role_id or "").strip()
@@ -1514,96 +1628,149 @@ class StateStore:
             return _fmt_member(int(row["id"]), clean_role_id, clean_phone, new_name, new_dept, new_enabled, row["source"], row["created_at"], _ext)
 
     def delete_role_member(self, role_id: str, phone: str, actor: str = "system") -> None:
+        """从分组移除单个成员（公开入口：自带事务与审计；核心逻辑在 _delete_role_member_unlocked，
+        delete_role 级联删除与批量删除复用同一份逻辑，保证口径完全一致）。"""
         clean_role_id, clean_phone, now_s = (role_id or "").strip(), (phone or "").strip(), self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone()
-            if not row:
-                raise BizError(404, "NOT_FOUND", "成员不存在")
-            self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
-            # 2026-11-03 新激活模型（用户拍板：移除=彻底删除）：按「绑定所在平台」逐条判断，
-            # 该平台已无任何角色归属时，**彻底删除**该平台的绑定记录（不再有停用态、也不回待归纳池），
-            # 用户需重新给机器人发消息、走 H5 登记重新激活（比对新版后台名册）。
-            # 人在企微角色里、只是退出密信角色时：只删密信绑定，企微绑定不动。
-            removed_bindings: List[str] = []
-            for dt in self.conn.execute(
-                "SELECT platform, external_id FROM delivery_target WHERE phone = ? AND usable = 1",
-                (clean_phone,),
-            ).fetchall():
-                plat = str(dt["platform"] or "").strip().lower()
-                still_in_plat_role = self.conn.execute(
-                    "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
-                    "WHERE m.phone = ? AND r.platform = ? LIMIT 1",
-                    (clean_phone, plat),
-                ).fetchone() is not None
-                if still_in_plat_role:
-                    continue
-                ext_id = str(dt["external_id"] or "").strip()
-                if not ext_id:
-                    continue
+            self._delete_role_member_unlocked(clean_role_id, clean_phone, actor, now_s)
+
+    def _delete_role_member_unlocked(
+        self, clean_role_id: str, clean_phone: str, actor: str, now_s: str, *, write_audit: bool = True
+    ) -> Dict[str, Any]:
+        """⚠️ 调用方必须已握 self.lock 且处于 self.conn 事务内。
+
+        移除成员的完整语义（2026-11-03 / 11-09 / 11-12 任务C 口径的合并实现）：
+        名册行删除 → 绑定条件删（该平台无其它角色归属才删）→ 该模板实例处置
+        （未完成转 cancelled 留痕、已完成物理删除）。write_audit=False 供级联删除
+        汇总记一条审计（role.purge / member.batch_delete）而不是逐人一条。
+        """
+        row = self.conn.execute("SELECT * FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone()
+        if not row:
+            raise BizError(404, "NOT_FOUND", "成员不存在")
+        self.conn.execute("DELETE FROM member WHERE id = ?", (int(row["id"]),))
+        # 2026-11-03 新激活模型（用户拍板：移除=彻底删除）：按「绑定所在平台」逐条判断，
+        # 该平台已无任何角色归属时，**彻底删除**该平台的绑定记录（不再有停用态、也不回待归纳池），
+        # 用户需重新给机器人发消息、走 H5 登记重新激活（比对新版后台名册）。
+        # 人在企微角色里、只是退出密信角色时：只删密信绑定，企微绑定不动。
+        removed_bindings: List[str] = []
+        for dt in self.conn.execute(
+            "SELECT platform, external_id FROM delivery_target WHERE phone = ? AND usable = 1",
+            (clean_phone,),
+        ).fetchall():
+            plat = str(dt["platform"] or "").strip().lower()
+            still_in_plat_role = self.conn.execute(
+                "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                "WHERE m.phone = ? AND r.platform = ? LIMIT 1",
+                (clean_phone, plat),
+            ).fetchone() is not None
+            if still_in_plat_role:
+                continue
+            ext_id = str(dt["external_id"] or "").strip()
+            if not ext_id:
+                continue
+            self.conn.execute(
+                "DELETE FROM delivery_target WHERE platform = ? AND external_id = ?",
+                (plat, ext_id),
+            )
+            removed_bindings.append(f"{plat}:{ext_id[-6:]}")
+
+        # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的任务实例一并清掉，
+        # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
+        # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留。
+        #
+        # 2026-11-09 用户口径（修正）：**移除要删干净**。
+        # 此前只删 status IN ('pending','submitted','overdue','rejected')，
+        # 已 sent/approved/expired 的实例保留 —— 结果「人已从项目经理组移出，
+        # 但模板下仍有她的 sent 实例」，用户看到的即是这个不一致。
+        #
+        # 2026-11-12 任务C（图二实锤口径修正）：**未完成的实例不再物理删除，
+        # 改标 cancelled（已取消）** —— 后台任务实例页可见「已取消」徽章（留痕可审计），
+        # cancelled 不再触发提醒/逾期通知/流转。已完成/已归档实例保持 11-09「移除删干净」口径。
+        cancelled_instance_ids: List[int] = []
+        removed_instance_ids: List[int] = []
+        open_rows = self.conn.execute(
+            "SELECT id, template_id, status FROM task_instance WHERE phone = ?",
+            (clean_phone,),
+        ).fetchall()
+        for inst in open_rows:
+            trow = self.conn.execute(
+                "SELECT role_ids FROM task_template WHERE template_id = ?", (inst["template_id"],)
+            ).fetchone()
+            try:
+                tpl_roles = [str(x) for x in json.loads((trow["role_ids"] if trow else "") or "[]") if str(x).strip()]
+            except Exception:
+                tpl_roles = []
+            if not tpl_roles:
+                continue
+            placeholders = ",".join("?" for _ in tpl_roles)
+            still_member = self.conn.execute(
+                f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) LIMIT 1",
+                (clean_phone, *tpl_roles),
+            ).fetchone() is not None
+            if still_member:
+                continue
+            inst_status = str(inst["status"] or "")
+            if inst_status in ("pending", "overdue", "rejected"):
+                # 未完成 → 作废留痕（不再发提醒，H5 旧链接提交被拦）
                 self.conn.execute(
-                    "DELETE FROM delivery_target WHERE platform = ? AND external_id = ?",
-                    (plat, ext_id),
+                    "UPDATE task_instance SET status = 'cancelled' WHERE id = ?",
+                    (int(inst["id"]),),
                 )
-                removed_bindings.append(f"{plat}:{ext_id[-6:]}")
+                cancelled_instance_ids.append(int(inst["id"]))
+            else:
+                # 完成/归档 → 保持 11-09「移除删干净」
+                self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
+                self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
+                removed_instance_ids.append(int(inst["id"]))
 
-            # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的任务实例一并清掉，
-            # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
-            # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留。
-            #
-            # 2026-11-09 用户口径（修正）：**移除要删干净**。
-            # 此前只删 status IN ('pending','submitted','overdue','rejected')，
-            # 已 sent/approved/expired 的实例保留 —— 结果「人已从项目经理组移出，
-            # 但模板下仍有她的 sent 实例」，用户看到的即是这个不一致。
-            #
-            # 2026-11-12 任务C（图二实锤口径修正）：**未完成的实例不再物理删除，
-            # 改标 cancelled（已取消）** —— 后台任务实例页可见「已取消」徽章（留痕可审计，
-            # 用户图二看到的就是「移出后实例还挂着待上传」）；cancelled 不再触发提醒/逾期通知/
-            # 流转（scheduler 只发 pending、overdue 通知只扫 overdue、advance 只动三种状态）。
-            # 已完成/已归档实例（submitted/sent/approved/expired）保持 11-09「移除删干净」口径。
-            cancelled_instance_ids: List[int] = []
-            removed_instance_ids: List[int] = []
-            open_rows = self.conn.execute(
-                "SELECT id, template_id, status FROM task_instance WHERE phone = ?",
-                (clean_phone,),
-            ).fetchall()
-            for inst in open_rows:
-                trow = self.conn.execute(
-                    "SELECT role_ids FROM task_template WHERE template_id = ?", (inst["template_id"],)
-                ).fetchone()
-                try:
-                    tpl_roles = [str(x) for x in json.loads((trow["role_ids"] if trow else "") or "[]") if str(x).strip()]
-                except Exception:
-                    tpl_roles = []
-                if not tpl_roles:
-                    continue
-                placeholders = ",".join("?" for _ in tpl_roles)
-                still_member = self.conn.execute(
-                    f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
-                    f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) LIMIT 1",
-                    (clean_phone, *tpl_roles),
-                ).fetchone() is not None
-                if still_member:
-                    continue
-                inst_status = str(inst["status"] or "")
-                if inst_status in ("pending", "overdue", "rejected"):
-                    # 未完成 → 作废留痕（不再发提醒，H5 旧链接提交被拦）
-                    self.conn.execute(
-                        "UPDATE task_instance SET status = 'cancelled' WHERE id = ?",
-                        (int(inst["id"]),),
-                    )
-                    cancelled_instance_ids.append(int(inst["id"]))
-                else:
-                    # 完成/归档 → 保持 11-09「移除删干净」
-                    self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
-                    self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
-                    removed_instance_ids.append(int(inst["id"]))
-
+        if write_audit:
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
                 {"name": row["name"], "dept": row["dept"], "removed_bindings": removed_bindings,
                  "removed_instances": len(removed_instance_ids),
                  "cancelled_instances": len(cancelled_instance_ids)}, now_s,
             )
+        return {
+            "phone": clean_phone, "name": row["name"],
+            "removed_bindings": removed_bindings,
+            "cancelled_instances": len(cancelled_instance_ids),
+            "removed_instances": len(removed_instance_ids),
+        }
+
+    def delete_role_members(self, role_id: str, phones: List[str], actor: str = "system") -> Dict[str, Any]:
+        """2026-11-12 下午：批量移除成员（用户要求「不要一个一个删」）。
+
+        逐个走 _delete_role_member_unlocked 同款语义（名册/绑定/实例/审计一致），
+        单个失败（如手机号不在本组）不影响其余，逐条回报；整批一条审计 member.batch_delete
+        汇总 + 单条审计照写（可追溯）。
+        """
+        clean_role_id = (role_id or "").strip()
+        clean_phones: List[str] = []
+        for p in phones or []:
+            s = str(p or "").strip()
+            if s and s not in clean_phones:
+                clean_phones.append(s)
+        if not clean_phones:
+            raise BizError(400, "VALIDATION_FAILED", "phones 不能为空")
+        if len(clean_phones) > 500:
+            raise BizError(400, "VALIDATION_FAILED", "单次批量移除最多 500 人")
+        now_s = self.now_str()
+        deleted: List[str] = []
+        failed: List[Dict[str, str]] = []
+        with self.lock, self.conn:
+            for ph in clean_phones:
+                try:
+                    self._delete_role_member_unlocked(clean_role_id, ph, actor, now_s)
+                    deleted.append(ph)
+                except BizError as exc:
+                    failed.append({"phone": ph, "code": exc.code, "message": exc.message})
+            if deleted:
+                self._insert_audit_unlocked(
+                    actor, "member.batch_delete", "role", clean_role_id,
+                    {"deleted": len(deleted), "failed": len(failed), "phones": deleted}, now_s,
+                )
+        return {"ok": True, "deleted": deleted, "failed": failed}
 
     def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1,
                             sync_global_profile: bool = True) -> Dict[str, Any]:
@@ -1694,9 +1861,9 @@ class StateStore:
                 batch_seen_phones.add(phone)
                 # 2026-11-09：部门名超长在**收集阶段**就判掉（原先在写库前才判，
                 # 导致 will_add 已经累加了不该写入的行，整批拒绝语义下数字对不上）。
-                if dept and len(dept) > 30:
+                if dept and len(dept) > MAX_DEPT_NAME_LEN:
                     invalid.append({"row": row_num, "phone": phone,
-                                    "reason": f"部门名称过长（最多 30 字）：{dept}"})
+                                    "reason": f"部门名称过长（最多 {MAX_DEPT_NAME_LEN} 字）：{dept}"})
                     continue
                 # 2026-11-09：全局已有该号 → 记录是否与全局一致（不一致的按「同步全局」处理并报告）
                 gp = global_profile.get(phone)
@@ -1723,7 +1890,7 @@ class StateStore:
                     continue
                 if _dept in dept_cache:
                     continue
-                if len(_dept) > 30:
+                if len(_dept) > MAX_DEPT_NAME_LEN:
                     dept_cache[_dept] = False
                     continue  # 超长部门不建档（收集阶段已把该行判为 invalid）
                 if self.department_exists(_dept):
@@ -1960,8 +2127,9 @@ class StateStore:
                 if not name:
                     result["invalid"].append({"row": idx, "phone": phone, "reason": "姓名不能为空"})
                     continue
-                if dept and len(dept) > 30:
-                    result["invalid"].append({"row": idx, "phone": phone, "reason": "部门名称过长（最多 30 字）"})
+                if dept and len(dept) > MAX_DEPT_NAME_LEN:
+                    result["invalid"].append({"row": idx, "phone": phone,
+                                              "reason": f"部门名称过长（最多 {MAX_DEPT_NAME_LEN} 字）"})
                     continue
                 if phone in existing or phone in seen_batch:
                     result["skipped"] += 1
@@ -2059,6 +2227,10 @@ class StateStore:
             "remind_at": d.get("remind_at"), "notice_times": notice_times, "deadline": d.get("deadline"),
             "period": d["period"], "anchor_weekday": d.get("anchor_weekday"), "anchor_dom": d.get("anchor_dom"),
             "deadline_offset": int(d.get("deadline_offset") or 0), "need_review": bool(d.get("need_review", 0)),
+            # 2026-11-12 任务E1：截止配置三件套（旧模板 deadline_type 为空 = 回落旧算法）
+            "has_deadline": bool(int(d.get("has_deadline") if d.get("has_deadline") is not None else 1)),
+            "deadline_type": (str(d.get("deadline_type") or "").strip() or None),
+            "deadline_time": (str(d.get("deadline_time") or "").strip() or None),
             "max_file_mb": d.get("max_file_mb"), "enabled": bool(d.get("enabled", 1)), "deleted": bool(d.get("deleted", 0)),
             "attach_image": bool(d.get("attach_image", 0)), "attach_image_path": d.get("attach_image_path"),
             "attach_image_name": d.get("attach_image_name"),
@@ -2169,6 +2341,8 @@ class StateStore:
 
         schema_json_str, remind_at, deadline, notice_times_str, max_file_mb = None, None, None, None, None
         allow_note, need_review = False, False
+        # 2026-11-12 任务E1：截止配置三件套默认值（notice 分支不参与，保持数据库列默认）
+        has_deadline, deadline_type, deadline_time = True, None, None
 
         if kind == "notice":
             nt_raw = merged.get("notice_times")
@@ -2191,11 +2365,56 @@ class StateStore:
             # 不写这里会让每次保存都把执行时间清空，列表显示空白、下次编辑还得重填。
             remind_at = clean_times[0]
         else:
-            remind_at, deadline = str(merged.get("remind_at") or "").strip(), str(merged.get("deadline") or "").strip()
-            if not is_valid_hhmm(remind_at) or not is_valid_hhmm(deadline):
-                raise BizError(400, "VALIDATION_FAILED", "remind_at 与 deadline 必须为合法的 HH:MM 格式")
-            if remind_at >= deadline:
-                raise BizError(400, "VALIDATION_FAILED", "提醒时间 remind_at 必须早于截止时间 deadline")
+            remind_at = str(merged.get("remind_at") or "").strip()
+            if not is_valid_hhmm(remind_at):
+                raise BizError(400, "VALIDATION_FAILED", "remind_at 必须为合法的 HH:MM 格式")
+
+            # ── 2026-11-12 任务E1：截止配置三件套（has_deadline / deadline_type / deadline_time）──
+            # 部分更新语义：键未提交 → 保留 existing 原值（与其他可选字段一致）。
+            if "has_deadline" in payload:
+                has_deadline = bool(payload.get("has_deadline"))
+            else:
+                has_deadline = bool(existing.get("has_deadline")) if existing else True
+
+            deadline_time: Optional[str] = None
+            deadline = ""
+            if has_deadline:
+                # deadline_time 缺省回落链：显式 deadline_time → 兼容字段 deadline → existing.deadline。
+                _dt_raw = str(merged.get("deadline_time") or "").strip()
+                _legacy = str(merged.get("deadline") or "").strip()
+                deadline_time = _dt_raw or _legacy or str((existing or {}).get("deadline") or "").strip()
+                # 旧列 deadline 同步保存为同一 HH:MM，保证任何仍读旧列的链路一致。
+                deadline = deadline_time
+
+                if "deadline_type" in payload and payload.get("deadline_type") is not None:
+                    deadline_type = str(payload.get("deadline_type") or "").strip()
+                    if deadline_type not in VALID_DEADLINE_TYPES:
+                        raise BizError(400, "VALIDATION_FAILED",
+                                       "deadline_type 必须是 same_day/weekend/month_end 之一")
+                else:
+                    deadline_type = str((existing or {}).get("deadline_type") or "").strip() or None
+                if not is_valid_hhmm(deadline_time):
+                    raise BizError(400, "VALIDATION_FAILED", "截止时间必须为合法的 HH:MM 格式")
+                # 执行时刻必须早于「当天截止」（当天/旧口径语义下提醒晚于截止即配置矛盾；
+                # 周末/月底截止天然在执行时刻之后，不做 HH:MM 顺序比较）。
+                # 2026-11-12 下午（用户拍板，图三报错修复）：截止 **00:00 = 当天 24 点**，
+                # 任何提醒时刻都早于它 → 豁免顺序比较（00:00 截止的模板应能创建）。
+                if (
+                    (deadline_type or "same_day") == "same_day"
+                    and deadline_time != "00:00"
+                    and remind_at >= deadline_time
+                ):
+                    raise BizError(400, "VALIDATION_FAILED", "提醒时间 remind_at 必须早于截止时间 deadline")
+            else:
+                # 无截止：兼容仍传 deadline 的老前端——存在时只校验格式，顺序约束不生效。
+                # 旧列 deadline 一并置空（否则未升级的展示链路会错误显示「截止 HH:MM」）。
+                legacy_raw = str(merged.get("deadline") or "").strip()
+                if legacy_raw and not is_valid_hhmm(legacy_raw):
+                    raise BizError(400, "VALIDATION_FAILED", "deadline 必须为合法的 HH:MM 格式")
+                deadline = None
+                deadline_time = None
+                deadline_type = None
+
             need_review, allow_note = bool(merged.get("need_review", False)), bool(merged.get("allow_note", False))
             if kind == "form":
                 # 2026-11-12 任务B：schema 来源两路——
@@ -2364,8 +2583,12 @@ class StateStore:
         return {
             "name": name, "kind": kind, "role_ids_json": json.dumps(role_ids, ensure_ascii=False),
             "schema_json": schema_json_str, "allow_note": 1 if allow_note else 0, "text_tpl": text_tpl,
-            "remind_at": remind_at, "notice_times": notice_times_str, "deadline": deadline, "period": period,
+            "remind_at": remind_at, "notice_times": notice_times_str, "deadline": deadline or None, "period": period,
             "anchor_weekday": anchor_weekday, "anchor_dom": anchor_dom, "deadline_offset": deadline_offset,
+            # 2026-11-12 任务E1：截止配置三件套（无截止 → has_deadline=0，deadline_time/type 置空）
+            "has_deadline": 1 if has_deadline else 0,
+            "deadline_type": deadline_type if has_deadline else None,
+            "deadline_time": deadline_time if has_deadline else None,
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "attach_image_name": attach_image_name,
@@ -2381,12 +2604,13 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
                     norm["period"], norm["anchor_weekday"], norm["anchor_dom"], norm["deadline_offset"],
+                    norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
                     norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], actor, now_s, now_s, int(owner_id),
@@ -2445,36 +2669,134 @@ class StateStore:
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
+                "has_deadline = ?, deadline_type = ?, deadline_time = ?, "
                 "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
-                    norm["anchor_dom"], norm["deadline_offset"], norm["need_review"], norm["max_file_mb"],
+                    norm["anchor_dom"], norm["deadline_offset"],
+                    norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
+                    norm["need_review"], norm["max_file_mb"],
                     norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
                     norm["enabled"], now_s, clean_id,
                 ),
             )
-            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"])}, now_s)
+            # 2026-11-12 下午修复（图一实锤）：编辑模板移除角色分组后，被移除角色成员的实例
+            # 还挂在「任务实例」页（旧实现只更新模板 role_ids，对实例零处理）。
+            # 处置口径（用户拍板）：**物理删除** —— 模板剩余角色已不含该成员时，其在该模板下的
+            # 全部实例（含未完成与已完成）连同提交/令牌一起清除，列表不再出现；
+            # 仍挂在模板其它角色的成员不动（与 delete_role_member 的「一人多角色」判据同源）。
+            _role_purge: Optional[Dict[str, Any]] = None
+            try:
+                _old_roles = [str(x) for x in json.loads(row["role_ids"] or "[]") if str(x).strip()]
+            except Exception:
+                _old_roles = []
+            try:
+                _new_roles = [str(x) for x in json.loads(norm["role_ids_json"] or "[]") if str(x).strip()]
+            except Exception:
+                _new_roles = []
+            _removed_roles = [r for r in _old_roles if r not in _new_roles]
+            if _removed_roles:
+                _place = ",".join("?" for _ in _removed_roles)
+                _rem_phones = [str(r[0]) for r in self.conn.execute(
+                    f"SELECT DISTINCT phone FROM member WHERE role_id IN ({_place})",
+                    tuple(_removed_roles)).fetchall()]
+                _orphan_phones: List[str] = []
+                for _ph in _rem_phones:
+                    _still = False
+                    if _new_roles:
+                        _keep_place = ",".join("?" for _ in _new_roles)
+                        _still = self.conn.execute(
+                            f"SELECT 1 FROM member WHERE phone = ? AND role_id IN ({_keep_place}) LIMIT 1",
+                            (_ph, *_new_roles)).fetchone() is not None
+                    if _still:
+                        continue
+                    _orphan_phones.append(_ph)
+                _deleted_instances = 0
+                for _ph in _orphan_phones:
+                    _ids = [int(r[0]) for r in self.conn.execute(
+                        "SELECT id FROM task_instance WHERE template_id = ? AND phone = ?",
+                        (clean_id, _ph)).fetchall()]
+                    if not _ids:
+                        continue
+                    _id_place = ",".join("?" for _ in _ids)
+                    self.conn.execute(f"DELETE FROM submission WHERE instance_id IN ({_id_place})", tuple(_ids))
+                    self.conn.execute(f"DELETE FROM h5_token WHERE instance_id IN ({_id_place})", tuple(_ids))
+                    _deleted_instances += int(self.conn.execute(
+                        f"DELETE FROM task_instance WHERE id IN ({_id_place})", tuple(_ids)).rowcount or 0)
+                _role_purge = {"removed_roles": _removed_roles, "orphan_phones": len(_orphan_phones),
+                               "deleted_instances": _deleted_instances}
+                if _orphan_phones:
+                    self._insert_audit_unlocked(
+                        actor, "template.role_removed_purge", "task_template", clean_id,
+                        _role_purge, now_s,
+                    )
+            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "role_removed_purge": _role_purge}, now_s)
             return self._deserialize_template_row(self.conn.execute("SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
 
-    def delete_template(self, template_id: str, actor: str = "system") -> None:
+    def _purge_template_rows_unlocked(self, template_id: str, now_s: str, uploads_dir: Optional[Path] = None) -> Dict[str, int]:
+        """⚠️ 调用方必须已握 self.lock 且处于 self.conn 事务内。
+
+        2026-11-12 下午（用户拍板，为 MySQL 迁移清数据）：物理清除一个模板的全部业务痕迹。
+        范围：实例 → 提交/上传引用/H5令牌/提醒日志/数据快照 → 模板行本体；磁盘附件先收集
+        路径再删（越界路径跳过，删文件失败只计数不回滚——与 delete_admin_account 同款口径）。
+        """
+        tid = (template_id or "").strip()
+        detail: Dict[str, int] = {"submission": 0, "upload_ref": 0, "h5_token": 0, "reminder_log": 0,
+                                  "data_snapshot": 0, "task_instance": 0, "task_template": 0,
+                                  "attachments_removed": 0}
+        if not tid:
+            return detail
+        if uploads_dir is not None:
+            rels = [str(r[0]) for r in self.conn.execute(
+                "SELECT rel_path FROM upload_ref WHERE template_id = ?", (tid,)).fetchall()]
+            _tpl_row = self.conn.execute(
+                "SELECT attach_image_path FROM task_template WHERE template_id = ?", (tid,)).fetchone()
+            _att = str(_tpl_row["attach_image_path"] or "").strip() if _tpl_row else ""
+            if _att:
+                rels.append(_att)
+            for rel in rels:
+                if self._purge_upload_file(uploads_dir, rel):
+                    detail["attachments_removed"] += 1
+        detail["submission"] = int(self.conn.execute(
+            "DELETE FROM submission WHERE instance_id IN (SELECT id FROM task_instance WHERE template_id = ?)",
+            (tid,)).rowcount or 0)
+        detail["upload_ref"] = int(self.conn.execute(
+            "DELETE FROM upload_ref WHERE template_id = ?", (tid,)).rowcount or 0)
+        detail["h5_token"] = int(self.conn.execute(
+            "DELETE FROM h5_token WHERE template_id = ?", (tid,)).rowcount or 0)
+        detail["reminder_log"] = int(self.conn.execute(
+            "DELETE FROM reminder_log WHERE template_id = ?", (tid,)).rowcount or 0)
+        # 2026-10-27 数据看板：调度器按 template_id 作为 source_key 读人工填报快照，一并清
+        detail["data_snapshot"] = int(self.conn.execute(
+            "DELETE FROM data_snapshot WHERE source_key = ?", (tid,)).rowcount or 0)
+        detail["task_instance"] = int(self.conn.execute(
+            "DELETE FROM task_instance WHERE template_id = ?", (tid,)).rowcount or 0)
+        detail["task_template"] = int(self.conn.execute(
+            "DELETE FROM task_template WHERE template_id = ?", (tid,)).rowcount or 0)
+        return detail
+
+    def delete_template(self, template_id: str, actor: str = "system", uploads_dir: Optional[Path] = None) -> Dict[str, Any]:
+        """2026-11-12 下午（用户拍板）：删除任务模板 = **物理清除**，不再在库里留行。
+
+        旧实现是软删（deleted=1 置位 + 未完成实例置 expired）——行永远留在本地库文件里，
+        与用户「删了就不在本地数据库文件里（为 MySQL 迁移减数据量）」的口径冲突。
+        新口径：模板行 + 全部实例（含未完成与已完成）+ 提交 + 令牌 + 日志 + 快照 + 磁盘附件
+        全部物理删除；审计记 template.purge（永不删）。
+        停用与删除就此划清：**停用 = 保留数据只停发；删除 = 彻底清空**。
+        H5 旧链接因模板行不存在而失效（get_template → None → 404）。
+        """
         clean_id, now_s = (template_id or "").strip(), self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT template_id, name FROM task_template WHERE template_id = ? AND deleted = 0", (clean_id,)).fetchone()
+            row = self.conn.execute("SELECT template_id, name FROM task_template WHERE template_id = ?", (clean_id,)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "任务模板不存在")
-            self.conn.execute("UPDATE task_template SET deleted = 1, enabled = 0, updated_at = ? WHERE template_id = ?", (now_s, clean_id))
-            # 2026-10-29 P1-6：模板删了，未完成的实例不该继续挂在列表里等提交/审核，
-            # 统一置 expired；已完成的实例保留，便于追溯历史。
-            expired_cnt = self.conn.execute(
-                "UPDATE task_instance SET status = 'expired' "
-                "WHERE template_id = ? AND status IN ('pending', 'submitted', 'overdue')",
-                (clean_id,),
-            ).rowcount
+            detail = self._purge_template_rows_unlocked(clean_id, now_s, uploads_dir)
             self._insert_audit_unlocked(
-                actor, "template.delete", "task_template", clean_id,
-                {"name": row["name"], "expired_instances": int(expired_cnt or 0)}, now_s,
+                actor, "template.purge", "task_template", clean_id,
+                {"name": row["name"], "deleted": detail}, now_s,
             )
+        return {"ok": True, "name": row["name"], "deleted": detail}
 
     def match_roster_member(self, phone: str, name: str, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """2026-11-03 新激活模型：按「手机号 + 姓名」与本平台名册比对（部门不作为拦截项）。
@@ -2677,8 +2999,10 @@ class StateStore:
         clean = (name or "").strip()
         if not clean:
             raise BizError(400, "VALIDATION_FAILED", "部门名称不能为空")
-        if len(clean) > 30:
-            raise BizError(400, "VALIDATION_FAILED", "部门名称过长（最多 30 字）")
+        # 2026-11-12 下午：30 字 → 200 字（官方通讯录部门名常超 30 字，须能正确创建/应用）
+        if len(clean) > MAX_DEPT_NAME_LEN:
+            raise BizError(400, "VALIDATION_FAILED",
+                           f"部门名称过长（最多 {MAX_DEPT_NAME_LEN} 字）")
         now_s = self.now_str()
         with self.lock, self.conn:
             if self.conn.execute("SELECT 1 FROM dept_option WHERE name = ?", (clean,)).fetchone():
@@ -2692,6 +3016,9 @@ class StateStore:
         clean = (name or "").strip()
         if not clean:
             raise BizError(400, "VALIDATION_FAILED", "部门名称不能为空")
+        if len(clean) > MAX_DEPT_NAME_LEN:
+            raise BizError(400, "VALIDATION_FAILED",
+                           f"部门名称过长（最多 {MAX_DEPT_NAME_LEN} 字）")
         now_s = self.now_str()
         with self.lock, self.conn:
             row = self.conn.execute("SELECT id, name FROM dept_option WHERE id = ?", (int(dept_id),)).fetchone()
@@ -2884,169 +3211,79 @@ class StateStore:
             return items
 
     def is_instance_window_closed(self, instance: Dict[str, Any], now_dt: Optional[datetime] = None) -> bool:
+        """该实例的提交窗口是否已关闭。
+
+        2026-11-12 任务E1/E2/E3 口径：
+        · rejected（驳回重交）：按重交截止 = max(原截止 + 72h, 驳回 + 24h)（R27，保留不动）；
+        · expired / 模板已删除：一律关闭；
+        · 其余状态：now > deadline_at 即关闭——无截止模板的 deadline_at 是哨兵
+          9999-12-31 23:59:59，字符串比较永不为真 → 永不过期（展示层特判「不限」）。
+        """
         now_s = format_dt(now_dt or self.now())
         if instance["status"] == "expired":
             return True
         if instance["status"] == "rejected":
-            # ⛔ 驳回重交窗口（calc_resubmit_deadline）：与本需求的「逾期补交」无关，一行不动
             return now_s > calc_resubmit_deadline(instance["deadline_at"], instance.get("reviewed_at"))
-        # 2026-10-29 逾期补交审核制：截止时刻一过就关闭**普通**提交窗口。
-        # 逾期后不再有「72 小时内免审可交」，只能走「回复【申请补交】→ 管理员审核 → 30 分钟新链接」，
-        # 由 h5._check_submission_window() 按 token purpose == "resubmit" 单独放行。
         return now_s > instance["deadline_at"]
 
-    # ── 2026-10-29 逾期补交审核制 ────────────────────────────────────────
-    # 口径（用户已拍板）：逾期后旧链接一律不放行；截止后 24h 内可回复【申请补交】；
-    # 每实例只有一次申请机会；通过 → 30 分钟新链接，拒绝 → 通知用户。
-    RESUBMIT_APPLY_WINDOW_HOURS = 24
-    RESUBMIT_LINK_TTL_MINUTES = 30
+    # ── 2026-11-12 任务E3：申请补交全链路下线 ──────────────────────────
+    # 原「逾期补交审核制」（list_overdue_in_window / request_resubmit /
+    # _load_resubmit_pending / approve_resubmit / reject_resubmit 及配套审核端点）
+    # 按用户拍板彻底删除：逾期后统一提示「当前任务已过期（截止时间：…），无法提交」，
+    # 不再有补交通道。⛔ 驳回重交（rejected → 窗口内原链接重交）是另一套机制，保留。
+    # task_instance.resubmit_* 列保留不动（存量历史数据兼容，只是不再读写）。
 
-    @staticmethod
-    def _resubmit_scope_sql() -> str:
-        """只有需要提交的模板才谈补交；通知类实例只是发送记录。"""
-        return "t.kind IN ('form','image','file')"
+    def list_pending_todo(self, phone: str, platform: Optional[str] = None,
+                          now_dt: Optional[datetime] = None, limit: int = 5) -> List[Dict[str, Any]]:
+        """2026-11-12 任务E4：【待办】指令的取数。
 
-    def list_overdue_in_window(self, phone: str, now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        """该手机号「已截止、仍逾期、且在 24h 申请窗口内」的实例。"""
+        查当前用户（按平台名册口径）status ∈ {pending, rejected} 且未截止的上传任务实例，
+        按 deadline_at 升序取前 limit 条（封顶防刷屏）。判定口径：
+        · 模板未删除且未停用（停用模板不再提醒，视为无待办；已删除模板已把实例关成 expired）；
+        · 通知类（notice）不算「待提交任务」；
+        · 平台过滤 = 模板所属角色平台（与实例生成同口径）；
+        · rejected 也算未完成（驳回重交窗口内仍可交）；
+        · 「未截止」：deadline_at > now（哨兵天然恒真）；
+          rejected 用重交截止判定（超过重交截止的按 advance 会转 expired，双保险）。
+        """
         clean_phone = (phone or "").strip()
         if not clean_phone:
             return []
-        cur_dt = now_dt or self.now()
+        now_s = format_dt(now_dt or self.now())
+        plat = (platform or "").strip().lower()
+        plat_sql = ""
+        params: List[Any] = [clean_phone]
+        if plat:
+            plat_sql = ("AND EXISTS (SELECT 1 FROM role r WHERE r.platform = ? "
+                        "AND instr(t.role_ids, r.role_id) > 0) ")
+            params.append(plat)
         with self.lock:
             rows = self.conn.execute(
-                "SELECT i.*, t.name AS template_name FROM task_instance i "
+                "SELECT i.*, t.name AS template_name, t.kind AS template_kind "
+                "FROM task_instance i "
                 "JOIN task_template t ON t.template_id = i.template_id "
-                f"WHERE i.phone = ? AND i.status = 'overdue' AND {self._resubmit_scope_sql()} "
-                "ORDER BY i.deadline_at",
-                (clean_phone,),
+                "WHERE i.phone = ? AND i.status IN ('pending', 'rejected') "
+                "AND t.kind != 'notice' AND t.enabled = 1 AND t.deleted = 0 "
+                + plat_sql +
+                "ORDER BY i.deadline_at ASC, i.id ASC LIMIT ?",
+                tuple(params + [max(1, int(limit))]),
             ).fetchall()
         out: List[Dict[str, Any]] = []
         for r in rows:
             d = dict(r)
-            deadline_dt = parse_dt(d["deadline_at"])
-            if deadline_dt <= cur_dt <= deadline_dt + timedelta(hours=self.RESUBMIT_APPLY_WINDOW_HOURS):
+            d["kind"] = d.pop("template_kind", None) or "form"
+            deadline_at = effective_instance_deadline(d)
+            if is_no_deadline(deadline_at) or deadline_at > now_s:
                 out.append(d)
         return out
-
-    def request_resubmit(self, phone: str, actor: str = "user", now_dt: Optional[datetime] = None) -> Dict[str, Any]:
-        """用户回复「申请补交」：把窗口内**所有**可申请实例一次性置为 pending 审核。
-
-        返回 result：
-        - applied        申请成功（items 为本次置为待审核的实例）
-        - already        窗口内实例都已申请过（一次机会已用）
-        - window_expired 有逾期实例但都超过 24h 申请窗口
-        - none           根本没有逾期实例
-        - admin_disabled 有逾期实例但所属模板的管理员账号已停用，不受理（2026-11-05 口径：
-                        挂起没人能审的申请，不如明确告知员工；已发出的 30 分钟补交 token 不受影响）
-        """
-        clean_phone = (phone or "").strip()
-        cur_dt = now_dt or self.now()
-        now_s = format_dt(cur_dt)
-        with self.lock, self.conn:
-            rows = self.conn.execute(
-                "SELECT i.*, t.name AS template_name, COALESCE(u.enabled, 1) AS owner_enabled "
-                "FROM task_instance i "
-                "JOIN task_template t ON t.template_id = i.template_id "
-                "LEFT JOIN admin_user u ON u.id = t.owner_id "
-                f"WHERE i.phone = ? AND i.status IN ('overdue','expired') AND {self._resubmit_scope_sql()} "
-                "ORDER BY i.deadline_at",
-                (clean_phone,),
-            ).fetchall()
-            inside: List[Dict[str, Any]] = []
-            outside = 0
-            for r in rows:
-                d = dict(r)
-                deadline_dt = parse_dt(d["deadline_at"])
-                if deadline_dt <= cur_dt <= deadline_dt + timedelta(hours=self.RESUBMIT_APPLY_WINDOW_HOURS):
-                    inside.append(d)
-                else:
-                    outside += 1
-
-            if not inside:
-                return {"result": "window_expired" if outside else "none", "items": []}
-
-            active: List[Dict[str, Any]] = []
-            for d in inside:
-                # ⚠️ 不能写 `int(v or 1)`：v=0（停用）会被 `or` 短路成 1，停用判定整个失效。
-                v = d.get("owner_enabled")
-                if v is None or int(v) == 1:
-                    active.append(d)
-            if not active:
-                return {"result": "admin_disabled", "items": inside}
-
-            fresh = [d for d in active if not str(d.get("resubmit_status") or "").strip()]
-            if not fresh:
-                return {"result": "already", "items": []}
-
-            for d in fresh:
-                self.conn.execute(
-                    "UPDATE task_instance SET resubmit_req_at = ?, resubmit_status = 'pending' WHERE id = ?",
-                    (now_s, int(d["id"])),
-                )
-            self._insert_audit_unlocked(
-                actor, "resubmit.apply", "task_instance", clean_phone,
-                {"instance_ids": [int(d["id"]) for d in fresh]}, now_s,
-            )
-            return {
-                "result": "applied",
-                "items": [{"id": int(d["id"]), "template_name": d.get("template_name"), "deadline_at": d["deadline_at"]} for d in fresh],
-            }
-
-    def _load_resubmit_pending(self, instance_id: int) -> Dict[str, Any]:
-        with self.lock:
-            row = self.conn.execute("SELECT * FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone()
-        if not row:
-            raise BizError(404, "NOT_FOUND", "任务实例不存在")
-        inst = dict(row)
-        if str(inst.get("resubmit_status") or "") != "pending":
-            raise BizError(400, "VALIDATION_FAILED", "该实例没有待审核的补交申请")
-        return inst
-
-    def approve_resubmit(self, instance_id: int, actor: str = "system", now_dt: Optional[datetime] = None) -> Dict[str, Any]:
-        """通过补交申请：置 approved + 签发 30 分钟 resubmit token（复用 issue_h5_token）。"""
-        cur_dt = now_dt or self.now()
-        now_s = format_dt(cur_dt)
-        inst = self._load_resubmit_pending(instance_id)
-        with self.lock, self.conn:
-            self.conn.execute(
-                "UPDATE task_instance SET resubmit_status = 'approved', resubmit_decided_by = ?, resubmit_decided_at = ? WHERE id = ?",
-                (actor, now_s, int(instance_id)),
-            )
-            self._insert_audit_unlocked(actor, "resubmit.approve", "task_instance", inst["phone"],
-                                        {"instance_id": int(instance_id)}, now_s)
-        raw_token = self.issue_h5_token(
-            phone=inst["phone"], template_id=inst["template_id"], period_key=inst["period_key"],
-            instance_id=int(instance_id), purpose="resubmit",
-            ttl_hours=self.RESUBMIT_LINK_TTL_MINUTES / 60.0,
-        )
-        return {
-            "instance": self.get_instance(int(instance_id)),
-            "raw_token": raw_token,
-            "expires_in_minutes": self.RESUBMIT_LINK_TTL_MINUTES,
-            "expires_at": format_dt(cur_dt + timedelta(minutes=self.RESUBMIT_LINK_TTL_MINUTES)),
-        }
-
-    def reject_resubmit(self, instance_id: int, actor: str = "system", reason: Optional[str] = None,
-                        now_dt: Optional[datetime] = None) -> Dict[str, Any]:
-        """拒绝补交申请：实例保持 overdue，但 resubmit_status 已非空 → 不能再申请。"""
-        now_s = format_dt(now_dt or self.now())
-        inst = self._load_resubmit_pending(instance_id)
-        with self.lock, self.conn:
-            self.conn.execute(
-                "UPDATE task_instance SET resubmit_status = 'rejected', resubmit_decided_by = ?, resubmit_decided_at = ? WHERE id = ?",
-                (actor, now_s, int(instance_id)),
-            )
-            self._insert_audit_unlocked(actor, "resubmit.reject", "task_instance", inst["phone"],
-                                        {"instance_id": int(instance_id), "reason": reason}, now_s)
-        return {"instance": self.get_instance(int(instance_id))}
 
     def submit_h5_task(
         self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
         note: Optional[str] = None, refs: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         tok = self.get_h5_token(raw_token)
-        # 2026-10-29：补交链接复用同一套 token 机制，只是 purpose == "resubmit"
-        if not tok or tok.get("purpose") not in ("submit", "resubmit"):
+        # 2026-11-12 任务E3：purpose 收窄为 submit（原「补交链接」机制已下线）
+        if not tok or tok.get("purpose") != "submit":
             raise BizError(404, "NOT_FOUND", "提交链接无效或不存在")
         cur_dt = self.now()
         now_s = format_dt(cur_dt)
@@ -3058,6 +3295,10 @@ class StateStore:
         tpl = self.get_template(inst["template_id"], include_deleted=True)
         if not tpl:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
+        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可提交。
+        # 停用（enabled=0）不拦——已下发链接仍可正常提交；删除（deleted=1）必须拦。
+        if tpl.get("deleted"):
+            raise BizError(400, "SUBMISSION_CLOSED", "该任务已被删除，无法提交")
         if inst["status"] == "approved":
             raise BizError(400, "VALIDATION_FAILED", "该任务已提交成功，无需重复提交")
         # 2026-10-28：已提交待审核的也不能再交一次（H5 页面已锁，这里做服务端兜底）
@@ -3067,16 +3308,16 @@ class StateStore:
         # 旧链接（推送/定时提醒里签的 H5 链接）点进来直接拦，不再收件。
         if inst["status"] == "cancelled":
             raise BizError(400, "WINDOW_CLOSED", "该任务已被取消（成员已移出分组），无需提交")
-        is_resubmit = tok.get("purpose") == "resubmit"
+        # 2026-11-12 任务E2：链接过期统一口径（用户拍板，与任务截止不作区分）
         if tok["expires_at"] < now_s:
-            if is_resubmit:
-                raise BizError(400, "WINDOW_CLOSED", "补交链接已过期（30 分钟有效），本次补交机会已使用")
-            raise BizError(400, "WINDOW_CLOSED", "该任务提交链接已过期，无法提交")
-        if not is_resubmit and inst["status"] == "expired":
-            raise BizError(400, "WINDOW_CLOSED", "任务已关闭，无法提交")
-        # 只有 purpose=resubmit 的未过期 token 能在逾期后放行；普通 token 一律不放行
-        if not is_resubmit and self.is_instance_window_closed(inst, cur_dt):
-            raise BizError(400, "WINDOW_CLOSED", "任务已逾期，请回复【申请补交】由管理员审核后获取新链接")
+            raise BizError(400, "TOKEN_EXPIRED", submission_expired_message(inst))
+        if inst["status"] == "expired":
+            # 提前流转（模板删除/72h 过期等）也已关窗，统一提示
+            raise BizError(400, "SUBMISSION_CLOSED", submission_expired_message(inst))
+        # 2026-11-12 任务E2/E3：窗口硬拦截——到点后统一提示（错误码 SUBMISSION_CLOSED）。
+        # 注意 rejected 走 is_instance_window_closed 的重交截止分支（保留）。
+        if self.is_instance_window_closed(inst, cur_dt):
+            raise BizError(400, "SUBMISSION_CLOSED", submission_expired_message(inst))
         if bool(tok["consumed"]):
             raise BizError(400, "VALIDATION_FAILED", "该链接已提交过，请勿重复使用")
 

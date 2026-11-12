@@ -114,22 +114,44 @@ def test_blank_department_allowed() -> None:
 
 
 def test_too_long_department_rejects_only_that_row() -> None:
+    """2026-11-12 下午口径修正：部门名上限 30 → 200（官方通讯录部门名常超 30 字）。
+    40 字不再是「过长」；超过 200 字才整批拒绝，且只拒绝超长那行。"""
+    from app.state import MAX_DEPT_NAME_LEN
+
     store = _store()
     try:
         rid = _role(store)
-        long_dept = "超长" * 20  # 40 字
+        over = "超长" * 101  # 202 字 > MAX_DEPT_NAME_LEN(200)
+        ok_long = "超长" * 20  # 40 字：旧口径判过长，新口径放行
         res = store.import_role_members(
             rid,
-            [{"row": 1, "phone": PHONE, "name": "张三", "dept": long_dept},
-             {"row": 2, "phone": OTHER, "name": "李四", "dept": "正常部"}],
+            [{"row": 1, "phone": PHONE, "name": "张三", "dept": over},
+             {"row": 2, "phone": OTHER, "name": "李四", "dept": ok_long}],
             dry_run=False, actor="t")
-        # 2026-11-09 新口径：导入改为**整批拒绝**（有错误行则整批不写入，待修复后再导）
+        # 2026-11-09 口径保留：导入为**整批拒绝**（有错误行则整批不写入，待修复后再导）
         assert res["blocked"] is True, res
         assert res["will_add"] == 0, res
         assert any(x["row"] == 1 and "过长" in x["reason"] for x in res["invalid"]), res
-        assert not store.department_exists(long_dept), "非法部门名不应建档"
-        assert not store.department_exists("正常部"), "整批拒绝 → 合法那行也不该建档"
+        assert not store.department_exists(over), "超上限部门名不应建档"
+        assert not store.department_exists(ok_long), "整批拒绝 → 合法那行也不该建档"
         assert not store.list_role_members(rid, size=50)["items"], "整批拒绝 → 一行都不该写入"
+    finally:
+        store.close()
+
+
+def test_department_over_30_chars_now_imports() -> None:
+    """2026-11-12 下午：30-200 字的部门名（含 40 字）正常导入 + 自动建档。"""
+    store = _store()
+    try:
+        rid = _role(store)
+        ok_long = "市场部华东大区第十分部市场营销处客户服务综合运营培训中心第一办公室"  # >30 字
+        res = store.import_role_members(
+            rid, [{"row": 1, "phone": PHONE, "name": "郑佳", "dept": ok_long}],
+            dry_run=False, actor="t")
+        assert res["will_add"] == 1 and not res["invalid"], res
+        assert store.department_exists(ok_long), "超 30 字部门应自动建档"
+        members = store.list_role_members(rid, size=50)["items"]
+        assert members and members[0]["dept"] == ok_long
     finally:
         store.close()
 

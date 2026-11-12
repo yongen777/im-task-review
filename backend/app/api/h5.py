@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     FileResponse = None  # type: ignore[assignment]
 
 from ..scheduler import NotifierProtocol
-from ..state import BizError, StateStore, calc_resubmit_deadline
+from ..state import BizError, StateStore, calc_resubmit_deadline, submission_expired_message
 
 logger = logging.getLogger(__name__)
 
@@ -125,16 +125,11 @@ def _check_submission_window(
     # H5 显示只读提示；提交侧 submit_h5_task 还有服务端硬拦截兜底。
     if inst["status"] == "cancelled":
         return False, "该任务已被取消（成员已移出分组），无需提交"
-    # 2026-10-29 逾期补交审核制：逾期后**只有**「补交申请已通过、且未过期」的 resubmit token 放行，
-    # 旧的普通提交链接一律不放行（取消原「overdue 72h 内免审可交」）。
-    is_resubmit = bool(tok) and tok.get("purpose") == "resubmit" and str(tok.get("expires_at") or "") >= state.now_str()
-    if is_resubmit:
-        return True, None
+    # 2026-11-12 任务E2/E3：截止即关窗——到点后统一提示
+    # 「当前任务已过期（截止时间：…），无法提交」（用户拍板，不区分链接过期与任务截止）。
+    # rejected 走 is_instance_window_closed 的重交截止分支（驳回重交机制保留）。
     if state.is_instance_window_closed(inst):
-        if inst["status"] == "rejected":
-            # 驳回重交窗口：保持原有语义与文案，不掺入逾期补交
-            return False, "提交窗口已关闭"
-        return False, "任务已逾期，请回复【申请补交】由管理员审核后获取新链接"
+        return False, submission_expired_message(inst)
     return True, None
 
 
@@ -254,9 +249,15 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
     if not tok:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
     if tok["expires_at"] < state.now_str():
-        if tok.get("purpose") == "resubmit":
-            return None, None, (401, {"code": "TOKEN_EXPIRED",
-                                      "message": "补交链接已过期（30 分钟有效），本次补交机会已使用"})
+        # 2026-11-12 任务E2：链接过期提示与任务截止统一口径（用户拍板「不区分」），
+        # 尽力解析实例拿真实截止时间；实例都没了才说「令牌已过期」。
+        expired_inst: Optional[Dict[str, Any]] = None
+        if tok.get("instance_id") is not None:
+            expired_inst = state.get_instance(int(tok["instance_id"]))
+        if expired_inst is None and tok.get("template_id") and tok.get("period_key"):
+            expired_inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
+        if expired_inst is not None:
+            return None, None, (401, {"code": "TOKEN_EXPIRED", "message": submission_expired_message(expired_inst)})
         return None, None, (401, {"code": "TOKEN_EXPIRED", "message": "H5 访问令牌已过期"})
 
     inst: Optional[Dict[str, Any]] = None
@@ -277,13 +278,16 @@ def _validate_upload_target_and_limits(
     if err:
         return None, None, "", "", 0, 0, err
 
-    window_open, window_reason = _check_submission_window(state, inst, tok)
-    if not window_open:
-        return None, None, "", "", 0, 0, (400, {"code": "WINDOW_CLOSED", "message": window_reason or "提交窗口已关闭"})
-
     tpl = state.get_template(inst["template_id"], include_deleted=True)
     if not tpl or tpl.get("deleted"):
-        return None, None, "", "", 0, 0, (404, {"code": "NOT_FOUND", "message": "任务模板不存在"})
+        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可用
+        # （先于窗口判断，与 info/submit 的「已删除」硬闸同序）
+        return None, None, "", "", 0, 0, (404, {"code": "NOT_FOUND", "message": "该任务已被删除，链接已失效"})
+
+    window_open, window_reason = _check_submission_window(state, inst, tok)
+    if not window_open:
+        # 2026-11-12 任务E2：到点后统一错误码 SUBMISSION_CLOSED + 统一文案
+        return None, None, "", "", 0, 0, (400, {"code": "SUBMISSION_CLOSED", "message": window_reason or "当前任务提交窗口已关闭"})
     spec = tpl.get("spec_json") if isinstance(tpl.get("spec_json"), dict) else {}
     modules = spec.get("upload_modules") or []
     # 2026-10-28：上报类（form）勾了「图片 / 文件」模块也要允许上传，之前只放行 image/file 两种模板
@@ -329,9 +333,20 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
         return err
     tpl = state.get_template(inst["template_id"], include_deleted=True)
     if not tpl or tpl.get("deleted"):
-        return 404, {"code": "NOT_FOUND", "message": "任务模板不存在"}
+        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可用
+        return 404, {"code": "NOT_FOUND", "message": "该任务已被删除，链接已失效"}
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
+    # 2026-11-12 任务E2 门禁一（展示层）：令牌已消耗（已成功提交过）→ 窗口关闭 + 只读完成态。
+    # 页面据此渲染只读卡，避免「已提交」实例在截止前仍显示可编辑表单。
+    # 说明：rejected 的重交由驳回通知里新签发的链接承载，旧链接（已 consumed）一律只读。
+    if bool(tok.get("consumed")):
+        window_open = False
+        if not window_reason:
+            if inst.get("status") == "rejected":
+                window_reason = "该任务已提交过，请使用管理员驳回通知里最新下发的重交链接。"
+            else:
+                window_reason = "该任务已提交，无需重复提交。"
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":

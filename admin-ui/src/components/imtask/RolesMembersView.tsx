@@ -154,11 +154,19 @@ export const RolesMembersView: React.FC = () => {
   const [editingDeptName, setEditingDeptName] = useState('');
   const [deptBusy, setDeptBusy] = useState(false);
 
-  // 2026-11-12 A3：超管「部门分级树」弹窗（基于已导入成员的 dept_path 聚合）
-  const [deptTreeOpen, setDeptTreeOpen] = useState(false);
+  // 2026-11-12 A3：部门分级树（数据源 = 已导入成员的 dept_path 聚合）
+  // 2026-11-12 下午（用户拍板）：与「部门管理」合并为一个入口 —— 树内嵌在部门管理弹窗里，
+  // 超管可在树上创建分支部门（节点「加入部门选项」/「新建下级部门」）。
   const [deptTree, setDeptTree] = useState<DeptTreeNode[]>([]);
   const [deptTreeLoading, setDeptTreeLoading] = useState(false);
   const [deptTreeBusy, setDeptTreeBusy] = useState('');
+  const [creatingChildPath, setCreatingChildPath] = useState<string | null>(null);
+  const [childDeptName, setChildDeptName] = useState('');
+
+  // 2026-11-12 下午：成员列表批量删除（勾选 + 一次移除，用户要求「不要一个一个删」）
+  const [selectedMemberPhones, setSelectedMemberPhones] = useState<Set<string>>(new Set());
+  const [confirmBulkRemove, setConfirmBulkRemove] = useState(false);
+  const [bulkRemoving, setBulkRemoving] = useState(false);
 
   // 2026-11-05 全平台成员池（仅超管）：按人聚合的全局名册与操作状态
   const [poolItems, setPoolItems] = useState<MemberPoolItem[]>([]);
@@ -369,10 +377,16 @@ export const RolesMembersView: React.FC = () => {
     }
   }, [toast]);
 
-  // 2026-11-12 A3：把树节点段名建进「部门管理」下拉选项（POST /departments，仅超管可写）
-  const handleAddDeptFromTree = async (node: DeptTreeNode) => {
-    const name = (node.name || '').trim();
+  // 2026-11-12 下午：把树节点建进部门下拉选项（POST /departments，仅超管可写）
+  // 改用**完整路径**（如「市场部/华东组」）—— 分级管理员改成员时选到的就是分级树里的分支，
+  // 部门名超 30 字也可正常创建（后端上限已放宽到 200）。
+  const handleAddDeptFromTree = async (node: DeptTreeNode, rawName?: string) => {
+    const name = (rawName ?? node.path ?? node.name ?? '').trim();
     if (!name) return;
+    if (departments.some((d) => d.name === name)) {
+      toast.warning(`部门选项「${name}」已存在，无需重复创建。`, '已在下拉选项里');
+      return;
+    }
     setDeptTreeBusy(node.path);
     try {
       await api.post('/api/admin/departments', { name });
@@ -385,6 +399,18 @@ export const RolesMembersView: React.FC = () => {
     } finally {
       setDeptTreeBusy('');
     }
+  };
+
+  // 2026-11-12 下午：在树节点下**新建下级部门**（写入下拉选项的名字 = 父路径/新名称）
+  const handleCreateChildDept = async (node: DeptTreeNode) => {
+    const seg = childDeptName.trim();
+    if (!seg) {
+      toast.warning('请填写新分支部门名称');
+      return;
+    }
+    await handleAddDeptFromTree(node, `${node.path}/${seg}`);
+    setChildDeptName('');
+    setCreatingChildPath(null);
   };
 
   const handleAddDepartment = async () => {
@@ -444,6 +470,11 @@ export const RolesMembersView: React.FC = () => {
       loadMembers(selectedRoleId);
     }
   }, [selectedRoleId, loadMembers]);
+
+  /* 2026-11-12 下午：切换角色时清空批量勾选（避免把上一个角色的选择带到新角色上误删） */
+  useEffect(() => {
+    setSelectedMemberPhones(new Set());
+  }, [selectedRoleId]);
 
   const currentRole: RoleItem | undefined = useMemo(
     () => roles.find((r) => r.role_id === selectedRoleId),
@@ -835,13 +866,59 @@ export const RolesMembersView: React.FC = () => {
       setConfirmRemoveRoleMember(null);
       await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
-        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」中移除（全局激活绑定状态保留）。`,
+        `已将「${member.name}」(${member.phone}) 从角色「${roleName}」中移除（该平台上已无其它角色归属时，激活绑定一并清除）。`,
         '已从角色移除',
       );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '移出角色成员失败');
     } finally {
       setRemovingRoleMember(false);
+    }
+  };
+
+  /* 2026-11-12 下午：批量移除成员（用户要求「不要一个一个删」）——
+     勾选复数成员 → 一次 POST batch-delete；语义与单删完全一致，
+     单个失败不影响其余，逐条回报。 */
+  const toggleMemberSelected = (phone: string) => {
+    setSelectedMemberPhones((prev) => {
+      const next = new Set(prev);
+      if (next.has(phone)) next.delete(phone);
+      else next.add(phone);
+      return next;
+    });
+  };
+
+  const handleConfirmBulkRemoveFromRole = async () => {
+    if (!selectedRoleId || selectedMemberPhones.size === 0) return;
+    const roleName = currentRole?.role_name || '当前角色';
+    setBulkRemoving(true);
+    try {
+      const res = await api.post<{
+        ok: boolean;
+        deleted: string[];
+        failed: Array<{ phone: string; code: string; message: string }>;
+      }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/batch-delete`, {
+        phones: [...selectedMemberPhones],
+      });
+      const okCnt = (res.deleted || []).length;
+      const failed = res.failed || [];
+      setSelectedMemberPhones(new Set());
+      setConfirmBulkRemove(false);
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
+      if (failed.length === 0) {
+        toast.success(`已从角色「${roleName}」批量移除 ${okCnt} 名成员。`, '批量移除完成');
+      } else {
+        toast.warning(
+          `成功移除 ${okCnt} 人，${failed.length} 人未移除（${failed
+            .map((f) => `${f.phone}:${f.message}`)
+            .join('；')}）。`,
+          '批量移除部分完成',
+        );
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '批量移除成员失败');
+    } finally {
+      setBulkRemoving(false);
     }
   };
 
@@ -924,34 +1001,93 @@ export const RolesMembersView: React.FC = () => {
   };
 
   // 2026-11-12 A3：递归渲染部门分级树（默认全展开；节点人数 = 含全部下级的总人数）
+  // 2026-11-12 下午：节点动作合并进「部门管理」弹窗 —— ①一键把该分支（全路径）建为部门选项；
+  // ②在该节点下新建下级分支（也进下拉选项，名字 = 完整路径，支持超长部门名）。
   const renderDeptTreeNodes = (nodes: DeptTreeNode[], depth: number): React.ReactNode =>
-    nodes.map((node) => (
-      <div key={node.path}>
-        <div
-          className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors"
-          style={{ marginLeft: depth * 18 }}
-        >
-          <Building2
-            className={`w-3 h-3 shrink-0 ${node.children.length > 0 ? 'text-blue-500' : 'text-slate-400'}`}
-          />
-          <span className={`text-xs ${node.children.length > 0 ? 'font-semibold text-slate-800' : 'text-slate-700'}`}>
-            {node.name}
-          </span>
-          <span className="text-[11px] text-slate-400 tabular-nums shrink-0">· {node.count} 人</span>
-          <span className="flex-1" />
-          <button
-            type="button"
-            disabled={deptTreeBusy === node.path}
-            onClick={() => void handleAddDeptFromTree(node)}
-            className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-700 text-[10px] font-semibold cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
-            title="把该部门名加入成员表单 / H5 登记页的部门下拉选项"
+    nodes.map((node) => {
+      const added = departments.some((d) => d.name === node.path);
+      const creatingChild = creatingChildPath === node.path;
+      return (
+        <div key={node.path}>
+          <div
+            className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors"
+            style={{ marginLeft: depth * 18 }}
           >
-            {deptTreeBusy === node.path ? '创建中…' : '加入部门选项'}
-          </button>
+            <Building2
+              className={`w-3 h-3 shrink-0 ${node.children.length > 0 ? 'text-blue-500' : 'text-slate-400'}`}
+            />
+            <span
+              className={`text-xs ${node.children.length > 0 ? 'font-semibold text-slate-800' : 'text-slate-700'}`}
+              title={node.path}
+            >
+              {node.name}
+            </span>
+            <span className="text-[11px] text-slate-400 tabular-nums shrink-0">· {node.count} 人</span>
+            <span className="flex-1" />
+            <button
+              type="button"
+              disabled={deptTreeBusy === node.path || added}
+              onClick={() => void handleAddDeptFromTree(node)}
+              className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-700 text-[10px] font-semibold cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
+              title={added ? '该分支已在部门下拉选项里' : '把该分支（完整路径）加入成员表单 / H5 登记页的部门下拉选项'}
+            >
+              {deptTreeBusy === node.path ? '创建中…' : added ? '已加入' : '加入部门选项'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setCreatingChildPath(creatingChild ? null : node.path);
+                setChildDeptName('');
+              }}
+              className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-emerald-50 text-slate-500 hover:text-emerald-700 text-[10px] font-semibold cursor-pointer shrink-0 transition-colors"
+              title="在该部门下新建一个分支部门（写入下拉选项，名字为完整路径）"
+            >
+              新建下级
+            </button>
+          </div>
+          {creatingChild && (
+            <div className="flex items-center gap-2 pl-2.5 py-1" style={{ marginLeft: (depth + 1) * 18 }}>
+              <span className="text-[11px] text-slate-400 truncate max-w-[40%]" title={node.path}>
+                {node.path} /
+              </span>
+              <input
+                autoFocus
+                type="text"
+                value={childDeptName}
+                onChange={(e) => setChildDeptName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void handleCreateChildDept(node);
+                  }
+                }}
+                placeholder="新分支部门名称（可超 30 字）"
+                className="flex-1 min-w-[140px] bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs outline-none focus:border-blue-500"
+              />
+              <button
+                type="button"
+                disabled={deptTreeBusy === node.path}
+                onClick={() => void handleCreateChildDept(node)}
+                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60 shrink-0"
+              >
+                创建
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setCreatingChildPath(null);
+                  setChildDeptName('');
+                }}
+                className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-[11px] font-semibold cursor-pointer shrink-0"
+              >
+                取消
+              </button>
+            </div>
+          )}
+          {node.children.length > 0 && renderDeptTreeNodes(node.children, depth + 1)}
         </div>
-        {node.children.length > 0 && renderDeptTreeNodes(node.children, depth + 1)}
-      </div>
-    ));
+      );
+    });
 
   return (
     <div className="space-y-5">
@@ -1192,25 +1328,16 @@ export const RolesMembersView: React.FC = () => {
                   <>
                     <button
                       type="button"
-                      onClick={() => setDeptModalOpen(true)}
-                      className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
-                      title="配置部门选项（成员表单与员工 H5 登记页共用）"
-                    >
-                      <Building2 className="w-3.5 h-3.5 text-slate-500" />
-                      <span>部门管理</span>
-                    </button>
-                    {/* 2026-11-12 A3：部门分级树（按已导入成员的官方组织路径聚合；仅超管） */}
-                    <button
-                      type="button"
                       onClick={() => {
-                        setDeptTreeOpen(true);
+                        /* 2026-11-12 下午：部门管理 = 唯一入口（平铺列表 + 官方分级树合并进同一弹窗） */
+                        setDeptModalOpen(true);
                         void loadDeptTree();
                       }}
                       className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
-                      title="按已导入成员的官方组织路径（dept_path）聚合的部门分级树；可从树节点一键加入部门选项"
+                      title="配置部门选项（平铺列表 + 按官方组织路径聚合的分级树；成员表单与员工 H5 登记页共用）"
                     >
-                      <Network className="w-3.5 h-3.5 text-slate-500" />
-                      <span>部门分级树</span>
+                      <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                      <span>部门管理</span>
                     </button>
                   </>
                 )}
@@ -1261,12 +1388,60 @@ export const RolesMembersView: React.FC = () => {
               </form>
             )}
 
+            {/* 2026-11-12 下午：批量移除工具条（勾选后出现；超管只读不参与） */}
+            {!isSuperAdmin && selectedMemberPhones.size > 0 && (
+              <div className="px-4 sm:px-5 py-2.5 bg-rose-50/70 border-b border-rose-100 flex flex-wrap items-center gap-2.5 text-xs">
+                <span className="font-semibold text-rose-700 flex items-center gap-1.5">
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>已勾选 {selectedMemberPhones.size} 名成员</span>
+                </span>
+                <span className="flex-1" />
+                <button
+                  type="button"
+                  onClick={() => setSelectedMemberPhones(new Set())}
+                  className="px-3 py-1.5 rounded-xl bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 font-semibold cursor-pointer shrink-0"
+                >
+                  取消勾选
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmBulkRemove(true)}
+                  className="px-3 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-semibold cursor-pointer shrink-0 inline-flex items-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>批量移除（{selectedMemberPhones.size} 人）</span>
+                </button>
+              </div>
+            )}
+
             {/* 第三层：成员列表表格 */}
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
-                    <th className="py-3 pl-5 pr-3">成员姓名</th>
+                    {!isSuperAdmin && (
+                      <th className="py-3 pl-5 pr-2 w-10">
+                        <input
+                          type="checkbox"
+                          aria-label="全选/取消全选当前列表成员"
+                          checked={
+                            filteredMembers.length > 0 &&
+                            filteredMembers.every((m) => selectedMemberPhones.has(m.phone))
+                          }
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setSelectedMemberPhones(
+                                new Set(filteredMembers.map((m) => m.phone)),
+                              );
+                            } else {
+                              setSelectedMemberPhones(new Set());
+                            }
+                          }}
+                          className="w-3.5 h-3.5 accent-rose-600 cursor-pointer"
+                        />
+                      </th>
+                    )}
+                    <th className={`py-3 ${isSuperAdmin ? 'pl-5' : 'pl-2'} pr-3`}>成员姓名</th>
                     <th className="py-3 px-3">手机号码</th>
                     <th className="py-3 px-3">部门</th>
                     <th className="py-3 px-3">激活状态</th>
@@ -1277,13 +1452,13 @@ export const RolesMembersView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100 text-xs">
                   {loadingMembers ? (
                     <tr>
-                      <td colSpan={6} className="py-12 text-center text-slate-400">
+                      <td colSpan={isSuperAdmin ? 6 : 7} className="py-12 text-center text-slate-400">
                         正在加载角色成员名册…
                       </td>
                     </tr>
                   ) : filteredMembers.length === 0 ? (
                     <tr>
-                      <td colSpan={6} className="py-12 text-center text-slate-400">
+                      <td colSpan={isSuperAdmin ? 6 : 7} className="py-12 text-center text-slate-400">
                         该角色下暂无匹配成员，可在上方直接添加、CSV 批量导入或点击「全局搜索已激活成员」拉入。
                       </td>
                     </tr>
@@ -1293,7 +1468,19 @@ export const RolesMembersView: React.FC = () => {
                         key={m.phone}
                         className="hover:bg-slate-50/70 transition-colors group"
                       >
-                        <td className="py-3.5 pl-5 pr-3">
+                        {!isSuperAdmin && (
+                          <td className="py-3.5 pl-5 pr-2">
+                            <input
+                              type="checkbox"
+                              aria-label={`勾选成员 ${m.name}`}
+                              checked={selectedMemberPhones.has(m.phone)}
+                              onChange={() => toggleMemberSelected(m.phone)}
+                              onClick={(e) => e.stopPropagation()}
+                              className="w-3.5 h-3.5 accent-rose-600 cursor-pointer"
+                            />
+                          </td>
+                        )}
+                        <td className={`py-3.5 ${isSuperAdmin ? 'pl-5' : 'pl-2'} pr-3`}>
                           <div className="flex items-center gap-2.5">
                             <div className="w-7 h-7 rounded-lg bg-slate-100 text-slate-700 font-bold text-xs flex items-center justify-center shrink-0">
                               {m.name.slice(0, 1)}
@@ -1443,14 +1630,16 @@ export const RolesMembersView: React.FC = () => {
       {/* 2026-11-03 部门管理弹窗：配置部门选项（成员表单与员工 H5 登记页共用） */}
       {deptModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <div>
                 <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
                   <Building2 className="w-4 h-4 text-blue-600" />
                   <span>部门管理</span>
                 </h3>
-                <p className="text-[11px] text-slate-400">员工 H5 登记页与成员表单的下拉选项，都来自这里</p>
+                <p className="text-[11px] text-slate-400">
+                  员工 H5 登记页与成员表单的下拉选项都来自这里；含官方部门分级树（超管可在树上创建分支部门）
+                </p>
               </div>
               <button onClick={() => setDeptModalOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-400">
                 <X className="w-5 h-5" />
@@ -1536,54 +1725,40 @@ export const RolesMembersView: React.FC = () => {
                 ))
               )}
             </div>
-          </div>
-        </div>
-      )}
 
-      {/* 2026-11-12 A3：部门分级树弹窗（仅超管；按已导入成员的官方组织路径聚合，含人数）
-          展示 member.dept_path 的层级结构；节点「加入部门选项」会把该段名建进 dept_option，
-          供成员表单 / H5 登记页下拉选择。 */}
-      {deptTreeOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
-                  <Network className="w-4 h-4 text-blue-600" />
-                  <span>部门分级树</span>
-                </h3>
-                <p className="text-[11px] text-slate-400">
-                  按已导入成员的官方组织路径（dept_path）聚合；人数含全部下级，仅统计启用成员
-                </p>
-              </div>
-              <div className="flex items-center gap-1">
+            {/* 2026-11-12 下午（用户拍板）：部门分级树并入「部门管理」弹窗 —— 单一入口。
+                按已导入成员的官方组织路径（dept_path）聚合；节点可一键把分支（完整路径）
+                建为部门选项，也可在该节点下新建下级分支；改名/删除仍在上方平铺列表里。 */}
+            <div className="border-t border-slate-100 pt-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-1.5">
+                  <Network className="w-3.5 h-3.5 text-blue-500" />
+                  <span className="text-xs font-bold text-slate-700">部门分级树（官方组织路径）</span>
+                </div>
                 <button
                   type="button"
                   onClick={() => void loadDeptTree()}
                   disabled={deptTreeLoading}
                   className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer disabled:opacity-50"
-                  title="刷新"
+                  title="刷新部门分级树"
                 >
                   <RefreshCw className={`w-4 h-4 ${deptTreeLoading ? 'animate-spin' : ''}`} />
                 </button>
-                <button
-                  onClick={() => setDeptTreeOpen(false)}
-                  className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
               </div>
-            </div>
-            <div className="max-h-[60vh] overflow-y-auto space-y-0.5 pr-1">
-              {deptTreeLoading ? (
-                <div className="py-10 text-center text-xs text-slate-400">正在聚合部门树…</div>
-              ) : deptTree.length === 0 ? (
-                <div className="py-10 text-center text-xs text-slate-400">
-                  暂无带官方组织路径的已导入成员；导入 / 添加成员并完成通讯录反查后，这里会按部门层级展示
-                </div>
-              ) : (
-                renderDeptTreeNodes(deptTree, 0)
-              )}
+              <p className="text-[11px] text-slate-400">
+                人数含全部下级，仅统计启用成员；「加入部门选项」写入的是完整路径（如「市场部/华东组」），部门名可超 30 字
+              </p>
+              <div className="max-h-56 overflow-y-auto space-y-0.5 pr-1 border border-slate-100 rounded-xl p-2 bg-slate-50/40">
+                {deptTreeLoading ? (
+                  <div className="py-8 text-center text-xs text-slate-400">正在聚合部门树…</div>
+                ) : deptTree.length === 0 ? (
+                  <div className="py-8 text-center text-xs text-slate-400">
+                    暂无带官方组织路径的已导入成员；导入 / 添加成员并完成通讯录反查后，这里会按部门层级展示
+                  </div>
+                ) : (
+                  renderDeptTreeNodes(deptTree, 0)
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -1603,7 +1778,7 @@ export const RolesMembersView: React.FC = () => {
                     确认将该成员移出当前角色？
                   </h3>
                   <p className="text-[11px] text-slate-500">
-                    移出后仅从当前角色分组剔除，保留全平台已激活状态
+                    移出后从当前角色名册剔除；未完成任务实例转「已取消」
                   </p>
                 </div>
               </div>
@@ -1628,10 +1803,12 @@ export const RolesMembersView: React.FC = () => {
               <div className="p-3 rounded-xl bg-emerald-50/80 border border-emerald-200/80 text-emerald-900 space-y-1">
                 <div className="font-semibold flex items-center gap-1.5">
                   <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
-                  <span>保留全局已激活绑定状态</span>
+                  <span>激活状态按平台判断，跨组保留</span>
                 </div>
                 <p className="text-[11px] text-emerald-800">
-                  该操作不会解除用户的办公软件会话绑定；后续任何管理员再次添加该手机号时，将自动识别为「已激活」免二次绑定。
+                  该手机号在当前办公软件下若还有其它角色分组，激活绑定保持不动；若已无任何角色归属，
+                  该平台绑定一并清除，后续需重新导入（导入即自动反查通讯录重新激活）。
+                  其未完成的任务实例转「已取消」，已完成的按既定口径一并清除。
                 </p>
               </div>
             </div>
@@ -1651,6 +1828,58 @@ export const RolesMembersView: React.FC = () => {
                 className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
               >
                 {removingRoleMember ? '正在移除…' : '确认从当前角色移除'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-11-12 下午：批量移除成员确认弹窗（语义与单删一致，一次移除勾选的全部成员） */}
+      {confirmBulkRemove && currentRole && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-50 text-rose-600 flex items-center justify-center shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 text-base">
+                    确认批量移除 {selectedMemberPhones.size} 名成员？
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    从角色「{currentRole.role_name}」名册中移出；语义与单个移除完全一致
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setConfirmBulkRemove(false)}
+                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-3 rounded-xl bg-rose-50/80 border border-rose-200/80 text-rose-900 space-y-1 text-xs leading-relaxed">
+              <p className="font-semibold">移除后果（与单个移除同款）：</p>
+              <p>· 名册行立即删除；该成员在当前平台已无其它角色归属时，激活绑定一并清除（后续重新导入即自动反查激活）。</p>
+              <p>· 未完成任务实例转「已取消」，已完成实例按既定口径一并清除。</p>
+              <p>· 单个成员移除失败不影响其余成员，结果逐条回报。</p>
+            </div>
+            <div className="pt-2 flex justify-end gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => setConfirmBulkRemove(false)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmBulkRemoveFromRole()}
+                disabled={bulkRemoving || selectedMemberPhones.size === 0}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60 transition-colors"
+              >
+                {bulkRemoving ? '正在批量移除…' : `确认批量移除（${selectedMemberPhones.size} 人）`}
               </button>
             </div>
           </div>

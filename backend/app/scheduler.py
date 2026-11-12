@@ -19,7 +19,16 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 from .channels.zdxlz import SendResult
 from .config import SHANGHAI_TZ, NowFn, default_now, format_dt, parse_dt
-from .state import StateStore, BizError, calc_resubmit_deadline, is_valid_hhmm
+from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例与文档都从 scheduler 导入
+    H5_TOKEN_TTL_HOURS,
+    NO_DEADLINE_SENTINEL,
+    StateStore,
+    BizError,
+    calc_h5_token_ttl_hours,
+    calc_resubmit_deadline,
+    is_no_deadline,
+    is_valid_hhmm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,18 +158,74 @@ def is_template_anchor_day(template: Dict[str, Any], dt: DateLike) -> bool:
 
 
 def calc_deadline_at(anchor_dt: DateLike, deadline_hhmm: str, deadline_offset: int = 0, period: Optional[str] = None) -> str:
-    """R47~R49：计算实例截止时间 YYYY-MM-DD HH:MM:SS（截止 = 锚点日 + deadline_offset 天的 deadline）。"""
+    """R47~R49：计算实例截止时间 YYYY-MM-DD HH:MM:SS（截止 = 锚点日 + deadline_offset 天的 deadline）。
+
+    2026-11-12 下午（用户拍板，图三报错修复）：截止时刻 **00:00 = 当天 24 点**
+    （即次日 0 点）——当天 0 点就是当天的 24 点，任何提醒时刻都早于它，应可正常创建。
+    """
     anchor_date = _to_date(anchor_dt)
     hour, minute = _parse_hhmm(deadline_hhmm)
     offset = 0 if period == "day" else int(deadline_offset or 0)
     if not (0 <= offset <= 6):
         raise ValueError(f"deadline_offset 必须在 0~6 天之间: {deadline_offset!r}")
     due_date = anchor_date + timedelta(days=offset)
+    if hour == 0 and minute == 0:
+        due_date = due_date + timedelta(days=1)  # 00:00 = 当天 24 点 = 次日 0 点
     return datetime.combine(due_date, time(hour=hour, minute=minute, second=0)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def calc_instance_deadline(template: Dict[str, Any], anchor_dt: DateLike) -> str:
+    """2026-11-12 任务E1：按模板截止配置计算实例截止时间（用户拍板口径）。
+
+    · has_deadline=0（无截止）→ 哨兵 9999-12-31 23:59:59（NOT NULL 列不动，字符串比较天然
+      永不过期；展示层统一特判「不限」）；
+    · deadline_type=same_day → 锚点日 + deadline_time；
+    · deadline_type=weekend  → 锚点日所在 ISO 周的周日 + deadline_time；
+    · deadline_type=month_end→ 锚点日所在月最后一天 + deadline_time；
+    · deadline_type 为空（旧模板）→ 回落旧算法 calc_deadline_at(deadline + deadline_offset)。
+
+    2026-11-12 下午（用户拍板，图三报错修复）：三种类型的截止时刻 **00:00 都按
+    「该基准日的 24 点」**（= 次日 0 点）计算——当天 0 点就是当天的 24 点，
+    应允许创建并在次日 0 点才过期（与 calc_deadline_at 旧口径同步）。
+    """
+    # has_deadline 显式为 0/False → 无截止；None/缺键（旧调用方、raw dict）→ 按有截止处理
+    _hd = template.get("has_deadline")
+    if _hd is not None and not int(_hd):
+        return NO_DEADLINE_SENTINEL
+    deadline_type = str(template.get("deadline_type") or "").strip()
+    if deadline_type:
+        hhmm = str(template.get("deadline_time") or template.get("deadline") or "").strip()
+        if not is_valid_hhmm(hhmm):
+            raise ValueError(f"模板截止时刻非法: {hhmm!r}")
+        anchor = _to_date(anchor_dt)
+        if deadline_type == "weekend":
+            due_date = anchor + timedelta(days=7 - anchor.isoweekday())  # isoweekday: 周日=7
+        elif deadline_type == "month_end":
+            due_date = date(anchor.year, anchor.month, calendar.monthrange(anchor.year, anchor.month)[1])
+        elif deadline_type == "same_day":
+            due_date = anchor
+        else:
+            raise ValueError(f"未知 deadline_type: {deadline_type!r}")
+        hour, minute = _parse_hhmm(hhmm)
+        if hour == 0 and minute == 0:
+            due_date = due_date + timedelta(days=1)  # 00:00 = 基准日 24 点 = 次日 0 点
+        return datetime.combine(due_date, time(hour=hour, minute=minute, second=0)).strftime("%Y-%m-%d %H:%M:%S")
+    # 旧模板兼容：沿用 R47~R49 算法（deadline + deadline_offset，行为与历史完全一致）
+    return calc_deadline_at(
+        anchor_dt,
+        str(template.get("deadline") or "").strip(),
+        int(template.get("deadline_offset") or 0),
+        template.get("period"),
+    )
+
+
 def format_deadline_display(deadline_at: str, ref_dt: Optional[DateLike] = None) -> str:
-    """§11：{截止时间} 转为「今天 18:00」或「10月25日 18:00」。"""
+    """§11：{截止时间} 转为「今天 18:00」或「10月25日 18:00」。
+
+    2026-11-12 任务E1：无截止哨兵统一显示「不限」（消息文案/H5/后台同口径）。
+    """
+    if is_no_deadline(deadline_at):
+        return "不限"
     dt = parse_dt(deadline_at)
     hhmm = dt.strftime("%H:%M")
     if ref_dt is not None and dt.date() == _to_date(ref_dt):
@@ -416,9 +481,18 @@ class Scheduler:
         return self._now_fn()
 
     def build_h5_submit_url(self, *, phone: str, template_id: str, period_key_val: str, instance_id: int) -> Tuple[str, str]:
-        """§8.1 签发真实 72h H5 令牌（库中只存 SHA-256），返回 (h5_url, raw_token)。"""
+        """§8.1 签发 H5 令牌（库中只存 SHA-256），返回 (h5_url, raw_token)。
+
+        2026-11-12 任务E1：有效期不再硬编码 72h，按实例动态计算（保守策略）：
+        · 无截止（哨兵）→ 720h（30 天）；
+        · 有截止 → min(截止 + 24h, 720h)；
+        · rejected 驳回重交 → 以重交截止 + 24h 封顶（覆盖整个重交窗口）。
+        """
+        inst = self.state.get_instance(int(instance_id))
+        ttl_hours = calc_h5_token_ttl_hours(inst, self.now()) if inst else float(H5_TOKEN_TTL_HOURS)
         raw_token = self.state.issue_h5_token(
-            phone=phone, template_id=template_id, period_key=period_key_val, instance_id=int(instance_id), purpose="submit", ttl_hours=72
+            phone=phone, template_id=template_id, period_key=period_key_val, instance_id=int(instance_id),
+            purpose="submit", ttl_hours=ttl_hours,
         )
         return f"{self.public_base_url}/h5/task#t={raw_token}", raw_token
 
@@ -430,7 +504,7 @@ class Scheduler:
         if not is_template_anchor_day(template, cur_dt):
             return []
         p_key = period_key(template["period"], cur_dt)
-        deadline_at = calc_deadline_at(cur_dt, template["deadline"], int(template.get("deadline_offset") or 0), template["period"])
+        deadline_at = calc_instance_deadline(template, cur_dt)
         return self.state.ensure_template_instances(template["template_id"], p_key, deadline_at)
 
     def _build_planned_dt(self, ref_dt: datetime, hhmm: str) -> datetime:
@@ -664,8 +738,14 @@ class Scheduler:
             phone=instance["phone"], template_id=instance["template_id"],
             period_key_val=instance["period_key"], instance_id=int(instance["id"]),
         )
-        resubmit_disp = format_deadline_display(instance["resubmit_deadline"], ref_dt=cur_dt)
-        msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n请在 {resubmit_disp} 前重新提交。\n👉 重新提交：{h5_url}"
+        # 2026-11-12 任务E1：无截止（哨兵）模板被驳回 → 重交窗口同样「不限」，
+        # 文案不带「请在 X 前重交」，避免「请在 不限 前重新提交」的病句。
+        if is_no_deadline(str(instance.get("resubmit_deadline") or instance.get("deadline_at") or "")):
+            window_line = "本任务无截止时间，请按审核意见尽快重新提交。"
+        else:
+            resubmit_disp = format_deadline_display(instance["resubmit_deadline"], ref_dt=cur_dt)
+            window_line = f"请在 {resubmit_disp} 前重新提交。"
+        msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n{window_line}\n👉 重新提交：{h5_url}"
 
         # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
         # 2026-11-10 方案A：按绑定的 external_type 传 receive_type（union_id 不依赖会话）。
@@ -727,7 +807,7 @@ class Scheduler:
             raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
 
         p_key = period_key(tpl["period"], cur_dt)
-        deadline_at = calc_deadline_at(cur_dt, tpl["deadline"], int(tpl.get("deadline_offset") or 0), tpl["period"])
+        deadline_at = calc_instance_deadline(tpl, cur_dt)
 
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
         self.state.ensure_template_instances(tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s)
@@ -1028,13 +1108,12 @@ class Scheduler:
             planned_str = format_dt(overdue_planned_dt)
             delay_sec = (cur_dt - overdue_planned_dt).total_seconds()
             def _make_overdue_msg(instance=inst, template=tpl, dl_dt=deadline_dt) -> str:
-                dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                # 2026-10-29 逾期补交审核制：逾期后旧链接不再放行，改引导用户回复「申请补交」。
-                # 任务名与截止时间照旧保留（原有内容不删）。
+                # 2026-11-12 任务E3：「申请补交」全链路下线，逾期通知改为纯截止告知
+                # （不引导任何补交通道）；文案口径与 H5/后端校验统一
+                # 「当前任务已过期（截止时间：…），无法提交」，不区分链接过期与任务截止。
                 return (
                     f"【{template['name']}】已逾期\n"
-                    f"截止时间：{dl_disp}，你尚未提交。\n\n"
-                    f"如需提交请回复【申请补交】，待管理员审核通过后将发送新链接。"
+                    f"你尚未提交。当前任务已过期（截止时间：{instance['deadline_at']}），无法提交。"
                 )
 
             # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。

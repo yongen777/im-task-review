@@ -96,14 +96,14 @@ def test_csv_import_dict_format():
         store.close()
 
 
-def test_h5_overdue_old_link_rejected_requires_resubmit():
-    """2026-10-29 新口径：逾期后**旧链接一律不放行**，必须走申请补交 → 审核 → 30 分钟新链接。
-
-    （原用例断言「逾期 72h 内仍可提交」，随需求变更作废；rejected 的驳回重交窗口另有用例覆盖。）
+def test_h5_overdue_old_link_rejected():
+    """2026-11-12 任务E2/E3 新口径：逾期后旧链接一律不放行，统一提示
+    「当前任务已过期（截止时间：…），无法提交」（补交通道已下线；
+    rejected 的驳回重交窗口另有用例覆盖）。
     """
     store = _mk_store()
     try:
-        # 固定"现在"：这条用例的申请窗口是「截止后 24h」，用真实日期跑会在第二天变成超窗。
+        # 固定"现在"：用真实日期跑会在第二天变成超窗。
         store._now_fn = lambda: _dt(19, 0)
         tpl = _form_tpl(store)
         pkey = "2026-10-28"
@@ -116,19 +116,15 @@ def test_h5_overdue_old_link_rejected_requires_resubmit():
         assert adv["to_overdue"] >= 1
         assert store.get_instance(inst["id"])["status"] == "overdue"
 
-        # 逾期后 3 小时：普通 token 不放行
+        # 逾期后 3 小时：普通 token 不放行（SUBMISSION_CLOSED + 统一文案）
         tok = store.issue_h5_token("13900001001", tpl["template_id"], pkey, inst["id"])
         with pytest.raises(BizError) as err:
             store.submit_h5_task(raw_token=tok, fields={"summary": "补交"})
-        assert err.value.code == "WINDOW_CLOSED"
-        assert "申请补交" in err.value.message
+        assert err.value.code == "SUBMISSION_CLOSED"
+        assert err.value.message == "当前任务已过期（截止时间：2026-10-28 18:00:00），无法提交"
 
-        # 申请 → 通过 → resubmit 链接放行
-        assert store.request_resubmit("13900001001")["result"] == "applied"
-        approved = store.approve_resubmit(int(inst["id"]), actor="admin")
-        res = store.submit_h5_task(raw_token=approved["raw_token"], fields={"summary": "补交"})
-        assert res["ok"] is True
-        assert res["late_submit"] is True
+        # 「申请补交」通道已下线：state 不再有该方法
+        assert not hasattr(store, "request_resubmit")
     finally:
         store.close()
 
@@ -254,8 +250,9 @@ def test_scheduler_async_doesnt_block():
 # ── 第三批 ──────────────────────────────────────────────────────────
 
 
-def test_delete_template_expires_open_instances():
-    """P1-6：删除模板 → 其未完成实例置 expired，已完成的不动。"""
+def test_delete_template_purges_open_instances():
+    """2026-11-12 下午口径（用户拍板）：删除模板 = 物理清除——实例行直接从库里删，
+    旧「置 expired 留行」的软删口径废除（清库迁移不留残留）。"""
     store = _mk_store()
     try:
         tpl = _form_tpl(store, need_review=False)
@@ -265,7 +262,7 @@ def test_delete_template_expires_open_instances():
         assert inst is not None
 
         store.delete_template(tpl["template_id"], actor="t")
-        assert store.get_instance(inst["id"])["status"] == "expired"
+        assert store.get_instance(inst["id"]) is None
     finally:
         store.close()
 

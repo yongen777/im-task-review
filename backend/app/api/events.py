@@ -25,8 +25,8 @@ except ImportError:  # pragma: no cover
     JSONResponse = None  # type: ignore[assignment,misc]
 
 from ..channels.zdxlz import SignatureVerificationError, ZdxlzChannel, is_event_timestamp_fresh
-from ..scheduler import NotifierProtocol
-from ..state import StateStore
+from ..scheduler import NotifierProtocol, format_deadline_display
+from ..state import StateStore, calc_h5_token_ttl_hours, effective_instance_deadline
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +116,7 @@ def _extract_user_name(payload: Dict[str, Any]) -> str:
 
 
 def _extract_message_text(payload: Dict[str, Any]) -> str:
-    """从回调事件 JSON 中提取发送方文本内容（已绑定用户用于「申请补交」等指令）。
+    """从回调事件 JSON 中提取发送方文本内容（已绑定用户用于【待办】等指令）。
     2026-11-11 任务一后，未绑定用户不再解析手机号/不再走任何绑定分支。"""
     candidates = [payload.get("text"), payload.get("content")]
     for nested_key in ("message", "msg", "data", "event"):
@@ -166,14 +166,23 @@ def handle_inbound_text(
     2026-11-10 企微自建应用接入时抽出：
       · 量子密信：process_app_event 验签+解密后调用本函数；
       · 企业微信：/api/wecom/callback 解出 XML 明文后调用本函数。
-    ⛔ 业务规则（登记引导 / 申请补交 / 闲聊 ack）只写这一份，新通道只做格式转换，不复制规则。
+    ⛔ 业务规则（【待办】指令 / 闲聊 ack / 未绑定拦截）只写这一份，新通道只做格式转换，不复制规则。
 
     2026-11-11 任务一（用户拍板，收归管理权）：
       · **废除私聊自激活**：未绑定用户发任意文本一律「不落库、不绑定、不反查」，
         统一回复固定提醒「尚未录入业务权限，请联系管理员录入激活」；
       · 唯一激活路径 = 管理后台导入/选入成员（组织架构选择器 / CSV 导入）时自动反查绑定；
       · 历史「路径 A/C/U」（对话文字、H5 链接、union_id 自动识别）全部停用；
-      · 已绑定用户不受影响（申请补交 / ack 照旧）。
+      · 已绑定用户不受影响。
+
+    2026-11-12 任务E3：原「申请补交」指令（逾期补交审核制）全链路下线，
+      逾期后统一提示「当前任务已过期（截止时间：…），无法提交」；
+      ⛔ 驳回重交（rejected）机制保留，由审核驳回通知里的链接承载。
+
+    2026-11-12 任务E4：新增【待办】指令——
+      支持「待办 / 我的任务 / 未完成」三种触发词（可带【】[] 括号）；
+      查当前用户在本平台 status ∈ {pending, rejected} 且未截止的上传任务（封顶 5 条），
+      逐项签发动态 TTL 链接回复；未绑定用户仍走固定提醒（零落库红线不动）。
     """
 
     bound_member = (
@@ -183,44 +192,49 @@ def handle_inbound_text(
     if bound_member is None:
         bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
     if bound_member is not None:
-        # 2026-10-29 逾期补交审核制：文本「申请补交」**优先**处理，
-        # ⛔ 不落入待归纳池、也不走下面那条「看不懂聊天」的固定 ack。
+        # 2026-11-12 任务E4：【待办】指令——去首尾【】[] 后匹配「待办 / 我的任务 / 未完成」。
         apply_text = (msg_text or "").strip().strip("【】[]　 ")
-        if apply_text == "申请补交":
+        if apply_text in ("待办", "我的任务", "未完成"):
             try:
-                res = state.request_resubmit(bound_member["phone"], actor=f"user:{user_id}")
+                todo_items = state.list_pending_todo(
+                    bound_member["phone"], platform=platform or None, limit=5,
+                )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("补交申请处理异常 user=%s: %s", user_id, exc)
-                res = {"result": "none", "items": []}
-            result = res.get("result")
-            if result == "applied":
-                reply = "已收到补交申请，请等待管理员审核。"
-                names = [str(i.get("template_name") or "").strip() for i in (res.get("items") or [])]
-                names = [n for n in names if n]
-                if names:
-                    reply += "\n本次申请涉及：" + "、".join(names)
-            elif result == "already":
-                reply = "该任务已申请过补交，不可重复申请。"
-            elif result == "window_expired":
-                reply = "已超补交申请窗口（需在截止时间后 24 小时内申请），本次不受理。"
-            elif result == "admin_disabled":
-                # 2026-11-05 用户/workbuddy 拍板：管理员停用期间不受理补交，但要说清是「人不在」
-                # 而不是「没有任务」——否则员工以为系统坏了。
-                n = len(res.get("items") or [])
-                reply = (f"你名下有 {n} 个逾期任务，但该任务的管理员账号已停用，暂时无法受理补交。"
-                         "请联系管理员恢复账号后再申请。")
+                logger.warning("待办查询异常 user=%s: %s", user_id, exc)
+                todo_items = []
+            if not todo_items:
+                reply = "您当前暂无待提交的任务。如需重新获取未完成任务的提交链接，请回复【待办】。"
             else:
-                reply = "当前没有可申请补交的逾期任务。"
-            send(reply, f"resubmit_{result}")
-            return 200, {"ok": True, "path": "resubmit", "bound": True, "result": result}
+                lines = [f"【待办任务】您当前有 {len(todo_items)} 项未完成的任务："]
+                for idx, it in enumerate(todo_items, start=1):
+                    deadline_at = effective_instance_deadline(it)
+                    dl_disp = format_deadline_display(deadline_at, ref_dt=state.now()) if deadline_at else "不限"
+                    try:
+                        ttl_hours = calc_h5_token_ttl_hours(it, state.now())
+                        raw_token = state.issue_h5_token(
+                            phone=str(it["phone"]), template_id=str(it["template_id"]),
+                            period_key=str(it["period_key"]), instance_id=int(it["id"]),
+                            purpose="submit", ttl_hours=ttl_hours,
+                        )
+                        link = f"{(base_url or '').rstrip('/')}/h5/task#t={raw_token}"
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("待办链接签发失败 instance=%s: %s", it.get("id"), exc)
+                        continue
+                    lines.append(f"{idx}. {it.get('template_name') or '任务'}（截止：{dl_disp}）")
+                    lines.append(f"提交链接：{link}")
+                reply = "\n".join(lines)
+            send(reply, f"todo_{len(todo_items)}")
+            return 200, {"ok": True, "path": "todo", "bound": True, "count": len(todo_items)}
 
-        # 2026-10-27 用户需求：已绑定用户发送非手机号消息时，机器人固定回复确认
+        # 2026-10-27 用户需求：已绑定用户发送非指令消息时，机器人固定回复确认
         # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
+        # 2026-11-12 任务E4：末尾追加【待办】指令指引。
         ack_text = (
             "【OPS任务调度助手】\n"
             "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容，\n"
             "暂时看不懂聊天和其他文字指令，这里不需要你回复文字。\n"
-            "任务提醒会按时自动送达，届时按提醒里的链接或表单提交即可；业务问题请联系对应管理员。"
+            "任务提醒会按时自动送达，届时按提醒里的链接或表单提交即可；业务问题请联系对应管理员。\n"
+            "如需重新获取未完成任务的提交链接，请回复【待办】。"
         )
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
@@ -250,7 +264,8 @@ def process_app_event(
     """§3.2 & §7.3 核心处理逻辑，返回 (status_code, body_dict)：
     - 验签失败一律返回 401，绝不进入绑定逻辑；
     - 2026-11-11 任务一：未绑定用户统一回「尚未录入业务权限」提醒，**零落库零绑定**；
-    - 已绑定用户支持「申请补交」指令与固定 ack。
+    - 已绑定用户支持【待办】指令（2026-11-12 任务E4）与固定 ack；
+      原「申请补交」指令已随补交链路一并下线（任务E3）。
     """
     base_url = public_base_url.rstrip("/")
     active_notifier: NotifierProtocol = notifier if notifier is not None else channel

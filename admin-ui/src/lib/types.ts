@@ -88,7 +88,11 @@ export interface TemplateItem {
   /** 支持关联多个业务角色（向后兼容单角色 role_id） */
   role_ids?: string[];
   remind_at: string;
-  deadline: string;
+  deadline: string | null;
+  /* 2026-11-12 任务E1：截止配置三件套（has_deadline=false = 无截止，展示「不限」） */
+  has_deadline?: boolean;
+  deadline_type?: 'same_day' | 'weekend' | 'month_end' | null;
+  deadline_time?: string | null;
   text_tpl: string;
   spec: TemplateSpec;
   enabled: boolean;
@@ -184,7 +188,8 @@ export type InstanceStatus =
   | 'approved'
   | 'rejected'
   | 'overdue'
-  | 'expired';
+  | 'expired'
+  | 'cancelled';
 
 export interface TaskInstanceItem {
   id: number;
@@ -212,11 +217,6 @@ export interface TaskInstanceItem {
   /* 2026-10-29：模板的计划执行时间（通知类可能有多个时点），列表「执行时间」列要用 */
   template_remind_at?: string | null;
   template_notice_times?: string[] | string | null;
-  /* 2026-10-29 逾期补交审核制：申请时间 / 审核状态 / 审核人 / 审核时间 */
-  resubmit_req_at?: string | null;
-  resubmit_status?: 'pending' | 'approved' | 'rejected' | null;
-  resubmit_decided_by?: string | null;
-  resubmit_decided_at?: string | null;
   owner_id?: number;
   owner_username?: string;
   owner_display_name?: string | null;
@@ -224,7 +224,8 @@ export interface TaskInstanceItem {
   created_at: string;
 }
 
-/* 2026-10-30 审核待办（跨日期聚合）：用户提交待审 / 补交申请待审 */
+/* 2026-10-30 审核待办（跨日期聚合）：用户提交待审
+   2026-11-12 任务E3：补交申请类随「申请补交」链路下线，只剩用户提交待审 */
 export interface PendingReviewItem {
   id: number;
   template_id: string;
@@ -239,8 +240,6 @@ export interface PendingReviewItem {
   late_submit?: boolean;
   deadline_at: string | null;
   submitted_at?: string | null;
-  resubmit_req_at?: string | null;
-  resubmit_status?: string | null;
   owner_id?: number;
   owner_username?: string;
   owner_display_name?: string | null;

@@ -100,7 +100,7 @@ def _mk_store() -> StateStore:
 
 
 def _mk_overdue(store: StateStore, *, hours_late: float = 2.0) -> Dict[str, Any]:
-    """建一个已逾期实例（用于验证「申请补交」分支）。"""
+    """建一个已逾期实例（2026-11-12 后「申请补交」已下线，该文本只落常规 ack）。"""
     # 2026-11-09：激活按**角色所属平台**判定 → 角色与绑定平台要一致（都是 wecom），
     # 否则成员在角色所属平台算未激活 → 不生成实例（下面 ensure 就会取不到）。
     rid = store.create_role("执行组", actor="t", platform="wecom")["role_id"]
@@ -186,8 +186,9 @@ def test_verify_url_503_when_not_configured() -> None:
 
 
 # ── 2. POST 业务回调 ────────────────────────────────────────────────
-def test_post_text_message_triggers_resubmit_branch() -> None:
-    """企微回调 → 解出 text → 「申请补交」→ 走现有业务分支并回执。"""
+def test_post_text_message_bound_user_gets_todo_ack() -> None:
+    """企微回调 → 解出 text → 已绑定用户「申请补交」已下线（任务E3）→ 落常规 ack
+    （含【待办】指引），不再写任何补交状态。"""
     store = _mk_store()
     try:
         inst = _mk_overdue(store)
@@ -204,9 +205,9 @@ def test_post_text_message_triggers_resubmit_branch() -> None:
         assert r.text == "success"  # 先应答（5 秒硬约束）
 
         # 业务在 BackgroundTasks 里同步执行完（TestClient 行为）
-        assert store.get_instance(inst["id"])["resubmit_status"] == "pending"
+        assert store.get_instance(inst["id"])["resubmit_status"] is None, "⛔ 补交链路已下线，不得写状态"
         assert notifier.sent, "应有回执"
-        assert "已收到补交申请" in notifier.sent[0][1]
+        assert "如需重新获取未完成任务的提交链接，请回复【待办】。" in notifier.sent[0][1]
         assert notifier.sent[0][0] == USERID
     finally:
         store.close()

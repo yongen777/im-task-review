@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """2026-10-30 审核待办聚合接口 /api/admin/instances/pending-reviews 的验收用例。
 
-背景：实例列表按 period_key 单日精确匹配，而补交待审的实例必然是往日的（逾期才补交），
-默认「今天」筛选下永远查不到。这个接口按「提交/申请时刻」跨自然日聚合两类待办。
+背景：实例列表按 period_key 单日精确匹配，往日的待审实例在默认「今天」筛选下查不到。
+这个接口按「提交时刻」跨自然日聚合待办。
+2026-11-12 任务E3：补交申请链路下线，待办只剩「用户提交待审」一类。
 """
 
 from __future__ import annotations
@@ -87,10 +88,6 @@ def test_pending_reviews_aggregates_across_natural_days() -> None:
         i_yday = _inst(store, tpl, -1)
         _mark(store, i_yday["id"], status="submitted",
               submitted_at=format_dt(store.now().replace(tzinfo=None) - timedelta(days=1)))
-        # 昨天逾期 + 补交待审
-        i_rq = _inst(store, tpl, -2)
-        _mark(store, i_rq["id"], status="overdue", resubmit_status="pending",
-              resubmit_req_at=format_dt(store.now().replace(tzinfo=None) - timedelta(days=1)))
         # 停用模板的待审实例：不该出现（先建实例再停用，否则实例根本不会被生成）
         tpl_off = _tpl(store, rid, "已停用模板")
         i_off = _inst(store, tpl_off, 0)
@@ -103,18 +100,18 @@ def test_pending_reviews_aggregates_across_natural_days() -> None:
         body = r.json()
         assert body["ok"] is True
         assert body["days"] == 7
+        # 2026-11-12 任务E3：补交申请链路下线，响应不再有 resubmit 字段
+        assert "resubmit" not in body
 
         sub_ids = {x["id"] for x in body["submitted"]}
         assert i_today["id"] in sub_ids and i_yday["id"] in sub_ids
         assert i_off["id"] not in sub_ids, "停用模板的实例不应出现在待办里"
 
-        rq_ids = {x["id"] for x in body["resubmit"]}
-        assert i_rq["id"] in rq_ids
         # 审核必需字段齐全
-        row = next(x for x in body["resubmit"] if x["id"] == i_rq["id"])
-        for k in ("member_name_snap", "phone", "template_name", "resubmit_req_at", "deadline_at"):
+        row = next(x for x in body["submitted"] if x["id"] == i_yday["id"])
+        for k in ("member_name_snap", "phone", "template_name", "submitted_at", "deadline_at"):
             assert row.get(k), f"缺少字段 {k}"
-        assert body["total"] == len(body["submitted"]) + len(body["resubmit"])
+        assert body["total"] == len(body["submitted"])
     finally:
         store.close()
 
@@ -143,7 +140,7 @@ def test_pending_reviews_empty_when_nothing_to_do() -> None:
         client = _env(store)
         body = client.get("/api/admin/instances/pending-reviews").json()
         assert body["total"] == 0
-        assert body["submitted"] == [] and body["resubmit"] == []
+        assert body["submitted"] == []
     finally:
         store.close()
 

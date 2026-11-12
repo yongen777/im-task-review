@@ -127,48 +127,8 @@ def test_disabled_admin_stops_scheduling_multi_tick() -> None:
         store.close()
 
 
-# ── 2. 停用期间补交申请：admin_disabled，且说清"人不在" ──
-def test_resubmit_returns_admin_disabled_when_owner_disabled() -> None:
-    store = _store()
-    try:
-        store.upsert_admin_user("admin", "Admin@2026", must_change=False)
-        a_id = int(store.create_admin_account(username="sa", display_name="sa")["id"])
-        rid = store.create_role("甲组", actor="sa", owner_id=a_id)["role_id"]
-        store.add_role_member(rid, PHONE_X, "张三", "市场部", actor="sa", owner_id=a_id)
-        store.upsert_delivery_target(PHONE_X, "uid_x")
-        tpl = store.create_template(_tpl_payload(rid, name="甲的上报", kind="form"),
-                                    actor="sa", owner_id=a_id)
-        # 造一个逾期实例（截止取「2 小时前」——与真实运行时刻无关，永远落在 24h 申请窗口内。
-        # ⛔ 原实现用「昨日 18:00」，窗口=截止+24h=当天 18:00 整点到期，一过 18:00 跑必挂
-        # （2026-11-10 18:04 远程 pytest 实锤：17:46 本地绿、18:04 远程红，纯时间炸弹））
-        now = store.now()
-        overdue_dt = now - timedelta(hours=2)
-        overdue_day = overdue_dt.strftime("%Y-%m-%d")
-        store.conn.execute(
-            "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, "
-            "deadline_at, created_at, owner_id) VALUES (?, ?, '张三', '市场部', ?, 'overdue', ?, ?, ?)",
-            (tpl["template_id"], PHONE_X, overdue_day,
-             overdue_dt.strftime("%Y-%m-%d %H:%M:%S"),
-             (overdue_dt - timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S"), a_id),
-        )
-        store.conn.commit()
-
-        assert store.request_resubmit(PHONE_X)["result"] == "applied"
-        # 重置回可申请状态，再停用管理员验证 admin_disabled
-        store.conn.execute("UPDATE task_instance SET resubmit_status = NULL, resubmit_req_at = NULL WHERE phone = ?", (PHONE_X,))
-        store.conn.commit()
-        store.update_admin_account(a_id, enabled=False, actor="admin")
-        res = store.request_resubmit(PHONE_X)
-        assert res["result"] == "admin_disabled", res
-        assert len(res["items"]) == 1
-        # 停用期间不置 pending
-        row = store.conn.execute("SELECT resubmit_status FROM task_instance WHERE phone = ?", (PHONE_X,)).fetchone()
-        assert not row["resubmit_status"]
-        # 启用后恢复受理
-        store.update_admin_account(a_id, enabled=True, actor="admin")
-        assert store.request_resubmit(PHONE_X)["result"] == "applied"
-    finally:
-        store.close()
+# ── 2.（已删除）停用期间补交申请 admin_disabled 用例 ──────────────────
+# 2026-11-12 任务E3：「申请补交」全链路下线，request_resubmit 已删除，该用例随之移除。
 
 
 # ── 3. 级联删除：数据全清、绑定条件删、路径越界防护、备份、审计 ──

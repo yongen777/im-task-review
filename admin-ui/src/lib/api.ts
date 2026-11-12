@@ -676,6 +676,7 @@ function computeStats(items: TaskInstanceItem[]): InstanceStats {
     rejected: 0,
     overdue: 0,
     expired: 0,
+    cancelled: 0, // 2026-11-12 任务E5：成员移出分组后作废的实例状态
   };
   for (const it of items) {
     by_status[it.status] = (by_status[it.status] || 0) + 1;
@@ -963,6 +964,17 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
 
     validateRemindAt(kind, period, remind_at, deadline);
 
+    /* 2026-11-12 任务E1：mock 模式同样保存截止三件套（与真实后端同口径） */
+    const has_deadline = kind === 'notice' ? false : Boolean(body?.has_deadline ?? true);
+    const deadline_type =
+      kind === 'notice' || !has_deadline
+        ? null
+        : ((body?.deadline_type as 'same_day' | 'weekend' | 'month_end' | undefined) ?? 'same_day');
+    const deadline_time =
+      kind === 'notice' || !has_deadline
+        ? null
+        : String(body?.deadline_time || deadline || '').trim() || null;
+
     const spec: TemplateSpec = {
       ...(body?.spec || {}),
       require_review: kind === 'notice' ? false : Boolean(body?.spec?.require_review ?? true),
@@ -977,6 +989,9 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
       role_ids,
       remind_at,
       deadline,
+      has_deadline,
+      deadline_type,
+      deadline_time,
       text_tpl,
       spec,
       enabled,
@@ -1158,10 +1173,29 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
           ? ''
           : body?.deadline !== undefined
             ? String(body.deadline).trim()
-            : existing.deadline;
+            : existing.deadline ?? '';
       const text_tpl =
         body?.text_tpl !== undefined ? String(body.text_tpl).trim() : existing.text_tpl;
       const enabled = body?.enabled !== undefined ? Boolean(body.enabled) : existing.enabled;
+      /* 2026-11-12 任务E1：mock 模式 PUT 同步截止三件套 */
+      const has_deadline =
+        existing.kind === 'notice'
+          ? false
+          : body?.has_deadline !== undefined
+            ? Boolean(body.has_deadline)
+            : (existing.has_deadline ?? true);
+      const deadline_type =
+        existing.kind === 'notice' || !has_deadline
+          ? null
+          : body?.deadline_type !== undefined
+            ? (body.deadline_type as 'same_day' | 'weekend' | 'month_end' | null)
+            : (existing.deadline_type ?? 'same_day');
+      const deadline_time =
+        existing.kind === 'notice' || !has_deadline
+          ? null
+          : body?.deadline_time !== undefined
+            ? String(body.deadline_time ?? '').trim() || null
+            : existing.deadline_time ?? null;
       const rawSpec = body?.spec !== undefined ? body.spec : existing.spec;
       const spec: TemplateSpec = {
         ...rawSpec,
@@ -1188,6 +1222,9 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
         role_ids,
         remind_at,
         deadline,
+        has_deadline,
+        deadline_type,
+        deadline_time,
         text_tpl,
         spec,
         enabled,
@@ -1336,6 +1373,32 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
       }
       return { ok: true };
     }
+  }
+
+  /* 2026-11-12 下午：批量移除成员（mock 模式与真实后端同路径；真实后端做名册/绑定/实例级联） */
+  const batchDeleteMatch = pathname.match(/^\/api\/admin\/roles\/([^/]+)\/members\/batch-delete$/);
+  if (method === 'POST' && batchDeleteMatch) {
+    const roleId = decodeURIComponent(batchDeleteMatch[1]);
+    if (!state.roles.some((r) => r.role_id === roleId)) throw new Error('ROLE_NOT_FOUND');
+    const phones = Array.isArray(body?.phones) ? body.phones.map((p: unknown) => String(p)) : [];
+    if (phones.length === 0) throw new Error('PHONES_REQUIRED');
+    const list = state.members[roleId] || [];
+    const deleted: string[] = [];
+    const failed: Array<{ phone: string; code: string; message: string }> = [];
+    for (const phone of phones) {
+      const idx = list.findIndex((m) => m.phone === phone);
+      if (idx === -1) {
+        failed.push({ phone, code: 'NOT_FOUND', message: '成员不存在' });
+        continue;
+      }
+      list.splice(idx, 1);
+      deleted.push(phone);
+    }
+    state.members[roleId] = list;
+    if (deleted.length > 0) {
+      appendAudit('member.batch_delete', `role:${roleId}`, `批量移除成员 ${deleted.length} 人：${deleted.join('、')}`);
+    }
+    return { ok: true, deleted, failed };
   }
 
   const memberSingleMatch = pathname.match(/^\/api\/admin\/roles\/([^/]+)\/members\/([^/]+)$/);

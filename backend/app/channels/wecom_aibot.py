@@ -107,7 +107,7 @@ class AibotBridge:
             client.on("authenticated", self._on_authenticated)
             client.on("disconnected", self._on_disconnected)
             # 收用户消息：SDK 的 message_handler 会按 msgtype 再发细分事件，
-            # 我们只处理文本（绑定手机号 / 申请补交 / 闲聊 ack 都是文本）。
+            # 我们只处理文本（【待办】指令 / 闲聊 ack 都是文本）。
             client.on("message.text", self._on_message_text)
             client.on("message", self._on_other_message)
         except Exception as exc:  # noqa: BLE001 - 不同 SDK 版本事件名可能有差异

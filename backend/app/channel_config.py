@@ -46,7 +46,7 @@ CHANNEL_SCHEMA: Dict[str, Dict[str, Any]] = {
             {"key": "app_secret", "label": "AppSecret", "required": True, "secret": True,
              "hint": "应用密钥，仅首次可复制"},
             # 2026-10-30 用户口径：必填 = 能保证「发送 + 回调接收」全链路的参数全集。
-            # 这两个缺了，验签/解密直接失败 → 用户发来的「姓名 手机号」「申请补交」机器人收不到。
+            # 这两个缺了，验签/解密直接失败 → 用户发来的「姓名 手机号」「【待办】」机器人收不到。
             {"key": "verify_token", "label": "回调 Token", "required": True, "secret": True,
              "hint": "与平台「事件订阅」里配置的 Token 一致，用于事件验签"},
             {"key": "encrypt_key", "label": "回调 EncryptKey", "required": True, "secret": True,

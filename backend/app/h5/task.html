@@ -120,14 +120,18 @@
           document.getElementById("tplName").textContent = data.template.name;
           document.getElementById("memberName").textContent = data.instance.name_snap;
           document.getElementById("periodKey").textContent = data.instance.period_key;
-          const STATUS_TEXT = { pending: "待上传", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期" };
+          /* 2026-11-12 任务E5：cancelled（成员移出分组后作废）补「已取消」徽章；
+             无截止模板的截止时间展示「不限」。 */
+          const STATUS_TEXT = { pending: "待上传", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期", cancelled: "已取消" };
           document.getElementById("instStatus").textContent = STATUS_TEXT[data.instance.status] || data.instance.status;
 
           /* 顶部任务卡：标题 + 截止徽章 + 提醒正文（与预览版式一致） */
           document.getElementById("headTitle").textContent = data.template.name;
           const dl = String(data.instance.deadline_at || "");
+          /* 哨兵 9999-12-31 = 无截止时间 → 徽章显示「不限」 */
+          const noDeadline = dl.startsWith("9999-12-31");
           const hhmm = dl.length >= 16 ? dl.slice(11, 16) : dl;
-          document.getElementById("headDeadline").textContent = "截止 " + hhmm;
+          document.getElementById("headDeadline").textContent = noDeadline ? "截止 不限" : "截止 " + hhmm;
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
           const area = document.getElementById("dynamicArea");
@@ -296,36 +300,34 @@
           if (data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
 
           /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
-             只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。 */
+             只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。
+             2026-11-12 任务E3：逾期补交通道下线——overdue 不再有可填写分支，
+             统一按锁定态给出「当前任务已过期（截止时间：…），无法提交」提示。 */
           const __status = data.instance.status;
-          /* 2026-10-29 逾期补交审核制：overdue 只有「管理员通过后签发的 resubmit 链接」才 window_open，
-             因此保留 overdue 可填写分支，但文案改成补交链接提示。 */
-          const __canResubmit = (__status === "rejected" || __status === "overdue") && !!data.window_open;
+          const __canResubmit = __status === "rejected" && !!data.window_open;
           if (__canResubmit) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
             tip.style.background = "#fff7ed";
             tip.style.borderColor = "#fed7aa";
             tip.style.color = "#c2410c";
-            if (__status === "rejected") {
-              tip.textContent = data.instance.resubmit_deadline
-                ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
-                : "该提交已被驳回，请按审核意见修改后重新提交。";
-            } else {
-              tip.textContent = "已超过截止时间。本条是管理员开通的补交链接，请在 30 分钟内提交完成，过期后本次补交机会即用掉。";
-            }
-            content.insertBefore(tip, submitBtn);
+            tip.textContent = data.instance.resubmit_deadline
+              ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
+              : "该提交已被驳回，请按审核意见修改后重新提交。";
+            contentEl.insertBefore(tip, submitBtn);
           } else if (__status !== "pending") {
             const LOCKED_TEXT = {
               submitted: "已提交，等待管理员审核。如需修改请联系管理员驳回后重新提交。",
               approved: "已审核通过，本条任务已完成。",
               rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
-              overdue: "任务已逾期，旧链接已失效。请回复【申请补交】，管理员审核通过后会发送新链接。",
-              expired: "该任务已过期，无法提交。",
+              /* 2026-11-12 任务E2：逾期/过期统一口径文案（与后端校验同句式） */
+              overdue: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
+              expired: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
+              cancelled: "该任务已被取消（成员已移出分组），无需提交。",
             };
             const tip = document.createElement("div");
             tip.className = "locked-tip";
-            tip.textContent = LOCKED_TEXT[__status] || "当前状态不可提交。";
+            tip.textContent = LOCKED_TEXT[__status] || (data.window_reason || "当前状态不可提交。");
             const content = document.getElementById("content");
             content.insertBefore(tip, submitBtn);
             content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });

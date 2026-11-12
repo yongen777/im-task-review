@@ -212,7 +212,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                   {/* 2026-10-28：预览按实际推送的纯文本渲染（密信不支持富文本卡片/超链接），
                       与实际发送内容一字不差，避免「预览一套、实发一套」。 */}
                   <div className="text-xs text-slate-800 whitespace-pre-line leading-relaxed">
-                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：今天 ${deadline || '18:00'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
+                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：${deadline ? `今天 ${deadline}` : '不限（长期有效）'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
                   </div>
                 </div>
               </div>
@@ -237,11 +237,9 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
             <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-1">
               <div className="flex items-center justify-between">
                 <span className="font-bold text-slate-900 text-xs">{displayTitle}</span>
-                {deadline && (
-                  <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
-                    截止 {deadline}
-                  </span>
-                )}
+                <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                  截止 {deadline || '不限'}
+                </span>
               </div>
               {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
               <div className="text-[11px] text-slate-500">
@@ -431,7 +429,11 @@ export const TemplatesView: React.FC = () => {
   };
   const [roleIds, setRoleIds] = useState<string[]>([]);
   const [remindAt, setRemindAt] = useState('08:15');
-  const [deadline, setDeadline] = useState('18:00');
+  /* 2026-11-12 任务E1：截止配置三件套（与后端同名字段对齐）。
+     hasDeadline=false → 无截止（deadlineType/deadlineTime 不提交任何值，实例截止存哨兵）。 */
+  const [hasDeadline, setHasDeadline] = useState<boolean>(true);
+  const [deadlineType, setDeadlineType] = useState<'same_day' | 'weekend' | 'month_end'>('same_day');
+  const [deadlineTime, setDeadlineTime] = useState('18:00');
   const [requireReview, setRequireReview] = useState<boolean>(true);
   const [enabled, setEnabled] = useState(true);
 
@@ -528,7 +530,9 @@ export const TemplatesView: React.FC = () => {
     const defaultRoleId = roleFilter || roles[0]?.role_id || 'role_branch_chief';
     setRoleIds(defaultRoleId ? [defaultRoleId] : []);
     setRemindAt(defaultKind === 'notice' ? '08:15' : '16:30');
-    setDeadline('18:00');
+    setHasDeadline(true);
+    setDeadlineType('same_day');
+    setDeadlineTime('18:00');
     setRequireReview(true);
     setNoticeItems(createDefaultNoticeItems());
     setUploadRemindText(
@@ -568,7 +572,12 @@ export const TemplatesView: React.FC = () => {
       tplRoles.length > 0 ? tplRoles : [roles[0]?.role_id || 'role_branch_chief'],
     );
     setRemindAt(tpl.remind_at);
-    setDeadline(tpl.deadline || '18:00');
+    /* 2026-11-12 任务E1：截止配置三件套回显（老模板无 deadline_type 时回落 same_day） */
+    setHasDeadline(tpl.has_deadline !== false);
+    setDeadlineType(
+      tpl.deadline_type === 'weekend' || tpl.deadline_type === 'month_end' ? tpl.deadline_type : 'same_day',
+    );
+    setDeadlineTime(tpl.deadline_time || tpl.deadline || '18:00');
     setRequireReview(tpl.kind === 'notice' ? false : tpl.spec?.require_review !== false);
     setEnabled(tpl.enabled);
 
@@ -691,6 +700,10 @@ export const TemplatesView: React.FC = () => {
         role_ids: tplRoleIds,
         remind_at: tpl.remind_at,
         deadline: tpl.kind === 'notice' ? '' : tpl.deadline,
+        /* 2026-11-12 任务E1：快捷启停带上截止三件套（后端已按 existing 回显补默认，双保险） */
+        has_deadline: tpl.kind !== 'notice' && tpl.has_deadline !== false,
+        deadline_type: tpl.deadline_type ?? null,
+        deadline_time: tpl.kind === 'notice' ? null : tpl.deadline_time || tpl.deadline || null,
         text_tpl: tpl.text_tpl,
         spec: tpl.spec,
         enabled: nextEnabled,
@@ -784,9 +797,9 @@ export const TemplatesView: React.FC = () => {
         })),
       };
     } else {
-      // 统一上传任务校验
-      if (!deadline.trim()) {
-        toast.warning('请填写截止时间');
+      // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
+      if (hasDeadline && !deadlineTime.trim()) {
+        toast.warning('请填写截止时刻');
         return;
       }
       if (!uploadRemindText.trim()) {
@@ -834,7 +847,14 @@ export const TemplatesView: React.FC = () => {
 
     setSaving(true);
     try {
-      const finalDeadline = kind === 'notice' ? '' : deadline.trim();
+      /* 2026-11-12 任务E1：截止三件套随保存提交——
+         无截止 → has_deadline=false（deadline/deadline_type/deadline_time 全空）；
+         有截止 → deadline_type ∈ {same_day, weekend, month_end} + deadline_time（HH:MM）。
+         旧列 deadline 同步存 deadline_time，保证未升级的读取链路一致。 */
+      const finalDeadline = kind === 'notice' || !hasDeadline ? '' : deadlineTime.trim();
+      const finalHasDeadline = kind !== 'notice' && hasDeadline;
+      const finalDeadlineType = finalHasDeadline ? deadlineType : null;
+      const finalDeadlineTime = finalHasDeadline ? deadlineTime.trim() : null;
       if (editingTpl) {
         await api.put(`/api/admin/templates/${editingTpl.id}`, {
           name: name.trim(),
@@ -842,6 +862,9 @@ export const TemplatesView: React.FC = () => {
           role_ids: roleIds,
           remind_at: remindAt.trim(),
           deadline: finalDeadline,
+          has_deadline: finalHasDeadline,
+          deadline_type: finalDeadlineType,
+          deadline_time: finalDeadlineTime,
           text_tpl: finalTextTpl,
           spec,
           enabled,
@@ -874,6 +897,9 @@ export const TemplatesView: React.FC = () => {
           role_ids: roleIds,
           remind_at: remindAt.trim(),
           deadline: finalDeadline,
+          has_deadline: finalHasDeadline,
+          deadline_type: finalDeadlineType,
+          deadline_time: finalDeadlineTime,
           text_tpl: finalTextTpl,
           spec,
           enabled,
@@ -1263,11 +1289,22 @@ export const TemplatesView: React.FC = () => {
                                   <span>{UPLOAD_MODULE_META[m]?.label || m}</span>
                                 </span>
                               ))}
-                              {tpl.deadline && (
-                                <span className="text-[11px] font-mono text-slate-500 ml-1">
-                                  截止 {tpl.deadline}
-                                </span>
-                              )}
+                              {/* 2026-11-12 任务E1：截止展示改「不限」/ 时刻 / 周日 / 月底 三种类型 */}
+                              {(() => {
+                                const dlType = tpl.deadline_type;
+                                const dlLabel = tpl.has_deadline === false
+                                  ? '不限'
+                                  : dlType === 'weekend'
+                                    ? `周日 ${tpl.deadline_time || tpl.deadline || ''}`
+                                    : dlType === 'month_end'
+                                      ? `月底 ${tpl.deadline_time || tpl.deadline || ''}`
+                                      : (tpl.deadline_time || tpl.deadline || '—');
+                                return (
+                                  <span className="text-[11px] font-mono text-slate-500 ml-1">
+                                    截止 {dlLabel}
+                                  </span>
+                                );
+                              })()}
                             </div>
                           </div>
                         )}
@@ -1651,17 +1688,74 @@ export const TemplatesView: React.FC = () => {
                       />
                     </div>
 
+                    {/* 截止配置（2026-11-12 任务E1 重构：开关 + 类型单选 + 时刻） */}
                     {kind === 'upload' && (
-                      <div>
-                        <label className="font-semibold text-slate-700 block mb-1">
-                          截止时间 <span className="text-rose-500">*</span>
+                      <div className="sm:col-span-2">
+                        <label className="font-semibold text-slate-700 block mb-1.5">
+                          截止配置 <span className="text-[11px] font-normal text-slate-400">（不设截止 = 任务长期有效）</span>
                         </label>
-                        <input
-                          type="time"
-                          value={deadline}
-                          onChange={(e) => setDeadline(e.target.value)}
-                          className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 font-mono text-slate-800 outline-none focus:bg-white focus:border-blue-500"
-                        />
+                        <div className="flex flex-wrap items-center gap-2">
+                          <label className="inline-flex items-center gap-1.5 cursor-pointer select-none bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
+                            <input
+                              type="checkbox"
+                              checked={hasDeadline}
+                              onChange={(e) => setHasDeadline(e.target.checked)}
+                              className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500"
+                            />
+                            <span className="font-semibold text-slate-800 text-xs">设置截止时间</span>
+                          </label>
+                          {hasDeadline && (
+                            <>
+                              <div className="inline-flex rounded-xl bg-white p-0.5 border border-slate-200 text-[11px]">
+                                <button
+                                  type="button"
+                                  onClick={() => setDeadlineType('same_day')}
+                                  className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer transition-all ${
+                                    deadlineType === 'same_day'
+                                      ? 'bg-blue-600 text-white shadow-2xs'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  当天截止
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeadlineType('weekend')}
+                                  className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer transition-all ${
+                                    deadlineType === 'weekend'
+                                      ? 'bg-blue-600 text-white shadow-2xs'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  本周日截止
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDeadlineType('month_end')}
+                                  className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer transition-all ${
+                                    deadlineType === 'month_end'
+                                      ? 'bg-blue-600 text-white shadow-2xs'
+                                      : 'text-slate-600 hover:text-slate-900'
+                                  }`}
+                                >
+                                  本月月底截止
+                                </button>
+                              </div>
+                              <input
+                                type="time"
+                                aria-label="截止时刻"
+                                value={deadlineTime}
+                                onChange={(e) => setDeadlineTime(e.target.value)}
+                                className="w-28 bg-slate-50 border border-slate-200 rounded-xl p-2 font-mono text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                              />
+                            </>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-1.5">
+                          {hasDeadline
+                            ? '到截止时刻后 H5 提交入口关闭，逾期后统一提示「当前任务已过期，无法提交」。'
+                            : '无截止时间：任务长期有效，提醒与 H5 页面显示「截止 不限」。'}
+                        </div>
                       </div>
                     )}
 
@@ -1992,7 +2086,7 @@ export const TemplatesView: React.FC = () => {
                     <UploadFlowPhonePreview
                       taskName={name}
                       remindAt={remindAt}
-                      deadline={deadline}
+                      deadline={hasDeadline ? deadlineTime : ''}
                       remindText={uploadRemindText}
                       modules={uploadModules}
                       fields={fields}

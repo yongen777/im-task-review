@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Check,
-  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
@@ -18,9 +17,10 @@ import { PendingReviewItem } from '../../lib/types';
 
 /* 2026-10-30 审核待办卡片
  *
- * 为什么单独做：实例列表的 period_key 是单日精确匹配，而「补交待审」的实例一定是往日的
- * （逾期才可能补交），默认「今天」的日期筛选下永远查不到 —— 管理员必须先手改日期。
- * 这个组件按「提交/申请时刻」跨自然日聚合两类待办，不改动原有筛选器与列表。
+ * 为什么单独做：实例列表的 period_key 是单日精确匹配，往日的待审实例在默认
+ * 「今天」筛选下查不到，这个组件按「提交时刻」跨自然日聚合，不改动原有筛选器与列表。
+ * 2026-11-12 任务E3：「申请补交」链路整体下线，原有「补交申请待审」一类行随之移除，
+ * 只保留「用户提交待审」。
  */
 
 interface PendingReviewsResponse {
@@ -28,9 +28,8 @@ interface PendingReviewsResponse {
   days: number;
   since: string;
   limit: number;
-  truncated: { submitted: boolean; resubmit: boolean };
+  truncated: { submitted: boolean };
   submitted: PendingReviewItem[];
-  resubmit: PendingReviewItem[];
   total: number;
 }
 
@@ -91,7 +90,6 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
         ? {
             ...prev,
             submitted: prev.submitted.filter((x) => x.id !== id),
-            resubmit: prev.resubmit.filter((x) => x.id !== id),
             total: Math.max(0, prev.total - 1),
           }
         : prev,
@@ -134,31 +132,16 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
     );
   };
 
-  const approveResubmit = (item: PendingReviewItem) =>
-    runAction(
-      item,
-      () => api.post(`/api/admin/instances/${item.id}/resubmit/approve`, {}),
-      `已通过「${item.member_name_snap}」的补交申请，补交链接已发送（30 分钟有效）。`,
-    );
-
-  const rejectResubmit = (item: PendingReviewItem) =>
-    runAction(
-      item,
-      () => api.post(`/api/admin/instances/${item.id}/resubmit/reject`, {}),
-      `已拒绝「${item.member_name_snap}」的补交申请，已通知本人。`,
-    );
-
   const total = data?.total ?? 0;
-  // 两类都为 0 → 整卡隐藏，不占空间
+  // 没有待办时整卡隐藏，不占空间
   if (!loading && total === 0) return null;
   if (!data && loading) return null;
 
-  const renderRow = (item: PendingReviewItem, kind: 'submitted' | 'resubmit') => {
+  const renderRow = (item: PendingReviewItem) => {
     const busy = busyId === item.id;
     const rejecting = rejectingId === item.id;
-    const isResubmit = kind === 'resubmit';
     return (
-      <div key={`${kind}-${item.id}`} className="border-b border-slate-100 last:border-b-0">
+      <div key={`submitted-${item.id}`} className="border-b border-slate-100 last:border-b-0">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 text-xs hover:bg-slate-50/70">
           <span className="font-bold text-slate-800 shrink-0">{item.member_name_snap}</span>
           <span className="font-mono text-slate-500 tabular-nums shrink-0">{item.phone}</span>
@@ -175,16 +158,9 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
             </>
           )}
           <span className="text-slate-300">·</span>
-          <span className="text-slate-500 tabular-nums">
-            {isResubmit ? '申请于' : '提交于'} {fmtMD(isResubmit ? item.resubmit_req_at : item.submitted_at)}
-          </span>
+          <span className="text-slate-500 tabular-nums">提交于 {fmtMD(item.submitted_at)}</span>
           <span className="text-slate-300">·</span>
           <span className="text-slate-500 tabular-nums">截止 {fmtMD(item.deadline_at)}</span>
-          {item.late_submit && (
-            <span className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200 text-[10px] font-semibold">
-              补交
-            </span>
-          )}
 
           <span className="ml-auto flex items-center gap-1.5 shrink-0">
             <button
@@ -195,48 +171,27 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
               <span>查看</span>
             </button>
             {!isSuperAdmin && (
-              isResubmit ? (
-                <>
-                  <button
-                    onClick={() => void approveResubmit(item)}
-                    disabled={busy}
-                    className="px-2 py-1 rounded-lg bg-violet-600 hover:bg-violet-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                  >
-                    <Check className="w-3 h-3" />
-                    <span>通过补交</span>
-                  </button>
-                  <button
-                    onClick={() => void rejectResubmit(item)}
-                    disabled={busy}
-                    className="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                  >
-                    <X className="w-3 h-3" />
-                    <span>拒绝补交</span>
-                  </button>
-                </>
-              ) : (
-                <>
-                  <button
-                    onClick={() => void approve(item)}
-                    disabled={busy}
-                    className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                  >
-                    <Check className="w-3 h-3" />
-                    <span>通过</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      setRejectingId(rejecting ? null : item.id);
-                      setRejectReason('');
-                    }}
-                    disabled={busy}
-                    className="px-2 py-1 rounded-lg bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
-                  >
-                    <X className="w-3 h-3" />
-                    <span>驳回</span>
-                  </button>
-                </>
-              )
+              <>
+                <button
+                  onClick={() => void approve(item)}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                >
+                  <Check className="w-3 h-3" />
+                  <span>通过</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setRejectingId(rejecting ? null : item.id);
+                    setRejectReason('');
+                  }}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-lg bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 font-semibold inline-flex items-center gap-1 cursor-pointer disabled:opacity-60"
+                >
+                  <X className="w-3 h-3" />
+                  <span>驳回</span>
+                </button>
+              </>
             )}
           </span>
         </div>
@@ -274,7 +229,6 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
   };
 
   const subCount = data?.submitted.length ?? 0;
-  const rqCount = data?.resubmit.length ?? 0;
 
   return (
     <div className="bg-white rounded-2xl border border-amber-200/80 shadow-2xs overflow-hidden">
@@ -285,9 +239,7 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
           <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-white text-amber-700 border border-amber-200 tabular-nums">
             共 {total} 条
           </span>
-          <span className="text-[11px] text-slate-500">
-            用户提交 {subCount} · 补交申请 {rqCount}
-          </span>
+          <span className="text-[11px] text-slate-500">用户提交 {subCount}</span>
         </div>
         <div className="flex items-center gap-1.5">
           <button
@@ -319,20 +271,7 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
                   <span className="text-amber-600 font-semibold">（仅显示最近 {data.limit} 条）</span>
                 )}
               </div>
-              {data?.submitted.map((it) => renderRow(it, 'submitted'))}
-            </>
-          )}
-
-          {rqCount > 0 && (
-            <>
-              <div className="px-3 pt-2 pb-1 text-[11px] font-bold text-slate-500 flex items-center gap-1.5">
-                <CheckCircle2 className="w-3 h-3 text-violet-500" />
-                <span>补交申请待审</span>
-                {data?.truncated.resubmit && (
-                  <span className="text-amber-600 font-semibold">（仅显示最近 {data.limit} 条）</span>
-                )}
-              </div>
-              {data?.resubmit.map((it) => renderRow(it, 'resubmit'))}
+              {data?.submitted.map((it) => renderRow(it))}
             </>
           )}
 

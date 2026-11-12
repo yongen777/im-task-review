@@ -166,7 +166,8 @@ class TestStage2A(unittest.TestCase):
 
         self.store.delete_template(tid, actor="admin")
         self.assertIsNone(self.store.get_template(tid, include_deleted=False))
-        self.assertIsNotNone(self.store.get_template(tid, include_deleted=True))
+        # 2026-11-12 下午口径（用户拍板）：删除 = 物理清除，库里不再保留软删行
+        self.assertIsNone(self.store.get_template(tid, include_deleted=True))
         self.assertEqual(self.store.list_templates()["total"], 1)
 
     def test_r44_partial_template_update_keeps_kind_and_notice_remind_at(self) -> None:

@@ -550,24 +550,19 @@ class TestStage2B(unittest.TestCase):
         self.assertEqual(r_ok_png.status_code, 200)
         ref_png = r_ok_png.json()["ref"]
 
-        # 2026-10-29 逾期补交审核制：逾期后普通链接不放行，
-        # 必须「申请补交 → 管理员通过 → 30 分钟新链接」才能提交（申请窗口截止后 24h 内）。
+        # 2026-11-12 任务E3：逾期补交链路下线——逾期后普通链接一律 SUBMISSION_CLOSED + 统一文案，
+        # 不再有「申请 → 通过 → 30 分钟新链接」通道（late 提交只能走 rejected 驳回重交）。
         self.current_dt = make_dt("2026-10-26 12:00:00")
         self.store.advance_instance_statuses(self.current_dt)
         r_sub_old = self.pub_client.post("/api/h5/task/submit", json={"token": tok_img, "payload": {"refs": [ref_png]}, "note": "出差补交"})
-        self.assertEqual((r_sub_old.status_code, r_sub_old.json()["code"]), (400, "WINDOW_CLOSED"))
-        self.assertEqual(self.store.request_resubmit("13600000001")["result"], "applied")
-        approved = self.store.approve_resubmit(int(inst_img["id"]), actor="admin")
-        r_sub_late = self.pub_client.post("/api/h5/task/submit", json={"token": approved["raw_token"], "payload": {"refs": [ref_png]}, "note": "出差补交"})
-        self.assertEqual(r_sub_late.status_code, 200)
-        self.assertTrue(r_sub_late.json()["late_submit"])
-        self.assertEqual(r_sub_late.json()["instance"]["late_submit"], 1)
+        self.assertEqual((r_sub_old.status_code, r_sub_old.json()["code"]), (400, "SUBMISSION_CLOSED"))
+        self.assertIn("当前任务已过期（截止时间：2026-10-25 18:00:00），无法提交", r_sub_old.json()["message"])
 
         self.current_dt = make_dt("2026-10-28 18:30:00")
         tok_file_late = self.store.issue_h5_token("13600000001", tpl_file["template_id"], "2026-10-25", inst_file["id"])
         self.current_dt = make_dt("2026-10-28 19:00:00")
         r_closed = self.pub_client.post("/api/h5/task/submit", json={"token": tok_file_late, "payload": {"refs": ["dummy"]}})
-        self.assertEqual((r_closed.status_code, r_closed.json()["code"]), (400, "WINDOW_CLOSED"))
+        self.assertEqual((r_closed.status_code, r_closed.json()["code"]), (400, "SUBMISSION_CLOSED"))
 
 
 if __name__ == "__main__":

@@ -90,7 +90,15 @@ CREATE TABLE IF NOT EXISTS task_template (
   deleted         INTEGER NOT NULL DEFAULT 0,
   created_by      TEXT NOT NULL,
   created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL
+  updated_at      TEXT NOT NULL,
+  /* 2026-11-12 任务E1：截止配置三件套。
+     has_deadline=0（无截止）时实例截止时间统一存哨兵 9999-12-31 23:59:59
+     （deadline_at 列 NOT NULL 不动，字符串比较天然永不过期，展示层特判「不限」）。
+     deadline_type ∈ {same_day, weekend, month_end}；NULL = 旧模板回落
+     旧列 deadline(HH:MM) + deadline_offset 的算法，行为不变。 */
+  has_deadline    INTEGER NOT NULL DEFAULT 1,
+  deadline_type   TEXT,
+  deadline_time   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_instance (
@@ -406,12 +414,17 @@ class Database:
             _ensure_column(self.conn, "pending_member", "dept", "TEXT")
             # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
             _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
-            # 2026-10-29 逾期补交审核制：逾期后必须「申请补交 → 管理员审核 → 30 分钟新链接」，
-            # 每实例只有一次申请机会（resubmit_status 一旦非空即视为已用过）。
+            # 2026-10-29 逾期补交审核制的 resubmit_* 四列：链路已于 2026-11-12 任务E3 彻底下线，
+            # 列保留仅为存量历史数据兼容（不再读写）；列定义动不了（SQLite 不能 DROP COLUMN 前的时代习惯）。
             _ensure_column(self.conn, "task_instance", "resubmit_req_at", "TEXT")
             _ensure_column(self.conn, "task_instance", "resubmit_status", "TEXT")
             _ensure_column(self.conn, "task_instance", "resubmit_decided_by", "TEXT")
             _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
+            # 2026-11-12 任务E1：模板截止配置三件套（旧库补列，历史模板 has_deadline 默认 1、
+            # deadline_type 留空 = 回落旧 deadline+deadline_offset 算法）。
+            _ensure_column(self.conn, "task_template", "has_deadline", "INTEGER NOT NULL DEFAULT 1")
+            _ensure_column(self.conn, "task_template", "deadline_type", "TEXT")
+            _ensure_column(self.conn, "task_template", "deadline_time", "TEXT")
             # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
             _migrate_role_platform(self.conn)
             # 2026-11-11：member.dept_path（官方通讯录完整组织路径，层级统计归集）

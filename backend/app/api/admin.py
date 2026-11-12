@@ -368,7 +368,6 @@ def _instance_filter_sql(
     q: Optional[str] = None,
     period_key: Optional[str] = None,
     status: Optional[str] = None,
-    resubmit_status: Optional[str] = None,
     platform: Optional[str] = None,
     owner_id: Optional[int] = None,
 ) -> tuple[str, str, List[Any]]:
@@ -414,10 +413,7 @@ def _instance_filter_sql(
         elif _parts:
             where.append("i.status IN (%s)" % ",".join("?" * len(_parts)))
             params.extend(_parts)
-    # 2026-10-29 逾期补交审核制：按「补交申请状态」单独筛选（pending/approved/rejected）
-    if resubmit_status and resubmit_status.strip():
-        where.append("i.resubmit_status = ?")
-        params.append(resubmit_status.strip())
+    # 2026-11-12 任务E3：「补交申请状态」筛选随申请补交链路一并下线。
 
     # 任务类型：notice=纯通知；upload=所有上传类（form/image/file）
     k = (kind or "").strip()
@@ -472,7 +468,6 @@ def _query_instances(
     template_name: Optional[str] = None,
     period_key: Optional[str] = None,
     status: Optional[str] = None,
-    resubmit_status: Optional[str] = None,
     kind: Optional[str] = None,
     role_id: Optional[str] = None,
     phone: Optional[str] = None,
@@ -490,7 +485,6 @@ def _query_instances(
         template_name=template_name,
         period_key=period_key,
         status=status,
-        resubmit_status=resubmit_status,
         kind=kind,
         role_id=role_id,
         phone=phone,
@@ -1126,10 +1120,13 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         try:
-            state.delete_template(template_id, actor=sess["username"])
+            # 2026-11-12 下午：删除模板 = 物理清除（含磁盘附件），需要 uploads_dir
+            cfg = getattr(request.app.state, "config", None)
+            uploads_dir = cfg.uploads_dir if cfg is not None else (state.db.db_path.parent / "uploads")
+            res = state.delete_template(template_id, actor=sess["username"], uploads_dir=uploads_dir)
         except BizError as exc:
             return biz_error_response(exc)
-        return {"ok": True}
+        return res
 
     # ── 2026-10-28 通知类「数据图片提醒」素材上传 ──
     # 管理员在模板里上传一张图片，到点随通知消息直接推送；不再依赖「人工填报 + 服务端出图」。
@@ -1518,10 +1515,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         try:
-            state.delete_role(role_id, actor=sess["username"])
+            # 2026-11-12 下午：删除分组 = 级联清除组内全部成员（返回明细供前端提示「需重新导入」）
+            res = state.delete_role(role_id, actor=sess["username"])
         except BizError as exc:
             return biz_error_response(exc)
-        return {"ok": True}
+        return res
 
     @router.get("/roles/{role_id}/members")
     async def list_role_members(
@@ -1695,6 +1693,28 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True}
+
+    @router.post("/roles/{role_id}/members/batch-delete")
+    async def batch_delete_role_members(role_id: str, request: Request):
+        """2026-11-12 下午：批量移除成员（用户要求「不要一个一个删」）。
+
+        语义与单删完全同源（_delete_role_member_unlocked）；
+        单个失败不影响其余，逐条回报。
+        """
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        body = await _read_json_body(request)
+        phones = body.get("phones")
+        if not isinstance(phones, list):
+            return error_response(400, "VALIDATION_FAILED", "phones 必须是数组")
+        try:
+            res = state.delete_role_members(role_id=role_id, phones=phones, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        return res
 
     @router.post("/roles/{role_id}/members/import")
     async def import_role_members(role_id: str, request: Request):
@@ -1999,7 +2019,6 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         template_name: Optional[str] = None,
         period_key: Optional[str] = None,
         status: Optional[str] = None,
-        resubmit_status: Optional[str] = None,
         kind: Optional[str] = None,
         role_id: Optional[str] = None,
         phone: Optional[str] = None,
@@ -2018,7 +2037,6 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         res = _query_instances(
             state,
             template_id=template_id,
-            resubmit_status=resubmit_status,
             template_name=template_name,
             period_key=period_key,
             status=status,
@@ -2035,11 +2053,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
 
     @router.get("/instances/pending-reviews")
     async def pending_reviews(request: Request, days: int = 7, platform: Optional[str] = None):
-        """跨日期的「待我处理」聚合：用户提交待审 + 补交申请待审。
+        """跨日期的「待我处理」聚合：用户提交待审。
 
-        为什么需要单开一个接口：实例列表的 period_key 是**单日精确匹配**，而补交待审的实例
-        必然是往日的（逾期才可能补交），默认「今天」筛选下永远查不到，管理员必须先手改日期。
-        这里按「提交/申请时刻」跨日聚合，不看任务日期；只读，不改任何状态。
+        为什么需要单开一个接口：实例列表的 period_key 是**单日精确匹配**，
+        这里按「提交时刻」跨日聚合，不看任务日期；只读，不改任何状态。
+        2026-11-12 任务E3：原「补交申请待审」聚合段随申请补交链路一并下线（resubmit 字段不再下发）。
         """
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -2074,12 +2092,6 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                        "ORDER BY COALESCE(i.submitted_at, i.created_at) DESC, i.id DESC LIMIT ?",
                 (start_s, *plat_params, limit + 1),
             ).fetchall()
-            rq_rows = state.conn.execute(
-                base + "AND i.resubmit_status = 'pending' AND COALESCE(i.resubmit_req_at, i.created_at) >= ? "
-                       + plat_sql +
-                       "ORDER BY COALESCE(i.resubmit_req_at, i.created_at) DESC, i.id DESC LIMIT ?",
-                (start_s, *plat_params, limit + 1),
-            ).fetchall()
 
         def _row(r):
             d0 = dict(r)
@@ -2089,16 +2101,14 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return d0
 
         subs = [_row(r) for r in sub_rows]
-        rqs = [_row(r) for r in rq_rows]
         return {
             "ok": True,
             "days": d,
             "since": start_s,
             "limit": limit,
-            "truncated": {"submitted": len(subs) > limit, "resubmit": len(rqs) > limit},
+            "truncated": {"submitted": len(subs) > limit},
             "submitted": subs[:limit],
-            "resubmit": rqs[:limit],
-            "total": min(len(subs), limit) + min(len(rqs), limit),
+            "total": min(len(subs), limit),
         }
 
     @router.get("/instances/{instance_id}")
@@ -2197,33 +2207,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             "reminders": reminders,
         }
 
-    # ── 2026-10-29 逾期补交审核 ────────────────────────────────────────
-    # 通过：签发 30 分钟 resubmit token 并把新链接推给用户；拒绝：推拒绝文案。
-    # 幂等由 state 侧保证（只有 resubmit_status='pending' 才能审），重复点击第二次会 400。
-    def _push_resubmit_message(inst: Dict[str, Any], text: str, tag: str) -> bool:
-        # 2026-11-03：按任务归属平台选通道（密信任务发密信、企微任务发企微），
-        # 不再跟全局 active 通道走，避免补交新链接串到另一个办公软件。
-        tpl = state.get_template(inst["template_id"])
-        plats = state.role_platforms(list((tpl or {}).get("role_ids") or []))
-        platform = plats.pop() if len(plats) == 1 else ""
-        nt = _notifiers.get(platform) if (platform and _notifiers) else _notifier
-        target = (
-            state.get_delivery_target(inst["phone"], platform=platform)
-            if (platform and _notifiers)
-            else state.get_delivery_target(inst["phone"])
-        )
-        ext_id = (target or {}).get("external_id")
-        # 2026-11-10 方案A：union_id 绑定按 receive_type="union_id" 投递（不依赖会话）
-        ext_type = str((target or {}).get("external_type") or "user").strip().lower() or "user"
-        if nt is None or not ext_id:
-            logger.warning("补交审核通知未发送（notifier 或 external_id 缺失） instance=%s", inst.get("id"))
-            return False
-        try:
-            res = nt.send_text(ext_id, text, f"{tag}|{inst['id']}|{int(time.time() * 1000)}", receive_type=ext_type)
-            return bool(getattr(res, "ok", False))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("补交审核通知发送失败 instance=%s: %s", inst.get("id"), exc)
-            return False
+    # ── 2026-10-29 逾期补交审核（2026-11-12 任务E3 整体下线）──────────────
+    # 原 /instances/{id}/resubmit/approve|reject 与 _push_resubmit_message 已删除：
+    # 「申请补交」链路不复存在；驳回重交（review → reject → scheduler.send_reject_notification）
+    # 机制保留，不受影响。
 
     @router.post("/channel-config/test-send")
     async def channel_test_send(request: Request):
@@ -2290,52 +2277,6 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             "ok": bool(res.ok), "kind": "text", "to": userid, "receive_type": ext_type,
             "detail": "文本已发送" if res.ok else f"发送失败：{res.error}",
         }
-
-    @router.post("/instances/{instance_id}/resubmit/approve")
-    async def approve_instance_resubmit(instance_id: int, request: Request):
-        sess, err = require_session(request, state, check_csrf=True)
-        if err is not None:
-            return err
-        assert sess is not None
-
-        try:
-            res = state.approve_resubmit(int(instance_id), actor=sess["username"])
-        except BizError as exc:
-            return biz_error_response(exc)
-
-        inst = res["instance"] or {}
-        tpl = state.get_template(inst.get("template_id") or "", include_deleted=True) or {}
-        base = (public_base_url or "").rstrip("/")
-        h5_url = f"{base}/h5/task#t={res['raw_token']}"
-        # 30 分钟有效期，文案按用户口径：先任务名，再 HH:MM，再链接，最后标有效期
-        expires_disp = str(res.get("expires_at") or "")[11:16]
-        text = (
-            f"【{tpl.get('name') or '任务'}】补交链接已开通，请于 {expires_disp} 前提交：\n"
-            f"{h5_url}\n（30 分钟内有效）"
-        )
-        sent = _push_resubmit_message(inst, text, "resubmit_ok")
-        return {"ok": True, "instance": inst, "h5_url": h5_url,
-                "expires_at": res.get("expires_at"), "sent": sent}
-
-    @router.post("/instances/{instance_id}/resubmit/reject")
-    async def reject_instance_resubmit(instance_id: int, request: Request):
-        sess, err = require_session(request, state, check_csrf=True)
-        if err is not None:
-            return err
-        assert sess is not None
-
-        body = await _read_json_body(request)
-        reason = str(body.get("reason") or "").strip() or None
-        try:
-            res = state.reject_resubmit(int(instance_id), actor=sess["username"], reason=reason)
-        except BizError as exc:
-            return biz_error_response(exc)
-
-        inst = res["instance"] or {}
-        tpl = state.get_template(inst.get("template_id") or "", include_deleted=True) or {}
-        text = f"【{tpl.get('name') or '任务'}】补交申请未通过，如有疑问请联系管理员。"
-        sent = _push_resubmit_message(inst, text, "resubmit_no")
-        return {"ok": True, "instance": inst, "sent": sent}
 
     @router.post("/instances/{instance_id}/review")
     async def review_instance(instance_id: int, request: Request):
