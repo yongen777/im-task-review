@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 from .channels.zdxlz import SendResult
 from .config import SHANGHAI_TZ, NowFn, default_now, format_dt, parse_dt
-from .state import StateStore, calc_resubmit_deadline, is_valid_hhmm
+from .state import StateStore, BizError, calc_resubmit_deadline, is_valid_hhmm
 
 logger = logging.getLogger(__name__)
 
@@ -700,6 +700,83 @@ class Scheduler:
                 retry=0, error="UNACTIVATED", idem_key=base_idem,
             )
         return last_res
+
+    def push_now(self, template_id: str, actor: str = "system", now_dt: Optional[datetime] = None) -> Dict[str, int]:
+        """2026-11-12 任务D：上传任务**一键推送**（创建者分级管理员专属测试按钮）。
+
+        用户拍板语义（原话）：手动推送一条 + 当期定时提醒一条**内容一模一样的双发**
+        ——测试场景用，管理员自行判断。实现刻意分链防重，两互不干扰、各自幂等：
+          · 定时链 run_once：kind='remind'，planned_str=当天 remind_at 执行时刻
+          · 手动链 push_now：kind='manual_push'，幂等键含「推送时刻 + 手机号序号」
+        守卫：
+          · 仅上传类模板（form/image/file）；notice 按 notice_times 自动发，拒绝手动推
+          · 绕过锚点日/「推送时刻 < 提醒时刻」门：非锚点日也允许补建当期实例（软护栏另设）
+          · 只发 status='pending' 且未过 deadline_at 的实例
+          · 同一次调用内每 (phone,seq) 只发一次（_deliver_with_log 首试 retry=0）；
+            发送失败留给 reminder_log 退避机制，不在本轮重试
+          · 同模板冷却护栏在 state.check_manual_push_cooldown（API 层调用），本方法不重复判
+        """
+        cur_dt = now_dt or self.now()
+        if cur_dt.tzinfo is None:
+            cur_dt = cur_dt.replace(tzinfo=SHANGHAI_TZ)
+        now_s = format_dt(cur_dt)
+        tpl = self.state.get_template(template_id, include_deleted=False)
+        if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
+            raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
+        if tpl["kind"] == "notice":
+            raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
+
+        p_key = period_key(tpl["period"], cur_dt)
+        deadline_at = calc_deadline_at(cur_dt, tpl["deadline"], int(tpl.get("deadline_offset") or 0), tpl["period"])
+
+        # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
+        self.state.ensure_template_instances(tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s)
+        instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
+
+        stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
+        push_seq: Dict[str, int] = {}
+        for inst in instances:
+            if str(inst["status"] or "") != "pending":
+                continue  # cancelled/overdue/rejected/submitted/approved/sent/expired 均不打扰
+            if str(inst["deadline_at"] or "") <= now_s:
+                continue  # 已过截止：不追发
+            phone = str(inst["phone"])
+            seq = push_seq.get(phone, 0) + 1
+            push_seq[phone] = seq
+
+            def _make_push_msg(instance=inst, template=tpl) -> str:
+                rendered = render_text_tpl(
+                    template["text_tpl"], member_name=instance["name_snap"], member_dept=instance["dept_snap"],
+                    template_name=template["name"], deadline_at=instance["deadline_at"], period=template["period"], ref_dt=cur_dt,
+                )
+                h5_url, _ = self.build_h5_submit_url(
+                    phone=instance["phone"], template_id=template["template_id"],
+                    period_key_val=instance["period_key"], instance_id=int(instance["id"]),
+                )
+                dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
+                # 与 run_once 定时提醒同版式（同名内容双发是用户拍板的特批场景）
+                return (
+                    f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                    f"截止时间：{dl_disp}\n"
+                    f"提交入口（点击链接打开上传任务）：\n{h5_url}"
+                )
+
+            for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
+                # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
+                base_idem = make_idem_key(
+                    tpl["template_id"], inst["phone"], p_key, "manual_push", seq, f"{now_s}|push|{seq}"
+                )
+                idem = self._idem_for(base_idem, platform)
+                ok = self._deliver_with_log(
+                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
+                    kind="manual_push", planned_str=now_s, delay_sec=0, idem_key=idem,
+                    msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                    send_fn=functools.partial(nt.send_text, receive_type=ext_type),
+                )
+                if ok:
+                    stats["pushed_instances"] += 1
+        return stats
 
     def run_once(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
         """执行一轮调度扫描（§6.1 A/B/C/D + R14 逾期通知），返回本轮统计计数。"""

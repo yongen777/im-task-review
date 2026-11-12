@@ -112,14 +112,30 @@ def sync_frontend_ui() -> None:
 
 
 def build_frontend() -> bool:
-    """vite build。失败返回 False（构建带病产物比不部署更糟）。"""
+    """vite build。失败返回 False（构建带病产物比不部署更糟）。
+
+    2026-11-12 Node 问题修正：本机 PATH 首位的 node 是 v11.13.0（ESM 语法直接报错，
+    HANDOFF 2026-11-12 记录在案），`cmd /c npm run build` 会挂。优先用 DSH 内置
+    Electron（ELECTRON_RUN_AS_NODE=1 即 node v24）直跑 vite.js（本轮实测 exit=0）；
+    两者任一不存在时回退 npm（其它机器不受影响）。
+    """
+    import os
+    vite_js = UI_SRC / "node_modules" / "vite" / "bin" / "vite.js"
+    electron = Path(r"D:\DSH\Desktop\DeepSeek Harness.exe")
+    env = dict(os.environ)
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    if vite_js.is_file() and electron.is_file():
+        cmd = [str(electron), str(vite_js), "build"]
+    else:
+        cmd = ["cmd", "/c", "npm", "run", "build"]
     r = subprocess.run(
-        ["cmd", "/c", "npm", "run", "build"],
-        cwd=str(UI_SRC), capture_output=True, text=True, timeout=300, shell=False,
+        cmd, cwd=str(UI_SRC), capture_output=True, timeout=300, shell=False, env=env,
+        encoding="utf-8", errors="replace",
     )
     if r.returncode != 0:
         print("✗ 前端构建失败：")
         print((r.stdout or "")[-500:])
+        print((r.stderr or "")[-200:])
         return False
     print("✓ vite build 完成")
     return True

@@ -121,6 +121,10 @@ def _check_submission_window(
 ) -> Tuple[bool, Optional[str]]:
     if inst["status"] == "approved":
         return False, "任务已审核通过，无需重复提交"
+    # 2026-11-12 任务C：cancelled（成员移出分组后作废）——旧链接进来窗口即关，
+    # H5 显示只读提示；提交侧 submit_h5_task 还有服务端硬拦截兜底。
+    if inst["status"] == "cancelled":
+        return False, "该任务已被取消（成员已移出分组），无需提交"
     # 2026-10-29 逾期补交审核制：逾期后**只有**「补交申请已通过、且未过期」的 resubmit token 放行，
     # 旧的普通提交链接一律不放行（取消原「overdue 72h 内免审可交」）。
     is_resubmit = bool(tok) and tok.get("purpose") == "resubmit" and str(tok.get("expires_at") or "") >= state.now_str()

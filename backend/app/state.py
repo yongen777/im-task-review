@@ -100,13 +100,27 @@ def _clamp_page_size(page: Any, size: Any) -> Tuple[int, int]:
 
 
 def _validate_form_schema(schema_raw: Any) -> List[Dict[str, Any]]:
+    """2026-11-12 任务B：schema_json 改为可选。
+
+    用户图一实锤：只勾「图片上传」建上传任务模板被 400「表单类型模板必须至少包含
+    1 个字段」拦死 —— 但任务本来就可以只要求传图/传文件/写文字，字段报数只是
+    H5 上传模块之一。空 schema（None / [] / 空串 / JSON null）一律返回 []；
+    给了内容则逐项校验（非法 JSON / 非数组 / 字段项非法仍 400，守卫不放松）。
+    提交侧 validate_form_submission_fields(schema=[], fields) 循环空表自然通过。
+    """
+    if schema_raw is None:
+        return []
     if isinstance(schema_raw, str):
+        if not schema_raw.strip():
+            return []
         try:
             schema_raw = json.loads(schema_raw)
         except Exception:
             raise BizError(400, "VALIDATION_FAILED", "schema_json 必须是合法的 JSON 数组")
-    if not isinstance(schema_raw, list) or len(schema_raw) < 1:
-        raise BizError(400, "VALIDATION_FAILED", "表单类型模板必须至少包含 1 个字段 (schema_json)")
+    if schema_raw is None or (isinstance(schema_raw, list) and not schema_raw):
+        return []
+    if not isinstance(schema_raw, list):
+        raise BizError(400, "VALIDATION_FAILED", "schema_json 必须是 JSON 数组")
 
     seen_keys: set[str] = set()
     normalized: List[Dict[str, Any]] = []
@@ -1540,11 +1554,16 @@ class StateStore:
             # 此前只删 status IN ('pending','submitted','overdue','rejected')，
             # 已 sent/approved/expired 的实例保留 —— 结果「人已从项目经理组移出，
             # 但模板下仍有她的 sent 实例」，用户看到的即是这个不一致。
-            # 现在：本组模板下的**全部**实例（含已发送/已归档）都清掉；
-            # 其它模板、其它组名下的实例不动。
+            #
+            # 2026-11-12 任务C（图二实锤口径修正）：**未完成的实例不再物理删除，
+            # 改标 cancelled（已取消）** —— 后台任务实例页可见「已取消」徽章（留痕可审计，
+            # 用户图二看到的就是「移出后实例还挂着待上传」）；cancelled 不再触发提醒/逾期通知/
+            # 流转（scheduler 只发 pending、overdue 通知只扫 overdue、advance 只动三种状态）。
+            # 已完成/已归档实例（submitted/sent/approved/expired）保持 11-09「移除删干净」口径。
+            cancelled_instance_ids: List[int] = []
             removed_instance_ids: List[int] = []
             open_rows = self.conn.execute(
-                "SELECT id, template_id FROM task_instance WHERE phone = ?",
+                "SELECT id, template_id, status FROM task_instance WHERE phone = ?",
                 (clean_phone,),
             ).fetchall()
             for inst in open_rows:
@@ -1565,14 +1584,25 @@ class StateStore:
                 ).fetchone() is not None
                 if still_member:
                     continue
-                self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
-                self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
-                removed_instance_ids.append(int(inst["id"]))
+                inst_status = str(inst["status"] or "")
+                if inst_status in ("pending", "overdue", "rejected"):
+                    # 未完成 → 作废留痕（不再发提醒，H5 旧链接提交被拦）
+                    self.conn.execute(
+                        "UPDATE task_instance SET status = 'cancelled' WHERE id = ?",
+                        (int(inst["id"]),),
+                    )
+                    cancelled_instance_ids.append(int(inst["id"]))
+                else:
+                    # 完成/归档 → 保持 11-09「移除删干净」
+                    self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
+                    self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
+                    removed_instance_ids.append(int(inst["id"]))
 
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
                 {"name": row["name"], "dept": row["dept"], "removed_bindings": removed_bindings,
-                 "removed_instances": len(removed_instance_ids)}, now_s,
+                 "removed_instances": len(removed_instance_ids),
+                 "cancelled_instances": len(cancelled_instance_ids)}, now_s,
             )
 
     def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1,
@@ -2048,6 +2078,32 @@ class StateStore:
         merged: Dict[str, Any] = dict(existing) if existing else {}
         merged.update(payload)
 
+        # ── 2026-11-12 任务B：kind="upload" 归一 ─────────────────────────────
+        # 前端重构后「上传任务」统一传 kind="upload"（不再细分 form/image/file），
+        # 后端 VALID_TEMPLATE_KINDS 只认 form/image/file/notice → 创建直接 400
+        # 「模板类型 kind 必须是 form/image/file/notice」，上传模板根本建不出来。
+        # 真实业务形态由 spec.upload_modules 决定，这里按勾选模块映射落库 kind：
+        #   · 勾了「字段报数」 → form（结构化字段 + 多附件）
+        #   · 否则勾了「文件」 → file；勾了「图片」 → image
+        #   · 什么都没勾（纯文字说明）→ form（空 schema，任务B 后允许）
+        # form/image/file/notice 原样通过（兼容旧前端 / 编辑保存 / 既有测试直传）。
+        if str(merged.get("kind") or "").strip() == "upload":
+            _spec_probe = merged.get("spec") if isinstance(merged.get("spec"), dict) else (
+                merged.get("spec_json") if isinstance(merged.get("spec_json"), dict) else {}
+            )
+            _mods_probe = [str(m).strip() for m in (_spec_probe.get("upload_modules") or []) if str(m or "").strip()]
+            if "fields" in _mods_probe:
+                _mapped_kind = "form"
+            elif "file" in _mods_probe:
+                _mapped_kind = "file"
+            elif "image" in _mods_probe:
+                _mapped_kind = "image"
+            else:
+                _mapped_kind = "form"
+            payload = dict(payload or {})
+            payload["kind"] = _mapped_kind
+            merged["kind"] = _mapped_kind
+
         name = str(merged.get("name") or "").strip()
         if not name:
             raise BizError(400, "VALIDATION_FAILED", "模板名称 name 不能为空")
@@ -2142,7 +2198,24 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", "提醒时间 remind_at 必须早于截止时间 deadline")
             need_review, allow_note = bool(merged.get("need_review", False)), bool(merged.get("allow_note", False))
             if kind == "form":
-                schema_json_str = json.dumps(_validate_form_schema(merged.get("schema_json")), ensure_ascii=False)
+                # 2026-11-12 任务B：schema 来源两路——
+                # 旧前端/测试直传 schema_json，优先用；重构前端只传 spec.fields（不传
+                # schema_json），为空时回落到 spec.fields（字段结构与 schema_json 项一致：
+                # key/label/type/required）。两路都空 → 空 schema（任务B 后允许）。
+                _schema_src = merged.get("schema_json")
+                _schema_empty = (
+                    _schema_src is None
+                    or (isinstance(_schema_src, str) and not _schema_src.strip())
+                    or (isinstance(_schema_src, list) and not _schema_src)
+                )
+                if _schema_empty:
+                    _spec_for_fields = merged.get("spec") if isinstance(merged.get("spec"), dict) else (
+                        merged.get("spec_json") if isinstance(merged.get("spec_json"), dict) else {}
+                    )
+                    _spec_fields = _spec_for_fields.get("fields")
+                    if isinstance(_spec_fields, list) and _spec_fields:
+                        _schema_src = _spec_fields
+                schema_json_str = json.dumps(_validate_form_schema(_schema_src), ensure_ascii=False)
             elif kind in ("image", "file"):
                 m_raw = merged.get("max_file_mb")
                 if m_raw is not None and str(m_raw).strip() != "":
@@ -2546,6 +2619,53 @@ class StateStore:
             rows = self.conn.execute("SELECT id, name, created_at FROM dept_option ORDER BY id ASC").fetchall()
         return [{"id": int(r["id"]), "name": str(r["name"]), "created_at": r["created_at"]} for r in rows]
 
+    def build_dept_tree(self) -> List[Dict[str, Any]]:
+        """2026-11-12 A3：基于已导入成员的 member.dept_path 聚合部门分级树（超管视图）。
+
+        口径：
+        · 数据源 = enabled=1 且 dept_path 非空的名册行（停用成员不算，2026-11-10 拍板），
+          按 (phone, dept_path) 去重 —— 同一人在多个角色/多个管理员名下的重复行不重复计数；
+        · 按 "/" 分段成树，节点 {name(段名), path(全路径), count(该层级名下人数), children}；
+        · count 是**人数**而非行数：含该层级及其全部下级，同一手机号在同一层级只计 1 次
+          （同一人跨两条不同 dept_path 时，公共祖先只计 1 人）；
+        · dept_path 为空/全空段的成员不计入（尚未反查到官方组织路径）。
+        """
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT phone, dept_path FROM member "
+                "WHERE enabled = 1 AND dept_path IS NOT NULL AND TRIM(dept_path) <> ''"
+            ).fetchall()
+        # 手机号 -> 该名下全部 dept_path 的段前缀集合（跨行合并去重，保人数口径）
+        phone_prefixes: Dict[str, set] = {}
+        for r in rows:
+            path = str(r["dept_path"] or "").strip()
+            if not path:
+                continue
+            segs = [s.strip() for s in path.split("/") if s.strip()]
+            if not segs:
+                continue
+            prefixes = phone_prefixes.setdefault(str(r["phone"]), set())
+            for i in range(1, len(segs) + 1):
+                prefixes.add("/".join(segs[:i]))
+        root: Dict[str, Any] = {"name": "", "path": "", "count": 0, "children": {}}
+        nodes: Dict[str, Dict[str, Any]] = {"": root}
+        for prefixes in phone_prefixes.values():
+            for prefix in sorted(prefixes):
+                segs = prefix.split("/")
+                node = nodes.get(prefix)
+                if node is None:
+                    parent_path = "/".join(segs[:-1])
+                    node = {"name": segs[-1], "path": prefix, "count": 0, "children": {}}
+                    nodes[prefix] = node
+                    nodes[parent_path]["children"][prefix] = node
+                node["count"] = int(node["count"]) + 1
+
+        def _finalize(node: Dict[str, Any]) -> Dict[str, Any]:
+            children = [_finalize(node["children"][k]) for k in sorted(node["children"])]
+            return {"name": node["name"], "path": node["path"], "count": int(node["count"]), "children": children}
+
+        return [_finalize(root["children"][k]) for k in sorted(root["children"])]
+
     def department_exists(self, name: str) -> bool:
         clean = (name or "").strip()
         if not clean:
@@ -2943,6 +3063,10 @@ class StateStore:
         # 2026-10-28：已提交待审核的也不能再交一次（H5 页面已锁，这里做服务端兜底）
         if inst["status"] == "submitted":
             raise BizError(400, "VALIDATION_FAILED", "该任务已提交，正在等待审核，不能重复提交")
+        # 2026-11-12 任务C：cancelled（成员移出分组后作废）的实例不可再提交——
+        # 旧链接（推送/定时提醒里签的 H5 链接）点进来直接拦，不再收件。
+        if inst["status"] == "cancelled":
+            raise BizError(400, "WINDOW_CLOSED", "该任务已被取消（成员已移出分组），无需提交")
         is_resubmit = tok.get("purpose") == "resubmit"
         if tok["expires_at"] < now_s:
             if is_resubmit:
@@ -2968,7 +3092,15 @@ class StateStore:
         ref_rows: List[Dict[str, Any]] = []
 
         if tpl["kind"] == "form":
-            fields_json_str = json.dumps(validate_form_submission_fields(tpl.get("schema_json") or [], fields), ensure_ascii=False)
+            # 2026-11-12 任务B：字段校验与 H5 实际渲染对齐。
+            # H5 只在 upload_modules 含 "fields"（或老模板无 upload_modules 时 form 默认渲染
+            # fields）时才渲染字段输入框；此前这里无条件校验 schema_json 的 required 字段，
+            # 「schema 有字段但 H5 没渲染」的老模板会把提交死锁（页面没有输入源，服务端却要必填）。
+            # effective_h5_modules 与 task.html 的 modules 推导同一口径。
+            if "fields" in effective_h5_modules(tpl):
+                fields_json_str = json.dumps(validate_form_submission_fields(tpl.get("schema_json") or [], fields), ensure_ascii=False)
+            else:
+                fields_json_str = None  # 未渲染字段模块：不校验、不落 fields（H5 本来就没有输入源）
             for r in clean_refs:
                 row = self.get_upload_ref(r)
                 if not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]:
@@ -3247,6 +3379,44 @@ class StateStore:
     def list_reminder_attempts(self, idem_key: str) -> List[Dict[str, Any]]:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM reminder_log WHERE idem_key = ? ORDER BY retry ASC, id ASC", (idem_key,)).fetchall()]
+
+    MANUAL_PUSH_COOLDOWN_SECONDS = 120  # 2026-11-12 任务D：同模板一键推送冷却窗口（防手抖）
+
+    def check_manual_push_cooldown(
+        self, template_id: str, actor: str = "system", now_dt: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """2026-11-12 任务D：一键推送软护栏——同模板 2 分钟内拒绝重复推送（429）。
+
+        判定口径：reminder_log 中该模板 kind='manual_push' 最近一次记录（任意成员、任意结果
+        ——failed/missed 也算「点过」，防手抖优先），attempted_at 距今 < 120s 即拒绝。
+        通过后**当场记一条 marker**（无实例、phone=操作人、idem 唯一），空名单模板也计入冷却，
+        不给「连点 10 次只有 1 次真发出去」留缝。返回时间基线给调用方审计与幂等键。
+        """
+        now_s = format_dt(now_dt or self.now())
+        clean_id = (template_id or "").strip()
+        # 读判 + 占位记账放同一个锁事务内：并发双击只放一个过（防抖护栏不许有窗口）
+        with self.lock, self.conn:
+            row = self.conn.execute(
+                "SELECT attempted_at FROM reminder_log WHERE template_id = ? AND kind = 'manual_push' ORDER BY id DESC LIMIT 1",
+                (clean_id,),
+            ).fetchone()
+            if row is not None:
+                last_ts = str(row["attempted_at"] or "").strip()
+                if last_ts:
+                    elapsed = (parse_dt(now_s) - parse_dt(last_ts)).total_seconds()
+                    if 0 <= elapsed < self.MANUAL_PUSH_COOLDOWN_SECONDS:
+                        raise BizError(
+                            429, "PUSH_COOLDOWN",
+                            f"该模板 2 分钟内已推送过一次，请稍后再试（上次推送：{last_ts[11:16]}）",
+                        )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO reminder_log("
+                "template_id, instance_id, phone, kind, planned_at, attempted_at, sent_at, result, error, retry, idem_key"
+                ") VALUES (?, NULL, ?, 'manual_push', ?, ?, NULL, 'sent', 'push_marker', 0, ?)",
+                (clean_id, (actor or "system").strip()[:60], now_s, now_s,
+                 f"push_marker|{clean_id}|{now_s}|{secrets.token_hex(6)}"),
+            )
+        return {"attempted_at": now_s}
 
     def record_reminder_log(
         self,

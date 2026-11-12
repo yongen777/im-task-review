@@ -26,25 +26,67 @@ import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 
 /**
- * 2026-11-09：把 CSV 文本解析成后端要的 csv_rows（数组）。
- * 格式：每行「手机号,姓名,部门」（逗号或中文逗号皆可）；空行忽略；# 开头为注释。
- * 第一行若是「手机号/姓名/部门」这类表头，自动跳过。
+ * 2026-11-12 A1：把 CSV 文本解析成后端要的 csv_rows（数组）——只收「姓名,手机号」两列。
+ * · 列序自动识别：首格命中 11 位手机号（1[3-9] 开头，与后端 is_valid_phone 同口径）
+ *   → 按 (手机号,姓名) 读；否则按 (姓名,手机号) 读。
+ * · 出现第 3 个非空列 → 该行进 errors（本地拦截，不提交后端）。
+ * · 部门不再手填（2026-11-11 拍板）：CSV 行 dept 恒传空，导入后由官方通讯录反查自动回填
+ *   member.dept / dept_path（后端 import_role_members + _auto_activate_imported 已就绪）。
+ * · 空行忽略；# 开头为注释；首行是「姓名/手机号」表头时自动跳过。
  */
-function parseCsvRows(csvText: string): Array<{ row: number; phone: string; name: string; dept: string }> {
-  const out: Array<{ row: number; phone: string; name: string; dept: string }> = [];
+function parseCsvRows(csvText: string): {
+  rows: Array<{ row: number; phone: string; name: string; dept: string }>;
+  errors: Array<{ row: number; phone: string; reason: string }>;
+} {
+  const rows: Array<{ row: number; phone: string; name: string; dept: string }> = [];
+  const errors: Array<{ row: number; phone: string; reason: string }> = [];
+  const phoneCellRe = /^1[3-9]\d{9}$/;
   const lines = (csvText || '').split(/\r?\n/);
   lines.forEach((raw, idx) => {
     const line = raw.trim();
     if (!line || line.startsWith('#')) return;
     const cells = line.split(/[,，\t]/).map((c) => c.trim());
-    const phone = cells[0] || '';
-    const name = cells[1] || '';
-    const dept = cells[2] || '';
-    // 跳过表头（手机号不是纯数字）
-    if (idx === 0 && !/^\d+$/.test(phone.replace(/\D/g, '')) && /手机号|phone/i.test(phone)) return;
-    out.push({ row: out.length + 1, phone, name, dept });
+    const nonEmpty = cells.filter((c) => c !== '');
+    const rowNo = rows.length + errors.length + 1;
+    // 跳过表头：首行格子全是「姓名/手机号」类字样且不含任何手机号数据
+    if (
+      idx === 0 &&
+      nonEmpty.length > 0 &&
+      nonEmpty.every((c) => /姓名|手机号|name|phone/i.test(c)) &&
+      !nonEmpty.some((c) => phoneCellRe.test(c))
+    ) {
+      return;
+    }
+    // 2026-11-12 A1：出现第 3 个非空列 → 拒绝该行（部门由官方通讯录反查回填，不再手填）
+    if (nonEmpty.length > 2) {
+      errors.push({
+        row: rowNo,
+        phone: '',
+        reason: '仅需姓名与手机号两列，请删除多余列（部门无需填写，导入后由官方通讯录自动匹配回填）',
+      });
+      return;
+    }
+    // 两列自动识别列序：首格命中 11 位手机号 → (手机号,姓名)，否则 (姓名,手机号)
+    let phone: string;
+    let name: string;
+    if (phoneCellRe.test(cells[0] || '')) {
+      phone = cells[0];
+      name = cells[1] || '';
+    } else {
+      name = cells[0] || '';
+      phone = cells[1] || '';
+    }
+    rows.push({ row: rowNo, phone, name, dept: '' });
   });
-  return out;
+  return { rows, errors };
+}
+
+/* 2026-11-12 A3：部门分级树节点（GET /api/admin/dept-tree，超管视图） */
+interface DeptTreeNode {
+  name: string;
+  path: string;
+  count: number;
+  children: DeptTreeNode[];
 }
 import {
   GlobalActivatedMemberItem,
@@ -111,6 +153,12 @@ export const RolesMembersView: React.FC = () => {
   const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
   const [editingDeptName, setEditingDeptName] = useState('');
   const [deptBusy, setDeptBusy] = useState(false);
+
+  // 2026-11-12 A3：超管「部门分级树」弹窗（基于已导入成员的 dept_path 聚合）
+  const [deptTreeOpen, setDeptTreeOpen] = useState(false);
+  const [deptTree, setDeptTree] = useState<DeptTreeNode[]>([]);
+  const [deptTreeLoading, setDeptTreeLoading] = useState(false);
+  const [deptTreeBusy, setDeptTreeBusy] = useState('');
 
   // 2026-11-05 全平台成员池（仅超管）：按人聚合的全局名册与操作状态
   const [poolItems, setPoolItems] = useState<MemberPoolItem[]>([]);
@@ -249,7 +297,8 @@ export const RolesMembersView: React.FC = () => {
   const [orgPickerOpen, setOrgPickerOpen] = useState(false);
   // 2026-11-09：导入被拦截时列出全部错误行（等用户修复后再导）
   const [importErrors, setImportErrors] = useState<Array<{ row: number; phone: string; reason: string }>>([]);
-  const [csvText, setCsvText] = useState('13900000000,张三,市场部');
+  // 2026-11-12 A1：两列「姓名,手机号」（列序自动识别）；部门走通讯录反查，不再出现在 CSV 里
+  const [csvText, setCsvText] = useState('姓名,手机号\n张三,13900000000');
   const [importing, setImporting] = useState(false);
 
   // 跨管理员全局搜索已激活成员弹窗（若其他管理员已激活该成员，直接复用免二次激活）
@@ -306,6 +355,37 @@ export const RolesMembersView: React.FC = () => {
   useEffect(() => {
     void loadDepartments();
   }, [loadDepartments]);
+
+  // 2026-11-12 A3：部门分级树（超管视图，按已导入成员的 dept_path 聚合；打开弹窗时拉取）
+  const loadDeptTree = useCallback(async () => {
+    setDeptTreeLoading(true);
+    try {
+      const res = await api.get<{ ok: boolean; items: DeptTreeNode[] }>('/api/admin/dept-tree');
+      setDeptTree(res.items || []);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '加载部门分级树失败');
+    } finally {
+      setDeptTreeLoading(false);
+    }
+  }, [toast]);
+
+  // 2026-11-12 A3：把树节点段名建进「部门管理」下拉选项（POST /departments，仅超管可写）
+  const handleAddDeptFromTree = async (node: DeptTreeNode) => {
+    const name = (node.name || '').trim();
+    if (!name) return;
+    setDeptTreeBusy(node.path);
+    try {
+      await api.post('/api/admin/departments', { name });
+      await loadDepartments();
+      toast.success(`部门「${name}」已加入成员表单 / H5 登记页的下拉选项。`, '已创建部门选项');
+    } catch (err) {
+      // 409 DEPT_NAME_TAKEN（该段名已存在）→ 按「未创建」提示而不是错误
+      const msg = err instanceof Error ? plainError(err.message) : '创建部门选项失败';
+      toast.warning(msg, '部门选项未创建');
+    } finally {
+      setDeptTreeBusy('');
+    }
+  };
 
   const handleAddDepartment = async () => {
     const name = newDeptName.trim();
@@ -776,7 +856,17 @@ export const RolesMembersView: React.FC = () => {
     try {
       // 2026-11-09：后端接口收的是 csv_rows（数组），原来这里传 csv_text → 协议不匹配、功能实际不可用。
       // 现在本地把 CSV 文本解析成行数组再提交。
-      const rows = parseCsvRows(csvText);
+      // 2026-11-12 A1：两列「姓名,手机号」自动识别列序；第 3 列等本地错误直接拦截，不提交后端。
+      const { rows, errors } = parseCsvRows(csvText);
+      if (errors.length > 0) {
+        // 与后端整批拦截同一交互：列出全部问题行、不关窗、一行都不写入
+        setImportErrors(errors);
+        toast.error(
+          `导入未执行：${errors.length} 行有问题，已全部列出（本次一行都没有写入）。请修复后重新导入。`,
+          '导入被拦截',
+        );
+        return;
+      }
       const res = await api.post<{
         ok: boolean;
         will_add?: number;
@@ -833,6 +923,36 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
+  // 2026-11-12 A3：递归渲染部门分级树（默认全展开；节点人数 = 含全部下级的总人数）
+  const renderDeptTreeNodes = (nodes: DeptTreeNode[], depth: number): React.ReactNode =>
+    nodes.map((node) => (
+      <div key={node.path}>
+        <div
+          className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors"
+          style={{ marginLeft: depth * 18 }}
+        >
+          <Building2
+            className={`w-3 h-3 shrink-0 ${node.children.length > 0 ? 'text-blue-500' : 'text-slate-400'}`}
+          />
+          <span className={`text-xs ${node.children.length > 0 ? 'font-semibold text-slate-800' : 'text-slate-700'}`}>
+            {node.name}
+          </span>
+          <span className="text-[11px] text-slate-400 tabular-nums shrink-0">· {node.count} 人</span>
+          <span className="flex-1" />
+          <button
+            type="button"
+            disabled={deptTreeBusy === node.path}
+            onClick={() => void handleAddDeptFromTree(node)}
+            className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-700 text-[10px] font-semibold cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
+            title="把该部门名加入成员表单 / H5 登记页的部门下拉选项"
+          >
+            {deptTreeBusy === node.path ? '创建中…' : '加入部门选项'}
+          </button>
+        </div>
+        {node.children.length > 0 && renderDeptTreeNodes(node.children, depth + 1)}
+      </div>
+    ));
+
   return (
     <div className="space-y-5">
       {/* 顶部标题与管理员视角（统一标准组件） */}
@@ -841,7 +961,7 @@ export const RolesMembersView: React.FC = () => {
         badge={`共 ${roles.length} 个角色分组`}
         description={
           <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span>管理各业务角色下的成员名单（支持姓名、手机号、部门；跨管理员导入自动匹配复用全局已激活状态）</span>
+            <span>管理各业务角色下的成员名单（支持姓名、手机号；部门由官方通讯录自动匹配回填；跨管理员导入自动匹配复用全局已激活状态）</span>
             <span aria-hidden="true" className="text-slate-300">·</span>
             <span>
               在册成员 <strong className="font-semibold text-slate-800 tabular-nums">{memberDistinctTotal}</strong> 人
@@ -1042,9 +1162,21 @@ export const RolesMembersView: React.FC = () => {
                       <ShieldCheck className="w-3.5 h-3.5" />
                       <span>全局搜索已激活成员</span>
                     </button>
-                    {/* 2026-11-11 用户拍板：CSV 批量导入已下线（组织架构选择器/快速添加替代，
-                        部门由官方通讯录反查回填）；如需批量可改用「从组织架构添加 → 选全员」 */}
-                    {/* 2026-11-11 任务二：组织架构选择器——按部门下钻直接选人，淘汰 CSV 来回导出 */}
+                    {/* 2026-11-12 A1：CSV 批量导入恢复（两列「姓名,手机号」自动识别列序；
+                        部门由官方通讯录反查回填，不再手填） */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setImportErrors([]);
+                        setImportModalOpen(true);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
+                      title="每行「姓名,手机号」两列（列序自动识别）；部门由官方通讯录自动匹配回填"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>CSV 批量导入</span>
+                    </button>
+                    {/* 2026-11-12 A1：组织架构添加入口暂时隐藏（应用户要求收敛入口，代码保留待明确启用）。
                     <button
                       onClick={() => setOrgPickerOpen(true)}
                       className="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
@@ -1053,18 +1185,34 @@ export const RolesMembersView: React.FC = () => {
                       <Network className="w-3.5 h-3.5" />
                       <span>从组织架构添加</span>
                     </button>
+                    */}
                   </>
                 )}
                 {isSuperAdmin && (
-                  <button
-                    type="button"
-                    onClick={() => setDeptModalOpen(true)}
-                    className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
-                    title="配置部门选项（成员表单与员工 H5 登记页共用）"
-                  >
-                    <Building2 className="w-3.5 h-3.5 text-slate-500" />
-                    <span>部门管理</span>
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setDeptModalOpen(true)}
+                      className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
+                      title="配置部门选项（成员表单与员工 H5 登记页共用）"
+                    >
+                      <Building2 className="w-3.5 h-3.5 text-slate-500" />
+                      <span>部门管理</span>
+                    </button>
+                    {/* 2026-11-12 A3：部门分级树（按已导入成员的官方组织路径聚合；仅超管） */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDeptTreeOpen(true);
+                        void loadDeptTree();
+                      }}
+                      className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
+                      title="按已导入成员的官方组织路径（dept_path）聚合的部门分级树；可从树节点一键加入部门选项"
+                    >
+                      <Network className="w-3.5 h-3.5 text-slate-500" />
+                      <span>部门分级树</span>
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -1108,15 +1256,8 @@ export const RolesMembersView: React.FC = () => {
                   <Plus className="w-3.5 h-3.5" />
                   <span>添加成员</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => setDeptModalOpen(true)}
-                  className="px-3 py-2 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 transition-colors"
-                  title="配置部门选项（成员表单与员工 H5 登记页共用）"
-                >
-                  <Building2 className="w-3.5 h-3.5 text-slate-500" />
-                  <span>部门管理</span>
-                </button>
+                {/* 2026-11-12 A2：部门管理入口收敛为超管专属（后端 /departments 写接口已有
+                    _require_super 守卫，分级管理员此前的入口点了必然 403）——按钮只保留在超管视角。 */}
               </form>
             )}
 
@@ -1393,6 +1534,55 @@ export const RolesMembersView: React.FC = () => {
                     ) : null}
                   </div>
                 ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-11-12 A3：部门分级树弹窗（仅超管；按已导入成员的官方组织路径聚合，含人数）
+          展示 member.dept_path 的层级结构；节点「加入部门选项」会把该段名建进 dept_option，
+          供成员表单 / H5 登记页下拉选择。 */}
+      {deptTreeOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
+                  <Network className="w-4 h-4 text-blue-600" />
+                  <span>部门分级树</span>
+                </h3>
+                <p className="text-[11px] text-slate-400">
+                  按已导入成员的官方组织路径（dept_path）聚合；人数含全部下级，仅统计启用成员
+                </p>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void loadDeptTree()}
+                  disabled={deptTreeLoading}
+                  className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer disabled:opacity-50"
+                  title="刷新"
+                >
+                  <RefreshCw className={`w-4 h-4 ${deptTreeLoading ? 'animate-spin' : ''}`} />
+                </button>
+                <button
+                  onClick={() => setDeptTreeOpen(false)}
+                  className="p-1 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+            <div className="max-h-[60vh] overflow-y-auto space-y-0.5 pr-1">
+              {deptTreeLoading ? (
+                <div className="py-10 text-center text-xs text-slate-400">正在聚合部门树…</div>
+              ) : deptTree.length === 0 ? (
+                <div className="py-10 text-center text-xs text-slate-400">
+                  暂无带官方组织路径的已导入成员；导入 / 添加成员并完成通讯录反查后，这里会按部门层级展示
+                </div>
+              ) : (
+                renderDeptTreeNodes(deptTree, 0)
               )}
             </div>
           </div>
@@ -1714,7 +1904,8 @@ export const RolesMembersView: React.FC = () => {
         </div>
       )}
 
-      {/* CSV 批量导入弹窗（手机号,姓名,部门；若部门不存在自动创建） */}
+      {/* 2026-11-12 A1：CSV 批量导入弹窗（仅「姓名,手机号」两列，列序自动识别；
+          部门由官方通讯录反查自动回填，不再手填） */}
       {importModalOpen && currentRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -1724,7 +1915,7 @@ export const RolesMembersView: React.FC = () => {
                   批量导入成员至「{currentRole.role_name}」
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  每行一条记录，格式：手机号,姓名,部门（新部门将自动建好，已激活手机号自动免二次激活）
+                  每行一条记录，仅需「姓名,手机号」两列（列序自动识别）；部门无需填写，导入后由官方通讯录自动匹配回填；已激活手机号自动免二次激活
                 </p>
               </div>
               <button
@@ -1739,7 +1930,7 @@ export const RolesMembersView: React.FC = () => {
                 rows={6}
                 value={csvText}
                 onChange={(e) => setCsvText(e.target.value)}
-                placeholder={'手机号,姓名,部门\n13900000000,张三,市场部'}
+                placeholder={'姓名,手机号\n张三,13900000000\n13900000001,李四（列序颠倒也能识别）'}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-mono text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 leading-relaxed"
               />
               {/* 2026-11-09：导入被拦截 → 列出全部错误行（不关窗，等用户修复后再导） */}

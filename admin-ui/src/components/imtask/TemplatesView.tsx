@@ -412,6 +412,9 @@ export const TemplatesView: React.FC = () => {
   const [editingTpl, setEditingTpl] = useState<TemplateItem | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [deleteConfirmTpl, setDeleteConfirmTpl] = useState<TemplateItem | null>(null);
+  /* 2026-11-12 任务D：一键推送（创建者分级管理员专属测试按钮；超管只读不显示） */
+  const [pushingId, setPushingId] = useState<number | null>(null);
+  const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
 
   // 弹窗表单状态（任务类型简化为两大类：'notice' 纯通知提醒 | 'upload' 上传任务）
   const [name, setName] = useState('');
@@ -913,6 +916,28 @@ export const TemplatesView: React.FC = () => {
     }
   };
 
+  /* 2026-11-12 任务D：一键推送确认动作——立即向当前「待提交」成员各发一条提醒
+     （与当期定时提醒互不影响、内容同版式；服务端另有 2 分钟冷却防手抖 + 审计）。 */
+  const handleConfirmPush = async () => {
+    if (!pushConfirmTpl) return;
+    const target = pushConfirmTpl;
+    setPushingId(target.id);
+    try {
+      const res = await api.post(`/api/admin/templates/${target.id}/push-now`);
+      const stats = res?.stats || {};
+      toast.success(
+        `已向 ${stats.pushed_instances ?? 0} 名待提交成员推送提醒（发送成功 ${stats.sent ?? 0} 条）。`,
+        '一键推送完成',
+      );
+      setPushConfirmTpl(null);
+    } catch (err) {
+      // 429 冷却（2 分钟内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
+      toast.error(err instanceof Error ? plainError(err.message) : '推送未成功');
+    } finally {
+      setPushingId(null);
+    }
+  };
+
   const addFieldRow = () => {
     setFields((prev) => [
       ...prev,
@@ -1304,6 +1329,22 @@ export const TemplatesView: React.FC = () => {
                           </span>
                         ) : (
                           <div className="inline-flex items-center justify-end gap-2">
+                            {/* 2026-11-12 任务D：一键推送（上传任务专属；notice 按时刻自动发）。 */}
+                            {tpl.kind !== 'notice' && (
+                              <button
+                                onClick={() => setPushConfirmTpl(tpl)}
+                                disabled={!tpl.enabled || busyId === tpl.id || pushingId === tpl.id}
+                                title={
+                                  tpl.enabled
+                                    ? '立即向待提交成员推送一条提醒（测试用；不影响当期定时提醒，同模板 2 分钟内不可重复推送）'
+                                    : '模板已停用，请先启用再推送'
+                                }
+                                className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                <Send className="w-3.5 h-3.5 shrink-0" />
+                                <span>{pushingId === tpl.id ? '推送中…' : '推送'}</span>
+                              </button>
+                            )}
                             <button
                               onClick={() => openEditModal(tpl)}
                               className="px-3 py-1.5 rounded-lg bg-blue-50 hover:bg-blue-100 text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
@@ -2013,6 +2054,45 @@ export const TemplatesView: React.FC = () => {
                 className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl font-semibold text-xs cursor-pointer"
               >
                 确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 一键推送确认弹窗（2026-11-12 任务D：测试用按钮，管理员自行判断场景） */}
+      {pushConfirmTpl && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <h3 className="font-bold text-slate-900 text-base">确认立即推送提醒</h3>
+              <button
+                onClick={() => setPushConfirmTpl(null)}
+                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              将立即向模板「
+              <span className="font-bold text-slate-900">{pushConfirmTpl.name}</span>
+              」当前<b>待提交</b>的成员各推送一条提醒（内容与定时提醒一致）。
+              <br />
+              此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 2 分钟内不可重复推送。
+            </p>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => setPushConfirmTpl(null)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-xs cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmPush}
+                disabled={pushingId === pushConfirmTpl.id}
+                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
+              >
+                {pushingId === pushConfirmTpl.id ? '推送中…' : '确认推送'}
               </button>
             </div>
           </div>

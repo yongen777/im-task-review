@@ -1211,6 +1211,63 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             "unactivated_count": stats["unactivated_count"],
         }
 
+    # ── 2026-11-12 任务D：上传任务一键推送（创建者分级管理员专属测试按钮）──
+    # 用户拍板：手动推送一条 + 当期定时提醒一条「同名内容双发」（测试用例场景，管理员自行判断）。
+    # 权限：仅分级管理员；超管 SUPER_ADMIN_READONLY 不放行（路径不在写白名单，middleware 先拦，
+    # 这里再拦一层防御）；模板归属由 middleware 的 /templates/{id} 路径归属校验兜住。
+    @router.post("/templates/{template_id}/push-now")
+    async def push_template_now(template_id: str, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+
+        _admin = _admin_profile(state, sess)
+        if _is_super_admin(_admin):
+            return error_response(
+                403, "SUPER_ADMIN_READONLY",
+                "一键推送属于业务操作；超级管理员只读，请由创建该模板的分级管理员自行推送",
+            )
+
+        # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
+        _tpl = state.get_template(template_id, include_deleted=False)
+        if not _tpl or _tpl.get("deleted"):
+            return error_response(404, "NOT_FOUND", "任务模板不存在")
+        if not _tpl.get("enabled"):
+            return error_response(404, "NOT_FOUND", "任务模板已停用，请先启用再推送")
+        if _tpl.get("kind") == "notice":
+            return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
+
+        # 软护栏：同模板 2 分钟内拒绝重复推送（防手抖）；通过即记 marker 占位
+        try:
+            guard = state.check_manual_push_cooldown(template_id, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+
+        scheduler = getattr(request.app.state, "scheduler", None)
+        if scheduler is None or not callable(getattr(scheduler, "push_now", None)):
+            state.record_reminder_log(
+                template_id=template_id, instance_id=None, phone=sess["username"],
+                kind="manual_push", planned_at=guard["attempted_at"], attempted_at=guard["attempted_at"],
+                sent_at=None, result="failed", error="SCHEDULER_UNAVAILABLE", retry=0,
+                idem_key=f"push_unavailable|{template_id}|{guard['attempted_at']}",
+            )
+            return error_response(503, "PUSH_UNAVAILABLE", "调度器未就绪，请稍后重试")
+
+        try:
+            stats = scheduler.push_now(template_id, actor=sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+        except Exception:  # noqa: BLE001
+            logger.exception("push_now 执行异常 template=%s", template_id)
+            return error_response(500, "PUSH_FAILED", "推送执行异常，请稍后重试")
+
+        state.write_audit(
+            username=sess["username"], action="template.push_now", target_type="task_template",
+            target_id=template_id, detail={"pushed_at": guard["attempted_at"], "stats": stats},
+        )
+        return {"ok": True, "pushed_at": guard["attempted_at"], "stats": stats}
+
     # ==================================================================
     # 2026-11-03 部门选项（后台配置；成员表单与 H5 登记页共用）
     # ==================================================================
@@ -1268,6 +1325,18 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True}
+
+    # ── 2026-11-12 A3：部门分级树（基于已导入成员的 dept_path 聚合；仅超管）──
+    @router.get("/dept-tree")
+    async def dept_tree(request: Request):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        forbidden = _require_super(state, sess)
+        if forbidden is not None:
+            return forbidden
+        return {"ok": True, "items": state.build_dept_tree()}
 
     # ── 全平台成员池（2026-11-05）：超管按「人」管理的全局名册，操作全局同步到所有管理员名下 ──
     @router.get("/member-pool")
