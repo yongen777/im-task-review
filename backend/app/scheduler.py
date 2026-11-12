@@ -806,6 +806,10 @@ class Scheduler:
             raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
         if tpl["kind"] == "notice":
             raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
+        # 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式，与定时调度物理隔离——
+        # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
+        if tpl.get("is_adhoc"):
+            raise BizError(400, "VALIDATION_FAILED", "不定期任务（菜单自选）不支持手动推送，成员通过【菜单】自主获取链接")
 
         p_key = period_key(tpl["period"], cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)

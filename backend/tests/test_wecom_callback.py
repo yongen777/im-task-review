@@ -207,7 +207,9 @@ def test_post_text_message_bound_user_gets_todo_ack() -> None:
         # 业务在 BackgroundTasks 里同步执行完（TestClient 行为）
         assert store.get_instance(inst["id"])["resubmit_status"] is None, "⛔ 补交链路已下线，不得写状态"
         assert notifier.sent, "应有回执"
-        assert "如需重新获取未完成任务的提交链接，请回复【待办】。" in notifier.sent[0][1]
+        # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）
+        assert "如需查看待办任务，请回复【待办】" in notifier.sent[0][1]
+        assert "如需自主上报不定期任务事项，请回复【菜单】" in notifier.sent[0][1]
         assert notifier.sent[0][0] == USERID
     finally:
         store.close()

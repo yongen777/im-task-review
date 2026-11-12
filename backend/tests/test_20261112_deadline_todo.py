@@ -290,7 +290,9 @@ def test_e3_resubmit_channel_decommissioned() -> None:
         )
         assert code == 200 and body["bound"] is True, body
         assert any(tag == "ack_nonphone" for _, tag in sent), sent
-        assert any("如需重新获取未完成任务的提交链接，请回复【待办】。" in t for t, _ in sent), sent[0][0]
+        # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）
+        assert any("如需查看待办任务，请回复【待办】。" in t for t, _ in sent), sent[0][0]
+        assert any("如需自主上报不定期任务事项，请回复【菜单】。" in t for t, _ in sent), sent[0][0]
         # 「申请补交」不再出现在任何回复里（该指令已下线）
         assert all("申请补交" not in t for t, _ in sent), sent
         # resubmit_status 保持 NULL（零写库）

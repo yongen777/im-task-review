@@ -962,16 +962,18 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
     if (!text_tpl) throw new Error('TEXT_TPL_REQUIRED');
     if (enabled && state.health.is_loopback_public_url) throw new Error('LOOPBACK_PUBLIC_URL');
 
-    validateRemindAt(kind, period, remind_at, deadline);
+    /* 2026-11-12 晚 · 不定期任务（菜单自选）：无推送时刻/无截止（与真实后端同口径） */
+    const is_adhoc = kind !== 'notice' && Boolean(body?.is_adhoc);
+    if (!is_adhoc) validateRemindAt(kind, period, remind_at, deadline);
 
     /* 2026-11-12 任务E1：mock 模式同样保存截止三件套（与真实后端同口径） */
-    const has_deadline = kind === 'notice' ? false : Boolean(body?.has_deadline ?? true);
+    const has_deadline = kind === 'notice' || is_adhoc ? false : Boolean(body?.has_deadline ?? true);
     const deadline_type =
-      kind === 'notice' || !has_deadline
+      kind === 'notice' || is_adhoc || !has_deadline
         ? null
         : ((body?.deadline_type as 'same_day' | 'weekend' | 'month_end' | undefined) ?? 'same_day');
     const deadline_time =
-      kind === 'notice' || !has_deadline
+      kind === 'notice' || is_adhoc || !has_deadline
         ? null
         : String(body?.deadline_time || deadline || '').trim() || null;
 
@@ -987,11 +989,12 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
       period,
       role_id,
       role_ids,
-      remind_at,
-      deadline,
+      remind_at: is_adhoc ? '' : remind_at,
+      deadline: is_adhoc ? '' : deadline,
       has_deadline,
       deadline_type,
       deadline_time,
+      is_adhoc,
       text_tpl,
       spec,
       enabled,
@@ -1178,20 +1181,24 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
         body?.text_tpl !== undefined ? String(body.text_tpl).trim() : existing.text_tpl;
       const enabled = body?.enabled !== undefined ? Boolean(body.enabled) : existing.enabled;
       /* 2026-11-12 任务E1：mock 模式 PUT 同步截止三件套 */
+      /* 2026-11-12 晚 · 不定期任务（菜单自选）：PUT 同步 is_adhoc（互斥：置空推送时刻与截止） */
+      const is_adhoc =
+        existing.kind !== 'notice' &&
+        (body?.is_adhoc !== undefined ? Boolean(body.is_adhoc) : Boolean(existing.is_adhoc));
       const has_deadline =
-        existing.kind === 'notice'
+        existing.kind === 'notice' || is_adhoc
           ? false
           : body?.has_deadline !== undefined
             ? Boolean(body.has_deadline)
             : (existing.has_deadline ?? true);
       const deadline_type =
-        existing.kind === 'notice' || !has_deadline
+        existing.kind === 'notice' || is_adhoc || !has_deadline
           ? null
           : body?.deadline_type !== undefined
             ? (body.deadline_type as 'same_day' | 'weekend' | 'month_end' | null)
             : (existing.deadline_type ?? 'same_day');
       const deadline_time =
-        existing.kind === 'notice' || !has_deadline
+        existing.kind === 'notice' || is_adhoc || !has_deadline
           ? null
           : body?.deadline_time !== undefined
             ? String(body.deadline_time ?? '').trim() || null
@@ -1213,18 +1220,19 @@ async function handleImTaskRequest(method: string, rawPath: string, body?: any):
       if (!text_tpl) throw new Error('TEXT_TPL_REQUIRED');
       if (enabled && state.health.is_loopback_public_url) throw new Error('LOOPBACK_PUBLIC_URL');
 
-      validateRemindAt(existing.kind, existing.period, remind_at, deadline);
+      if (!is_adhoc) validateRemindAt(existing.kind, existing.period, remind_at, deadline);
 
       const updated: TemplateItem = {
         ...existing,
         name,
         role_id,
         role_ids,
-        remind_at,
-        deadline,
+        remind_at: is_adhoc ? '' : remind_at,
+        deadline: is_adhoc ? '' : deadline,
         has_deadline,
         deadline_type,
         deadline_time,
+        is_adhoc,
         text_tpl,
         spec,
         enabled,

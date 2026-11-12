@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -226,15 +227,72 @@ def handle_inbound_text(
             send(reply, f"todo_{len(todo_items)}")
             return 200, {"ok": True, "path": "todo", "bound": True, "count": len(todo_items)}
 
+        # ── 2026-11-12 晚 · 不定期任务（菜单自选，Pull 模式）──────────────────
+        # 触发词**唯一锁定【菜单】**；数字回复即刻签发一次性专属填报链接；
+        # 无推送提醒、无截止时间，随到随报、提交即焚、支持一人多次上报。
+        if apply_text == "菜单":
+            try:
+                menu_items = state.list_adhoc_menu_items(bound_member["phone"], platform=platform or None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("菜单查询异常 user=%s: %s", user_id, exc)
+                menu_items = []
+            if not menu_items:
+                reply = "【OPS任务调度助手】当前暂无可自主上报的任务事项。"
+            else:
+                lines = [
+                    "【自主上报事项清单】",
+                    "请直接回复对应【数字编号】获取专属提交链接：",
+                ]
+                for it in menu_items:
+                    lines.append(f"{it['no']}. 【{it['name']}】")
+                lines.append("（直接回复数字如\"1\"即可进入填报）")
+                reply = "\n".join(lines)
+            send(reply, "menu_items")
+            return 200, {"ok": True, "path": "menu", "bound": True, "count": len(menu_items)}
+
+        if re.fullmatch(r"\d{1,3}", apply_text or ""):
+            num = int(apply_text)
+            try:
+                item = state.get_adhoc_menu_item_by_number(
+                    bound_member["phone"], num, platform=platform or None)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("菜单数字定位异常 user=%s: %s", user_id, exc)
+                item = None
+            issued: Optional[Dict[str, Any]] = None
+            if item is not None:
+                try:
+                    issued = state.create_adhoc_instance_and_token(
+                        item["template_id"], bound_member["phone"], platform=platform or None)
+                except Exception as exc:  # noqa: BLE001 - 含权限/下线 BizError → 统一按「未找到」拦截
+                    logger.warning("菜单签发异常 user=%s tpl=%s: %s", user_id, item.get("template_id"), exc)
+                    issued = None
+            if item is None or issued is None:
+                # 需求三-3：数字不存在或无权填报 → 按未找到拦截，严禁越权签发
+                send(f"【OPS任务调度助手】未找到编号为 {num} 的事项，请回复【菜单】查看最新列表。", "menu_miss")
+                return 200, {"ok": True, "path": "menu_number", "found": False, "number": num}
+            if not issued.get("ok"):
+                # 防手抖冷却：不建新实例，只提示（零新写入，重复回调零重复消息）
+                send(str(issued.get("message") or "请稍后再试"), "menu_cooldown")
+                return 200, {"ok": True, "path": "menu_number", "cooldown": True, "number": num}
+            link = f"{(base_url or '').rstrip('/')}/h5/task#t={issued['token']}"
+            reply = (
+                f"请点击链接完成【{issued['name']}】填报：\n"
+                f"👉 提交入口：{link}\n"
+                f"（本链接提交后自动作废；如需再次上报请重新回复\"{num}\"）"
+            )
+            send(reply, "menu_issued")
+            return 200, {"ok": True, "path": "menu_number", "found": True, "number": num,
+                        "instance_id": issued.get("instance_id")}
+
         # 2026-10-27 用户需求：已绑定用户发送非指令消息时，机器人固定回复确认
         # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
-        # 2026-11-12 任务E4：末尾追加【待办】指令指引。
+        # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）。
         ack_text = (
             "【OPS任务调度助手】\n"
-            "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容，\n"
-            "暂时看不懂聊天和其他文字指令，这里不需要你回复文字。\n"
-            "任务提醒会按时自动送达，届时按提醒里的链接或表单提交即可；业务问题请联系对应管理员。\n"
-            "如需重新获取未完成任务的提交链接，请回复【待办】。"
+            "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容。\n"
+            "如需查看待办任务，请回复【待办】。\n"
+            "如需自主上报不定期任务事项，请回复【菜单】。\n"
+            "业务问题请联系对应管理员。"
         )
         send(ack_text, "ack_nonphone")
         return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}

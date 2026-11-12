@@ -349,9 +349,15 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
     window_open, window_reason = _check_submission_window(state, inst, tok)
     # 已提交/已审核通过 → 页面正常打开渲染表单（removed 只读锁死：用户拍板二-3）；
     # 令牌已消耗同样放行（提交侧有终审拦截，页面可用性不再由 consumed 决定）。
+    # 2026-11-12 晚 · 不定期任务（菜单自选）例外：链接一次性（需求五-3）——
+    # 提交成功后刷新只显示「您已完成本次提交」，禁止同一链接二次提交（页面锁死）。
     if inst.get("status") in ("submitted", "approved"):
-        window_open = True
-        window_reason = ""
+        if bool((tpl or {}).get("is_adhoc")):
+            window_open = False
+            window_reason = "您已完成本次提交"
+        else:
+            window_open = True
+            window_reason = ""
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":

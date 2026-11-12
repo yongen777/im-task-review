@@ -318,8 +318,10 @@
               ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
               : "该提交已被驳回，请按审核意见修改后重新提交。";
             contentEl.insertBefore(tip, submitBtn);
-          } else if (__status === "submitted" || __status === "approved") {
-            /* 打开放行：只给状态提示条，不锁控件（提交时后端终审拦截重复提交） */
+          } else if ((__status === "submitted" || __status === "approved") && !!data.window_open) {
+            /* 打开放行：只给状态提示条，不锁控件（提交时后端终审拦截重复提交）。
+               不定期任务（菜单自选）的一次性链接提交后 window_open=False → 落到锁定分支，
+               只显示「您已完成本次提交」（需求五-3）。 */
             const tip = document.createElement("div");
             tip.className = "locked-tip";
             tip.style.background = "#eff6ff";

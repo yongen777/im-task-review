@@ -477,6 +477,9 @@ export const TemplatesView: React.FC = () => {
   const [textLabel, setTextLabel] = useState('文字情况说明');
   const [textPlaceholder, setTextPlaceholder] = useState('请简要填写执行情况或差缺原因说明…');
   const [saving, setSaving] = useState(false);
+  /** 2026-11-12 晚 · 不定期任务（菜单自选）：无推送时刻、无截止，调度物理隔离——
+   *  成员私聊回复【菜单】+ 数字自主获取一次性填报链接（Pull 模式，随到随报、提交即焚、支持多次）。 */
+  const [isAdhoc, setIsAdhoc] = useState(false);
 
   const roleMap = useMemo(() => {
     const map: Record<string, string> = {};
@@ -547,6 +550,7 @@ export const TemplatesView: React.FC = () => {
     setEditingTpl(null);
     setName('');
     setKind(defaultKind);
+    setIsAdhoc(false);
     setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
     setExecMode('weekly');
     setExecDomDays([]);
@@ -576,6 +580,8 @@ export const TemplatesView: React.FC = () => {
     setEditingTpl(tpl);
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
+    /* 2026-11-12 晚 · 不定期任务回显：菜单模式（无推送时刻/无截止，界面禁用两项配置） */
+    setIsAdhoc(Boolean(tpl.is_adhoc) && tpl.kind !== 'notice');
     /* 2026-10-29 执行日：null/空 = 每天 → 七天全上 */
     setExecWeekdays(
       Array.isArray(tpl.exec_weekdays) && tpl.exec_weekdays.length
@@ -594,7 +600,7 @@ export const TemplatesView: React.FC = () => {
     setRoleIds(
       tplRoles.length > 0 ? tplRoles : [roles[0]?.role_id || 'role_branch_chief'],
     );
-    setRemindAt(tpl.remind_at);
+    setRemindAt(tpl.remind_at || '');
     /* 2026-11-12 任务E1：截止配置三件套回显（老模板无 deadline_type 时回落 same_day） */
     setHasDeadline(tpl.has_deadline !== false);
     setDeadlineType(
@@ -763,17 +769,17 @@ export const TemplatesView: React.FC = () => {
       toast.warning('请至少选择 1 个所属业务角色');
       return;
     }
-    if (!remindAt.trim()) {
+    if (!isAdhoc && !remindAt.trim()) {
       toast.warning('请填写执行时间');
       return;
     }
     /* 2026-10-29 执行日：必须至少选一天，否则永远不会执行（2026-11-02 起周期固定按周）*/
     /* 2026-11-10 月度模式：切换为「每月执行」时必须至少选一个日期 */
-    if (execMode === 'weekly' && execWeekdays.length === 0) {
+    if (!isAdhoc && execMode === 'weekly' && execWeekdays.length === 0) {
       toast.warning('请至少选择一天「执行日」', '缺少执行日');
       return;
     }
-    if (execMode === 'monthly' && execDomDays.length === 0) {
+    if (!isAdhoc && execMode === 'monthly' && execDomDays.length === 0) {
       toast.warning('每月执行至少选择一个日期（或点「每月月底」快捷）', '缺少执行日');
       return;
     }
@@ -875,7 +881,7 @@ export const TemplatesView: React.FC = () => {
          有截止 → deadline_type ∈ {same_day, weekend, month_end} + deadline_time（HH:MM）。
          旧列 deadline 同步存 deadline_time，保证未升级的读取链路一致。 */
       const finalDeadline = kind === 'notice' || !hasDeadline ? '' : deadlineTime.trim();
-      const finalHasDeadline = kind !== 'notice' && hasDeadline;
+      const finalHasDeadline = kind !== 'notice' && hasDeadline && !isAdhoc;
       const finalDeadlineType = finalHasDeadline ? deadlineType : null;
       const finalDeadlineTime = finalHasDeadline ? deadlineTime.trim() : null;
       if (editingTpl) {
@@ -883,7 +889,8 @@ export const TemplatesView: React.FC = () => {
           name: name.trim(),
           role_id: roleIds[0],
           role_ids: roleIds,
-          remind_at: remindAt.trim(),
+          remind_at: isAdhoc ? '' : remindAt.trim(),
+          is_adhoc: kind !== 'notice' && isAdhoc,
           deadline: finalDeadline,
           has_deadline: finalHasDeadline,
           deadline_type: finalDeadlineType,
@@ -894,8 +901,8 @@ export const TemplatesView: React.FC = () => {
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null
              2026-11-10：月度模式时 exec_dom_days 带选中几号（每周字段随 UI 状态一并提交，
              后端以 exec_dom_days 非空优先判定）；切回每周时显式 [] 清空月度 */
-          exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
-          exec_dom_days: execMode === 'monthly' ? execDomDays : [],
+          exec_weekdays: isAdhoc ? null : execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: isAdhoc ? [] : execMode === 'monthly' ? execDomDays : [],
           /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
              导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
           need_review: kind === 'notice' ? false : requireReview,
@@ -918,7 +925,8 @@ export const TemplatesView: React.FC = () => {
           period: 'day',
           role_id: roleIds[0],
           role_ids: roleIds,
-          remind_at: remindAt.trim(),
+          remind_at: isAdhoc ? '' : remindAt.trim(),
+          is_adhoc: kind !== 'notice' && isAdhoc,
           deadline: finalDeadline,
           has_deadline: finalHasDeadline,
           deadline_type: finalDeadlineType,
@@ -927,8 +935,8 @@ export const TemplatesView: React.FC = () => {
           spec,
           enabled,
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
-          exec_weekdays: execWeekdays.length === 7 ? null : execWeekdays,
-          exec_dom_days: execMode === 'monthly' ? execDomDays : [],
+          exec_weekdays: isAdhoc ? null : execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: isAdhoc ? [] : execMode === 'monthly' ? execDomDays : [],
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
@@ -1155,6 +1163,12 @@ export const TemplatesView: React.FC = () => {
                             <Bell className="w-3.5 h-3.5 shrink-0" />
                             <span>通知提醒</span>
                           </span>
+                        ) : tpl.is_adhoc ? (
+                          /* 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式徽章 */
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-violet-50 text-violet-700 border-violet-200 text-xs font-semibold" title="无推送时刻/无截止，成员回复【菜单】自主获取链接">
+                            <Smartphone className="w-3.5 h-3.5 shrink-0" />
+                            <span>不定期（菜单自选）</span>
+                          </span>
                         ) : (
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-blue-50 text-blue-700 border-blue-200 text-xs font-semibold">
                             <Smartphone className="w-3.5 h-3.5 shrink-0" />
@@ -1165,10 +1179,18 @@ export const TemplatesView: React.FC = () => {
 
                       {/* 4. 执行时间 */}
                       <td className="py-4 px-3 whitespace-nowrap">
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50/80 text-blue-700 border border-blue-200/70 font-mono text-xs font-bold">
-                          <Clock className="w-3.5 h-3.5 shrink-0" />
-                          <span>{tpl.remind_at}</span>
-                        </span>
+                        {tpl.is_adhoc && !isNotice ? (
+                          /* 不定期任务无推送时刻（调度物理隔离） */
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-violet-50/80 text-violet-700 border border-violet-200/70 font-mono text-xs font-bold">
+                            <Clock className="w-3.5 h-3.5 shrink-0" />
+                            <span>—（菜单自选）</span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50/80 text-blue-700 border border-blue-200/70 font-mono text-xs font-bold">
+                            <Clock className="w-3.5 h-3.5 shrink-0" />
+                            <span>{tpl.remind_at || '—'}</span>
+                          </span>
+                        )}
                       </td>
 
                       {/* 5. 任务内容配置 */}
@@ -1584,15 +1606,44 @@ export const TemplatesView: React.FC = () => {
                       </select>
                     </div>
 
+                    {/* 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式开关（仅上传任务可勾） */}
+                    {kind === 'upload' && (
+                      <div className="sm:col-span-2 -mt-1">
+                        <label
+                          className={`inline-flex items-start gap-2 rounded-xl border px-3 py-2 cursor-pointer transition-colors ${
+                            isAdhoc
+                              ? 'bg-violet-50 border-violet-300'
+                              : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={isAdhoc}
+                            onChange={(e) => setIsAdhoc(e.target.checked)}
+                            className="w-4 h-4 mt-0.5 rounded text-violet-600 focus:ring-violet-500"
+                          />
+                          <span className="text-xs leading-5">
+                            <span className="font-bold text-slate-800">不定期任务（菜单自选）</span>
+                            <span className="text-slate-500 block">
+                              不定时推送催报：无推送时间、无截止时间，成员私聊回复【菜单】自主获取一次性填报链接，
+                              随到随报、提交后链接自动作废、可再次上报。勾选后「执行日 / 执行时间 / 截止配置」自动禁用。
+                            </span>
+                          </span>
+                        </label>
+                      </div>
+                    )}
+
                     {/* 2026-11-02 用户口径：去掉「执行周期」概念 —— 管理员只选星期几，固定在每周选中的那几天触发 */}
                     {/* 2026-11-10 双模式：每周（周几）/ 每月（几号）；月底=31（调度自动适配小月/闰年） */}
-                    <div>
+                    <div className={isAdhoc ? 'opacity-45 pointer-events-none select-none' : ''}>
                       <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
                         <span>执行日</span>
                         <span className="text-[10px] text-slate-400 font-normal">
-                          {execMode === 'weekly'
-                            ? '只在这些星期生成任务；没选的日子不提醒、不产生逾期'
-                            : '只在每月选中的日期生成任务；选中 31 号时小月/闰月自动按当月最后一天执行'}
+                          {isAdhoc
+                            ? '不定期任务无执行日（不推送）'
+                            : execMode === 'weekly'
+                              ? '只在这些星期生成任务；没选的日子不提醒、不产生逾期'
+                              : '只在每月选中的日期生成任务；选中 31 号时小月/闰月自动按当月最后一天执行'}
                         </span>
                       </label>
                       {/* 模式切换 */}
@@ -1696,9 +1747,9 @@ export const TemplatesView: React.FC = () => {
                     </div>
 
                     {/* 执行时间 & 截止时间（2026-10-28 重排版：时间字段并列一行 + 原生时间选择器） */}
-                    <div className={kind === 'notice' ? 'sm:col-span-2' : ''}>
+                    <div className={(kind === 'notice' ? 'sm:col-span-2 ' : '') + (isAdhoc ? 'opacity-45 pointer-events-none select-none' : '')}>
                       <label className="font-semibold text-slate-700 block mb-1">
-                        执行时间 <span className="text-rose-500">*</span>
+                        执行时间 {isAdhoc ? <span className="text-[10px] text-violet-600 font-normal">（不定期任务无推送时刻）</span> : <span className="text-rose-500">*</span>}
                       </label>
                       <input
                         type="time"
@@ -1710,9 +1761,9 @@ export const TemplatesView: React.FC = () => {
 
                     {/* 截止配置（2026-11-12 任务E1 重构：开关 + 类型单选 + 时刻） */}
                     {kind === 'upload' && (
-                      <div className="sm:col-span-2">
+                      <div className={'sm:col-span-2 ' + (isAdhoc ? 'opacity-45 pointer-events-none select-none' : '')}>
                         <label className="font-semibold text-slate-700 block mb-1.5">
-                          截止配置 <span className="text-[11px] font-normal text-slate-400">（不设截止 = 任务长期有效）</span>
+                          截止配置 <span className="text-[11px] font-normal text-slate-400">（不设截止 = 任务长期有效；不定期任务无截止概念）</span>
                         </label>
                         <div className="flex flex-wrap items-center gap-2">
                           <label className="inline-flex items-center gap-1.5 cursor-pointer select-none bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">

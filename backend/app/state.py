@@ -36,6 +36,37 @@ PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 FIELD_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+ROLE_ID_RE = re.compile(r"r_[0-9a-fA-F]+")
+
+
+def parse_role_ids(raw: Any) -> List[str]:
+    """2026-11-12 晚（需求四 · 角色删除引用加固）：role_ids 字段的**规范解析**。
+
+    统一支持 JSON 数组字符串与逗号/分号分隔格式；解析失败时按 role_id 词法兜底提取，
+    保证「只要该角色被任意未删除模板引用，删除就 100% 拦截」——
+    旧实现 `json.loads` 失败直接置空列表会导致**漏判误删**（用户点名的隐患）。
+    """
+    s = raw if isinstance(raw, str) else ("" if raw is None else json.dumps(raw, ensure_ascii=False))
+    s = (s or "").strip()
+    if not s:
+        return []
+    try:
+        data = json.loads(s)
+        if isinstance(data, (list, tuple)):
+            return [str(x).strip() for x in data if str(x).strip()]
+        if isinstance(data, str):
+            s = data.strip()
+        else:
+            return [str(data).strip()] if str(data).strip() else []
+    except Exception:
+        pass
+    # 逗号 / 分号 / 空白 / 括号引号的兜底切分（历史脏数据 / 手工导入行）
+    tokens = re.split(r"[,;，；\s\[\]【】{}「」()（）'\"]+", s)
+    found = [t for t in (str(t).strip() for t in tokens) if t and ROLE_ID_RE.fullmatch(t)]
+    if found:
+        return found
+    # 极端脏数据：连切分都提不出来 → 保守放行解析为空，由调用方做字符串包含兜底
+    return []
 
 VALID_TEMPLATE_KINDS = ("form", "image", "file", "notice")
 VALID_PERIODS = ("day", "week", "month")
@@ -1501,12 +1532,12 @@ class StateStore:
             existing = self.conn.execute("SELECT * FROM role WHERE role_id = ?", (clean_id,)).fetchone()
             if not existing:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
+            # 2026-11-12 晚 · 需求四加固：规范解析（JSON 数组 / 逗号分隔统一提取），
+            # 解析不出 token 时按「原始字符串包含该 role_id」保守拦截 —— 杜绝漏判误删。
             for trow in self.conn.execute("SELECT role_ids FROM task_template WHERE deleted = 0").fetchall():
-                try:
-                    rids = json.loads(trow["role_ids"] or "[]")
-                except Exception:
-                    rids = []
-                if clean_id in rids:
+                _raw_ids = str(trow["role_ids"] or "")
+                rids = parse_role_ids(_raw_ids)
+                if clean_id in rids or (not rids and _raw_ids and clean_id in _raw_ids):
                     raise BizError(409, "ROLE_IN_USE", "该角色已被任务模板引用，请先删除相关任务模板")
             phones = [str(r[0]) for r in self.conn.execute(
                 "SELECT phone FROM member WHERE role_id = ? ORDER BY id ASC", (clean_id,)).fetchall()]
@@ -1720,10 +1751,9 @@ class StateStore:
             trow = self.conn.execute(
                 "SELECT role_ids FROM task_template WHERE template_id = ?", (inst["template_id"],)
             ).fetchone()
-            try:
-                tpl_roles = [str(x) for x in json.loads((trow["role_ids"] if trow else "") or "[]") if str(x).strip()]
-            except Exception:
-                tpl_roles = []
+            # 2026-11-12 晚 · 需求四加固：同款规范解析（脏数据兜底切分）
+            _raw_tpl_roles = str((trow["role_ids"] if trow else "") or "")
+            tpl_roles = parse_role_ids(_raw_tpl_roles)
             if not tpl_roles:
                 continue
             placeholders = ",".join("?" for _ in tpl_roles)
@@ -2261,6 +2291,8 @@ class StateStore:
             "exec_weekdays": exec_weekdays,
             "exec_dom_days": exec_dom_days,
             "data_keys": data_keys, "spec_json": spec_json,
+            # 2026-11-12 晚 · 不定期任务（菜单自选）：True = 无推送/无截止/调度物理隔离
+            "is_adhoc": bool(int(d.get("is_adhoc") if d.get("is_adhoc") is not None else 0)),
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
 
@@ -2338,6 +2370,16 @@ class StateStore:
         # 避免后台编辑框和消息里一直夹着反斜杠 n 这种字符。
         text_tpl = text_tpl.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
 
+        # ── 2026-11-12 晚 · 不定期任务（菜单自选）：is_adhoc 互斥边界（需求三-4）──
+        # 后台勾选「不定期任务（菜单自选）」后：推送时刻强制禁用/置空（调度链物理隔离、
+        # 绝不主动催报）、截止时间强制禁用/置空（链接永不逾期、H5 永不显示截止）。
+        _adhoc_raw = merged.get("is_adhoc")
+        if _adhoc_raw is None:
+            _adhoc_raw = (existing or {}).get("is_adhoc") or 0
+        is_adhoc = bool(int(_adhoc_raw or 0))
+        if is_adhoc and kind == "notice":
+            raise BizError(400, "VALIDATION_FAILED", "通知类模板不支持「不定期任务（菜单自选）」模式")
+
         if kind == "notice":
             if str(merged.get("period") or "day").strip() != "day":
                 raise BizError(400, "VALIDATION_FAILED", "通知类模板 period 固定为 day")
@@ -2389,13 +2431,21 @@ class StateStore:
             # 不写这里会让每次保存都把执行时间清空，列表显示空白、下次编辑还得重填。
             remind_at = clean_times[0]
         else:
-            remind_at = str(merged.get("remind_at") or "").strip()
-            if not is_valid_hhmm(remind_at):
-                raise BizError(400, "VALIDATION_FAILED", "remind_at 必须为合法的 HH:MM 格式")
+            if is_adhoc:
+                # 2026-11-12 晚 · 不定期任务：推送时刻强制置空（调度链物理隔离）+ 截止强制无。
+                # remind_at=None 跳过 HH:MM 校验；has_deadline=False 走下面的无截止分支。
+                remind_at = None
+                has_deadline = False
+            else:
+                remind_at = str(merged.get("remind_at") or "").strip()
+                if not is_valid_hhmm(remind_at):
+                    raise BizError(400, "VALIDATION_FAILED", "remind_at 必须为合法的 HH:MM 格式")
 
             # ── 2026-11-12 任务E1：截止配置三件套（has_deadline / deadline_type / deadline_time）──
             # 部分更新语义：键未提交 → 保留 existing 原值（与其他可选字段一致）。
-            if "has_deadline" in payload:
+            if is_adhoc:
+                has_deadline = False  # 需求三-4：不定期任务强制无截止（无视 payload，杜绝脏配置）
+            elif "has_deadline" in payload:
                 has_deadline = bool(payload.get("has_deadline"))
             else:
                 has_deadline = bool(existing.get("has_deadline")) if existing else True
@@ -2578,6 +2628,11 @@ class StateStore:
         else:
             exec_dom_days_norm = (existing or {}).get("exec_dom_days")
 
+        # 2026-11-12 晚 · 不定期任务：无执行日概念（无推送时刻 → 调度链物理隔离），强制置空。
+        if is_adhoc:
+            exec_weekdays_norm = None
+            exec_dom_days_norm = None
+
         # 2026-10-29 修复：前端提交的键是 `spec`（notice_items 里带上传时的**原始文件名**
         # 与管理员填的描述），后端一直只读 `spec_json` → 这些配置从来没落库，
         # 每次重新打开模板都被前端按 attach_image_path 重建，于是名字/描述回到默认值。
@@ -2614,6 +2669,8 @@ class StateStore:
             "deadline_type": deadline_type if has_deadline else None,
             "deadline_time": deadline_time if has_deadline else None,
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
+            # 2026-11-12 晚 · 不定期任务（菜单自选）：持久化 flag（调度链按它物理隔离）
+            "is_adhoc": 1 if is_adhoc else 0,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "attach_image_name": attach_image_name,
             "exec_weekdays": json.dumps(exec_weekdays_norm, ensure_ascii=False) if exec_weekdays_norm else None,
@@ -2628,8 +2685,8 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, deleted, created_by, created_at, updated_at, owner_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, is_adhoc, deleted, created_by, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
@@ -2637,7 +2694,7 @@ class StateStore:
                     norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
                     norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
-                    norm["enabled"], actor, now_s, now_s, int(owner_id),
+                    norm["enabled"], norm["is_adhoc"], actor, now_s, now_s, int(owner_id),
                 ),
             )
             self._insert_audit_unlocked(actor, "template.create", "task_template", template_id, {"name": norm["name"], "kind": norm["kind"], "period": norm["period"]}, now_s)
@@ -2694,7 +2751,7 @@ class StateStore:
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
                 "has_deadline = ?, deadline_type = ?, deadline_time = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, is_adhoc = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
@@ -2702,7 +2759,7 @@ class StateStore:
                     norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
                     norm["need_review"], norm["max_file_mb"],
                     norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
-                    norm["enabled"], now_s, clean_id,
+                    norm["enabled"], norm["is_adhoc"], now_s, clean_id,
                 ),
             )
             # 2026-11-12 下午修复（图一实锤）：编辑模板移除角色分组后，被移除角色成员的实例
@@ -2711,14 +2768,8 @@ class StateStore:
             # 全部实例（含未完成与已完成）连同提交/令牌一起清除，列表不再出现；
             # 仍挂在模板其它角色的成员不动（与 delete_role_member 的「一人多角色」判据同源）。
             _role_purge: Optional[Dict[str, Any]] = None
-            try:
-                _old_roles = [str(x) for x in json.loads(row["role_ids"] or "[]") if str(x).strip()]
-            except Exception:
-                _old_roles = []
-            try:
-                _new_roles = [str(x) for x in json.loads(norm["role_ids_json"] or "[]") if str(x).strip()]
-            except Exception:
-                _new_roles = []
+            _old_roles = parse_role_ids(row["role_ids"] or "")
+            _new_roles = parse_role_ids(norm["role_ids_json"] or "")
             _removed_roles = [r for r in _old_roles if r not in _new_roles]
             if _removed_roles:
                 _place = ",".join("?" for _ in _removed_roles)
@@ -2955,7 +3006,13 @@ class StateStore:
         member_count, activated_count = len(members), sum(1 for m in members if m["activated"])
         return {"member_count": member_count, "activated_count": activated_count, "unactivated_count": member_count - activated_count}
 
-    def list_active_templates(self, include_notice: bool = True) -> List[Dict[str, Any]]:
+    def list_active_templates(self, include_notice: bool = True, include_adhoc: bool = False) -> List[Dict[str, Any]]:
+        """调度链取模板的**唯一入口**（通知/实例生成/提醒/逾期流转全部从这里取）。
+
+        2026-11-12 晚 · 不定期任务（菜单自选）物理隔离：include_adhoc 默认 False——
+        定时调度器对 adhoc 模板**绝不主动发消息、绝不生成实例、绝不催报**；
+        只有【菜单】取数显式带 include_adhoc=True（此时仍受启用/平台授权约束）。
+        """
         with self.lock:
             # 2026-11-05 拍板口径落地：「停用管理员 = 名下模板立即停止派发」。
             # 此前只查模板自身的 enabled/deleted，管理员账号被停用后模板照常发消息（口径未实现的实测缺口）。
@@ -2965,6 +3022,7 @@ class StateStore:
                 "SELECT t.* FROM task_template t "
                 "LEFT JOIN admin_user u ON u.id = t.owner_id "
                 "WHERE t.enabled = 1 AND t.deleted = 0 AND COALESCE(u.enabled, 1) = 1"
+                + (" AND t.is_adhoc = 0" if not include_adhoc else "")
                 + ("" if include_notice else " AND t.kind != 'notice'")
                 + " ORDER BY t.template_id ASC"
             )
@@ -3301,6 +3359,118 @@ class StateStore:
     # 按用户拍板彻底删除：逾期后统一提示「当前任务已过期（截止时间：…），无法提交」，
     # 不再有补交通道。⛔ 驳回重交（rejected → 窗口内原链接重交）是另一套机制，保留。
     # task_instance.resubmit_* 列保留不动（存量历史数据兼容，只是不再读写）。
+
+    # ── 2026-11-12 晚 · 不定期任务（菜单自选）：取数与一次性链接签发 ──────────
+
+    ADHOC_MENU_COOLDOWN_SECONDS = 60  # 同一（成员, 事项）重复数字签发的防手抖冷却
+
+    def list_adhoc_menu_items(self, phone: str, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """【菜单】清单：当前平台下该用户**所在角色有权填报**的已启用不定期任务事项。
+
+        需求三边界：① 平台天然隔离（角色平台 = 用户查询平台）；② 角色权限约束
+        （非模板关联角色成员 → 列表不出现）；③ 菜单编号 = 清单顺序 1..N（同平台同管理员
+        下天然唯一）；排序按创建时间稳定，避免两次【菜单】之间编号漂移。
+        """
+        clean_phone = str(phone or "").strip()
+        plat = str(platform or "").strip().lower()
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM task_template WHERE deleted = 0 AND enabled = 1 AND is_adhoc = 1 "
+                "AND kind != 'notice' ORDER BY created_at ASC, rowid ASC").fetchall()
+            tpls = [self._deserialize_template_row(r) for r in rows]
+        out: List[Dict[str, Any]] = []
+        for tpl in tpls:
+            roles = [str(x).strip() for x in (tpl.get("role_ids") or []) if str(x).strip()]
+            if not roles:
+                continue
+            placeholders = ",".join("?" for _ in roles)
+            with self.lock:
+                row = self.conn.execute(
+                    f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                    f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) AND m.enabled = 1 "
+                    f"AND (? = '' OR r.platform = ?) LIMIT 1",
+                    (clean_phone, *roles, plat, plat)).fetchone()
+            if row is None:
+                continue
+            out.append({"no": len(out) + 1, "template_id": tpl["template_id"], "name": tpl["name"]})
+        return out
+
+    def get_adhoc_menu_item_by_number(self, phone: str, number: int, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """数字回复 → 菜单事项定位（越权/不存在 → None，按「未找到事项」拦截）。"""
+        try:
+            clean_no = int(str(number).strip())
+        except Exception:
+            return None
+        for it in self.list_adhoc_menu_items(phone, platform=platform):
+            if int(it["no"]) == clean_no:
+                return it
+        return None
+
+    def create_adhoc_instance_and_token(
+        self, template_id: str, phone: str, platform: Optional[str] = None, now_dt: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """数字回复匹配成功 → 现场创建**全新一次性实例**并签发专属 H5 链接（需求一-4 / 五-3）。
+
+        · period_key = `adhoc-<签发时刻>-<随机后缀>`：绕开 (template_id, phone, period_key)
+          唯一键 → 同一用户可对同一事项**多次上报**（每次数字回复 = 全新实例+新链接）；
+        · deadline_at 固定哨兵：无截止 → 永不逾期、H5 永不显示截止；
+        · 链接仅供提交 1 次：提交成功后实例转 submitted/approved → 旧链接 H5 关窗
+          「您已完成本次提交」、再提交终审「已上传，请勿重复提交」；
+        · 防手抖刷屏：同一（成员, 事项）冷却窗口内已有未完成/刚提交实例 → 不建新实例，
+          返回 ok=False + 提示文案（零新写入，满足「重复回调不得产生重复消息」红线）。
+        """
+        clean_phone = str(phone or "").strip()
+        clean_tid = str(template_id or "").strip()
+        cur_dt = now_dt or self.now()
+        now_s = format_dt(cur_dt)
+        cooldown_s = format_dt(cur_dt - timedelta(seconds=self.ADHOC_MENU_COOLDOWN_SECONDS))
+        item = None
+        for it in self.list_adhoc_menu_items(clean_phone, platform=platform):
+            if it["template_id"] == clean_tid:
+                item = it
+                break
+        if item is None:
+            raise BizError(403, "FORBIDDEN", "您没有该事项的填报权限")
+        tpl = self.get_template(clean_tid, include_deleted=False)
+        if not tpl or not tpl.get("is_adhoc") or not tpl.get("enabled"):
+            raise BizError(404, "NOT_FOUND", "该事项不存在或已下线")
+        roles = [str(x).strip() for x in (tpl.get("role_ids") or []) if str(x).strip()]
+        with self.lock, self.conn:
+            recent = self.conn.execute(
+                "SELECT id, status FROM task_instance WHERE template_id = ? AND phone = ? AND created_at > ? "
+                "AND status IN ('pending', 'submitted', 'approved') ORDER BY id DESC LIMIT 1",
+                (clean_tid, clean_phone, cooldown_s)).fetchone()
+            if recent is not None:
+                return {
+                    "ok": False, "reason": "cooldown",
+                    "message": (
+                        f"您刚才已获取过【{tpl['name']}】的提交链接，请先完成本次填报；"
+                        f"如需再次上报，请 {self.ADHOC_MENU_COOLDOWN_SECONDS} 秒后再回复对应数字。"
+                    ),
+                }
+            placeholders = ",".join("?" for _ in roles)
+            mrow = self.conn.execute(
+                f"SELECT name, dept FROM member WHERE phone = ? AND role_id IN ({placeholders}) "
+                f"AND enabled = 1 ORDER BY id ASC LIMIT 1",
+                (clean_phone, *roles)).fetchone()
+            if mrow is None:
+                raise BizError(403, "FORBIDDEN", "您没有该事项的填报权限")
+            period_key = f"adhoc-{cur_dt.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+            self.conn.execute(
+                "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (clean_tid, clean_phone, mrow["name"], mrow["dept"], period_key,
+                 NO_DEADLINE_SENTINEL, now_s, int(tpl.get("owner_id") or 1)),
+            )
+            inst_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        # 令牌在锁外签发（issue_h5_token 自带锁；无截止 → 720h 长链）
+        raw_token = self.issue_h5_token(
+            phone=clean_phone, template_id=clean_tid, period_key=period_key,
+            instance_id=inst_id, purpose="submit",
+            ttl_hours=calc_h5_token_ttl_hours({"status": "pending", "deadline_at": NO_DEADLINE_SENTINEL}, cur_dt),
+        )
+        return {"ok": True, "reason": "issued", "instance_id": inst_id, "period_key": period_key,
+                "token": raw_token, "name": tpl["name"]}
 
     def is_member_active_for_roles(self, phone: str, role_ids: List[str]) -> bool:
         """该手机号在给定角色集合下是否仍有 enabled=1 的名册行。

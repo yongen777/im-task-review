@@ -425,6 +425,9 @@ class Database:
             _ensure_column(self.conn, "task_template", "has_deadline", "INTEGER NOT NULL DEFAULT 1")
             _ensure_column(self.conn, "task_template", "deadline_type", "TEXT")
             _ensure_column(self.conn, "task_template", "deadline_time", "TEXT")
+            # 2026-11-12 晚 · 不定期任务（菜单自选）：无推送时刻、无截止、调度链物理隔离，
+            # 用户私聊回复【菜单】/ 数字按需签发一次性填报链接（Pull 模式）。
+            _ensure_column(self.conn, "task_template", "is_adhoc", "INTEGER NOT NULL DEFAULT 0")
             # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
             _migrate_role_platform(self.conn)
             # 2026-11-11：member.dept_path（官方通讯录完整组织路径，层级统计归集）
