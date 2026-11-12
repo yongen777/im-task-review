@@ -300,11 +300,12 @@ def test_c_cancelled_not_resurrected_not_advanced_not_delivered() -> None:
         assert store.get_instance(inst_id)["status"] == "cancelled"
 
         # ④ 旧链接提交被服务端硬拦截 + H5 窗口检查关闭
+        # 2026-11-12 下午新口径（四-3）：成员被移出角色 → cancelled 统一「任务已关闭」（403 TASK_CLOSED）
         try:
             store.submit_h5_task(raw_token=tok)
             raise AssertionError("cancelled 实例仍可提交（BUG）")
         except BizError as e:
-            assert e.status_code == 400 and e.code == "WINDOW_CLOSED", (e.status_code, e.code)
+            assert (e.status_code, e.code, e.message) == (403, "TASK_CLOSED", "任务已关闭"), (e.status_code, e.code, e.message)
         window_open, reason = _check_submission_window(store, store.get_instance(inst_id), tok)
         assert window_open is False and "取消" in (reason or ""), (window_open, reason)
     finally:

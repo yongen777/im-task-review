@@ -791,7 +791,8 @@ class Scheduler:
         守卫：
           · 仅上传类模板（form/image/file）；notice 按 notice_times 自动发，拒绝手动推
           · 绕过锚点日/「推送时刻 < 提醒时刻」门：非锚点日也允许补建当期实例（软护栏另设）
-          · 只发 status='pending' 且未过 deadline_at 的实例
+          · 2026-11-12 下午：覆盖 pending/overdue/rejected/**submitted/approved**（用户拍板：
+            立即推送支持已提交任务再次推送，便于催办/自测）；cancelled/expired/已过截止/成员停用不发送
           · 同一次调用内每 (phone,seq) 只发一次（_deliver_with_log 首试 retry=0）；
             发送失败留给 reminder_log 退避机制，不在本轮重试
           · 同模板冷却护栏在 state.check_manual_push_cooldown（API 层调用），本方法不重复判
@@ -816,10 +817,20 @@ class Scheduler:
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         push_seq: Dict[str, int] = {}
         for inst in instances:
-            if str(inst["status"] or "") != "pending":
-                continue  # cancelled/overdue/rejected/submitted/approved/sent/expired 均不打扰
-            if str(inst["deadline_at"] or "") <= now_s:
+            inst_status = str(inst["status"] or "")
+            # 2026-11-12 下午（用户拍板，二-1）：立即推送**覆盖已提交/已审核通过**——
+            # pending / overdue / rejected / submitted / approved 均正常发送并签发有效链接
+            # （催办与自测场景）；cancelled（任务已关闭）与 expired（过期归档）不打扰。
+            if inst_status not in ("pending", "overdue", "rejected", "submitted", "approved"):
+                continue
+            # 已过截止不追发（矩阵）；rejected 以「驳回 + 24h」重交窗口为有效截止
+            eff_dl = (calc_resubmit_deadline(str(inst["deadline_at"] or ""), inst.get("reviewed_at"))
+                      if inst_status == "rejected" else str(inst["deadline_at"] or ""))
+            if eff_dl <= now_s:
                 continue  # 已过截止：不追发
+            # 成员账号被停用/移出 → 不推送（四-5 口径）
+            if not self.state.is_member_active_for_roles(str(inst["phone"]), tpl.get("role_ids") or []):
+                continue
             phone = str(inst["phone"])
             seq = push_seq.get(phone, 0) + 1
             push_seq[phone] = seq

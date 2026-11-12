@@ -421,7 +421,7 @@ def test_e4_todo_rejected_counts_and_link_ttl_covers_rewindow() -> None:
         inst = _ensure_today(store, tpl, "2026-11-12 18:00:00")
         raw = store.issue_h5_token(PHONE, tpl["template_id"], "2026-11-12", inst["id"])
         store.submit_h5_task(raw_token=raw, fields={"summary": "初稿"})
-        # 12:00 驳回 → 重交截止 = max(11-15 18:00, 11-13 12:00) = 11-15 18:00
+        # 12:00 驳回 → 2026-11-12 下午新口径：重交截止 = 驳回时刻 + 24h = 11-13 12:00
         CLOCK["now"] = datetime(2026, 11, 12, 12, 0, 0)
         rej = store.review_instance(inst["id"], action="reject", reason="太糊", reviewer="admin")
         assert rej["status"] == "rejected"
@@ -429,11 +429,10 @@ def test_e4_todo_rejected_counts_and_link_ttl_covers_rewindow() -> None:
 
         items = store.list_pending_todo(PHONE, platform="zdxlz", now_dt=CLOCK["now"])
         assert [i["template_name"] for i in items] == ["驳回重交"], items
-        # 待办签发的链接 TTL 以重交截止为基准再 +24h：
-        # 重交截止 = max(11-15 18:00, 11-13 12:00) = 11-15 18:00，
-        # (11-16 18:00) - (11-12 12:00) = 102h → 链接寿命覆盖整个 78h 重交窗口。
+        # 待办签发的链接 TTL 与 24h 重交窗口严格对齐：
+        # 重交截止 = 11-13 12:00（驳回+24h），(11-13 12:00) - (11-12 12:00) = 24h。
         ttl = calc_h5_token_ttl_hours(inst, CLOCK["now"])
-        assert ttl == 102.0, ttl
+        assert ttl == 24.0, ttl
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()
@@ -470,7 +469,9 @@ def test_e4_todo_empty_reply_and_unbound_zero_writes() -> None:
 
 # ════════════════════ 外加：停用可提交 / 删除关死（含 rejected 挂起） ════════════════════
 
-def test_extra_disabled_template_issued_link_still_submits() -> None:
+def test_extra_disabled_template_link_closed_reenable_restores() -> None:
+    """2026-11-12 下午新口径（取代「停用仍可提交」）：停用模板 → 已下发旧链接
+    统一拦截「任务已关闭」；重新启用且未过截止 → 自动恢复可提交。"""
     store = _store()
     try:
         rid = _seed_member(store)
@@ -478,12 +479,22 @@ def test_extra_disabled_template_issued_link_still_submits() -> None:
         inst = _ensure_today(store, tpl, "2026-11-12 18:00:00")
         raw_token = store.issue_h5_token(PHONE, tpl["template_id"], "2026-11-12", inst["id"])
 
-        # 停用模板（enabled=0）：已下发链接仍可正常查看与提交
+        # 停用模板（enabled=0）→ 打开/提交统一 403「任务已关闭」
         store.update_template(tpl["template_id"], {"enabled": False}, actor="t")
         CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 0)
         code, info = process_h5_task_info(state=store, raw_token=raw_token)
-        assert code == 200 and info["window_open"] is True, (code, info.get("window_reason"))
-        res = store.submit_h5_task(raw_token=raw_token, fields={"summary": "停用后仍交"})
+        assert (code, info["code"], info["message"]) == (403, "TASK_CLOSED", "任务已关闭"), (code, info)
+        try:
+            store.submit_h5_task(raw_token=raw_token, fields={"summary": "停用后想交"})
+            raise AssertionError("停用后必须拒绝提交")
+        except BizError as exc:
+            assert (exc.status_code, exc.code, exc.message) == (403, "TASK_CLOSED", "任务已关闭"), exc
+
+        # 重新启用 → 未过截止 → 自动恢复可用
+        store.update_template(tpl["template_id"], {"enabled": True}, actor="t")
+        code2, info2 = process_h5_task_info(state=store, raw_token=raw_token)
+        assert code2 == 200 and info2["window_open"] is True, (code2, info2.get("window_reason"))
+        res = store.submit_h5_task(raw_token=raw_token, fields={"summary": "恢复后交"})
         assert res["status"] == "approved"  # need_review=False
         assert store.get_instance(inst["id"])["status"] == "approved"
     finally:
@@ -505,24 +516,28 @@ def test_extra_deleted_template_link_closed_including_rejected() -> None:
 
         # 删除模板 → rejected 挂起实例一并关死（重交窗口内也交不了）
         store.delete_template(tpl["template_id"], actor="t")
-        # 2026-11-12 下午口径修正：删除模板 = **物理清除**（实例/提交/令牌随模板一起删）。
-        # 旧链接的令牌已不存在 → info 返回 TOKEN_INVALID、submit 以「链接无效」拒绝 —— 仍然交不了。
+        # 2026-11-12 下午口径：删除模板 = **物理清除**（实例/提交随模板删）；
+        # h5_token 行**保留**作轻量失效识别（tombstone）→ 旧链接点开统一提示
+        # 「任务已关闭」（而不是「无效令牌」技术报错）。
         assert store.get_instance(inst["id"]) is None, "删除模板后实例行必须物理清除"
+        with store.lock:
+            tk_cnt = store.conn.execute(
+                "SELECT COUNT(1) FROM h5_token WHERE template_id = ?", (tpl["template_id"],)).fetchone()[0]
+        assert int(tk_cnt) >= 1, "删除模板后令牌行必须保留作失效识别"
         code, info = process_h5_task_info(state=store, raw_token=raw)
-        assert (code, info["code"]) == (401, "TOKEN_INVALID"), (code, info)
-        assert "H5 访问令牌" in info["message"], info["message"]
+        assert (code, info["code"], info["message"]) == (403, "TASK_CLOSED", "任务已关闭"), (code, info)
         try:
             store.submit_h5_task(raw_token=raw, fields={"summary": "还想交"})
             raise AssertionError("删除后必须拒绝提交")
         except BizError as exc:
-            assert exc.status_code == 404 and exc.code == "NOT_FOUND", (exc.status_code, exc.code, exc.message)
+            assert (exc.status_code, exc.code, exc.message) == (403, "TASK_CLOSED", "任务已关闭"), exc
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()
 
 
 def test_extra_h5_upload_for_deleted_template_rejected() -> None:
-    """上传端点（附件）对已删除模板同样关死：令牌随物理清除一并删除 → TOKEN_INVALID，不收文件。"""
+    """上传端点（附件）对已删除模板同样关死：令牌保留作识别 → 403「任务已关闭」，不收文件。"""
     from app.api.h5 import _validate_upload_target_and_limits
 
     store = _store()
@@ -534,7 +549,7 @@ def test_extra_h5_upload_for_deleted_template_rejected() -> None:
         store.delete_template(tpl["template_id"], actor="t")
         result = _validate_upload_target_and_limits(store, raw, "photo.png")
         err = result[-1]
-        assert err is not None and err[0] == 401, result
-        assert err[1]["code"] == "TOKEN_INVALID", err
+        assert err is not None and err[0] == 403, result
+        assert (err[1]["code"], err[1]["message"]) == ("TASK_CLOSED", "任务已关闭"), err
     finally:
         store.close()

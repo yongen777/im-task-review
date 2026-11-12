@@ -72,23 +72,24 @@ def is_valid_hhmm(value: str) -> bool:
 
 
 def calc_resubmit_deadline(deadline_at: str, reviewed_at: Optional[str]) -> str:
-    """R27：驳回重交窗口 = max(原截止 + 72h, 驳回时刻 + 24h)。
+    """驳回重交窗口。
 
-    2026-11-12 任务E1：无截止（哨兵）模板的实例被驳回时没有「截止」概念，
-    重交窗口同样取哨兵（长期有效），避免 9999 年 +72h 溢出。
+    2026-11-12 下午（用户拍板，取代 R27 的 max(原截止+72h, 驳回+24h)）：
+      · 有截止时间的模板 → 重交截止统一锁定为 **驳回时刻 + 24h**；
+        超 24h 未重交 → 重交窗口自动关闭（advance 流转 expired），再打开/提交均按过期拦截；
+      · 无截止时间（哨兵）的模板 → 重交窗口同样**无限期**（哨兵），
+        通知文案提示「本任务无截止时间，请按审核意见尽快重新提交」。
     """
     if is_no_deadline(deadline_at):
         return NO_DEADLINE_SENTINEL
-    orig_end = parse_dt(deadline_at) + timedelta(hours=72)
-    if not reviewed_at:
-        return format_dt(orig_end)
-    return format_dt(max(orig_end, parse_dt(reviewed_at) + timedelta(hours=24)))
+    base_s = str(reviewed_at or "").strip() or format_dt(default_now())
+    return format_dt(parse_dt(base_s) + timedelta(hours=24))
 
 
 def effective_instance_deadline(instance: Dict[str, Any]) -> str:
     """该实例对用户「还能不能交」真正生效的截止时刻。
 
-    · rejected（驳回重交）：重交截止 = max(原截止 + 72h, 驳回 + 24h)；
+    · rejected（驳回重交）：重交截止 = **驳回时刻 + 24h**（无截止模板 = 哨兵，无限期）；
     · 其余：实例自身的 deadline_at（无截止模板 = 哨兵，永不过期）。
     """
     deadline_at = str(instance.get("deadline_at") or "")
@@ -119,18 +120,22 @@ def calc_h5_token_ttl_hours(instance: Optional[Dict[str, Any]], now_dt: Optional
     用户拍板口径（保守策略）：
       · 无截止时间（哨兵）→ 720h（30 天）；
       · 有截止时间 → min(截止 + 24h, 720h)；
-      · 驳回重交 → 以「重交截止」为基准同样 + 24h 再封顶（保证重交链接覆盖整个
-        rejected 重交窗口，否则早期驳回的实例链接会在窗口关闭前先失效）。
+      · 驳回重交（2026-11-12 下午拍板）：链接有效期与 **24h 重交窗口对齐**
+        （= 重交截止 − 当前时刻；驳回后立刻签发即 24h，越晚签发越短），保底 1h、封顶 720h；
     从「签发时刻」起算；已过期场景保底 1h，让用户能打开页面看到过期提示。
     """
     if not instance:
         return float(H5_TOKEN_TTL_HOURS)
     now_dt = now_dt or default_now()
+    inst_status = str(instance.get("status") or "")
     deadline_at = effective_instance_deadline(instance)
     if is_no_deadline(deadline_at):
         return float(H5_TOKEN_TTL_CAP_HOURS)
     try:
-        end_dt = parse_dt(deadline_at) + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)
+        end_dt = parse_dt(deadline_at)
+        # 2026-11-12 下午：rejected 的链接寿命严格对齐 24h 重交窗口（不再额外 +24h 宽限）
+        if inst_status != "rejected":
+            end_dt = end_dt + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)
     except Exception:
         return float(H5_TOKEN_TTL_HOURS)
     # parse_dt 返回带 Asia/Shanghai 时区的 datetime；测试注入的 now 可能是 naive，统一对齐
@@ -141,6 +146,25 @@ def calc_h5_token_ttl_hours(instance: Optional[Dict[str, Any]], now_dt: Optional
         end_dt = end_dt.replace(tzinfo=ref_dt.tzinfo)
     hours = (end_dt - ref_dt).total_seconds() / 3600.0
     return float(min(max(hours, H5_TOKEN_TTL_FLOOR_HOURS), H5_TOKEN_TTL_CAP_HOURS))
+
+
+def format_deadline_rule(template: Optional[Dict[str, Any]]) -> str:
+    """2026-11-12 下午：截止规则的**统一展示样式**（用户拍板「引用截止时间的地方统一成这样样式」）。
+
+    本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限 —— 模板列表徽章、编辑弹窗预览、
+    H5 任务页徽章统一用规则样式；过期拦截文案仍显示已解析的具体时间戳（精确到分秒）。
+    """
+    if not template:
+        return "不限"
+    _hd = template.get("has_deadline")
+    if _hd is not None and not int(_hd):
+        return "不限"
+    hhmm = str(template.get("deadline_time") or template.get("deadline") or "").strip()
+    if not hhmm:
+        return "不限"
+    d_type = str(template.get("deadline_type") or "").strip() or "same_day"
+    label = {"same_day": "今天", "weekend": "本周日", "month_end": "本月月底"}.get(d_type, "截止")
+    return f"{label} {hhmm}"
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -2721,7 +2745,7 @@ class StateStore:
                         continue
                     _id_place = ",".join("?" for _ in _ids)
                     self.conn.execute(f"DELETE FROM submission WHERE instance_id IN ({_id_place})", tuple(_ids))
-                    self.conn.execute(f"DELETE FROM h5_token WHERE instance_id IN ({_id_place})", tuple(_ids))
+                    # h5_token 行保留（tombstone）：旧链接点开 → 统一提示「任务已关闭」（四-4 口径）
                     _deleted_instances += int(self.conn.execute(
                         f"DELETE FROM task_instance WHERE id IN ({_id_place})", tuple(_ids)).rowcount or 0)
                 _role_purge = {"removed_roles": _removed_roles, "orphan_phones": len(_orphan_phones),
@@ -2731,7 +2755,51 @@ class StateStore:
                         actor, "template.role_removed_purge", "task_template", clean_id,
                         _role_purge, now_s,
                     )
-            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "role_removed_purge": _role_purge}, now_s)
+            # 2026-11-12 下午（用户拍板，一-2）：截止规则编辑后对未完成实例**动态重算**——
+            # 基于各实例原本的派发日（created_at 日期）按新规则重算 deadline_at，旧 H5 链接
+            # 顶部截止时间同步更新：
+            #   · 延后（含改「无截止」）→ 已逾期(overdue)实例自动恢复 pending（旧链接立即可填报），
+            #     未消耗令牌寿命同步**顺延**（只延不缩），确保新截止前不提前失效；
+            #   · 提前至当前时刻之前 → 立即翻 overdue（旧链接打开/提交按统一过期提示拦截）；
+            #   · 已完成（submitted/approved/expired/cancelled）不受影响（历史隔离）；
+            #     rejected 的重交窗口按「驳回+24h」已锁定，不随模板截止变化（三口径）。
+            _deadline_sync: Dict[str, int] = {}
+            if str(norm.get("kind") or "") != "notice":
+                from .scheduler import calc_instance_deadline  # 延迟导入：scheduler 模块级依赖本模块，避免循环
+                _fresh_tpl = self._deserialize_template_row(self.conn.execute(
+                    "SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
+                for _r in self.conn.execute(
+                    "SELECT id, status, deadline_at, created_at FROM task_instance "
+                    "WHERE template_id = ? AND status IN ('pending','overdue')", (clean_id,)).fetchall():
+                    try:
+                        _anchor = datetime.strptime(str(_r["created_at"] or "")[:10], "%Y-%m-%d").date()
+                        _new_dl = calc_instance_deadline(_fresh_tpl, _anchor)
+                    except Exception:
+                        continue
+                    if _new_dl != str(_r["deadline_at"] or ""):
+                        self.conn.execute("UPDATE task_instance SET deadline_at = ? WHERE id = ?", (_new_dl, int(_r["id"])))
+                        _deadline_sync["recalced"] = int(_deadline_sync.get("recalced", 0)) + 1
+                    if str(_r["status"]) == "pending" and _new_dl <= now_s:
+                        self.conn.execute(
+                            "UPDATE task_instance SET status = 'overdue' WHERE id = ? AND status = 'pending'",
+                            (int(_r["id"]),))
+                        _deadline_sync["to_overdue"] = int(_deadline_sync.get("to_overdue", 0)) + 1
+                    elif str(_r["status"]) == "overdue" and _new_dl > now_s:
+                        self.conn.execute(
+                            "UPDATE task_instance SET status = 'pending' WHERE id = ? AND status = 'overdue'",
+                            (int(_r["id"]),))
+                        _deadline_sync["restored"] = int(_deadline_sync.get("restored", 0)) + 1
+                    # 链接寿命联动（只延不缩）：无截止 → 哨兵（永不过期）
+                    _new_exp_s = (NO_DEADLINE_SENTINEL if is_no_deadline(_new_dl)
+                                  else format_dt(parse_dt(_new_dl) + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)))
+                    for _tk in self.conn.execute(
+                        "SELECT token_id, expires_at FROM h5_token WHERE instance_id = ? AND purpose = 'submit' AND consumed = 0",
+                        (int(_r["id"]),)).fetchall():
+                        if str(_tk["expires_at"] or "") < _new_exp_s:
+                            self.conn.execute("UPDATE h5_token SET expires_at = ? WHERE token_id = ?",
+                                              (_new_exp_s, str(_tk["token_id"])))
+                            _deadline_sync["tokens_extended"] = int(_deadline_sync.get("tokens_extended", 0)) + 1
+            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "role_removed_purge": _role_purge, "deadline_sync": _deadline_sync}, now_s)
             return self._deserialize_template_row(self.conn.execute("SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
 
     def _purge_template_rows_unlocked(self, template_id: str, now_s: str, uploads_dir: Optional[Path] = None) -> Dict[str, int]:
@@ -2763,8 +2831,9 @@ class StateStore:
             (tid,)).rowcount or 0)
         detail["upload_ref"] = int(self.conn.execute(
             "DELETE FROM upload_ref WHERE template_id = ?", (tid,)).rowcount or 0)
-        detail["h5_token"] = int(self.conn.execute(
-            "DELETE FROM h5_token WHERE template_id = ?", (tid,)).rowcount or 0)
+        # 2026-11-12 下午（用户拍板，四-1）：h5_token 行**保留**作为轻量失效识别（tombstone）——
+        # 模板物理清除后，用户点开旧链接仍能被识别为「任务已关闭」，而不是「无效令牌」技术报错。
+        # 令牌行只有 token_id/phone/template_id 等无业务内容字段，不构成迁移数据负担。
         detail["reminder_log"] = int(self.conn.execute(
             "DELETE FROM reminder_log WHERE template_id = ?", (tid,)).rowcount or 0)
         # 2026-10-27 数据看板：调度器按 template_id 作为 source_key 读人工填报快照，一并清
@@ -3233,6 +3302,44 @@ class StateStore:
     # 不再有补交通道。⛔ 驳回重交（rejected → 窗口内原链接重交）是另一套机制，保留。
     # task_instance.resubmit_* 列保留不动（存量历史数据兼容，只是不再读写）。
 
+    def is_member_active_for_roles(self, phone: str, role_ids: List[str]) -> bool:
+        """该手机号在给定角色集合下是否仍有 enabled=1 的名册行。
+
+        2026-11-12 下午（用户拍板）：成员账号被停用/删除 → 其名下未完成任务链接同步关闭。
+        """
+        clean_roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
+        clean_phone = str(phone or "").strip()
+        if not clean_roles or not clean_phone:
+            return False
+        placeholders = ",".join("?" for _ in clean_roles)
+        with self.lock:
+            row = self.conn.execute(
+                f"SELECT 1 FROM member WHERE phone = ? AND role_id IN ({placeholders}) AND enabled = 1 LIMIT 1",
+                (clean_phone, *clean_roles)).fetchone()
+        return row is not None
+
+    def instance_close_reason(self, instance: Optional[Dict[str, Any]], template: Optional[Dict[str, Any]]) -> Optional[str]:
+        """2026-11-12 下午（用户拍板）：「任务已关闭」统一拦截闸——返回 None=可用，否则返回统一文案。
+
+        覆盖五类失效（H5 打开/上传/提交三处同口径，且**先于**过期窗口判断）：
+          1) 任务模板被删除 —— 物理清除后靠保留的 h5_token 行识别（提示「任务已关闭」而非技术报错）；
+          2) 任务模板被停用 —— 重新启用自动恢复；
+          3) 成员被移出关联角色（单删/批量删 → 未完成实例已标 cancelled）；
+          4) 编辑模板移除关联角色（role_removed_purge 已物理清实例，旧链接凭令牌识别）；
+          5) 成员账号被停用（member.enabled=0，名册行还在）。
+        """
+        if template is None or template.get("deleted"):
+            return "任务已关闭"
+        if not template.get("enabled"):
+            return "任务已关闭"
+        if instance is None:
+            return "任务已关闭"
+        if str(instance.get("status") or "") == "cancelled":
+            return "任务已关闭"
+        if not self.is_member_active_for_roles(str(instance.get("phone") or ""), template.get("role_ids") or []):
+            return "任务已关闭"
+        return None
+
     def list_pending_todo(self, phone: str, platform: Optional[str] = None,
                           now_dt: Optional[datetime] = None, limit: int = 5) -> List[Dict[str, Any]]:
         """2026-11-12 任务E4：【待办】指令的取数。
@@ -3290,24 +3397,19 @@ class StateStore:
         self.advance_instance_statuses(cur_dt)
 
         inst = self.get_instance(int(tok["instance_id"])) if tok.get("instance_id") else None
-        if not inst:
-            raise BizError(404, "NOT_FOUND", "任务实例不存在")
-        tpl = self.get_template(inst["template_id"], include_deleted=True)
-        if not tpl:
-            raise BizError(404, "NOT_FOUND", "任务模板不存在")
-        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可提交。
-        # 停用（enabled=0）不拦——已下发链接仍可正常提交；删除（deleted=1）必须拦。
-        if tpl.get("deleted"):
-            raise BizError(400, "SUBMISSION_CLOSED", "该任务已被删除，无法提交")
-        if inst["status"] == "approved":
-            raise BizError(400, "VALIDATION_FAILED", "该任务已提交成功，无需重复提交")
-        # 2026-10-28：已提交待审核的也不能再交一次（H5 页面已锁，这里做服务端兜底）
-        if inst["status"] == "submitted":
-            raise BizError(400, "VALIDATION_FAILED", "该任务已提交，正在等待审核，不能重复提交")
-        # 2026-11-12 任务C：cancelled（成员移出分组后作废）的实例不可再提交——
-        # 旧链接（推送/定时提醒里签的 H5 链接）点进来直接拦，不再收件。
-        if inst["status"] == "cancelled":
-            raise BizError(400, "WINDOW_CLOSED", "该任务已被取消（成员已移出分组），无需提交")
+        tpl = self.get_template(inst["template_id"], include_deleted=True) if inst else None
+        # 2026-11-12 下午（用户拍板）：五类失效统一拦截「任务已关闭」，先于过期窗口判断；
+        # 模板被物理删除/实例被清除时，靠保留的 h5_token 行识别出「任务已关闭」而非技术报错。
+        close_reason = self.instance_close_reason(inst, tpl)
+        if close_reason:
+            raise BizError(403, "TASK_CLOSED", close_reason)
+        # 2026-11-12 下午（用户拍板）：H5 页面对已提交/已审核通过的实例**打开放行**（正常渲染表单），
+        # 仅在最后一步提交时终审拦截，统一提示「已上传，请勿重复提交」（不动已有历史提交记录）。
+        if inst["status"] in ("submitted", "approved"):
+            raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
+        # 旧链接令牌已消耗（提交过一次）→ 同口径按重复提交拦截
+        if bool(tok["consumed"]):
+            raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
         # 2026-11-12 任务E2：链接过期统一口径（用户拍板，与任务截止不作区分）
         if tok["expires_at"] < now_s:
             raise BizError(400, "TOKEN_EXPIRED", submission_expired_message(inst))
@@ -3318,8 +3420,6 @@ class StateStore:
         # 注意 rejected 走 is_instance_window_closed 的重交截止分支（保留）。
         if self.is_instance_window_closed(inst, cur_dt):
             raise BizError(400, "SUBMISSION_CLOSED", submission_expired_message(inst))
-        if bool(tok["consumed"]):
-            raise BizError(400, "VALIDATION_FAILED", "该链接已提交过，请勿重复使用")
 
         fields_json_str, up_row = None, None
         # 勾了「文字说明」模块就必须把 note 存下来（否则下面校验必填时会永远判空）

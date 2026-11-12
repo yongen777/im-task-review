@@ -124,10 +124,12 @@ def test_p1_tpl_remove_role_purges_orphan_member_instances() -> None:
         with store.lock:
             left_submission = store.conn.execute(
                 "SELECT COUNT(1) FROM submission WHERE instance_id NOT IN (SELECT id FROM task_instance)").fetchone()[0]
+            # 2026-11-12 下午（四-4）：被移除成员的 h5_token 行**保留**作 tombstone，
+            # 旧链接点开统一提示「任务已关闭」（不再是无效令牌）
             left_token = store.conn.execute(
                 "SELECT COUNT(1) FROM h5_token WHERE instance_id NOT IN (SELECT id FROM task_instance)").fetchone()[0]
         assert int(left_submission) == 0, "被删实例的提交残留"
-        assert int(left_token) == 0, "被删实例的令牌残留"
+        assert int(left_token) >= 1, "被移除成员的令牌必须保留作「任务已关闭」识别"
         with store.lock:
             purged = store.conn.execute(
                 "SELECT COUNT(1) FROM task_instance WHERE template_id=? AND phone='13900002002'",
@@ -218,14 +220,18 @@ def test_p2_delete_template_purges_all_rows_and_files() -> None:
         assert res["ok"] is True and res["deleted"]["task_instance"] == 1, res
         with store.lock:
             counts: dict[str, int] = {}
-            for t in ("task_template", "task_instance", "h5_token", "reminder_log", "upload_ref"):
+            for t in ("task_template", "task_instance", "reminder_log", "upload_ref"):
                 counts[t] = int(store.conn.execute(
                     f"SELECT COUNT(1) FROM {t} WHERE template_id = ?", (tid,)).fetchone()[0] or 0)
             counts["data_snapshot"] = int(store.conn.execute(
                 "SELECT COUNT(1) FROM data_snapshot WHERE source_key = ?", (tid,)).fetchone()[0] or 0)
             counts["submission"] = int(store.conn.execute("SELECT COUNT(1) FROM submission").fetchone()[0] or 0)
-        for k, v in counts.items():
-            assert v == 0, f"删除模板后 {k} 仍有 {v} 行残留"
+            # 2026-11-12 下午（四-1）：h5_token 保留作「任务已关闭」识别（tombstone）
+            counts["h5_token_kept"] = int(store.conn.execute(
+                "SELECT COUNT(1) FROM h5_token WHERE template_id = ?", (tid,)).fetchone()[0] or 0)
+        for k in ("task_template", "task_instance", "reminder_log", "upload_ref", "data_snapshot", "submission"):
+            assert counts[k] == 0, f"删除模板后 {k} 仍有 {counts[k]} 行残留"
+        assert counts["h5_token_kept"] >= 1, "令牌行必须保留作失效识别"
         assert store.get_template(tid, include_deleted=True) is None, "模板行必须物理删除"
         assert not (uploads / file_rel).exists(), "磁盘附件必须删除"
         with store.lock:

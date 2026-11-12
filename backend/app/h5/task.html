@@ -127,11 +127,10 @@
 
           /* 顶部任务卡：标题 + 截止徽章 + 提醒正文（与预览版式一致） */
           document.getElementById("headTitle").textContent = data.template.name;
-          const dl = String(data.instance.deadline_at || "");
-          /* 哨兵 9999-12-31 = 无截止时间 → 徽章显示「不限」 */
-          const noDeadline = dl.startsWith("9999-12-31");
-          const hhmm = dl.length >= 16 ? dl.slice(11, 16) : dl;
-          document.getElementById("headDeadline").textContent = noDeadline ? "截止 不限" : "截止 " + hhmm;
+          /* 2026-11-12 下午（用户拍板）：截止徽章统一**规则样式**（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
+             来自后端 format_deadline_rule —— 模板编辑保存后旧链接顶部实时跟随最新配置。 */
+          const __rule = String(data.template.deadline_rule || "").trim();
+          document.getElementById("headDeadline").textContent = "截止 " + (__rule || "不限");
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
           const area = document.getElementById("dynamicArea");
@@ -302,7 +301,11 @@
           /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
              只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。
              2026-11-12 任务E3：逾期补交通道下线——overdue 不再有可填写分支，
-             统一按锁定态给出「当前任务已过期（截止时间：…），无法提交」提示。 */
+             统一按锁定态给出「当前任务已过期（截止时间：…），无法提交」提示。
+             2026-11-12 下午（用户拍板，二-3）：**submitted / approved 打开放行**——
+             页面正常渲染表单并允许交互，仅最后一步「提交」由后端终审拦「已上传，请勿重复提交」。 */
+          const dl = String(data.instance.deadline_at || "");
+          const noDeadline = dl.startsWith("9999-12-31");
           const __status = data.instance.status;
           const __canResubmit = __status === "rejected" && !!data.window_open;
           if (__canResubmit) {
@@ -315,15 +318,24 @@
               ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
               : "该提交已被驳回，请按审核意见修改后重新提交。";
             contentEl.insertBefore(tip, submitBtn);
+          } else if (__status === "submitted" || __status === "approved") {
+            /* 打开放行：只给状态提示条，不锁控件（提交时后端终审拦截重复提交） */
+            const tip = document.createElement("div");
+            tip.className = "locked-tip";
+            tip.style.background = "#eff6ff";
+            tip.style.borderColor = "#bfdbfe";
+            tip.style.color = "#1d4ed8";
+            tip.textContent = __status === "submitted"
+              ? "本任务已提交，正在等待管理员审核。再次点击「提交上传」会提示「已上传，请勿重复提交」。"
+              : "本任务已审核通过。如需修改请联系管理员驳回后重新提交（再次提交会提示「已上传，请勿重复提交」）。";
+            contentEl.insertBefore(tip, submitBtn);
           } else if (__status !== "pending") {
             const LOCKED_TEXT = {
-              submitted: "已提交，等待管理员审核。如需修改请联系管理员驳回后重新提交。",
-              approved: "已审核通过，本条任务已完成。",
               rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
               /* 2026-11-12 任务E2：逾期/过期统一口径文案（与后端校验同句式） */
               overdue: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
               expired: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
-              cancelled: "该任务已被取消（成员已移出分组），无需提交。",
+              cancelled: "任务已关闭。",
             };
             const tip = document.createElement("div");
             tip.className = "locked-tip";

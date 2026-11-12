@@ -20,7 +20,7 @@ except ImportError:  # pragma: no cover
     FileResponse = None  # type: ignore[assignment]
 
 from ..scheduler import NotifierProtocol
-from ..state import BizError, StateStore, calc_resubmit_deadline, submission_expired_message
+from ..state import BizError, StateStore, calc_resubmit_deadline, format_deadline_rule, submission_expired_message
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +266,9 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
     if inst is None and tok.get("template_id") and tok.get("period_key"):
         inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
     if inst is None:
-        return None, None, (404, {"code": "NOT_FOUND", "message": "任务实例不存在"})
+        # 2026-11-12 下午（四）：令牌有效但实例已不存在（模板物理删除/移除角色清理）→
+        # 统一「任务已关闭」（不暴露「任务实例不存在」技术报错）
+        return None, None, (403, {"code": "TASK_CLOSED", "message": "任务已关闭"})
     return tok, inst, None
 
 
@@ -279,10 +281,11 @@ def _validate_upload_target_and_limits(
         return None, None, "", "", 0, 0, err
 
     tpl = state.get_template(inst["template_id"], include_deleted=True)
-    if not tpl or tpl.get("deleted"):
-        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可用
-        # （先于窗口判断，与 info/submit 的「已删除」硬闸同序）
-        return None, None, "", "", 0, 0, (404, {"code": "NOT_FOUND", "message": "该任务已被删除，链接已失效"})
+    # 2026-11-12 下午（四）：五类失效统一拦截「任务已关闭」，先于窗口判断；
+    # 模板被物理删除后靠保留的 h5_token 行识别（不再是「该任务已被删除」技术分支）。
+    close_reason = state.instance_close_reason(inst, tpl)
+    if close_reason:
+        return None, None, "", "", 0, 0, (403, {"code": "TASK_CLOSED", "message": close_reason})
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
     if not window_open:
@@ -327,26 +330,28 @@ async def read_upload_file_bounded(file: UploadFile, max_bytes: int) -> Tuple[Op
 
 
 def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dict[str, Any]]:
-    """§9.8 H5 加载任务实例与模板详情。"""
+    """§9.8 H5 加载任务实例与模板详情。
+
+    2026-11-12 下午（用户拍板，一-1/二-3/四）：旧链接**实时**读模板最新配置——
+    页面渲染的名称/说明/字段/上传组件始终取库里最新的模板行（保存即生效）；
+    已提交/已审核通过实例 H5 **打开放行**（正常渲染表单，window_open=True），
+    重复提交只在最后一步「提交」时由后端终审拦截「已上传，请勿重复提交」。
+    """
     tok, inst, err = _resolve_token_and_instance(state, raw_token)
     if err:
         return err
     tpl = state.get_template(inst["template_id"], include_deleted=True)
-    if not tpl or tpl.get("deleted"):
-        # 2026-11-12 外加需求（用户拍板）：任务被删除后，已下发的 H5 链接一律不可用
-        return 404, {"code": "NOT_FOUND", "message": "该任务已被删除，链接已失效"}
+    # 2026-11-12 下午（四）：五类失效统一拦截「任务已关闭」（先于过期窗口判断）
+    close_reason = state.instance_close_reason(inst, tpl)
+    if close_reason:
+        return 403, {"code": "TASK_CLOSED", "message": close_reason}
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
-    # 2026-11-12 任务E2 门禁一（展示层）：令牌已消耗（已成功提交过）→ 窗口关闭 + 只读完成态。
-    # 页面据此渲染只读卡，避免「已提交」实例在截止前仍显示可编辑表单。
-    # 说明：rejected 的重交由驳回通知里新签发的链接承载，旧链接（已 consumed）一律只读。
-    if bool(tok.get("consumed")):
-        window_open = False
-        if not window_reason:
-            if inst.get("status") == "rejected":
-                window_reason = "该任务已提交过，请使用管理员驳回通知里最新下发的重交链接。"
-            else:
-                window_reason = "该任务已提交，无需重复提交。"
+    # 已提交/已审核通过 → 页面正常打开渲染表单（removed 只读锁死：用户拍板二-3）；
+    # 令牌已消耗同样放行（提交侧有终审拦截，页面可用性不再由 consumed 决定）。
+    if inst.get("status") in ("submitted", "approved"):
+        window_open = True
+        window_reason = ""
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":
@@ -362,6 +367,12 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
             "kind": tpl["kind"],
             "period": tpl["period"],
             "deadline": tpl["deadline"],
+            # 2026-11-12 下午：统一截止规则样式（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
+            # 旧链接保存模板后顶部徽章随最新配置实时更新（一-2 动态重算后 deadline_at 同步）。
+            "deadline_rule": format_deadline_rule(tpl),
+            "has_deadline": tpl.get("has_deadline"),
+            "deadline_type": tpl.get("deadline_type"),
+            "deadline_time": tpl.get("deadline_time"),
             "allow_note": tpl["allow_note"],
             "schema_json": tpl.get("schema_json"),
             "spec_json": tpl.get("spec_json"),

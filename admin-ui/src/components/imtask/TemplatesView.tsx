@@ -142,26 +142,18 @@ interface UploadH5PreviewProps {
   textPlaceholder: string;
 }
 
-/* 与后端 format_deadline_display 同口径：今天→「今天 HH:MM」，其它→「M月D日 HH:MM」 */
-const previewDeadlineText = (type: 'same_day' | 'weekend' | 'month_end' | null, hhmm: string): string => {
+/* 与后端 format_deadline_rule 同口径的规则样式由 formatDeadlineRuleLabel 提供（见下）。 */
+
+/* 2026-11-12 下午（用户拍板）：截止规则统一展示样式 —— 「本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限」。
+   与后端 format_deadline_rule 一字不差；列表徽章 / 编辑弹窗两处预览 / H5 任务页徽章全部用它。 */
+export const formatDeadlineRuleLabel = (
+  type: 'same_day' | 'weekend' | 'month_end' | null | undefined,
+  hhmm: string,
+): string => {
   if (!hhmm) return '不限';
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = now.getMonth();
-  let d: Date;
-  if (type === 'weekend') {
-    d = new Date(y, m, now.getDate() + (7 - (now.getDay() === 0 ? 7 : now.getDay()))); // 本周日（周日=0）
-  } else if (type === 'month_end') {
-    d = new Date(y, m + 1, 0); // 当月最后一天
-  } else {
-    d = new Date(y, m, now.getDate()); // 当天截止
-  }
-  if (hhmm === '00:00') {
-    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1); // 00:00 = 当天 24 点 = 次日 0 点
-  }
-  const isToday =
-    d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
-  return isToday ? `今天 ${hhmm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hhmm}`;
+  const label =
+    type === 'weekend' ? '本周日' : type === 'month_end' ? '本月月底' : '今天';
+  return `${label} ${hhmm}`;
 };
 
 const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
@@ -176,8 +168,9 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   textPlaceholder,
 }) => {
   const [step, setStep] = useState<'im' | 'h5'>('h5');
-  /* 截止时间展示（按类型换算具体日期，与实发消息一字不差） */
-  const deadlineText = previewDeadlineText(deadlineType, deadline);
+  /* 截止时间展示：统一规则样式（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
+   与实发消息里后端解析出的具体时间戳互补——预览层按用户选择的规则展示。 */
+  const deadlineText = deadline ? formatDeadlineRuleLabel(deadlineType, deadline) : '不限';
 
   const displayTitle = taskName.trim() || '当日上门走访晒图与意向单报数';
   const displayRemindText =
@@ -268,7 +261,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
               <div className="flex items-center justify-between">
                 <span className="font-bold text-slate-900 text-xs">{displayTitle}</span>
                 <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
-                  截止 {deadline ? deadlineText.replace(/^今天 /, '') : '不限'}
+                  截止 {deadline ? deadlineText : '不限'}
                 </span>
               </div>
               {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
@@ -1319,16 +1312,13 @@ export const TemplatesView: React.FC = () => {
                                   <span>{UPLOAD_MODULE_META[m]?.label || m}</span>
                                 </span>
                               ))}
-                              {/* 2026-11-12 任务E1：截止展示改「不限」/ 时刻 / 周日 / 月底 三种类型 */}
+                              {/* 2026-11-12 下午（用户拍板）：截止展示统一**规则样式**——
+                                  本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限（与预览、H5 徽章一字不差） */}
                               {(() => {
-                                const dlType = tpl.deadline_type;
-                                const dlLabel = tpl.has_deadline === false
-                                  ? '不限'
-                                  : dlType === 'weekend'
-                                    ? `周日 ${tpl.deadline_time || tpl.deadline || ''}`
-                                    : dlType === 'month_end'
-                                      ? `月底 ${tpl.deadline_time || tpl.deadline || ''}`
-                                      : (tpl.deadline_time || tpl.deadline || '—');
+                                const dlLabel = formatDeadlineRuleLabel(
+                                  tpl.has_deadline === false ? null : (tpl.deadline_type ?? 'same_day'),
+                                  tpl.deadline_time || tpl.deadline || '',
+                                );
                                 return (
                                   <span className="text-[11px] font-mono text-slate-500 ml-1">
                                     截止 {dlLabel}

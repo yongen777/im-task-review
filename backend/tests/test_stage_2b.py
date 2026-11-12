@@ -217,7 +217,8 @@ class TestStage2B(unittest.TestCase):
 
     def test_fix3_r14_overdue_notice_r27_resubmit_and_rejected_expired(self) -> None:
         dl = "2026-10-25 18:00:00"
-        self.assertEqual(calc_resubmit_deadline(dl, "2026-10-26 04:00:00"), "2026-10-28 18:00:00")
+        # 2026-11-12 下午新口径：重交截止 = 驳回时刻 + 24h（不再取 max(截止+72h, 驳回+24h)）
+        self.assertEqual(calc_resubmit_deadline(dl, "2026-10-26 04:00:00"), "2026-10-27 04:00:00")
         self.assertEqual(calc_resubmit_deadline(dl, "2026-10-28 06:00:00"), "2026-10-29 06:00:00")
 
         rid = self.store.create_role("日报组", actor="admin")["role_id"]
