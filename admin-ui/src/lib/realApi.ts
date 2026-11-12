@@ -201,6 +201,14 @@ function tplToMock(t: any): TemplateItem {
     /* 2026-10-28 修复：form 类模板后端存的是 remind_at（非 notice_times），双向兼容 */
     remind_at: (t.notice_times && t.notice_times[0]) || t.remind_at || '',
     deadline: t.deadline || '',
+    /* 2026-11-12 任务E1 截止三件套（用户实锤修复：此前只回 deadline，
+       deadline_type 永远 undefined → 列表徽章/编辑弹窗永远回落「今天」；
+       老模板无 has_deadline 时按「有 deadline 时刻」推断） */
+    has_deadline: t.has_deadline !== undefined ? !!t.has_deadline : !!t.deadline,
+    deadline_type: (t.deadline_type || null) as TemplateItem['deadline_type'],
+    deadline_time: t.deadline_time || null,
+    /* 2026-11-12 晚 · 不定期任务（菜单自选）：此前同样漏映射，后台勾选保存/回显全部失效 */
+    is_adhoc: !!t.is_adhoc,
     text_tpl: t.text_tpl || '',
     spec,
     enabled: t.enabled !== false,
@@ -282,6 +290,13 @@ function tplFromMock(t: any, partial = false) {
     if (t.period !== undefined && t.period !== '') out.period = t.period;
     if (t.remind_at !== undefined) out.remind_at = String(t.remind_at || '').trim();
     if (t.deadline !== undefined) out.deadline = String(t.deadline || '').trim();
+    /* 2026-11-12 任务E1 截止三件套（用户实锤修复：partial 白名单此前漏了这三个字段，
+       编辑保存被吞 → 后端收不到 deadline_type="month_end"，回落按 same_day 处理） */
+    if (t.has_deadline !== undefined) out.has_deadline = !!t.has_deadline;
+    if (t.deadline_type !== undefined) out.deadline_type = t.deadline_type || null;
+    if (t.deadline_time !== undefined) out.deadline_time = t.deadline_time || null;
+    /* 2026-11-12 晚 · 不定期任务（菜单自选）：同层补齐 */
+    if (t.is_adhoc !== undefined) out.is_adhoc = !!t.is_adhoc;
     if (t.notice_times !== undefined) out.notice_times = t.notice_times;
     if (t.text_tpl !== undefined || hasNoticeItems) out.text_tpl = text;
     if (t.enabled !== undefined) out.enabled = t.enabled !== false;
@@ -315,6 +330,12 @@ function tplFromMock(t: any, partial = false) {
   out.text_tpl = text;
   out.notice_times = times;
   out.deadline = isNotice ? '' : t.deadline || '';
+  /* 2026-11-12 任务E1 截止三件套（用户实锤修复：新建分支此前同样只送 deadline） */
+  out.has_deadline = isNotice ? false : t.has_deadline !== undefined ? !!t.has_deadline : !!t.deadline;
+  out.deadline_type = isNotice || !out.has_deadline ? null : (t.deadline_type || 'same_day');
+  out.deadline_time = isNotice || !out.has_deadline ? null : (t.deadline_time || t.deadline || null);
+  /* 2026-11-12 晚 · 不定期任务（菜单自选） */
+  out.is_adhoc = !isNotice && !!t.is_adhoc;
   out.period = t.period || 'day';
   out.attach_image = attach;
   out.attach_image_path = t.attach_image_path || null;

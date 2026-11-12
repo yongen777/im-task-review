@@ -56,7 +56,7 @@ const __RD={
       if(t.attach_image)spec.notice_items.push({id:"n_file",format:"file",file_name:"数据看板.png",file_caption:"当日数据看板（到点自动生成并推送）"});
     }else{spec.schema_json=t.schema_json}
     return{id:t.template_id,template_id:t.template_id,name:t.name,kind:t.kind==="form"?"upload":(t.kind||"notice"),
-      period:t.period||"day",role_id:(t.role_ids||[])[0]||"",remind_at:(t.notice_times||[])[0]||"",deadline:t.deadline||"",
+      period:t.period||"day",role_id:(t.role_ids||[])[0]||"",remind_at:(t.notice_times||[])[0]||"",deadline:t.deadline||"",has_deadline:t.has_deadline!==undefined?!!t.has_deadline:!!t.deadline,deadline_type:t.deadline_type||null,deadline_time:t.deadline_time||null,is_adhoc:!!t.is_adhoc,
       text_tpl:t.text_tpl||"",spec,enabled:t.enabled!==false,attach_image:!!t.attach_image,
       data_keys:t.data_keys||[],created_at:t.created_at,updated_at:t.updated_at};
   },
@@ -74,7 +74,7 @@ const __RD={
     const isNotice=kind==="notice";
     const times=isNotice?[t.remind_at].filter(x=>/^\d{1,2}:\d{2}$/.test(x||"")):[];
     return{name:t.name,kind,role_ids:t.role_id?[t.role_id]:(t.role_ids||[]),text_tpl:text,
-      notice_times:times,deadline:isNotice?"":(t.deadline||""),period:t.period||"day",
+      notice_times:times,deadline:isNotice?"":(t.deadline||""),period:t.period||"day",has_deadline:isNotice?false:(t.has_deadline!==undefined?!!t.has_deadline:!!(t.deadline||"")),deadline_type:(isNotice||!(t.has_deadline!==undefined?!!t.has_deadline:!!(t.deadline||"")))?null:(t.deadline_type||"same_day"),deadline_time:(isNotice||!(t.has_deadline!==undefined?!!t.has_deadline:!!(t.deadline||"")))?null:(t.deadline_time||t.deadline||null),is_adhoc:!isNotice&&!!t.is_adhoc,
       attach_image:attach,data_keys:t.data_keys||[],enabled:t.enabled!==false};
   },
   remToMock(m){return{id:m.id,instance_id:m.instance_id,slot:(m.kind||"")==="notice_img"?"看板":(m.kind||""),retry_no:m.retry||0,
