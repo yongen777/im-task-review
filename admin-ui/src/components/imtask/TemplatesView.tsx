@@ -130,6 +130,11 @@ interface UploadH5PreviewProps {
   taskName: string;
   remindAt: string;
   deadline: string;
+  /* 2026-11-12 下午（紧急修复）：截止类型——预览的「截止时间」必须按类型换算日期
+     （本月月底→当月最后一天、本周日→本周日、当天→今天；00:00=当天24点=次日0点），
+     与后端 scheduler.calc_instance_deadline / format_deadline_display 同口径，
+     避免「预览显示今天 17:00、实发显示 11月30日 17:00」的两套话术。 */
+  deadlineType: 'same_day' | 'weekend' | 'month_end' | null;
   remindText: string;
   modules: UploadH5Module[];
   fields: FormFieldSpec[];
@@ -137,10 +142,33 @@ interface UploadH5PreviewProps {
   textPlaceholder: string;
 }
 
+/* 与后端 format_deadline_display 同口径：今天→「今天 HH:MM」，其它→「M月D日 HH:MM」 */
+const previewDeadlineText = (type: 'same_day' | 'weekend' | 'month_end' | null, hhmm: string): string => {
+  if (!hhmm) return '不限';
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  let d: Date;
+  if (type === 'weekend') {
+    d = new Date(y, m, now.getDate() + (7 - (now.getDay() === 0 ? 7 : now.getDay()))); // 本周日（周日=0）
+  } else if (type === 'month_end') {
+    d = new Date(y, m + 1, 0); // 当月最后一天
+  } else {
+    d = new Date(y, m, now.getDate()); // 当天截止
+  }
+  if (hhmm === '00:00') {
+    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1); // 00:00 = 当天 24 点 = 次日 0 点
+  }
+  const isToday =
+    d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return isToday ? `今天 ${hhmm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hhmm}`;
+};
+
 const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   taskName,
   remindAt,
   deadline,
+  deadlineType,
   remindText,
   modules,
   fields,
@@ -148,6 +176,8 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   textPlaceholder,
 }) => {
   const [step, setStep] = useState<'im' | 'h5'>('h5');
+  /* 截止时间展示（按类型换算具体日期，与实发消息一字不差） */
+  const deadlineText = previewDeadlineText(deadlineType, deadline);
 
   const displayTitle = taskName.trim() || '当日上门走访晒图与意向单报数';
   const displayRemindText =
@@ -212,7 +242,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                   {/* 2026-10-28：预览按实际推送的纯文本渲染（密信不支持富文本卡片/超链接），
                       与实际发送内容一字不差，避免「预览一套、实发一套」。 */}
                   <div className="text-xs text-slate-800 whitespace-pre-line leading-relaxed">
-                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：${deadline ? `今天 ${deadline}` : '不限（长期有效）'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
+                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：${deadline ? deadlineText : '不限'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
                   </div>
                 </div>
               </div>
@@ -238,7 +268,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
               <div className="flex items-center justify-between">
                 <span className="font-bold text-slate-900 text-xs">{displayTitle}</span>
                 <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
-                  截止 {deadline || '不限'}
+                  截止 {deadline ? deadlineText.replace(/^今天 /, '') : '不限'}
                 </span>
               </div>
               {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
@@ -2087,6 +2117,7 @@ export const TemplatesView: React.FC = () => {
                       taskName={name}
                       remindAt={remindAt}
                       deadline={hasDeadline ? deadlineTime : ''}
+                      deadlineType={hasDeadline ? deadlineType : null}
                       remindText={uploadRemindText}
                       modules={uploadModules}
                       fields={fields}
