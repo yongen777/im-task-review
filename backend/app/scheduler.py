@@ -29,6 +29,15 @@ from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例�
     is_no_deadline,
     is_valid_hhmm,
 )
+# 2026-11-13 冲刺模块二：受控并发投递（8 线程 + 令牌桶 + 熔断）
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+from .throttle import (  # noqa: E402
+    CircuitBreaker,
+    TokenBucket,
+    breaker_threshold,
+    delivery_qps,
+    delivery_threads,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +670,116 @@ class Scheduler:
         except Exception as exc:  # noqa: BLE001
             logger.warning("附图直链文本发送异常 external=%s: %s", external_id, exc)
 
+    def _prepare_delivery(
+        self,
+        *,
+        template_id: str,
+        instance_id: Optional[int],
+        phone: str,
+        external_id: Optional[str],
+        kind: str,
+        planned_str: str,
+        delay_sec: float,
+        idem_key: str,
+        msg_text_fn,
+        cur_dt: datetime,
+        now_s: str,
+        stats: Dict[str, int],
+    ) -> Optional[Dict[str, Any]]:
+        """主线程 DB 预处理（幂等占位 + 前置记账），返回「待网络发送任务」或 None（已记账/已跳过）。
+
+        2026-11-13 冲刺模块二：从 _deliver_with_log 拆出前半（纯 DB 部分）——
+        多线程并发投递时 **worker 只做网络 IO**，查重占位与记账全部留在主线程串行完成，
+        规避 sqlite 单连接跨线程 + 保证「查重→发送→记录」的原子互斥（幂等红线）。
+        """
+        retry_no = self._resolve_retry_slot(idem_key, cur_dt=cur_dt)
+        if retry_no is None:
+            return None
+        if retry_no == 0 and delay_sec > self.COMPENSATION_WINDOW_SECONDS:
+            self.state.record_reminder_log(
+                template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
+                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="missed", retry=0,
+                error="COMPENSATION_WINDOW_EXCEEDED", idem_key=idem_key,
+            )
+            stats["missed"] += 1
+            return None
+        if not external_id:
+            self.state.record_reminder_log(
+                template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
+                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="skipped", retry=retry_no,
+                error="UNACTIVATED", idem_key=idem_key,
+            )
+            stats["skipped"] += 1
+            return None
+        return {
+            "template_id": template_id, "instance_id": instance_id, "phone": phone,
+            "external_id": external_id, "kind": kind, "planned_str": planned_str,
+            "idem_key": idem_key, "retry_no": retry_no, "msg_text": msg_text_fn(),
+            "now_s": now_s,
+        }
+
+    def _record_delivery(self, task: Dict[str, Any], send_res: Optional[SendResult], stats: Dict[str, int]) -> bool:
+        """主线程记账（worker 纯网络 IO，DB 全部回主线程串行写）。返回是否真的发出。"""
+        ok = bool(send_res is not None and send_res.ok)
+        self.state.record_reminder_log(
+            template_id=task["template_id"], instance_id=task["instance_id"], phone=task["phone"],
+            kind=task["kind"], planned_at=task["planned_str"], attempted_at=task["now_s"],
+            sent_at=task["now_s"] if ok else None, result=send_res.result if send_res else "failed",
+            retry=task["retry_no"], error=send_res.error if send_res else "CIRCUIT_OPEN", idem_key=task["idem_key"],
+        )
+        if ok:
+            stats["sent"] += 1
+        else:
+            stats["failed"] += 1
+            if send_res is not None and send_res.need_activate:
+                self.state.mark_delivery_target_unusable(task["phone"])
+        return ok
+
+    def _deliver_batch_concurrent(self, tasks: List[Dict[str, Any]], stats: Dict[str, int]) -> List[bool]:
+        """2026-11-13 冲刺模块二：**受控并发投递引擎**（定时链与一键推送共用）。
+
+        · 8 工作线程（IMT_DELIVERY_THREADS，规范 8~10）：worker 只做网络发送，规避 sqlite 跨线程；
+        · 全局令牌桶 25 QPS（IMT_DELIVERY_QPS）：2665 人总投递 ≤ ~107s（< 120s 闸门），流量平滑不触发 429；
+        · 连续失败熔断（IMT_DELIVERY_BREAKER_N，默认 10）：下游通道连续超时/不可用时短路剩余批次
+          （剩余任务记 failed/CIRCUIT_OPEN，防慢连接耗尽线程拖垮后台与 H5）；
+        · 幂等红线：retry slot 在主线程预处理阶段已占定（每任务唯一），记录在主线程串行完成——
+          任何情况下（含连跑多周期/中途重启）同周期同成员绝不重复收到两条。
+        """
+        if not tasks:
+            return []
+        bucket = getattr(self, "_delivery_bucket", None)
+        breaker = getattr(self, "_delivery_breaker", None)
+        if bucket is None or breaker is None:
+            bucket = TokenBucket(rate_per_sec=delivery_qps())
+            breaker = CircuitBreaker(fail_threshold=breaker_threshold())
+            self._delivery_bucket, self._delivery_breaker = bucket, breaker
+
+        def _send_worker(task: Dict[str, Any]) -> Optional[SendResult]:
+            # 熔断开启 → 剩余任务快速短路（不占桶、不睡网络），主线程按 CIRCUIT_OPEN 记账
+            if breaker.is_open():
+                return None
+            # 令牌桶挡在**真实网络发送前**（worker 侧全局限流；主线程只负责喂任务不阻塞）
+            bucket.acquire()
+            return task["send_fn"](task["external_id"], task["msg_text"], task["idem_key"])
+
+        results: List[Optional[Tuple[Dict[str, Any], Optional[SendResult]]]] = [None] * len(tasks)
+        with ThreadPoolExecutor(max_workers=delivery_threads()) as pool:
+            futures = [pool.submit(_send_worker, t) for t in tasks]
+            for idx, fut in enumerate(futures):
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001 - 通道抛异常按发送失败记账（不拖垮整批）
+                    logger.warning("delivery worker exception idem=%s: %s", tasks[idx]["idem_key"], exc)
+                    res = SendResult(ok=False, result="failed", error=f"EXC:{exc}"[:120], need_activate=False)
+                if res is not None and res.ok:
+                    breaker.record_success()
+                elif res is None and breaker.is_open():
+                    breaker.record_failure()  # 熔断开启后的剩余任务按失败记账（保持节奏统计）
+                elif res is not None and not res.ok:
+                    breaker.record_failure()
+                results[idx] = (tasks[idx], res)
+        return [self._record_delivery(t, res, stats) for t, res in results]
+
     def _deliver_with_log(
         self,
         *,
@@ -681,44 +800,19 @@ class Scheduler:
         """发一条并记账；返回是否**真的发出去了**（True=result 为 sent）。
 
         2026-10-28 方案A：notice 实例需要据此把状态从 pending 改成 sent。
+        2026-11-13 冲刺模块二：实现重构为「主线程预处理 → 单任务直发 → 主线程记账」，
+        与 _deliver_batch_concurrent 共用同一套幂等/记账语义。
         """
-        retry_no = self._resolve_retry_slot(idem_key, cur_dt=cur_dt)
-        if retry_no is None:
-            return False
-
-        if retry_no == 0 and delay_sec > self.COMPENSATION_WINDOW_SECONDS:
-            self.state.record_reminder_log(
-                template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
-                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="missed", retry=0,
-                error="COMPENSATION_WINDOW_EXCEEDED", idem_key=idem_key,
-            )
-            stats["missed"] += 1
-            return False
-
-        if not external_id:
-            self.state.record_reminder_log(
-                template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
-                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="skipped", retry=retry_no,
-                error="UNACTIVATED", idem_key=idem_key,
-            )
-            stats["skipped"] += 1
-            return False
-
-        msg_text = msg_text_fn()
-        active_send = send_fn or self.notifier.send_text
-        send_res = active_send(external_id, msg_text, idem_key)
-        self.state.record_reminder_log(
-            template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
-            planned_at=planned_str, attempted_at=now_s, sent_at=now_s if send_res.ok else None, result=send_res.result,
-            retry=retry_no, error=send_res.error, idem_key=idem_key,
+        task = self._prepare_delivery(
+            template_id=template_id, instance_id=instance_id, phone=phone, external_id=external_id,
+            kind=kind, planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_key,
+            msg_text_fn=msg_text_fn, cur_dt=cur_dt, now_s=now_s, stats=stats,
         )
-        if send_res.ok:
-            stats["sent"] += 1
-        else:
-            stats["failed"] += 1
-            if send_res.need_activate:
-                self.state.mark_delivery_target_unusable(phone)
-        return bool(send_res.ok)
+        if task is None:
+            return False
+        active_send = send_fn or self.notifier.send_text
+        send_res = active_send(task["external_id"], task["msg_text"], task["idem_key"])
+        return self._record_delivery(task, send_res, stats)
 
     def send_reject_notification(
         self, instance: Dict[str, Any], reason: str, now_dt: Optional[datetime] = None
@@ -856,6 +950,9 @@ class Scheduler:
                     f"提交入口（点击链接打开上传任务）：\n{h5_url}"
                 )
 
+            # 2026-11-13 冲刺模块二：一键推送改走受控并发引擎（8 线程 + 25QPS 桶 + 熔断）——
+            # 2665 人整点高峰单轮投递压进 2 分钟内；幂等占位/消息渲染/记账全在主线程。
+            batch: List[Dict[str, Any]] = []
             for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                 # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
                 # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
@@ -863,14 +960,18 @@ class Scheduler:
                     tpl["template_id"], inst["phone"], p_key, "manual_push", seq, f"{now_s}|push|{seq}"
                 )
                 idem = self._idem_for(base_idem, platform)
-                ok = self._deliver_with_log(
-                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
-                    kind="manual_push", planned_str=now_s, delay_sec=0, idem_key=idem,
-                    msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                    send_fn=functools.partial(nt.send_text, receive_type=ext_type),
+                task = self._prepare_delivery(
+                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                    external_id=ext_id, kind="manual_push", planned_str=now_s, delay_sec=0,
+                    idem_key=idem, msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
                 )
-                if ok:
-                    stats["pushed_instances"] += 1
+                if task is None:
+                    continue
+                task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                batch.append(task)
+            oks = self._deliver_batch_concurrent(batch, stats)
+            if any(oks):
+                stats["pushed_instances"] += 1
         return stats
 
     def run_once(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
@@ -927,6 +1028,9 @@ class Scheduler:
                         continue
 
                     # 2026-11-02 方案A：实例已在上方按天预生成，这里只负责「到点发送 + 置 sent」。
+                    # 2026-11-13 冲刺模块二：改走受控并发引擎（8 线程 + 25QPS 令牌桶 + 熔断）——
+                    # 主线程先完成全部幂等占位/前置记账，worker 只做网络发送，结果回主线程串行记账。
+                    batch: List[Dict[str, Any]] = []
                     for inst in instances:
 
                         def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
@@ -941,21 +1045,28 @@ class Scheduler:
                             return body.strip()
 
                         # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-                        sent_any = False
                         for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                             idem = self._idem_for(
                                 make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str),
                                 platform,
                             )
-                            ok = self._deliver_with_log(
+                            task = self._prepare_delivery(
                                 template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                                 external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
                                 idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                                send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                             )
-                            sent_any = sent_any or ok
-                        if sent_any:
-                            self.state.update_instance_status(int(inst["id"]), "sent")
+                            if task is None:
+                                continue
+                            task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                            batch.append(task)
+                    oks = self._deliver_batch_concurrent(batch, stats)
+                    # 批量回写：实例任一通道成功 → pending 置 sent（2026-10-28 方案A）
+                    by_inst: Dict[int, bool] = {}
+                    for task, ok in zip(batch, oks):
+                        by_inst[int(task["instance_id"])] = by_inst.get(int(task["instance_id"]), False) or ok
+                    for inst_id, ok in by_inst.items():
+                        if ok:
+                            self.state.update_instance_status(inst_id, "sent")
 
                     # 2026-10-28 通知类附图：优先推管理员上传的图片（attach_image_path），
                     # 没上传图时才退回「数据看板自动出图」的旧路径（依赖当天人工填报的快照值）。
@@ -1071,6 +1182,9 @@ class Scheduler:
             planned_str = format_dt(planned_dt)
             delay_sec = (cur_dt - planned_dt).total_seconds()
 
+            # 2026-11-13 冲刺模块二：定时提醒主链改走受控并发引擎（8 线程 + 25QPS 桶 + 熔断）。
+            # 消息渲染（含 H5 链接签发）与幂等占位在主线程完成，worker 只做网络发送。
+            remind_batch: List[Dict[str, Any]] = []
             for inst in instances:
                 if inst["status"] != "pending":
                     continue
@@ -1099,18 +1213,24 @@ class Scheduler:
                         make_idem_key(tpl["template_id"], inst["phone"], p_key, "remind", 1, planned_str),
                         platform,
                     )
-                    self._deliver_with_log(
+                    task = self._prepare_delivery(
                         template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
                         kind="remind", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem,
                         msg_text_fn=_make_remind_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                        send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                     )
+                    if task is None:
+                        continue
+                    task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                    remind_batch.append(task)
+            self._deliver_batch_concurrent(remind_batch, stats)
 
         adv = self.state.advance_instance_statuses(cur_dt)
         stats["to_overdue"] = adv["to_overdue"]
         stats["to_expired"] = adv["to_expired"]
 
         # R14：deadline 后 10 分钟对未交者（overdue）发 1 次逾期通知（kind='overdue'，不重复）
+        # 2026-11-13 冲刺模块二：同样走受控并发引擎（批量收集 → 并发投递）。
+        overdue_batch: List[Dict[str, Any]] = []
         for inst in self.state.list_overdue_instances():
             deadline_dt = parse_dt(inst["deadline_at"])
             overdue_planned_dt = deadline_dt + timedelta(minutes=self.OVERDUE_NOTICE_DELAY_MINUTES)
@@ -1137,12 +1257,16 @@ class Scheduler:
                     make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
                     platform,
                 )
-                self._deliver_with_log(
+                task = self._prepare_delivery(
                     template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
                     kind="overdue", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_platform,
                     msg_text_fn=_make_overdue_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                    send_fn=functools.partial(nt.send_text, receive_type=ext_type),
                 )
+                if task is None:
+                    continue
+                task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                overdue_batch.append(task)
+        self._deliver_batch_concurrent(overdue_batch, stats)
 
         return stats
 

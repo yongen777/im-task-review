@@ -78,6 +78,15 @@ VALID_DEADLINE_TYPES = ("same_day", "weekend", "month_end")
 MAX_DEPT_NAME_LEN = 200
 
 
+def _is_number_str(v: str) -> bool:
+    """字符串是否可作数值看板项（2026-11-13 模块三「报数视图」判定）。"""
+    try:
+        float(str(v).strip())
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 class BizError(Exception):
     def __init__(self, status_code: int, code: str, message: str) -> None:
         super().__init__(message)
@@ -1036,7 +1045,12 @@ class StateStore:
         return {"ok": True, "username": str(row["username"]), "must_change_password": True}
 
     def backup_database(self, tag: str = "manual") -> str:
-        """SQLite 文件级备份（先 WAL checkpoint 保证备份完整，落在 data/ 目录），返回备份路径。"""
+        """SQLite 文件级备份（先 WAL checkpoint 保证备份完整，落在 data/ 目录），返回备份路径。
+
+        mysql 引擎：库内备份走宝塔/云快照体系，这里返回空串（不伪造备份）。
+        """
+        if getattr(self.db, "engine", "sqlite") == "mysql":
+            return ""
         import shutil
 
         with self.lock:
@@ -3646,6 +3660,16 @@ class StateStore:
         late_submit = 1 if (now_s > inst["deadline_at"] or int(inst.get("late_submit") or 0) == 1) else 0
 
         with self.lock, self.conn:
+            # 2026-11-13 冲刺模块四压测实锤修复：「读状态→检查→写」跨锁段组合在多线程并发下
+            # 存在竞态（同一令牌并发提交可全部通过前置闸门），同一 H5 链接出现双写。
+            # 修复 = **原子 CAS 消费令牌**：UPDATE ... WHERE consumed = 0，抢不到即已被
+            # 并发请求消费 → 立即拒绝（幂等红线：提交事务内的互斥，双引擎下均原子）。
+            _cas = self.conn.execute(
+                "UPDATE h5_token SET consumed = 1 WHERE token_id = ? AND consumed = 0",
+                (tok["token_id"],),
+            )
+            if int(_cas.rowcount or 0) == 0:
+                raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
             cur = self.conn.execute(
                 "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, refs_json, source, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)",
@@ -3662,7 +3686,6 @@ class StateStore:
                 "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL WHERE id = ?",
                 (new_status, now_s, late_submit, int(inst["id"])),
             )
-            self.conn.execute("UPDATE h5_token SET consumed = 1 WHERE token_id = ?", (tok["token_id"],))
 
         return {"ok": True, "submission_id": sub_id, "status": new_status, "late_submit": bool(late_submit), "message": "已提交，等待审核" if tpl["need_review"] else "已完成"}
 
@@ -3969,3 +3992,169 @@ class StateStore:
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
         with self.lock:
             return [dict(r) for r in self.conn.execute(f"SELECT * FROM reminder_log {where_sql} ORDER BY id ASC", tuple(params)).fetchall()]
+
+    # ==================================================================
+    # 2026-11-13 冲刺模块三：多维自适应统计看板（四 KPI / 报数-文本-附件三视图 /
+    # 督办红榜 / 超管只读全局 + 分级管理员按 owner_id 隔离）
+    # ==================================================================
+    def stats_dashboard(
+        self,
+        owner_id: Optional[int] = None,
+        template_id: Optional[str] = None,
+        period_key: Optional[str] = None,
+        red_list_limit: int = 50,
+    ) -> Dict[str, Any]:
+        """统计看板聚合（单次取数，三段：kpis / views / red_list）。
+
+        · KPI 四件：应交总数 / 已交数 / 完成率 / 按时率（含平均提交耗时分钟数）；
+        · 三视图：numbers（数值字段）/ texts（文字说明）/ files（附件）——
+          数据来自 submission（fields_json / note / refs_json），按提交人聚合；
+        · 督办红榜：form 类已过期仍未交（pending/overdue 且 deadline 已过）按滞留时间倒序；
+        · owner_id：分级管理员数据隔离（None = 超管全局只读口径）。
+        """
+        where, params = [], []
+        if owner_id is not None:
+            where.append("i.owner_id = ?")
+            params.append(int(owner_id))
+        if template_id:
+            where.append("i.template_id = ?")
+            params.append(template_id)
+        if period_key:
+            where.append("i.period_key = ?")
+            params.append(period_key)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        kpis: Dict[str, Any] = {
+            "should_submit": 0, "submitted": 0, "approved": 0, "rejected": 0,
+            "pending": 0, "overdue": 0, "late_submit": 0,
+            "completion_rate": 0.0, "on_time_rate": 0.0, "avg_submit_minutes": None,
+        }
+        numbers: List[Dict[str, Any]] = []
+        texts: List[Dict[str, Any]] = []
+        files: List[Dict[str, Any]] = []
+        red_list: List[Dict[str, Any]] = []
+        now_s = self.now_str()
+
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT i.status AS status, COUNT(1) AS cnt, "
+                f"SUM(CASE WHEN i.late_submit = 1 THEN 1 ELSE 0 END) AS late_cnt "
+                f"FROM task_instance i {where_sql} GROUP BY i.status",
+                tuple(params),
+            ).fetchall()
+            total = done = late_total = 0
+            for r in rows:
+                st, cnt = str(r["status"]), int(r["cnt"] or 0)
+                total += cnt
+                late_total += int(r["late_cnt"] or 0)
+                if st in ("submitted", "approved"):
+                    done += cnt
+                if st in kpis:
+                    kpis[st] = cnt
+            kpis["should_submit"] = total
+            kpis["submitted"] = done
+            kpis["late_submit"] = late_total
+            if total:
+                kpis["completion_rate"] = round(done / total * 100.0, 1)
+                kpis["on_time_rate"] = round((total - late_total) / total * 100.0, 1)
+
+            # 平均提交耗时：双引擎兼容（不用 julianday/sqlite 专属函数），Python 侧相减
+            avg_rows = self.conn.execute(
+                f"SELECT i.created_at AS created_at, i.submitted_at AS submitted_at "
+                f"FROM task_instance i {where_sql} AND i.submitted_at IS NOT NULL",
+                tuple(params) if where else (),
+            ).fetchall() if where else self.conn.execute(
+                "SELECT i.created_at AS created_at, i.submitted_at AS submitted_at "
+                "FROM task_instance i WHERE i.submitted_at IS NOT NULL"
+            ).fetchall()
+            minutes: List[float] = []
+            for r in avg_rows:
+                try:
+                    created = parse_dt(str(r["created_at"]))
+                    submitted = parse_dt(str(r["submitted_at"]))
+                    delta_min = (submitted - created).total_seconds() / 60.0
+                    if delta_min >= 0:
+                        minutes.append(delta_min)
+                except Exception:  # noqa: BLE001
+                    continue
+            if minutes:
+                kpis["avg_submit_minutes"] = round(sum(minutes) / len(minutes), 1)
+
+            # 三视图：报数（fields_json 数值）/ 文本（note）/ 附件（refs_json）
+            sub_rows = self.conn.execute(
+                f"SELECT i.phone AS phone, i.name_snap AS name, i.dept_snap AS dept, "
+                f"i.template_id AS template_id, i.period_key AS period_key, i.status AS status, "
+                f"s.fields_json AS fields_json, s.note AS note, s.refs_json AS refs_json, s.mime AS mime "
+                f"FROM task_instance i JOIN submission s ON s.instance_id = i.id "
+                f"WHERE s.id = (SELECT MAX(s2.id) FROM submission s2 WHERE s2.instance_id = i.id) "
+                f"AND ({' AND '.join(['1=1'] + where) if where else '1=1'})",
+                tuple(params),
+            ).fetchall()
+            for r in sub_rows:
+                base = {
+                    "phone": r["phone"], "name": r["name"], "dept": r["dept"] or "",
+                    "template_id": r["template_id"], "period_key": r["period_key"],
+                    "status": r["status"],
+                }
+                fjson = str(r["fields_json"] or "")
+                if fjson:
+                    try:
+                        fvals = json.loads(fjson)
+                    except Exception:  # noqa: BLE001
+                        fvals = {}
+                    for k, v in (fvals or {}).items():
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            numbers.append({**base, "field": k, "value": v})
+                        elif isinstance(v, str) and _is_number_str(v):
+                            numbers.append({**base, "field": k, "value": float(v)})
+                        elif isinstance(v, str) and v.strip():
+                            texts.append({**base, "text": v.strip()})
+                if r["note"] and str(r["note"]).strip():
+                    texts.append({**base, "text": str(r["note"]).strip()})
+                rjson = str(r["refs_json"] or "")
+                if rjson:
+                    try:
+                        refs = json.loads(rjson)
+                    except Exception:  # noqa: BLE001
+                        refs = []
+                    if refs:
+                        files.append({**base, "file_count": len(refs), "refs": refs})
+
+            # 督办红榜：form 类已过截止仍未交（pending/overdue），滞留小时 Python 侧算（双引擎兼容）
+            red_where = [w for w in where]
+            red_params = list(params)
+            red_where.append("t.kind = 'form'")
+            red_where.append("i.status IN ('pending', 'overdue')")
+            red_where.append("i.deadline_at < ?")
+            red_params.append(now_s)
+            red_where.append("i.deadline_at < '9999-12-31 23:59:59'")  # 哨兵截止（不限）不进红榜
+            red_rows = self.conn.execute(
+                f"SELECT i.phone AS phone, i.name_snap AS name, i.dept_snap AS dept, "
+                f"t.name AS template_name, i.deadline_at AS deadline_at "
+                f"FROM task_instance i JOIN task_template t ON t.template_id = i.template_id "
+                f"WHERE {' AND '.join(red_where)} "
+                f"ORDER BY i.deadline_at ASC LIMIT ?",
+                tuple(red_params + [int(red_list_limit)]),
+            ).fetchall()
+            try:
+                now_dt = parse_dt(now_s)
+            except Exception:  # noqa: BLE001
+                now_dt = self.now()
+            for r in red_rows:
+                overdue_hours = 0
+                try:
+                    overdue_hours = int((now_dt - parse_dt(str(r["deadline_at"]))).total_seconds() // 3600)
+                except Exception:  # noqa: BLE001
+                    pass
+                red_list.append({
+                    "phone": r["phone"], "name": r["name"], "dept": r["dept"] or "",
+                    "template_name": r["template_name"], "deadline_at": r["deadline_at"],
+                    "overdue_hours": overdue_hours,
+                })
+            red_list.sort(key=lambda x: -x["overdue_hours"])
+
+        return {
+            "kpis": kpis,
+            "views": {"numbers": numbers, "texts": texts, "files": files},
+            "red_list": red_list,
+        }

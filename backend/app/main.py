@@ -17,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from .api.admin import create_admin_router, register_admin_guard
 from .api.events import create_events_router, handle_inbound_text
 from .api.wecom_callback import create_wecom_router
+from .h5log import H5AccessLogMiddleware
 from .api.h5 import create_h5_router
 from .channels.zdxlz import ZdxlzChannel
 from .channel_config import ChannelConfigStore, apply_db_channel_config
@@ -234,6 +235,11 @@ def create_apps(
 
     public_app = FastAPI(title="IMTask Public Service", version="1.2.0")
     admin_app = FastAPI(title="IMTask Admin Service", version="1.2.0")
+
+    # 2026-11-13 冲刺模块二：H5 入口纯净单行访问日志（logs/h5_access-YYYYMMDD.log 按天切割；
+    # 毫秒时间戳 | IP | 方法 路径 | 状态码 | 耗时 | SLOW | 敏感参数脱敏）。
+    # 只挂业务端口；管理端口不记录（后台有 admin_audit 体系）。
+    public_app.add_middleware(H5AccessLogMiddleware)
 
     public_app.state.config = cfg
     public_app.state.store = store

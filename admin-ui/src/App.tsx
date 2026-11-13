@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import {
   ClipboardCheck,
+  BarChart3,
   FileSpreadsheet,
   Users,
   CalendarCheck2,
@@ -12,10 +13,11 @@ import { AdminMe, AdminUserCard } from './components/system/AdminUserCard';
 import { TemplatesView } from './components/imtask/TemplatesView';
 import { RolesMembersView } from './components/imtask/RolesMembersView';
 import { InstancesView } from './components/imtask/InstancesView';
+import { StatisticsView } from './components/imtask/StatisticsView';
 import { AdminAccountsView } from './components/imtask/AdminAccountsView';
 import ChannelSettingsView from './components/imtask/ChannelSettingsView';
 
-type TabKey = 'instances' | 'templates' | 'roles' | 'accounts' | 'channels';
+type TabKey = 'instances' | 'templates' | 'roles' | 'stats' | 'accounts' | 'channels';
 
 interface MainAppProps {
   me: AdminMe;
@@ -56,6 +58,12 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
       label: '角色与成员名册',
       icon: Users,
       badge: roles.length,
+      badgeTone: 'slate',
+    },
+    {
+      id: 'stats',
+      label: '统计看板',
+      icon: BarChart3,
       badgeTone: 'slate',
     },
   ];
@@ -191,6 +199,7 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               {activeTab === 'instances' && <InstancesView />}
               {activeTab === 'templates' && <TemplatesView />}
               {activeTab === 'roles' && <RolesMembersView />}
+          {activeTab === 'stats' && <StatisticsView />}
               {activeTab === 'accounts' && isSuperAdmin && <AdminAccountsView />}
               {activeTab === 'channels' && isSuperAdmin && <ChannelSettingsView />}
             </>

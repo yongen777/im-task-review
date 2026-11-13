@@ -2480,6 +2480,33 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # ==================================================================
     # §9.6 统计概览接口
     # ==================================================================
+    @router.get("/stats/dashboard")
+    async def stats_dashboard(
+        request: Request,
+        template_id: Optional[str] = None,
+        period_key: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ):
+        """2026-11-13 冲刺模块三：多维自适应统计看板。
+
+        权限口径：超管 = 全局只读（跨 owner 聚合）；分级管理员 = 自动按自己 owner_id
+        隔离（传别人的 owner_id 会被 _owner_filter 收敛回自己，与全库既有口径一致）。
+        返回：四 KPI（应交/已交/完成率/按时率/平均耗时）+ 三视图（报数/文本/附件）
+        + 督办红榜（过期未交按滞留时长倒序）。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        effective_owner = _owner_filter(_admin, owner_id)
+        data = state.stats_dashboard(
+            owner_id=effective_owner,
+            template_id=(template_id or "").strip() or None,
+            period_key=(period_key or "").strip() or None,
+        )
+        return {"ok": True, "scope_owner_id": effective_owner, **data}
+
     @router.get("/stats")
     async def get_stats(
         request: Request,

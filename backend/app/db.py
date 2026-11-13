@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
-"""SQLite 数据库连接、WAL 模式、全库 14 张表 = 10 业务表 + 3 支撑表 + 1 版本门表 schema_version（§4 + v1.2 §16 P6）。"""
+"""数据层连接工厂：双引擎（sqlite 默认 / mysql 8.0 兼容 5.7.43）。
+
+sqlite：单文件 + WAL + DEFERRED 事务（历史行为不变，全量单测跑这一层）。
+mysql（2026-11-13 冲刺模块一）：
+  · `Database` 按环境变量 IMT_DB_ENGINE 分支，生产换引擎零改码；
+  · 连接走 dbutils.PooledDB 连接池（每事务借还，InnoDB 行级锁）；
+  · SQL 方言翻译器 `_translate_sql`（?→%s、INSERT OR IGNORE→INSERT IGNORE、
+    ON CONFLICT→ON DUPLICATE KEY UPDATE、rowid→id、last_insert_rowid→LAST_INSERT_ID）；
+  · 5.7 三坑规范（用户拍板）：索引列显式 VARCHAR(64/128)；TEXT 列禁 DEFAULT；
+    索引行长在 innodb_large_prefix=ON + DYNAMIC 行格式下 3072 字节无忧。
+"""
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 from pathlib import Path
@@ -358,13 +369,17 @@ def _migrate_role_platform(conn: sqlite3.Connection) -> None:
 
 
 class Database:
-    """单文件 SQLite 连接管理（开启 WAL，配合线程级可重入锁串行写入）。"""
+    """连接管理（sqlite 单文件 WAL / mysql 连接池，双引擎按 IMT_DB_ENGINE 切换）。"""
 
     def __init__(self, db_path: Path, now_str_fn) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._now_str_fn = now_str_fn
+        self.engine = (os.environ.get("IMT_DB_ENGINE", "").strip().lower() or "sqlite")
         self.lock = threading.RLock()
+        self._now_str_fn = now_str_fn
+        if self.engine == "mysql":
+            self._init_mysql()
+            return
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # 2026-10-29 P1-1：改为 DEFERRED 隔离级别，使 `with self.conn:` 真正开事务、
         # 中途异常能整体回滚；原来 isolation_level=None 是自动提交，多条写操作没有原子性。
         # 2026-11-05：补写锁等待。调度线程与请求线程共用一个连接，WAL 下写写仍互斥；
@@ -379,8 +394,17 @@ class Database:
         self.conn.execute("PRAGMA busy_timeout=15000")
         self.init_schema()
 
+    def _init_mysql(self) -> None:
+        """mysql 引擎装配：连接池 + schema 初始化（表结构见 MYSQL_DDL）。"""
+        cfg = mysql_config_from_env()
+        self.conn = MySQLConnProxy(cfg)
+        self.init_schema()
+
     def init_schema(self) -> None:
         with self.lock:
+            if self.engine == "mysql":
+                _init_mysql_schema(self.conn, self._now_str_fn, self.lock)
+                return
             self.conn.executescript(DDL_SCRIPT)
             _ensure_column(self.conn, "task_template", "allow_note", "INTEGER NOT NULL DEFAULT 0")
             _ensure_column(self.conn, "task_template", "anchor_weekday", "INTEGER")
@@ -455,4 +479,546 @@ class Database:
 
     def close(self) -> None:
         with self.lock:
+            if self.engine == "mysql":
+                self.conn.close()  # 关闭连接池
+                return
             self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# MySQL 引擎（2026-11-13 冲刺模块一）：方言翻译 + 连接池代理 + 5.7 兼容 DDL
+# ---------------------------------------------------------------------------
+
+MYSQL_DDL = """
+CREATE TABLE IF NOT EXISTS schema_version (
+  version     INT NOT NULL,
+  updated_at  VARCHAR(32) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS scope (
+  scope_id   VARCHAR(64)  NOT NULL,
+  name       VARCHAR(128) NOT NULL,
+  type       VARCHAR(16)  NOT NULL DEFAULT 'dept',
+  parent_id  VARCHAR(64)  DEFAULT NULL,
+  created_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (scope_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS role (
+  role_id    VARCHAR(64)  NOT NULL,
+  name       VARCHAR(128) NOT NULL,
+  note       VARCHAR(512) DEFAULT NULL,
+  platform   VARCHAR(16)  NOT NULL DEFAULT 'zdxlz',
+  owner_id   INT          NOT NULL DEFAULT 1,
+  created_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (role_id),
+  UNIQUE KEY uk_role_platform_name (platform, name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS member (
+  id         INT AUTO_INCREMENT,
+  role_id    VARCHAR(64)  NOT NULL,
+  phone      VARCHAR(32)  NOT NULL,
+  name       VARCHAR(128) NOT NULL,
+  dept       VARCHAR(128) DEFAULT NULL,
+  dept_path  VARCHAR(512) DEFAULT NULL,
+  enabled    TINYINT      NOT NULL DEFAULT 1,
+  source     VARCHAR(32)  NOT NULL DEFAULT 'manual',
+  owner_id   INT          NOT NULL DEFAULT 1,
+  created_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_member_role_phone (role_id, phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS delivery_target (
+  platform      VARCHAR(16)  NOT NULL DEFAULT 'zdxlz',
+  phone         VARCHAR(32)  NOT NULL,
+  external_id   VARCHAR(128) NOT NULL,
+  external_type VARCHAR(16)  NOT NULL DEFAULT 'user',
+  usable        TINYINT      NOT NULL DEFAULT 1,
+  activated_at  VARCHAR(32)  NOT NULL,
+  last_event_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (platform, phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS task_template (
+  template_id     VARCHAR(64)  NOT NULL,
+  name            VARCHAR(128) NOT NULL,
+  kind            VARCHAR(16)  NOT NULL,
+  role_ids        VARCHAR(512) NOT NULL,
+  owner_id        INT          NOT NULL DEFAULT 1,
+  schema_json     MEDIUMTEXT,
+  allow_note      TINYINT      NOT NULL DEFAULT 0,
+  text_tpl        MEDIUMTEXT   NOT NULL,
+  remind_at       VARCHAR(8)   DEFAULT NULL,
+  notice_times    VARCHAR(255) DEFAULT NULL,
+  has_deadline    TINYINT      NOT NULL DEFAULT 1,
+  deadline_type   VARCHAR(16)  DEFAULT NULL,
+  deadline_time   VARCHAR(8)   DEFAULT NULL,
+  deadline        VARCHAR(8)   DEFAULT NULL,
+  period          VARCHAR(16)  NOT NULL,
+  anchor_weekday  TINYINT      DEFAULT NULL,
+  anchor_dom      TINYINT      DEFAULT NULL,
+  deadline_offset INT          NOT NULL DEFAULT 0,
+  need_review     TINYINT      NOT NULL DEFAULT 0,
+  max_file_mb     INT          DEFAULT NULL,
+  enabled         TINYINT      NOT NULL DEFAULT 1,
+  deleted         TINYINT      NOT NULL DEFAULT 0,
+  is_adhoc        TINYINT      NOT NULL DEFAULT 0,
+  attach_image         TINYINT      NOT NULL DEFAULT 0,
+  data_keys            VARCHAR(1024) DEFAULT NULL,
+  attach_image_path    VARCHAR(255)  DEFAULT NULL,
+  attach_image_name    VARCHAR(128)  DEFAULT NULL,
+  exec_weekdays        VARCHAR(64)   DEFAULT NULL,
+  exec_dom_days        VARCHAR(64)   DEFAULT NULL,
+  spec_json            MEDIUMTEXT,
+  created_by     VARCHAR(64)  NOT NULL,
+  created_at     VARCHAR(32)  NOT NULL,
+  updated_at     VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (template_id),
+  KEY ix_tpl_owner (owner_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS task_instance (
+  id            INT AUTO_INCREMENT,
+  template_id   VARCHAR(64)  NOT NULL,
+  phone         VARCHAR(32)  NOT NULL,
+  name_snap     VARCHAR(128) NOT NULL,
+  dept_snap     VARCHAR(128),
+  period_key    VARCHAR(16)  NOT NULL,
+  status        VARCHAR(16)  NOT NULL,
+  deadline_at   VARCHAR(32)  NOT NULL,
+  owner_id      INT          NOT NULL DEFAULT 1,
+  created_at    VARCHAR(32)  NOT NULL,
+  submitted_at  VARCHAR(32)  DEFAULT NULL,
+  reviewed_at   VARCHAR(32)  DEFAULT NULL,
+  reviewer      VARCHAR(64)  DEFAULT NULL,
+  reject_reason VARCHAR(512) DEFAULT NULL,
+  reject_count  INT          NOT NULL DEFAULT 0,
+  late_submit   TINYINT      NOT NULL DEFAULT 0,
+  resubmit_req_at       VARCHAR(32) DEFAULT NULL,
+  resubmit_status       VARCHAR(16) DEFAULT NULL,
+  resubmit_decided_by   VARCHAR(64) DEFAULT NULL,
+  resubmit_decided_at   VARCHAR(32) DEFAULT NULL,
+  resubmit_deadline     VARCHAR(32) DEFAULT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_inst_tpl_phone_period (template_id(64), phone, period_key),
+  KEY ix_inst_status (status, deadline_at),
+  KEY ix_inst_period (period_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS submission (
+  id          INT AUTO_INCREMENT,
+  instance_id INT         NOT NULL,
+  fields_json MEDIUMTEXT,
+  file_ref    VARCHAR(64)  DEFAULT NULL,
+  file_name   VARCHAR(255) DEFAULT NULL,
+  mime        VARCHAR(128) DEFAULT NULL,
+  size        INT          DEFAULT NULL,
+  note        TEXT,
+  refs_json   MEDIUMTEXT,
+  source      VARCHAR(16)  NOT NULL,
+  status      VARCHAR(16)  NOT NULL,
+  created_at  VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  KEY ix_sub_inst (instance_id, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS reminder_log (
+  id           INT AUTO_INCREMENT,
+  template_id  VARCHAR(64) NOT NULL,
+  instance_id  INT         DEFAULT NULL,
+  phone        VARCHAR(32) NOT NULL,
+  kind         VARCHAR(16) NOT NULL,
+  planned_at   VARCHAR(32) NOT NULL,
+  attempted_at VARCHAR(32) DEFAULT NULL,
+  sent_at      VARCHAR(32) DEFAULT NULL,
+  result       VARCHAR(16) NOT NULL,
+  error        VARCHAR(255) DEFAULT NULL,
+  retry        INT         NOT NULL DEFAULT 0,
+  idem_key     VARCHAR(64) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_rem_idem_retry (idem_key, retry),
+  KEY ix_rem_idem (idem_key, result)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS upload_ref (
+  ref         VARCHAR(64)  NOT NULL,
+  phone       VARCHAR(32)  NOT NULL,
+  template_id VARCHAR(64)  DEFAULT NULL,
+  file_name   VARCHAR(255) NOT NULL,
+  mime        VARCHAR(128) NOT NULL,
+  size        INT          NOT NULL,
+  rel_path    VARCHAR(255) NOT NULL,
+  consumed    TINYINT      NOT NULL DEFAULT 0,
+  created_at  VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (ref),
+  KEY ix_upload_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS h5_token (
+  token_id    VARCHAR(64) NOT NULL,
+  phone       VARCHAR(32) NOT NULL,
+  template_id VARCHAR(64) NOT NULL,
+  period_key  VARCHAR(16) NOT NULL,
+  instance_id INT         DEFAULT NULL,
+  purpose     VARCHAR(16) NOT NULL,
+  created_at  VARCHAR(32) NOT NULL,
+  expires_at  VARCHAR(32) NOT NULL,
+  consumed    TINYINT     NOT NULL DEFAULT 0,
+  PRIMARY KEY (token_id),
+  KEY ix_h5tok_phone_tpl (phone, template_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS admin_user (
+  id               INT AUTO_INCREMENT,
+  username         VARCHAR(64) NOT NULL,
+  pwd_hash         VARCHAR(255) NOT NULL,
+  must_change      TINYINT     NOT NULL DEFAULT 0,
+  display_name     VARCHAR(128) NOT NULL DEFAULT '',
+  role_level       VARCHAR(16)  NOT NULL DEFAULT 'sub_admin',
+  allowed_platforms VARCHAR(255) NOT NULL DEFAULT '["zdxlz","wecom"]',
+  enabled          TINYINT      NOT NULL DEFAULT 1,
+  last_login_at    VARCHAR(32)  DEFAULT NULL,
+  created_at       VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_admin_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS admin_session (
+  sid         VARCHAR(64) NOT NULL,
+  user_id     INT         NOT NULL,
+  csrf        VARCHAR(64) NOT NULL,
+  parent_sid  VARCHAR(64) DEFAULT NULL,
+  created_at  VARCHAR(32) NOT NULL,
+  last_seen   VARCHAR(32) NOT NULL,
+  expires_at  VARCHAR(32) NOT NULL,
+  PRIMARY KEY (sid),
+  KEY ix_adm_sess_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS channel_config (
+  id         INT AUTO_INCREMENT,
+  channel    VARCHAR(16)  NOT NULL,
+  payload    MEDIUMTEXT   NOT NULL,
+  updated_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_channel (channel)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS admin_audit (
+  id          INT AUTO_INCREMENT,
+  username    VARCHAR(64) NOT NULL,
+  action      VARCHAR(64) NOT NULL,
+  target_type VARCHAR(64) DEFAULT NULL,
+  target_id   VARCHAR(64) DEFAULT NULL,
+  detail      TEXT,
+  created_at  VARCHAR(32) NOT NULL,
+  PRIMARY KEY (id),
+  KEY ix_audit_user_time (username, id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS data_snapshot (
+  id          INT AUTO_INCREMENT,
+  source_key  VARCHAR(128) NOT NULL,
+  period_key  VARCHAR(16)  NOT NULL,
+  values_json MEDIUMTEXT  NOT NULL,
+  note        VARCHAR(512) DEFAULT NULL,
+  updated_by  VARCHAR(64) DEFAULT NULL,
+  updated_at  VARCHAR(32) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_data_snapshot (source_key(64), period_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS pending_member (
+  id           INT AUTO_INCREMENT,
+  external_id  VARCHAR(128) NOT NULL,
+  platform     VARCHAR(16)  DEFAULT NULL,
+  phone        VARCHAR(32)  DEFAULT NULL,
+  name         VARCHAR(128) DEFAULT NULL,
+  dept         VARCHAR(128) DEFAULT NULL,
+  last_message TEXT,
+  activated_at VARCHAR(32)  NOT NULL,
+  updated_at   VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_pending_ext (external_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS dept_option (
+  id         INT AUTO_INCREMENT,
+  name       VARCHAR(128) NOT NULL,
+  created_at VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_dept_option (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+""".strip()
+
+
+def mysql_config_from_env() -> dict:
+    """MySQL 连接参数（.env 由 config 加载；此处只读 os.environ）。"""
+    host = os.environ.get("IMT_MYSQL_HOST", "").strip() or "127.0.0.1"
+    port = int(os.environ.get("IMT_MYSQL_PORT", "3306").strip() or "3306")
+    user = os.environ.get("IMT_MYSQL_USER", "").strip()
+    password = os.environ.get("IMT_MYSQL_PASSWORD", "")
+    database = os.environ.get("IMT_MYSQL_DATABASE", "").strip() or "im_task"
+    if not user:
+        raise RuntimeError("IMT_DB_ENGINE=mysql 但未配置 IMT_MYSQL_USER（检查 .env）")
+    return {
+        "host": host, "port": port, "user": user, "password": password,
+        "database": database, "charset": "utf8mb4",
+    }
+
+
+def _translate_sql(sql: str) -> str:
+    """sqlite 方言 → mysql 方言（state.py 全部 SQL 的在线翻译层）。
+
+    五族规则（覆盖 state.py 的既有用法，grep 实证过）：
+      1. ? 占位符 → %s（跳过引号内字符——文本里可能带 ?，如 JSON）；
+      2. INSERT OR IGNORE INTO t → INSERT IGNORE INTO t；
+      3. ON CONFLICT(cols) DO UPDATE SET a=excluded.a,... →
+         ON DUPLICATE KEY UPDATE a=VALUES(a),...（全库唯一键已在表上，冲突集等价）；
+      4. rowid → id（仅 task_instance 等自增主键表用 ORDER BY rowid）；
+      5. last_insert_rowid() → LAST_INSERT_ID()。
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    in_str: str | None = None
+    while i < n:
+        ch = sql[i]
+        if in_str:
+            out.append(ch)
+            if ch == in_str:
+                in_str = None
+            elif ch == "\\" and in_str == "'" and i + 1 < n:  # sqlite 转义 ''
+                out.append(sql[i + 1])
+                i += 1
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        # 规则 2
+        if sql.startswith("INSERT OR IGNORE INTO", i):
+            out.append("INSERT IGNORE INTO")
+            i += len("INSERT OR IGNORE INTO")
+            continue
+        # 规则 3
+        if sql.startswith("ON CONFLICT", i):
+            j = sql.find("DO UPDATE SET", i)
+            if j == -1:
+                raise ValueError(f"ON CONFLICT 无 DO UPDATE 分支（暂不支持）: {sql[:80]}")
+            cols = sql[i + len("ON CONFLICT"): j].strip()
+            set_part = sql[j + len("DO UPDATE SET"):]
+            sets = [s.strip() for s in set_part.split(",") if s.strip()]
+            mysql_sets = []
+            for s in sets:
+                if "=" not in s:
+                    raise ValueError(f"ON CONFLICT 不认识的 SET 片段: {s}")
+                col, expr = s.split("=", 1)
+                col = col.strip()
+                mysql_sets.append(f"{col}=VALUES({col})" if "excluded." in expr else f"{col}={expr.strip()}")
+            out.append("ON DUPLICATE KEY UPDATE " + ", ".join(mysql_sets))
+            i = j + len("DO UPDATE SET") + len(set_part)
+            continue
+        # 规则 4/5（词边界）
+        if sql.startswith("rowid", i) and (i + 5 >= n or not (sql[i + 5].isalnum() or sql[i + 5] == "_")):
+            out.append("id")
+            i += 5
+            continue
+        if sql.startswith("last_insert_rowid()", i):
+            out.append("LAST_INSERT_ID()")
+            i += len("last_insert_rowid()")
+            continue
+        if ch == "?":
+            out.append("%s")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+class RowLike(dict):
+    """pymysql 行 → sqlite3.Row 的鸭子形态（支持 ['k']、[0]、dict()、keys()）。"""
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class _CursorWrap:
+    """pymysql cursor 包装：行转 RowLike；暴露 lastrowid/rowcount/description。"""
+
+    def __init__(self, cur) -> None:
+        self._cur = cur
+        self.lastrowid = cur.lastrowid
+        self.rowcount = cur.rowcount
+        self.description = cur.description
+
+    @staticmethod
+    def _row(r):
+        return RowLike(r) if r is not None else None  # DictCursor 行已是 dict 子类
+
+    def fetchone(self):
+        return self._row(self._cur.fetchone())
+
+    def fetchall(self):
+        return [self._row(r) for r in self._cur.fetchall()]
+
+    def __iter__(self):
+        for r in self._cur:
+            yield self._row(r)
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+class MySQLConnProxy:
+    """state.py 的 `self.conn` 鸭子替身（mysql 引擎）。
+
+    语义对齐 sqlite3.Connection：
+      · `with proxy:` —— 事务段（可重入计数；首个进入借连接，最后退出 commit/归还）；
+      · execute/executemany —— 无事务段时：借连接 → 执行 → 立即 commit → 归还；
+      · 翻译在每条语句边界内完成（参数无需处理——qmark 顺序两方一致）。
+    线程模型：sticky 连接按线程本地存储（FastAPI 线程池 + 调度线程各自独立事务），
+    池由 dbutils.PooledDB 管理（mincached=2 / maxconnections=16，够 8 投递线程+Web 并发）。
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        import pymysql
+        from dbutils.pooled_db import PooledDB
+
+        self._cfg = cfg
+        self._tls = threading.local()
+        self._pool = PooledDB(
+            creator=pymysql,
+            mincached=2, maxconnections=16, blocking=True,
+            ping=1,  # 每次借出 ping 检活（8 小时断连自愈）
+            host=cfg["host"], port=cfg["port"], user=cfg["user"], password=cfg["password"],
+            database=cfg["database"], charset=cfg["charset"],
+            cursorclass=pymysql.cursors.DictCursor, autocommit=False,
+        )
+
+    # ---- 连接借还 ----
+    def _borrow(self):
+        return self._pool.connection()
+
+    def _release(self, conn, *, rollback: bool) -> None:
+        try:
+            if rollback:
+                conn.rollback()
+            else:
+                conn.commit()
+        finally:
+            conn.close()  # PooledDB: 归还池
+
+    # ---- 事务段（sqlite `with conn:` 对齐）----
+    def __enter__(self):
+        st = getattr(self._tls, "stack", None)
+        if st:
+            self._tls.stack = st + [st[-1]]
+            return self
+        conn = self._borrow()
+        self._tls.stack = [conn]
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        st = getattr(self._tls, "stack", None)
+        if not st:
+            return False
+        conn = st.pop()
+        if st:
+            return False  # 嵌套：最外层负责提交
+        try:
+            self._release(conn, rollback=exc_type is not None)
+        except Exception:  # noqa: BLE001 - 事务提交失败在异常路径下不让连接泄漏
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+    # ---- 执行 ----
+    def execute(self, sql: str, params=()):
+        msql = _translate_sql(sql)
+        st = getattr(self._tls, "stack", None)
+        if st:
+            cur = st[-1].cursor()
+            cur.execute(msql, params)
+            return _CursorWrap(cur)
+        conn = self._borrow()
+        try:
+            cur = conn.cursor()
+            cur.execute(msql, params)
+            wrapped = _CursorWrap(cur)
+            conn.commit()
+            return wrapped
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def executemany(self, sql: str, seq_of_params):
+        msql = _translate_sql(sql)
+        st = getattr(self._tls, "stack", None)
+        if st:
+            cur = st[-1].cursor()
+            cur.executemany(msql, seq_of_params)
+            return _CursorWrap(cur)
+        conn = self._borrow()
+        try:
+            cur = conn.cursor()
+            cur.executemany(msql, seq_of_params)
+            wrapped = _CursorWrap(cur)
+            conn.commit()
+            return wrapped
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    # sqlite 兼容杂项
+    def commit(self):
+        st = getattr(self._tls, "stack", None)
+        if st:
+            st[-1].commit()
+
+    def rollback(self):
+        st = getattr(self._tls, "stack", None)
+        if st:
+            st[-1].rollback()
+
+    def close(self):
+        self._pool.close()  # 关池（进程退出/测试清理）
+
+
+def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn, lock: threading.RLock) -> None:
+    """mysql 建库初始化：DDL（幂等）+ 种子行（与 sqlite init_schema 尾段对齐）。"""
+    stmts = [s.strip() for s in MYSQL_DDL.split(";") if s.strip()]
+    # CREATE TABLE ... 独立事务执行（DDL 隐式提交，逐条执行即可）
+    with lock:
+        for stmt in stmts:
+            proxy.execute(stmt)
+        with proxy as conn_tx:
+            now_str = now_str_fn()
+            row = conn_tx.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            if row is None:
+                conn_tx.execute(
+                    "INSERT INTO schema_version(version, updated_at) VALUES (?, ?)",
+                    (SCHEMA_VERSION, now_str))
+            elif int(row["version"]) < SCHEMA_VERSION:
+                conn_tx.execute(
+                    "UPDATE schema_version SET version = ?, updated_at = ?",
+                    (SCHEMA_VERSION, now_str))
+            if conn_tx.execute("SELECT scope_id FROM scope WHERE scope_id = 'root'").fetchone() is None:
+                conn_tx.execute(
+                    "INSERT INTO scope(scope_id, name, type, parent_id, created_at) "
+                    "VALUES ('root', ?, 'dept', NULL, ?)", ("默认组织", now_str))
