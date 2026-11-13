@@ -48,7 +48,7 @@ BACKEND_DIRS = [
 # 目录里绝不动的名字（生产数据/缓存/git 元数据）
 SKIP_NAMES = {"__pycache__", ".pytest_cache", ".venv", "node_modules", "data", ".git"}
 # 只同步文本类文件（favicon/png 等二进制不脱敏不文本化，按需专用拷贝）
-TEXT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".mjs", ".json", ".html", ".css", ".md", ".ini", ".example", ".txt", ".sh", ".cfg"}
+TEXT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".mjs", ".json", ".html", ".css", ".md", ".ini", ".example", ".txt", ".sh", ".cfg", ".sql"}
 # 评审库 admin_static 整目录以工作区构建产物为准
 REPO_STATIC = REPO / "backend" / "app" / "admin_static"
 REPO_UI_SRC = REPO / "admin-ui" / "src"
