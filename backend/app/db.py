@@ -804,6 +804,15 @@ def _translate_sql(sql: str) -> str:
             out.append("INSERT IGNORE INTO")
             i += len("INSERT OR IGNORE INTO")
             continue
+        # 规则 6（2026-11-13 member-pool 实锤补丁）：sqlite 命名占位符 :name → pymysql 的 %(name)s；
+        # 参数 dict 两边原生兼容（sqlite 认 :name，pymysql 认 %(name)s），无需转换参数结构。
+        if ch == ":" and i + 1 < n and (sql[i + 1].isalpha() or sql[i + 1] == "_"):
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] == "_"):
+                j += 1
+            out.append("%(" + sql[i + 1:j] + ")s")
+            i = j
+            continue
         # 规则 3
         if sql.startswith("ON CONFLICT", i):
             j = sql.find("DO UPDATE SET", i)

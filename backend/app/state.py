@@ -814,9 +814,9 @@ class StateStore:
             "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 "
             " JOIN role r2 ON r2.role_id = m2.role_id JOIN admin_user u ON u.id = m2.owner_id "
             f" WHERE m2.phone = m.phone {pf('r2')}) AS owner_names, "
-            "(SELECT GROUP_CONCAT(r.name || '（' || r.platform || '）', '、') FROM member m3 "
-            " JOIN role r ON r.role_id = m3.role_id "
-            f" WHERE m3.phone = m.phone {pf('r')}) AS role_detail, "
+            # 2026-11-13 冲刺模块一 MySQL 适配：原「GROUP_CONCAT(r.name || '（' || r.platform || '）', '、')」
+            # 的 || 字符串拼接是 sqlite 专属（MySQL 不认）——role_detail 改由主查询后 Python 侧聚合补齐
+            # （查 role 明细 → 按 phone 分组拼「名称（平台）」），双引擎零方言依赖。
             "(SELECT u.display_name FROM member m4 JOIN role r4 ON r4.role_id = m4.role_id "
             " JOIN admin_user u ON u.id = m4.owner_id "
             f" WHERE m4.phone = m.phone {pf('r4')} ORDER BY m4.id ASC LIMIT 1) AS first_owner_name, "
@@ -863,13 +863,30 @@ class StateStore:
                     "row_count": rows_n,
                     "role_count": int(r["role_count"] or 0),
                     "admin_count": int(r["admin_count"] or 0),
-                    "role_detail": str(r["role_detail"] or ""),
+                    "role_detail": "",  # 下方 Python 聚合补齐（双引擎零方言依赖）
                     "first_owner_name": str(r["first_owner_name"] or ""),
                     "first_owner_username": str(r["first_owner_username"] or ""),
                     "activated_platforms": [p for p in str(r["activated_platforms"] or "").split(",") if p],
                     "name_inconsistent": int(r["distinct_names"] or 0) > 1,
                     "dept_inconsistent": int(r["distinct_depts"] or 0) > 1,
                 })
+            # role_detail Python 侧聚合：查 role 明细按 phone 分组拼「名称（平台）」，
+            # 与原 sqlite 的 GROUP_CONCAT(r.name || '（' || r.platform || '）', '、') 语义一致。
+            if out:
+                detail_by_phone: Dict[str, List[str]] = {}
+                detail_rows = self.conn.execute(
+                    "SELECT m.phone AS phone, r.name AS role_name, r.platform AS platform "
+                    "FROM member m JOIN role r ON r.role_id = m.role_id "
+                    + ("WHERE r.platform = ? " if use_plat else "")
+                    + "ORDER BY m.id ASC",
+                    (plat,) if use_plat else (),
+                ).fetchall()
+                for dr in detail_rows:
+                    detail_by_phone.setdefault(str(dr["phone"]), []).append(
+                        f"{dr['role_name']}（{dr['platform']}）")
+                for item in out:
+                    parts = detail_by_phone.get(item["phone"]) or []
+                    item["role_detail"] = "、".join(parts)
         return out
 
     def _pool_require_phone(self, phone: str, platform: Optional[str] = None) -> str:
