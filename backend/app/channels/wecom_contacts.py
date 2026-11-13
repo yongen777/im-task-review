@@ -20,8 +20,9 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
+from .contacts_cache import TtlCache
 from .wecom import WecomClient
 from .wecom_mcp import WecomMcpContacts
 
@@ -47,10 +48,57 @@ class WecomContacts:
         self.client = client or WecomClient(self.corpid, agentid, self.secret)
         apikey = str(getattr(cfg, "wecom_mcp_apikey", "") or "").strip()
         self.mcp = mcp or (WecomMcpContacts(apikey) if apikey else None)
+        # 2026-11-13 用户需求一 ·1：同 zdxlz，手机号严格反查结果短期 TTL 缓存
+        self._phone_cache = TtlCache()
 
     def is_configured(self) -> bool:
         """反查是否具备最小凭证（自建应用 corpid+secret，或 MCP apikey）。"""
         return bool((self.corpid and self.secret) or self.mcp is not None)
+
+    def cache_clear(self) -> None:
+        """清空手机号查询缓存（运维/测试用）。"""
+        self._phone_cache.clear()
+
+    def supports_strict_phone_verify(self) -> bool:
+        """是否具备「手机号精确反查」能力（getuserid 需要自建应用 corpid+secret）。
+
+        仅 MCP（apikey，无自建应用凭证）时**不具备**——MCP 只能按姓名搜，无法用手机号
+        做严格核验（2026-11-10 实测定档）。此时上层按降级处理，保持旧 fail-open。
+        """
+        return bool(self.corpid and self.secret)
+
+    def resolve_user_strict(self, phone: str, name: str = "",
+                            dept: str = "") -> Tuple[str, Optional[Dict[str, Any]]]:
+        """2026-11-13 严格版手机号反查（导入/加人实名校验专用）。
+
+        返回：
+          · ("ok", user)  → 官方通讯录有此人（getuserid 成功）；
+          · ("ok", None)  → **确定查无此人**（40003/60111，进缓存）；
+          · ("error", None) → 查询失败（60011 无权限/网络异常，**不进缓存**）。
+        调用方应先用 supports_strict_phone_verify() 判定；未具备凭证时本方法也按
+        ("error", None) 返回，绝不误报「不存在」。
+        命中/查无结果走 TTL 内存缓存（getuserid 不带部门信息 → department/dept_path 留空）。
+        """
+        del name, dept  # getuserid 口径：只按手机号精确反查，姓名/部门不参与
+        clean = str(phone or "").strip()
+        if not clean:
+            return ("error", None)
+        if not self.supports_strict_phone_verify():
+            return ("error", None)
+        cached = self._phone_cache.get(clean)
+        if cached is not None:
+            return cached
+        try:
+            status, uid = self.client.get_userid_by_mobile_strict(clean)
+        except Exception as exc:  # noqa: BLE001 - fail-open：异常按查询失败处理
+            logger.warning("企微严格反查异常 phone=%s: %s", _mask(clean), _mask(str(exc))[:160])
+            return ("error", None)
+        if status != "ok":
+            return ("error", None)
+        result: Tuple[str, Optional[Dict[str, Any]]] = (
+            "ok", {"external_id": uid, "department": "", "dept_path": ""} if uid else None)
+        self._phone_cache.set(clean, result)
+        return result
 
     def resolve_userid(self, phone: str, name: str = "", dept: str = "") -> Optional[str]:
         """名册成员 → 企微 userid。查不到/无凭证/异常 → None，绝不抛异常。"""

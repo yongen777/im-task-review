@@ -51,7 +51,7 @@ const ERROR_CODE_DICT: Record<string, string> = {
   MEMBER_NAME_REQUIRED: '请填写成员姓名，姓名不能为空。',
   MEMBER_NOT_FOUND: '在该角色下未找到此手机号对应的成员，请刷新列表后再试。',
   CSV_EMPTY: '导入内容为空，请粘贴或选择包含「手机号,姓名」的 CSV 数据。',
-  CSV_TOO_LARGE: '单次导入数据量过大，请分批导入（每次不超过 2000 行）。',
+  CSV_TOO_LARGE: '单次导入数据量过大，请分批导入（每次不超过 5000 行）。',
 
   // 任务实例与审核相关
   STATUS_FILTER_INVALID: '状态筛选条件无效，请重新选择筛选状态。',

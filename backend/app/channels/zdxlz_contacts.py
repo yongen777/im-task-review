@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from .contacts_cache import TtlCache
 from .zdxlz_crypto import ResponseCryptoError, decrypt_response_json
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,9 @@ class ZdxlzContacts:
         self.cfg = cfg
         self.channel = channel  # 复用其 get_access_token（应用级 token，线程安全）
         self._client = http_client or (httpx.Client(timeout=12.0) if httpx is not None else None)
+        # 2026-11-13 用户需求一 ·1：手机号查询结果短期缓存（默认 600s，IMT_CONTACTS_CACHE_TTL 可调）。
+        # 2600 人导入时「严格核验 + 导入即激活」两条路径共用同一份反查结果，避免重复网络往返。
+        self._phone_cache = TtlCache()
 
     # ── 内部 ────────────────────────────────────────────────────────
     def _call(self, path: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -111,18 +115,47 @@ class ZdxlzContacts:
         }
 
     # ── 对外 ────────────────────────────────────────────────────────
-    def search_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
-        """按手机号精确查用户（官方 search 的 phone 参数已实测可用）。"""
+    def cache_clear(self) -> None:
+        """清空手机号查询缓存（运维/测试用；生产排查「刚入职查不到」时可调）。"""
+        self._phone_cache.clear()
+
+    def search_by_phone_strict(self, phone: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """2026-11-13 严格版手机号反查（导入/加人实名校验专用）。
+
+        返回：
+          · ("ok", user)  → 官方通讯录有此人；
+          · ("ok", None)  → **查询成功但查无此人**（确定性结论，进缓存）；
+          · ("error", None) → 查询失败（token/网络/接口错误/解密失败，**不进缓存**，
+            调用方必须按「查询失败」处理，绝不能当成「不存在」）。
+        命中/查无结果走 TTL 内存缓存；同一手机号 TTL 内只打一次官方接口。
+        """
         clean = str(phone or "").strip()
         if not clean:
-            return None
+            return ("ok", None)
+        cached = self._phone_cache.get(clean)
+        if cached is not None:
+            return cached
         obj = self._call("/open/v2/user/search", {"phone": clean})
-        if not obj:
-            return None
+        if obj is None:
+            # 失败与「查无」必须可区分：导入/加人的拦截文案依赖这个区分
+            return ("error", None)
+        user: Optional[Dict[str, Any]] = None
         for row in obj.get("users") or []:
             if str(row.get("phone") or "").strip() == clean:
-                return self._pick_user(row)
-        return None
+                user = self._pick_user(row)
+                break
+        result: Tuple[str, Optional[Dict[str, Any]]] = ("ok", user)
+        self._phone_cache.set(clean, result)
+        return result
+
+    def search_by_phone(self, phone: str) -> Optional[Dict[str, Any]]:
+        """按手机号精确查用户（官方 search 的 phone 参数已实测可用）。
+
+        2026-11-13 起内部走 search_by_phone_strict + 缓存，签名/语义保持不变
+        （查不到/失败均返回 None，历史调用方零改动）。
+        """
+        status, user = self.search_by_phone_strict(phone)
+        return user if status == "ok" else None
 
     def search_by_name(self, name: str) -> List[Dict[str, Any]]:
         clean = str(name or "").strip()

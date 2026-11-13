@@ -388,11 +388,13 @@ def test_d_push_now_permission_matrix_and_delivery() -> None:
                 (notice_id,)).fetchone()[0] == 0
 
         # 属主推送：2 名已激活成员 → 各一条，实例状态仍 pending
+        # 2026-11-13 修复一：接口改为「请求内建实例 + 后台投递」，立即返回 queued；
+        # 后台投递在 TestClient 完整响应周期内完成，消息数断言不变。
         CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 0)
         r = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
         assert r.status_code == 200, r.text
-        stats = r.json()["stats"]
-        assert stats["sent"] == 2 and stats["pushed_instances"] == 2, stats
+        body = r.json()
+        assert body.get("queued") is True and body.get("instance_count") == 2, body
         assert len(ntf.sent_messages) == 2
         insts = store.list_instances_for_period(tpl_id, "2026-11-12")
         assert [i["status"] for i in insts] == ["pending", "pending"]

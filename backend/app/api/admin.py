@@ -2,6 +2,7 @@
 """后台管理 API（§9.1 会话 / §9.2 模板 / §9.3 角色成员 / §9.4 实例与审核 / §9.5 日志 / §9.6 统计与导出 + v1.2 §16 P2 守卫）。"""
 from __future__ import annotations
 
+import asyncio
 import base64
 import concurrent.futures
 import csv
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from ..channel_config import (
@@ -1213,7 +1214,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # 权限：仅分级管理员；超管 SUPER_ADMIN_READONLY 不放行（路径不在写白名单，middleware 先拦，
     # 这里再拦一层防御）；模板归属由 middleware 的 /templates/{id} 路径归属校验兜住。
     @router.post("/templates/{template_id}/push-now")
-    async def push_template_now(template_id: str, request: Request):
+    async def push_template_now(template_id: str, request: Request, background_tasks: BackgroundTasks):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1251,19 +1252,54 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             )
             return error_response(503, "PUSH_UNAVAILABLE", "调度器未就绪，请稍后重试")
 
+        # 2026-11-13 修复一（2600 人推送防卡死）：请求内只做「权限/形态校验 + 冷却占位 +
+        # 当期实例生成」（毫秒~秒级，asyncio.to_thread 移出事件循环）；实际投递
+        # （8 线程 × 25QPS ≈ 107s）交给后台线程，立即返回 200 —— 浏览器/反代 60s 超时红线内，
+        # 投递期间 H5 提交、后台查询、调度器 tick 全部不受影响。
         try:
-            stats = scheduler.push_now(template_id, actor=sess["username"])
+            prep = await asyncio.to_thread(
+                scheduler.push_now_prepare, template_id, actor=sess["username"])
         except BizError as exc:
             return biz_error_response(exc)
         except Exception:  # noqa: BLE001
-            logger.exception("push_now 执行异常 template=%s", template_id)
-            return error_response(500, "PUSH_FAILED", "推送执行异常，请稍后重试")
+            logger.exception("push_now prepare 异常 template=%s", template_id)
+            return error_response(500, "PUSH_FAILED", "推送准备阶段异常，请稍后重试")
 
+        def _bg_deliver() -> None:
+            """后台投递（线程池执行，事件循环零阻塞）；成功/异常都留痕，绝不向响应传播。"""
+            try:
+                stats = scheduler.push_now_deliver(template_id, prep, actor=sess["username"])
+            except Exception as exc:  # noqa: BLE001 - 后台任务异常只留痕，不炸进程
+                logger.exception("push_now 后台投递异常 template=%s", template_id)
+                try:
+                    state.record_reminder_log(
+                        template_id=template_id, instance_id=None, phone=sess["username"],
+                        kind="manual_push", planned_at=guard["attempted_at"],
+                        attempted_at=guard["attempted_at"], sent_at=None, result="failed",
+                        error=f"BACKGROUND_PUSH_FAILED:{str(exc)[:100]}", retry=0,
+                        idem_key=f"push_bg_failed|{template_id}|{guard['attempted_at']}",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("push_now 后台失败留痕异常 template=%s", template_id)
+                return
+            state.write_audit(
+                username=sess["username"], action="template.push_now", target_type="task_template",
+                target_id=template_id, detail={"pushed_at": guard["attempted_at"], "stats": stats},
+            )
+
+        background_tasks.add_task(_bg_deliver)
+        # 受理审计（与完成审计同 action；detail.phase='dispatch' 区分，完成后另有一条带 stats）
         state.write_audit(
             username=sess["username"], action="template.push_now", target_type="task_template",
-            target_id=template_id, detail={"pushed_at": guard["attempted_at"], "stats": stats},
+            target_id=template_id,
+            detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
+                    "period_key": prep["period_key"], "instance_count": prep["instance_count"]},
         )
-        return {"ok": True, "pushed_at": guard["attempted_at"], "stats": stats}
+        return {
+            "ok": True, "queued": True, "pushed_at": guard["attempted_at"],
+            "period_key": prep["period_key"], "deadline_at": prep["deadline_at"],
+            "instance_count": prep["instance_count"],
+        }
 
     # ==================================================================
     # 2026-11-03 部门选项（后台配置；成员表单与 H5 登记页共用）
@@ -1728,7 +1764,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         dry_run = bool(body.get("dry_run", True))
         _admin = _admin_profile(state, sess)
         try:
-            res = state.import_role_members(
+            # 2026-11-13：2600 人导入含通讯录核验（16 线程，几十秒级）→ 必须移出事件循环，
+            # 否则核验期间 H5 提交/后台查询全部排队（调度器 tick 也会受影响）。
+            res = await asyncio.to_thread(
+                state.import_role_members,
                 role_id=role_id,
                 csv_rows=csv_rows,  # type: ignore[arg-type]
                 dry_run=dry_run,
@@ -1923,8 +1962,8 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             selected = body.get("selected_users")
             if not isinstance(selected, list) or not selected:
                 return error_response(400, "VALIDATION_FAILED", "请选择成员或指定部门")
-            if len(selected) > 500:
-                return error_response(400, "VALIDATION_FAILED", "单次最多导入 500 人（超出请分批）")
+            if len(selected) > 5000:
+                return error_response(400, "VALIDATION_FAILED", "单次最多导入 5000 人（超出请分批）")
             users = selected  # type: ignore[assignment]
             if not isinstance(users, list) or not all(isinstance(u, dict) for u in users):
                 return error_response(400, "VALIDATION_FAILED", "selected_users 必须是对象数组")

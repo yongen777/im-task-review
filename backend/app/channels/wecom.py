@@ -23,7 +23,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 try:  # httpx 与其它通道保持一致；测试可注入假 client
     import httpx
@@ -275,6 +275,10 @@ class WecomClient:
         return out
 
     # ── 网页授权（P3 预留）─────────────────────────────────────────
+    # 手机号对应用户「确定不存在」的官方错误码（沿用 2026-11-10 实测注释：40003/60111）。
+    # 其余错误码（60011 无通讯录权限等）一律按「查询失败」处理，绝不可当作「不存在」。
+    GETUSERID_NOT_FOUND_CODES = {40003, 60111}
+
     def get_userid_by_mobile(self, mobile: str) -> Optional[str]:
         """手机号反查成员 userid（官方文档 95402：POST /cgi-bin/user/getuserid）。
 
@@ -286,9 +290,23 @@ class WecomClient:
         返回 None = 查不到 / 无权限 / 网络异常（调用方按 fail-open 降级，绝不抛异常拖垮导入）。
         ⚠️ access_token 与 aibot 长连接凭证**互不相干**：本方法只走 HTTP，绝不触碰长连接。
         """
+        status, userid = self.get_userid_by_mobile_strict(mobile)
+        return userid if status == "ok" else None
+
+    def get_userid_by_mobile_strict(self, mobile: str) -> Tuple[str, Optional[str]]:
+        """2026-11-13 严格版手机号反查（导入/加人实名校验专用）。
+
+        返回：
+          · ("ok", userid)  → 官方通讯录有此人；
+          · ("ok", None)    → **确定查无此人**（40003/60111：手机号无对应用户/不在可见范围）；
+          · ("error", None) → 查询失败（60011 无权限 / token 失效 / 网络异常）。
+
+        ⛔ 调用方绝不可把 ("error", None) 当成「不存在」——否则一次权限/网络故障
+        会把整批成员误判为「手机号不存在」。
+        """
         clean = (mobile or "").strip()
         if not clean:
-            return None
+            return ("error", None)
         try:
             data = self._request(
                 "POST",
@@ -308,14 +326,18 @@ class WecomClient:
                 errcode = int(data.get("errcode") or 0)
         except WecomError as exc:
             logger.warning("user/getuserid 调用失败 errcode=%s: %s", exc.errcode, exc.errmsg[:120])
-            return None
+            return ("error", None)
         if errcode != 0:
-            # 60011=应用无通讯录权限；40003/60111=手机号对应用户不存在/不在可见范围
+            masked = clean[:3] + "****" + clean[7:]
+            if errcode in self.GETUSERID_NOT_FOUND_CODES:
+                logger.warning("user/getuserid 查无此人手机号=%s: %s %s",
+                               masked, errcode, str(data.get("errmsg") or "")[:120])
+                return ("ok", None)
             logger.warning("user/getuserid 失败手机号=%s: %s %s",
-                           clean[:3] + "****" + clean[7:], errcode, str(data.get("errmsg") or "")[:120])
-            return None
+                           masked, errcode, str(data.get("errmsg") or "")[:120])
+            return ("error", None)
         userid = str(data.get("userid") or "").strip()
-        return userid or None
+        return ("ok", userid or None)
 
     def get_userid_by_code(self, code: str) -> Optional[str]:
         """用 OAuth2 的 code 换成员 userid（静默授权，不弹窗）。

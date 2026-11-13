@@ -935,6 +935,14 @@ export const RolesMembersView: React.FC = () => {
       // 现在本地把 CSV 文本解析成行数组再提交。
       // 2026-11-12 A1：两列「姓名,手机号」自动识别列序；第 3 列等本地错误直接拦截，不提交后端。
       const { rows, errors } = parseCsvRows(csvText);
+      // 2026-11-13：行数上限与后端 IMPORT_ROW_LIMIT=5000 对齐——超限本地直接拦截，不发大请求
+      if (rows.length > 5000) {
+        toast.error(
+          `单次最多导入 5000 人（当前 ${rows.length} 行），请分批导入。`,
+          '导入被拦截',
+        );
+        return;
+      }
       if (errors.length > 0) {
         // 与后端整批拦截同一交互：列出全部问题行、不关窗、一行都不写入
         setImportErrors(errors);

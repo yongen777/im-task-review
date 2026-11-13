@@ -6,12 +6,13 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import NowFn, default_now, format_dt, parse_dt
 from .db import Database
@@ -105,6 +106,45 @@ def is_valid_phone(phone: str) -> bool:
 def mask_phone(phone: str) -> str:
     s = (phone or "").strip()
     return f"{s[:3]}****{s[-4:]}" if len(s) == 11 else s
+
+
+# ── 2026-11-13 用户需求一：严格实名校验导入（2600 人真实导入前拍板） ────────
+# · 行数硬上限从 500 上调到 5000；
+# · 批量实名校验并发从 4 提升到 16（IMT_CONTACTS_VERIFY_THREADS，夹紧 1~64）；
+# · 通讯录手机号查询短期 TTL 缓存（600s，见 channels/contacts_cache.py）；
+# · 单人加成员与 CSV 批量导入在写库前先官方通讯录核验（手机号存在 + 姓名一致）；
+# · CSV 批量按行序扫，第一处实名错误立即中断，整批零写入（严格原子性）。
+IMPORT_ROW_LIMIT = 5000
+
+_NAME_PAREN_SUFFIX_RE = re.compile(r"[（(][^（）()]*[）)]\s*$")
+
+
+def contacts_verify_threads() -> int:
+    """通讯录批量核验并发线程数（默认 16，环境变量 IMT_CONTACTS_VERIFY_THREADS 可调，夹紧 1~64）。"""
+    try:
+        return max(1, min(64, int(float(os.environ.get("IMT_CONTACTS_VERIFY_THREADS", "") or 16))))
+    except (TypeError, ValueError):
+        return 16
+
+
+def clean_name_for_match(name: Any) -> str:
+    """姓名归一化（实名校验比对用）：去空白 + 剥「（德阳云中台）」类括号后缀（可叠加多层）
+    + 剥「_德阳市」类下划线后缀，只留纯姓名。
+
+    官方通讯录姓名常带部门展示后缀（如 `林波（德阳云中台）`、`简睿骁_德阳市`），
+    名册里管理员输入的则是纯姓名——比对前两侧都按本函数清洗。
+    与 channels/wecom_mcp.normalize_name 同规则；此处独立实现，避免数据层
+    （state.py）反向依赖具体通道模块。
+    """
+    out = str(name or "").strip()
+    while True:
+        stripped = _NAME_PAREN_SUFFIX_RE.sub("", out).strip()
+        if stripped == out:
+            break
+        out = stripped
+    if "_" in out:
+        out = out.split("_", 1)[0].strip()
+    return out
 
 
 def is_valid_hhmm(value: str) -> bool:
@@ -1651,10 +1691,87 @@ class StateStore:
             for r in rows
         ]
 
+    # ── 2026-11-13 用户需求一：严格实名校验（单人添加 / CSV 批量导入共用） ──────
+    def _strict_contacts_lookup(self, platform: str) -> Optional[Callable[[str, str, str], Tuple[str, Optional[Dict[str, Any]]]]]:
+        """当前平台「严格手机号核验」函数；None = 该平台不具备严格核验能力（降级）。
+
+        入参 (phone, name, dept)，返回：
+          ("ok", 官方用户 dict) | ("ok", None)=**确定查无此人** | ("error", None)=查询失败。
+
+        降级条件（沿用 2026-11-10/11 的 fail-open 约定，绝不误伤存量流程）：
+          · zdxlz：contacts 未装配，或客户端未实现 search_by_phone_strict（测试假件/旧装配）；
+          · wecom：wecom_contacts 未装配 / 未实现 resolve_user_strict / 无自建应用凭证
+            （仅 MCP 时只能按姓名搜，无法用手机号做严格核验）。
+        """
+        plat = (platform or "").strip().lower()
+        if plat == "zdxlz":
+            resolver = getattr(self, "contacts", None)
+            strict = getattr(resolver, "search_by_phone_strict", None) if resolver is not None else None
+            if strict is None:
+                return None
+            return lambda phone, name, dept: strict(phone)
+        if plat == "wecom":
+            resolver = getattr(self, "wecom_contacts", None)
+            strict = getattr(resolver, "resolve_user_strict", None) if resolver is not None else None
+            if strict is None:
+                return None
+            supports = getattr(resolver, "supports_strict_phone_verify", None)
+            if supports is not None and not supports():
+                return None
+            return lambda phone, name, dept: strict(phone, name, dept)
+        return None
+
+    def _contacts_verify_batch(self, phones: List[str], platform: str) -> Optional[Dict[str, Tuple[str, Optional[Dict[str, Any]]]]]:
+        """批量实名校验（16 线程并发 + 客户端 TTL 缓存）；None = 平台不支持严格核验。
+
+        返回 {phone: ("ok", user|None) | ("error", None)}（按手机号去重）。
+        ⚠️ 本方法只做**只读**网络查询，不写库、不持 self.lock —— 2600 人核验期间
+        调度器（30s tick）与后台其它请求不受影响（导入写库在后续独立事务内完成）。
+        """
+        lookup = self._strict_contacts_lookup(platform)
+        if lookup is None:
+            return None
+        unique: List[str] = []
+        seen: set = set()
+        for phone in phones or []:
+            p = str(phone or "").strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            unique.append(p)
+        if not unique:
+            return {}
+
+        def _one(phone: str) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+            try:
+                status, user = lookup(phone, "", "")
+            except Exception:  # noqa: BLE001 - 任何异常按查询失败处理，绝不混入「不存在」
+                status, user = "error", None
+            return phone, status, user
+
+        workers = max(1, min(contacts_verify_threads(), len(unique)))
+        if workers == 1:
+            outcomes = [_one(p) for p in unique]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                outcomes = list(pool.map(_one, unique))
+        return {phone: (status, user) for phone, status, user in outcomes}
+
     def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
-        """2026-11-11 用户拍板：快速添加**只收姓名+手机号**，部门由官方通讯录反查回填
+        """添加单个角色成员（管理员「快速添加」= 姓名 + 手机号）。
+
+        2026-11-13 用户需求一 ·2（写库前严格实名核验，非匹配即拦截、零写入）：
+          ① 手机号在官方通讯录查不到 → 手机号 {phone} 不存在，请确定手机号是否正确；
+          ② 官方姓名（剥「（部门）」/「_部门」后缀后）与输入不一致 → {姓名} 姓名不正确，请核对后重试；
+          ③ 官方通讯录查询失败 → 按查询失败拦截（绝不当作不存在/不符）；
+          ④ 核验通过的查询结果**一次查询三处复用**：核验 / 部门回填（member.dept、dept_path）/
+             激活绑定（不再像旧实现那样二次反查同一手机号）。
+
+        2026-11-11 拍板口径保留：快速添加**只收姓名+手机号**，部门由官方通讯录反查回填
         （末级部门进 dept 展示列、全路径进 dept_path 供层级统计归集）；
-        显式传 dept 的旧调用方仍兼容（dept_path 反查补全）。"""
+        显式传 dept 的旧调用方仍兼容（dept_path 反查补全）。
+        resolver 无严格核验能力（降级环境/企微仅 MCP）时保持旧行为（不拦截）。
+        """
         clean_role_id, clean_phone, clean_name = (role_id or "").strip(), (phone or "").strip(), (name or "").strip()
         clean_dept = str(dept).strip() if dept is not None and str(dept).strip() else None
         clean_path: Optional[str] = None
@@ -1662,20 +1779,43 @@ class StateStore:
             raise BizError(400, "PHONE_INVALID", "手机号格式不正确")
         if not clean_name:
             raise BizError(400, "VALIDATION_FAILED", "姓名不能为空")
-        now_s = self.now_str()
-        # 2026-11-11：官方通讯录反查官方部门（锁外做网络查询）——只在调用方没给部门时反查
+        # 角色必须存在：优先 404（不能被通讯录核验文案盖掉）
         _role_plat_pre = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
-        _plat_key_pre = str((_role_plat_pre["platform"] if _role_plat_pre else "") or self.platform).lower()
-        if clean_dept is None and _plat_key_pre == "zdxlz":
+        if _role_plat_pre is None:
+            raise BizError(404, "NOT_FOUND", "角色不存在")
+        _plat_key_pre = str(_role_plat_pre["platform"] or self.platform).strip().lower()
+        # ── 严格核验（锁外网络查询；失败/查无/不符都不写库） ──
+        resolved_user: Optional[Dict[str, Any]] = None
+        strict_lookup = self._strict_contacts_lookup(_plat_key_pre)
+        if strict_lookup is not None:
+            try:
+                _status, _user = strict_lookup(clean_phone, clean_name, clean_dept or "")
+            except Exception:  # noqa: BLE001 - 反查异常按查询失败拦截，绝不误报手机号不存在
+                _status, _user = "error", None
+            if _status != "ok":
+                raise BizError(503, "CONTACTS_QUERY_FAILED", "官方通讯录查询失败，请稍后重试")
+            if _user is None:
+                raise BizError(400, "PHONE_NOT_IN_CONTACTS", f"手机号 {clean_phone} 不存在，请确定手机号是否正确")
+            if _user.get("name") is not None and clean_name_for_match(_user.get("name")) != clean_name_for_match(clean_name):
+                raise BizError(400, "NAME_MISMATCH", f"{clean_name} 姓名不正确，请核对后重试")
+            resolved_user = _user
+            if clean_dept is None:
+                clean_dept = str(resolved_user.get("department") or "").strip() or None
+                clean_path = str(resolved_user.get("dept_path") or "").strip() or None
+        elif clean_dept is None and _plat_key_pre == "zdxlz":
+            # 降级（无严格核验能力）：保留 2026-11-11 旧口径 —— 反查官方部门回填，
+            # 查不到/失败不阻塞加人；反查到的结果同样复用给激活绑定（避免二次查询）。
             zdxlz_c = getattr(self, "contacts", None)
             if zdxlz_c is not None:
                 try:
                     _u = zdxlz_c.search_by_phone(clean_phone)
-                except Exception:  # noqa: BLE001 - 反查失败不阻塞加人
+                except Exception:  # noqa: BLE001
                     _u = None
                 if _u:
+                    resolved_user = _u
                     clean_dept = str(_u.get("department") or "").strip() or None
                     clean_path = str(_u.get("dept_path") or "").strip() or None
+        now_s = self.now_str()
         with self.lock, self.conn:
             if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
                 raise BizError(404, "NOT_FOUND", "角色不存在")
@@ -1690,8 +1830,11 @@ class StateStore:
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "dept_path": clean_path, "source": source}, now_s)
             member = _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
 
-        # 2026-11-10 方案A：单个加人也自动激活（zdxlz/企微均适用；查不到/未装配时静默跳过）
-        self._auto_activate_imported([(clean_phone, clean_name, clean_dept, clean_path)], platform=_plat_key, actor=actor)
+        # 2026-11-10 方案A：单个加人也自动激活（zdxlz/企微均适用；查不到/未装配时静默跳过）。
+        # 2026-11-13：复用上面核验查询到的官方用户（pre_resolved），不再二次反查同一手机号。
+        self._auto_activate_imported(
+            [(clean_phone, clean_name, clean_dept, clean_path)], platform=_plat_key, actor=actor,
+            pre_resolved={clean_phone: resolved_user} if resolved_user is not None else None)
         return member
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
@@ -1868,12 +2011,25 @@ class StateStore:
            写库时**同步到全局池**（该号在所有管理员名下的行一起改）
         ③ **允许重名** —— 判据是手机号唯一，不是姓名唯一
 
+        2026-11-13 用户口径（2600 人真实导入前，严格实名 + 原子性）：
+        ④ 行数上限 5000（IMPORT_ROW_LIMIT，超出直接拒绝，不再有 500 行限制）；
+        ⑤ 格式校验全过后，用官方通讯录**逐行严格核验**（手机号存在 + 姓名一致，
+           16 线程并发 + TTL 缓存）；**按传入顺序**扫，第一处错误立即中断，整批 0 写入；
+        ⑥ 全部 100% 通过才在同一事务内一次性入册并激活（前面通过的行也绝不提前写库）；
+        ⑦ 查询失败（网络/凭证/权限）按「查询失败」中断，绝不当作「不存在」；
+        ⑧ 核验结果复用给激活（pre_resolved），每个手机号只打一次通讯录接口。
+
         sync_global_profile=False 时不做全局同步（只在本组建行）。
         """
         clean_role_id = (role_id or "").strip()
         if not isinstance(csv_rows, list):
             raise BizError(400, "VALIDATION_FAILED", "csv_rows 必须是数组")
+        if len(csv_rows) > IMPORT_ROW_LIMIT:
+            raise BizError(400, "CSV_TOO_LARGE", f"单次最多导入 {IMPORT_ROW_LIMIT} 人（超出请分批）")
         now_s = self.now_str()
+
+        # ── 阶段一（锁内，纯 DB 读 + 格式校验）：收集待写行；格式/重复类错误整批拦截 ──
+        # 网络核验放到阶段二（锁外）——不能在持锁事务里跑 2600 次查询，否则调度器 30s tick 被堵死。
         with self.lock, self.conn:
             # 2026-11-10 方案A：顺带取角色平台（导入即激活只对 zdxlz 生效）
             role_row = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
@@ -1965,6 +2121,35 @@ class StateStore:
                 will_add += 1
                 to_insert.append((row_num, phone, name, dept))
 
+            # ── 阶段二（锁外，只读网络）：官方通讯录严格实名核验（16 线程 + TTL 缓存）──
+        # 只查不写、不持锁；2600 人核验期间调度器与其它后台请求不受影响。
+        # 严格按传入顺序扫，第一处错误立即中断（后面的行不再提示）。
+        verified: Dict[str, Dict[str, Any]] = {}
+        verification_skipped = False
+        if not invalid:
+            lookup = self._contacts_verify_batch([row[1] for row in to_insert], role_platform)
+            if lookup is None:
+                verification_skipped = True  # 降级环境 / 企微仅 MCP：保持旧 fail-open 行为
+            else:
+                for row_no, phone, name, dept in to_insert:
+                    status, user = lookup.get(phone, ("error", None))
+                    if status != "ok":
+                        invalid.append({"row": row_no, "phone": "",
+                                        "reason": "官方通讯录查询失败，请稍后重试（本次导入已取消，未写入任何数据）"})
+                        break
+                    if user is None:
+                        invalid.append({"row": row_no, "phone": "",
+                                        "reason": f"{phone} 不存在，请确定手机号是否正确（本次导入已取消，未写入任何数据）"})
+                        break
+                    official_name = user.get("name")
+                    if official_name is not None and clean_name_for_match(official_name) != clean_name_for_match(name):
+                        invalid.append({"row": row_no, "phone": "",
+                                        "reason": f"{name}（{phone}）姓名不正确（本次导入已取消，未写入任何数据）"})
+                        break
+                    verified[phone] = user
+
+        # ── 阶段三（锁内，单事务）：部门自动建档 + 全量写入 + 全局同步；blocked 一律回滚 ──
+        with self.lock, self.conn:
             # 部门自动建档：本次导入用到的、部门管理里还没有的部门，导入时一并建好。
             dept_cache: Dict[str, bool] = {}
             created_depts: List[str] = []
@@ -1996,25 +2181,21 @@ class StateStore:
                         )
                 created_depts.append(_dept)
 
-            # 2026-11-09 用户口径：「待修复后才全量导入成功」——
-            # 只要有错误行（重复/冲突/格式错），**整批不写入**，把全部错误行返回给用户。
-            # 无错误时才写入，并按需同步全局池的姓名/部门。
+            # 2026-11-09 用户口径 + 2026-11-13 严格原子：只要有错误行（格式/重复/实名不符），
+            # **整批不写入**；全部 100% 通过才在同一事务内写入并按需同步全局池。
             synced_global_rows = 0
             blocked = bool(invalid)
             if not dry_run and not blocked:
-                # 长度等校验已在收集阶段完成，这里不再重复判
-                insert_rows: List[Tuple[int, str, str, Optional[str]]] = list(to_insert)
-                if invalid:
-                    blocked = True
-                else:
-                    for _row_no, phone, name, dept in insert_rows:
+                try:
+                    for _row_no, phone, name, dept in to_insert:
                         self.conn.execute(
                             "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) "
                             "VALUES (?, ?, ?, ?, 1, 'import', ?, ?)",
                             (clean_role_id, phone, name, dept, now_s, int(owner_id)),
                         )
-                        # 2026-11-11：CSV/导入路径的部门由反查回填 dept_path（_auto_activate_imported 负责）
-                    will_add = len(insert_rows)
+                        # 2026-11-11：CSV/导入路径的 dept_path 由阶段二核验结果回填
+                        # （_auto_activate_imported 负责，pre_resolved 复用同一份查询结果）
+                    will_add = len(to_insert)
                     # 2026-11-09：把该号在**所有**管理员名下的行同步成这次的姓名/部门（全局池）
                     if sync_global_profile:
                         for upd in global_profile_updates:
@@ -2034,9 +2215,14 @@ class StateStore:
                     self._insert_audit_unlocked(
                         actor, "member.import", "role", clean_role_id,
                         {"will_add": will_add, "already_exists": already_exists, "invalid_count": len(invalid),
-                         "departments_created": created_depts, "synced_global_rows": synced_global_rows},
+                         "departments_created": created_depts, "synced_global_rows": synced_global_rows,
+                         "contacts_verified": len(verified), "verification_skipped": verification_skipped},
                         now_s,
                     )
+                except sqlite3.IntegrityError:
+                    # 阶段一→阶段三之间名册被并发修改（同手机号被别的请求先加进来）。
+                    # 事务上下文会整体回滚 → 严格保持「要么全写入，要么一条都不写」。
+                    raise BizError(409, "DUPLICATE", "导入过程中名册已发生变化（手机号冲突），本次导入已全部取消，请重试")
 
             if blocked:
                 # 整批拒绝：will_add 归零（没有任何一行被写入）
@@ -2050,25 +2236,32 @@ class StateStore:
                       "invalid": invalid, "departments_created": created_depts,
                       "blocked": blocked,
                       "synced_global_rows": synced_global_rows,
-                      "global_profile_updates": global_profile_updates}
+                      "global_profile_updates": global_profile_updates,
+                      "contacts_verified": len(verified),
+                      "verification_skipped": verification_skipped}
             # 2026-11-10 方案A：本批真实写入的成员（事务提交后再做通讯录解析，不持锁跑网络）
             imported_members = (
                 [(str(row[1]).strip(), str(row[2]).strip(), row[3], None) for row in to_insert]
                 if (not dry_run and not blocked) else []
             )
 
-        # ── 导入即激活：事务外把名册成员反查成平台 id 并写绑定（fail-open，不影响导入结果）──
+        # ── 导入即激活：事务外写绑定（fail-open）；2026-11-13 复用阶段二核验结果，通常零额外查询 ──
         result["auto_activation"] = self._auto_activate_imported(
-            imported_members, platform=role_platform, actor=actor, role_id=clean_role_id)
+            imported_members, platform=role_platform, actor=actor, role_id=clean_role_id,
+            pre_resolved=verified if verified else None)
         return result
 
     def _auto_activate_imported(self, members: List[Tuple[str, str, str, Optional[str]]],
                                 platform: str = "zdxlz", actor: str = "system",
-                                role_id: Optional[str] = None) -> Dict[str, Any]:
+                                role_id: Optional[str] = None,
+                                pre_resolved: Optional[Dict[str, Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
         """2026-11-10 方案A：导入即激活 —— 用官方通讯录把名册成员反查成平台 id 并落绑定。
 
         入参 members：[(phone, name, dept, dept_path), ...]
         （zdxlz 只用手机号；企微 MCP 需要 姓名+部门；dept_path 可空，反查成功会回填）。
+
+        2026-11-13：pre_resolved = 本轮严格实名校验已查到的官方用户 {phone: user|None}；
+        命中则直接复用（不再二次打接口），手机号在导入流程里只查一次。
 
         平台分发（两通道镜像对接，用户 2026-11-10 拍板）：
           · zdxlz → self.contacts.search_by_phone（官方响应 decryptV2 解密后取 union_id，
@@ -2137,12 +2330,21 @@ class StateStore:
 
         def _resolve(item: Tuple[str, str, str, Optional[str]]):
             phone, name, dept, path = item
+            # 2026-11-13：严格核验 / 旧部门回填已查过的结果直接复用，不再二次打接口
+            if pre_resolved is not None and phone in pre_resolved:
+                u = pre_resolved.get(phone) or {}
+                uid = str(u.get("union_id") or u.get("external_id") or "").strip() or None
+                leaf = str(u.get("department") or "").strip() or None
+                full = str(u.get("dept_path") or "").strip() or None
+                return phone, uid, leaf, full
             uid, leaf, full = _resolve_one(phone, name, dept, path)
             return phone, uid, leaf, full
 
         activated = failed = 0
         failed_phones: List[str] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        # 2026-11-13 用户需求一 ·1：批量核验/激活并发 4 → 16（IMT_CONTACTS_VERIFY_THREADS 可调）
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, min(contacts_verify_threads(), len(to_resolve)))) as pool:
             outcomes = list(pool.map(_resolve, to_resolve))
         for phone, uid, leaf, full in outcomes:
             if not uid:

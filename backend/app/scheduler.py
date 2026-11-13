@@ -890,6 +890,23 @@ class Scheduler:
           · 同一次调用内每 (phone,seq) 只发一次（_deliver_with_log 首试 retry=0）；
             发送失败留给 reminder_log 退避机制，不在本轮重试
           · 同模板冷却护栏在 state.check_manual_push_cooldown（API 层调用），本方法不重复判
+
+        2026-11-13 修复一（2600 人推送防卡死）：拆成 prepare（校验+当期实例生成）+
+        deliver（实际投递）两段；本方法 = 两段顺序执行，行为与历史完全一致（调度层直调、
+        既有用例零改动）。API 层改为「请求内 prepare + 后台线程 deliver」——25QPS 下
+        2600 人投递约 108 秒，绝不放进事件循环（否则 H5 白屏、网关 60s 超时）。
+        """
+        prep = self.push_now_prepare(template_id, actor=actor, now_dt=now_dt)
+        return self.push_now_deliver(template_id, prep, actor=actor)
+
+    def push_now_prepare(self, template_id: str, actor: str = "system",  # noqa: ARG002
+                         now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """2026-11-13 修复一：一键推送·准备段（校验 + 当期实例生成，**不发送任何消息**）。
+
+        返回 {template_id, pushed_at, period_key, deadline_at, instance_count}：
+          · pushed_at = 时间基线，也是幂等键种子——deliver 必须用它保持时间一致；
+          · 幂等键语义不变：同一个 prep 重放只会命中既有幂等记录，绝不二次发送。
+        本段只做毫秒~秒级 DB 操作，供 API 请求内安全执行（asyncio.to_thread）。
         """
         cur_dt = now_dt or self.now()
         if cur_dt.tzinfo is None:
@@ -904,12 +921,34 @@ class Scheduler:
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "不定期任务（菜单自选）不支持手动推送，成员通过【菜单】自主获取链接")
-
         p_key = period_key(tpl["period"], cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)
-
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
         self.state.ensure_template_instances(tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s)
+        instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
+        return {
+            "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
+            "deadline_at": deadline_at, "instance_count": len(instances),
+        }
+
+    def push_now_deliver(self, template_id: str, prep: Dict[str, Any],
+                         actor: str = "system") -> Dict[str, int]:  # noqa: ARG002
+        """2026-11-13 修复一：一键推送·投递段（后台线程执行，绝不占用事件循环）。
+
+        prep 来自 push_now_prepare；p_key/pushed_at 固定（重放同 prep → 幂等 0 新增）。
+        投递走 _deliver_batch_concurrent（8 线程 + 25QPS 桶 + 熔断）：2665 人 ≈ 107s，
+        这段在网络线程池里等待，调用方（后台线程）阻塞无妨，事件循环完全自由。
+        """
+        cur_dt = parse_dt(str(prep.get("pushed_at") or ""))
+        if cur_dt.tzinfo is None:
+            cur_dt = cur_dt.replace(tzinfo=SHANGHAI_TZ)
+        now_s = format_dt(cur_dt)
+        p_key = str(prep.get("period_key") or "")
+        tpl = self.state.get_template(template_id, include_deleted=False)
+        if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
+            raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
+        if tpl["kind"] == "notice":
+            raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
 
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}

@@ -974,18 +974,34 @@ export const TemplatesView: React.FC = () => {
   };
 
   /* 2026-11-12 任务D：一键推送确认动作——立即向当前「待提交」成员各发一条提醒
-     （与当期定时提醒互不影响、内容同版式；服务端另有 2 分钟冷却防手抖 + 审计）。 */
+     （与当期定时提醒互不影响、内容同版式；服务端另有 2 分钟冷却防手抖 + 审计）。
+     2026-11-13 修复一：2600 人推送改为「请求内建实例 + 后台投递」——接口立即返回 queued，
+     不再同步等待 108 秒（避免浏览器/网关超时与事件循环冻结）。 */
   const handleConfirmPush = async () => {
     if (!pushConfirmTpl) return;
     const target = pushConfirmTpl;
     setPushingId(target.id);
     try {
-      const res = await api.post(`/api/admin/templates/${target.id}/push-now`);
-      const stats = res?.stats || {};
-      toast.success(
-        `已向 ${stats.pushed_instances ?? 0} 名待提交成员推送提醒（发送成功 ${stats.sent ?? 0} 条）。`,
-        '一键推送完成',
-      );
+      const res = await api.post<{
+        queued?: boolean;
+        instance_count?: number;
+        pushed_at?: string;
+        deadline_at?: string;
+        stats?: { sent?: number; pushed_instances?: number };
+      }>(`/api/admin/templates/${target.id}/push-now`);
+      if (res?.queued) {
+        toast.success(
+          `当期已生成 ${res.instance_count ?? 0} 条任务实例，提醒消息已在后台逐条投递` +
+            `（2600 人约需 2 分钟）。发送结果可在「提醒日志 / 任务实例」页核对。`,
+          '一键推送已启动',
+        );
+      } else {
+        const stats = res?.stats || {};
+        toast.success(
+          `已向 ${stats.pushed_instances ?? 0} 名待提交成员推送提醒（发送成功 ${stats.sent ?? 0} 条）。`,
+          '一键推送完成',
+        );
+      }
       setPushConfirmTpl(null);
     } catch (err) {
       // 429 冷却（2 分钟内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
