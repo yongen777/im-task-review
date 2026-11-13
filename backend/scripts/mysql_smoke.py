@@ -104,8 +104,8 @@ def main() -> int:
         print("H5_CAS_OK:", out["status"])
 
         # data_snapshot upsert（ON CONFLICT → ON DUPLICATE KEY UPDATE）
-        store.upsert_data_snapshot("smoke_src", p_key, {"a": "1"}, actor="smoke")
-        store.upsert_data_snapshot("smoke_src", p_key, {"a": "2"}, actor="smoke")
+        store.upsert_data_snapshot("smoke_src", p_key, {"a": "1"}, updated_by="smoke")
+        store.upsert_data_snapshot("smoke_src", p_key, {"a": "2"}, updated_by="smoke")
         snap = store.get_data_snapshot_values("smoke_src", p_key)
         assert str(snap.get("a")) == "2", snap
         print("SNAPSHOT_UPSERT_OK:", snap.get("a"))
