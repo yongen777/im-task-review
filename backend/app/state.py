@@ -10,7 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -228,11 +228,15 @@ def calc_h5_token_ttl_hours(instance: Optional[Dict[str, Any]], now_dt: Optional
     return float(min(max(hours, H5_TOKEN_TTL_FLOOR_HOURS), H5_TOKEN_TTL_CAP_HOURS))
 
 
-def format_deadline_rule(template: Optional[Dict[str, Any]]) -> str:
-    """2026-11-12 下午：截止规则的**统一展示样式**（用户拍板「引用截止时间的地方统一成这样样式」）。
+def format_deadline_rule(template: Optional[Dict[str, Any]], ref_dt: Optional[datetime] = None) -> str:
+    """2026-11-13 用户拍板：截止时间统一显示为**当前周期对应的具体日期** `M月D日 HH:MM`。
 
-    本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限 —— 模板列表徽章、编辑弹窗预览、
-    H5 任务页徽章统一用规则样式；过期拦截文案仍显示已解析的具体时间戳（精确到分秒）。
+    （废除 2026-11-12 的「本月月底 17:00 / 本周日 17:00 / 今天 17:00」抽象规则词——
+    换算口径与 scheduler.calc_instance_deadline 同源：same_day=当天、weekend=本周日、
+    month_end=当月最后一天；无截止 → 「不限」。）
+    模板列表徽章、编辑弹窗预览、H5 任务页徽章统一用它；消息文案另有
+    scheduler.format_deadline_display（实例级具体时间戳，同为 M月D日 HH:MM）。
+    ref_dt：换算基准日（默认当前时刻）；测试可注入。
     """
     if not template:
         return "不限"
@@ -242,9 +246,22 @@ def format_deadline_rule(template: Optional[Dict[str, Any]]) -> str:
     hhmm = str(template.get("deadline_time") or template.get("deadline") or "").strip()
     if not hhmm:
         return "不限"
-    d_type = str(template.get("deadline_type") or "").strip() or "same_day"
-    label = {"same_day": "今天", "weekend": "本周日", "month_end": "本月月底"}.get(d_type, "截止")
-    return f"{label} {hhmm}"
+    try:
+        ref = ref_dt or default_now()
+        r_date = ref.date() if isinstance(ref, datetime) else ref
+        d_type = str(template.get("deadline_type") or "").strip() or "same_day"
+        if d_type == "month_end":
+            # 当月最后一天：下月 1 号往前一天（不引 calendar，双引擎无关的纯日期运算）
+            nxt = date(r_date.year + 1, 1, 1) if r_date.month == 12 else date(r_date.year, r_date.month + 1, 1)
+            target = nxt - timedelta(days=1)
+        elif d_type == "weekend":
+            # 本周日（ISO：周日=7；当天是周日则就是今天）
+            target = r_date + timedelta(days=(7 - r_date.isoweekday()) % 7)
+        else:
+            target = r_date
+        return f"{target.month}月{target.day}日 {hhmm}"
+    except Exception:  # noqa: BLE001 - 极端配置兜底：至少给出时刻
+        return hhmm
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -4377,3 +4394,48 @@ class StateStore:
             "views": {"numbers": numbers, "texts": texts, "files": files},
             "red_list": red_list,
         }
+
+    def stats_roster(
+        self,
+        template_id: str,
+        period_key: Optional[str] = None,
+        owner_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """2026-11-13 用户需求：单任务当期**实时上传名单**（统计看板重设计的数据源）。
+
+        一次查询返回该任务当期全部实例的「谁交了/谁没交」：
+          · 排序：已交（submitted/approved/rejected）在前、按提交时间倒序；未交在后、按姓名；
+          · 字段：phone/name/dept/status/submitted_at/late_submit/deadline_at/period_key；
+          · owner_id：分级管理员数据隔离（None = 超管全局只读，与 stats_dashboard 同口径）。
+        2600 人规模单次查询直出（不做分页；前端内存分页/搜索，15s 自动刷新只打一个接口）。
+        """
+        clean_tpl = (template_id or "").strip()
+        if not clean_tpl:
+            return {"total": 0, "items": []}
+        where = ["i.template_id = ?"]
+        params: List[Any] = [clean_tpl]
+        if (period_key or "").strip():
+            where.append("i.period_key = ?")
+            params.append(period_key.strip())
+        if owner_id is not None:
+            where.append("i.owner_id = ?")
+            params.append(int(owner_id))
+        items: List[Dict[str, Any]] = []
+        with self.lock:
+            rows = self.conn.execute(
+                f"SELECT i.phone AS phone, i.name_snap AS name, i.dept_snap AS dept, "
+                f"i.status AS status, i.submitted_at AS submitted_at, i.late_submit AS late_submit, "
+                f"i.deadline_at AS deadline_at, i.period_key AS period_key "
+                f"FROM task_instance i WHERE {' AND '.join(where)} "
+                f"ORDER BY CASE WHEN i.status IN ('submitted','approved','rejected') THEN 0 ELSE 1 END, "
+                f"i.submitted_at DESC, i.name_snap ASC",
+                tuple(params),
+            ).fetchall()
+        for r in rows:
+            items.append({
+                "phone": r["phone"], "name": r["name"], "dept": r["dept"] or "",
+                "status": r["status"], "submitted_at": r["submitted_at"],
+                "late_submit": bool(r["late_submit"]),
+                "deadline_at": r["deadline_at"], "period_key": r["period_key"],
+            })
+        return {"total": len(items), "items": items}

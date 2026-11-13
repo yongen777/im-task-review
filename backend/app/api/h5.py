@@ -19,7 +19,7 @@ except ImportError:  # pragma: no cover
     APIRouter = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
     FileResponse = None  # type: ignore[assignment]
 
-from ..scheduler import NotifierProtocol
+from ..scheduler import NotifierProtocol, format_deadline_display
 from ..state import BizError, StateStore, calc_resubmit_deadline, format_deadline_rule, submission_expired_message
 
 logger = logging.getLogger(__name__)
@@ -373,9 +373,12 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
             "kind": tpl["kind"],
             "period": tpl["period"],
             "deadline": tpl["deadline"],
-            # 2026-11-12 下午：统一截止规则样式（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
-            # 旧链接保存模板后顶部徽章随最新配置实时更新（一-2 动态重算后 deadline_at 同步）。
+            # 2026-11-12 下午：统一截止规则样式（旧链接保存模板后顶部徽章随最新配置实时更新）；
+            # 2026-11-13 用户拍板：展示**具体日期**（M月D日 HH:MM），不再出现「本月月底」等规则词。
             "deadline_rule": format_deadline_rule(tpl),
+            # 2026-11-13：实例级具体截止（"11月30日 17:00" / "不限"）——前端徽章优先用它，
+            # 避免月末任务在 12 月打开的 11 月旧周期链接顶部漂成「12月31日」。
+            "deadline_display": format_deadline_display(str(inst.get("deadline_at") or "")),
             "has_deadline": tpl.get("has_deadline"),
             "deadline_type": tpl.get("deadline_type"),
             "deadline_time": tpl.get("deadline_time"),

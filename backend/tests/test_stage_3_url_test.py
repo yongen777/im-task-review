@@ -124,7 +124,7 @@ class TestPlatformUrlTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertTrue(body.get("bound"))
         self.assertEqual(len(self.notifier.sent_messages), 1)
-        self.assertIn("【OPS任务调度助手】", self.notifier.sent_messages[0].text)
+        self.assertIn("【德阳量密助手】", self.notifier.sent_messages[0].text)
         self.assertIn("消息已收到", self.notifier.sent_messages[0].text)
         # 2026-11-12 晚：兜底文案按用户规范更新（新增【菜单】自主上报入口）
         self.assertIn("如需查看待办任务，请回复【待办】", self.notifier.sent_messages[0].text)

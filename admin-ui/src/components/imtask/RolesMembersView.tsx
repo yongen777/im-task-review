@@ -135,6 +135,9 @@ export const RolesMembersView: React.FC = () => {
   const [members, setMembers] = useState<RoleMemberItem[]>([]);
   const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberKeyword, setMemberKeyword] = useState('');
+  // 2026-11-13：成员列表内存分页（后端单次拉全量 ≤5000，前端按 20/页翻页——2600 人名册可完整翻看）
+  const [memberPage, setMemberPage] = useState(1);
+  const MEMBER_PAGE_SIZE = 20;
 
   // 从当前角色移除成员交互确认弹窗状态
   const [confirmRemoveRoleMember, setConfirmRemoveRoleMember] = useState<RoleMemberItem | null>(null);
@@ -337,8 +340,9 @@ export const RolesMembersView: React.FC = () => {
       }
       setLoadingMembers(true);
       try {
-        const res = await api.get<{ ok: boolean; items: RoleMemberItem[] }>(
-          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}`,
+        const res = await api.get<{ ok: boolean; total?: number; items: RoleMemberItem[] }>(
+          // 2026-11-13：size=5000 一次取全量（与后端 IMPORT_ROW_LIMIT 同上限），前端内存分页
+          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}&size=5000`,
         );
         setMembers(res.items || []);
       } catch (err) {
@@ -509,6 +513,21 @@ export const RolesMembersView: React.FC = () => {
       (m) => m.phone.includes(kw) || m.name.toLowerCase().includes(kw),
     );
   }, [members, memberKeyword]);
+
+  /* 2026-11-13：内存分页。当前页成员 = filteredMembers 切片；搜索/换角色/增删自动回第 1 页。
+     勾选批量删除维持基于全量 filteredMembers 的语义（翻页不清空勾选）。 */
+  const scrollToMembersTop = () => {
+    window.document.getElementById('role-members-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  const memberTotalPages = Math.max(1, Math.ceil(filteredMembers.length / MEMBER_PAGE_SIZE));
+  const safeMemberPage = Math.min(memberPage, memberTotalPages);
+  const pagedMembers = useMemo(
+    () => filteredMembers.slice((safeMemberPage - 1) * MEMBER_PAGE_SIZE, safeMemberPage * MEMBER_PAGE_SIZE),
+    [filteredMembers, safeMemberPage],
+  );
+  useEffect(() => {
+    setMemberPage(1);
+  }, [memberKeyword, selectedRoleId, members.length]);
 
   const handleOpenCreateRole = () => {
     setEditingRoleId('');
@@ -1265,7 +1284,7 @@ export const RolesMembersView: React.FC = () => {
       </div>
 
       {/* 下方主工作区：全宽展示当前角色成员名册（已按线上最新版本移除右侧待归纳池面板） */}
-      <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
+      <div id="role-members-section" className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">
         {currentRole ? (
           <>
             {/* 第一层：角色名册标题 + 搜索框 + 全局搜索已激活成员 + CSV 批量导入 */}
@@ -1276,7 +1295,7 @@ export const RolesMembersView: React.FC = () => {
                     {currentRole.role_name}
                   </h3>
                   <span className="text-xs text-slate-400 font-normal tabular-nums">
-                    · {filteredMembers.length} / {members.length} 名成员
+                    · 共 {members.length} 名成员{memberKeyword.trim() ? `（匹配 ${filteredMembers.length}）` : ''}
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5">
@@ -1471,7 +1490,7 @@ export const RolesMembersView: React.FC = () => {
                       </td>
                     </tr>
                   ) : (
-                    filteredMembers.map((m) => (
+                    pagedMembers.map((m) => (
                       <tr
                         key={m.phone}
                         className="hover:bg-slate-50/70 transition-colors group"
@@ -1623,6 +1642,54 @@ export const RolesMembersView: React.FC = () => {
                 </tbody>
               </table>
             </div>
+
+            {/* 2026-11-13：分页器 —— 2600 人名册可完整翻看（每页 20，内存分页零后端改动） */}
+            {memberTotalPages > 1 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-t border-slate-100 bg-slate-50/60">
+                <div className="text-xs text-slate-500 tabular-nums">
+                  共 <span className="font-bold text-slate-700">{filteredMembers.length}</span> 名成员
+                  · 第 <span className="font-bold text-slate-700">{safeMemberPage}</span> / {memberTotalPages} 页
+                  {memberKeyword.trim() ? '（按关键词过滤）' : ''}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={safeMemberPage <= 1}
+                    onClick={() => { setMemberPage(1); scrollToMembersTop(); }}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
+                  >
+                    首页
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeMemberPage <= 1}
+                    onClick={() => { setMemberPage((p) => Math.max(1, p - 1)); scrollToMembersTop(); }}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
+                  >
+                    ‹ 上一页
+                  </button>
+                  <span className="px-2 py-1 text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg tabular-nums">
+                    {safeMemberPage} / {memberTotalPages}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={safeMemberPage >= memberTotalPages}
+                    onClick={() => { setMemberPage((p) => Math.min(memberTotalPages, p + 1)); scrollToMembersTop(); }}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
+                  >
+                    下一页 ›
+                  </button>
+                  <button
+                    type="button"
+                    disabled={safeMemberPage >= memberTotalPages}
+                    onClick={() => { setMemberPage(memberTotalPages); scrollToMembersTop(); }}
+                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
+                  >
+                    末页
+                  </button>
+                </div>
+              </div>
+            )}
           </>
         ) : (
           <div className="p-14 text-center text-slate-400 text-xs">

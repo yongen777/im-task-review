@@ -491,12 +491,29 @@ def test_resubmit_no_deadline_template_is_unlimited() -> None:
 # ════════════════════ 统一截止规则样式 ════════════════════
 
 def test_deadline_rule_style_unified() -> None:
-    """本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限 —— 全端统一措辞。"""
-    assert format_deadline_rule({"has_deadline": 1, "deadline_type": "month_end", "deadline_time": "17:00"}) == "本月月底 17:00"
-    assert format_deadline_rule({"has_deadline": 1, "deadline_type": "weekend", "deadline_time": "17:00"}) == "本周日 17:00"
-    assert format_deadline_rule({"has_deadline": 1, "deadline_type": "same_day", "deadline_time": "17:00"}) == "今天 17:00"
+    """2026-11-13 用户拍板：截止统一显示**当前周期对应的具体日期**（M月D日 HH:MM）。
+
+    同日→当天、本周日→本周日真实日期、月底→当月最后一天（换算与 scheduler.calc_instance_deadline 同源）；
+    无截止=「不限」。基准日 2026-11-12 为周四：本周日=11-15、当月最后一天=11-30。
+    """
+    ref = datetime(2026, 11, 12, 9, 0, 0)
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "month_end", "deadline_time": "17:00"}, ref_dt=ref) == "11月30日 17:00"
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "weekend", "deadline_time": "17:00"}, ref_dt=ref) == "11月15日 17:00"
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "same_day", "deadline_time": "17:00"}, ref_dt=ref) == "11月12日 17:00"
     assert format_deadline_rule({"has_deadline": 0}) == "不限"
-    assert format_deadline_rule({"has_deadline": 1, "deadline_type": "same_day", "deadline_time": "00:00"}) == "今天 00:00"
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "same_day", "deadline_time": "00:00"}, ref_dt=ref) == "11月12日 00:00"
+    # 周日当天（2026-11-15 就是周日）→ 当天
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "weekend", "deadline_time": "17:00"},
+        ref_dt=datetime(2026, 11, 15, 9, 0, 0)) == "11月15日 17:00"
+    # 跨年边界：12 月月底
+    assert format_deadline_rule(
+        {"has_deadline": 1, "deadline_type": "month_end", "deadline_time": "17:00"},
+        ref_dt=datetime(2026, 12, 13, 9, 0, 0)) == "12月31日 17:00"
 
 
 def test_cal_resubmit_pure_function_new_semantics() -> None:

@@ -1026,10 +1026,15 @@ export const InstancesView: React.FC = () => {
                 <div>
                   <div className="text-[11px] text-slate-400">截止时间</div>
                   <div className="font-mono text-slate-700 mt-0.5">
-                    {/* 2026-11-12 任务E1：无截止模板的实例截止时间存哨兵 9999-12-31 → 显示「不限」 */}
-                    {String(detailData.instance.deadline_at || '').startsWith('9999-12-31')
-                      ? '不限'
-                      : detailData.instance.deadline_at || '—'}
+                    {/* 2026-11-12 任务E1：无截止模板的实例截止时间存哨兵 9999-12-31 → 显示「不限」；
+                        2026-11-13：具体时间戳统一缩写为「11月30日 17:00」样式（三端口径） */}
+                    {(() => {
+                      const raw = String(detailData.instance.deadline_at || '');
+                      if (raw.startsWith('9999-12-31')) return '不限';
+                      const m2 = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+                      if (!m2) return raw || '—';
+                      return `${Number(m2[2])}月${Number(m2[3])}日 ${m2[4]}:${m2[5]}`;
+                    })()}
                   </div>
                 </div>
               )}

@@ -229,17 +229,17 @@ def calc_instance_deadline(template: Dict[str, Any], anchor_dt: DateLike) -> str
 
 
 def format_deadline_display(deadline_at: str, ref_dt: Optional[DateLike] = None) -> str:
-    """§11：{截止时间} 转为「今天 18:00」或「10月25日 18:00」。
+    """§11：{截止时间} 统一显示为具体日期「11月30日 18:00」。
 
     2026-11-12 任务E1：无截止哨兵统一显示「不限」（消息文案/H5/后台同口径）。
+    2026-11-13 用户拍板：连当天也统一 `M月D日 HH:MM`（废除「今天 18:00」措辞），
+    与 state.format_deadline_rule / 前端徽章三端一字不差。
     """
+    del ref_dt  # 2026-11-13：不再需要「当天」特判，参数保留兼容旧调用方
     if is_no_deadline(deadline_at):
         return "不限"
     dt = parse_dt(deadline_at)
-    hhmm = dt.strftime("%H:%M")
-    if ref_dt is not None and dt.date() == _to_date(ref_dt):
-        return f"今天 {hhmm}"
-    return f"{dt.month}月{dt.day}日 {hhmm}"
+    return f"{dt.month}月{dt.day}日 {dt.strftime('%H:%M')}"
 
 
 def render_text_tpl(

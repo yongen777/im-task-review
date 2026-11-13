@@ -286,7 +286,8 @@ class TestStage2A(unittest.TestCase):
         self.assertEqual((s2["generated_instances"], s2["sent"], s2["skipped"]), (0, 1, 0))  # 2026-11-09 新口径：未激活不建实例 → 无 skipped
         self.assertEqual(len(notifier.sent_messages), 1)
         self.assertIn("陈一（研发部）", notifier.sent_messages[0].text)
-        self.assertIn("今天 18:00", notifier.sent_messages[0].text)
+        # 2026-11-13：截止文案统一具体日期（当天也不再显示「今天」）
+        self.assertIn("10月25日 18:00", notifier.sent_messages[0].text)
         self.assertIn("https://task.example.com/h5/task#t=", notifier.sent_messages[0].text)
         self.assertNotIn("#t=preview", notifier.sent_messages[0].text)
         self.assertEqual(len(self.store.list_instances_for_period(tid, "2026-10-25")), 1)  # 2026-11-09 新口径

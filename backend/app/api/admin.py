@@ -2546,6 +2546,31 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         )
         return {"ok": True, "scope_owner_id": effective_owner, **data}
 
+    @router.get("/stats/roster")
+    async def stats_roster(
+        request: Request,
+        template_id: str = "",
+        period_key: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ):
+        """2026-11-13 用户需求：单任务当期**实时上传名单**（统计看板重设计用）。
+
+        与 /stats/dashboard 同一套 owner 隔离口径；前端 15s 自动刷新只打这一个接口，
+        一次拿全「已交/未交」明细（内存分页 + 搜索），2600 人规模也不拆页。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        effective_owner = _owner_filter(_admin, owner_id)
+        data = state.stats_roster(
+            template_id=template_id,
+            period_key=(period_key or "").strip() or None,
+            owner_id=effective_owner,
+        )
+        return {"ok": True, "scope_owner_id": effective_owner, **data}
+
     @router.get("/stats")
     async def get_stats(
         request: Request,

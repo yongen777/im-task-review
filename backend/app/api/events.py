@@ -204,7 +204,8 @@ def handle_inbound_text(
                 logger.warning("待办查询异常 user=%s: %s", user_id, exc)
                 todo_items = []
             if not todo_items:
-                reply = "您当前暂无待提交的任务。如需重新获取未完成任务的提交链接，请回复【待办】。"
+                # 2026-11-13 用户口径：机器人全局更名「德阳量密助手」，无待办文案精确到字
+                reply = "【德阳量密助手】当前暂无待提交的任务事项。"
             else:
                 lines = [f"【待办任务】您当前有 {len(todo_items)} 项未完成的任务："]
                 for idx, it in enumerate(todo_items, start=1):
@@ -237,7 +238,7 @@ def handle_inbound_text(
                 logger.warning("菜单查询异常 user=%s: %s", user_id, exc)
                 menu_items = []
             if not menu_items:
-                reply = "【OPS任务调度助手】当前暂无可自主上报的任务事项。"
+                reply = "【德阳量密助手】当前暂无可自主上报的任务事项。"
             else:
                 lines = [
                     "【自主上报事项清单】",
@@ -268,7 +269,7 @@ def handle_inbound_text(
                     issued = None
             if item is None or issued is None:
                 # 需求三-3：数字不存在或无权填报 → 按未找到拦截，严禁越权签发
-                send(f"【OPS任务调度助手】未找到编号为 {num} 的事项，请回复【菜单】查看最新列表。", "menu_miss")
+                send(f"【德阳量密助手】未找到编号为 {num} 的事项，请回复【菜单】查看最新列表。", "menu_miss")
                 return 200, {"ok": True, "path": "menu_number", "found": False, "number": num}
             if not issued.get("ok"):
                 # 防手抖冷却：不建新实例，只提示（零新写入，重复回调零重复消息）
@@ -288,8 +289,8 @@ def handle_inbound_text(
         # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
         # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）。
         ack_text = (
-            "【OPS任务调度助手】\n"
-            "你好，消息已收到。我是任务调度助手，只负责按设定时间推送任务提醒、收集上报内容。\n"
+            "【德阳量密助手】\n"
+            "你好，消息已收到。我是德阳量密助手，只负责按设定时间推送任务提醒、收集上报内容。\n"
             "如需查看待办任务，请回复【待办】。\n"
             "如需自主上报不定期任务事项，请回复【菜单】。\n"
             "业务问题请联系对应管理员。"
@@ -301,7 +302,7 @@ def handle_inbound_text(
     # 未绑定用户 = 管理后台尚未录入/激活（member 无此人 → 绑定也不存在）。
     # ⛔ 不解析手机号、不反查通讯录、不写任何表 —— 唯一激活路径是管理端录入。
     plain_prompt = (
-        "【OPS任务调度助手】\n"
+        "【德阳量密助手】\n"
         "您好，当前系统尚未录入您的业务权限，请联系管理员在管理后台录入激活后使用。"
     )
     send(plain_prompt, "not_registered")

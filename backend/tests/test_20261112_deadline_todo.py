@@ -353,7 +353,8 @@ def test_e4_todo_command_basic_and_variants() -> None:
             assert code == 200 and body["path"] == "todo" and body["count"] == 2, body
             reply = sent[-1][0]
             assert "您当前有 2 项未完成的任务" in reply, reply
-            for kw in ("晨报", "晚报", "提交链接：http://e.com/h5/task#t=", "今天 18:00", "今天 19:30"):
+            # 2026-11-13：截止文案统一具体日期（当天也不再显示「今天」）
+            for kw in ("晨报", "晚报", "提交链接：http://e.com/h5/task#t=", "11月12日 18:00", "11月12日 19:30"):
                 assert kw in reply, reply
 
         # 签发的 token 有效期为动态值：晨报截止 18:00 → now 09:00 + min(9h+24h, 720h) = 33h
@@ -451,7 +452,9 @@ def test_e4_todo_empty_reply_and_unbound_zero_writes() -> None:
             send=_collect(sent), platform="zdxlz", base_url="http://e.com",
         )
         assert code == 200 and body["path"] == "todo" and body["count"] == 0, body
-        assert "您当前暂无待提交的任务" in sent[-1][0] and sent[-1][1].startswith("todo_"), sent
+        # 2026-11-13 用户拍板：机器人更名「德阳量密助手」，无待办文案精确到字
+        assert sent[-1][0] == "【德阳量密助手】当前暂无待提交的任务事项。", sent
+        assert sent[-1][1].startswith("todo_"), sent
 
         # 未绑定用户：零落库红线（不建绑定、不落待归纳、不签 token）
         sent.clear()

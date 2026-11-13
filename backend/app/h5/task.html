@@ -42,6 +42,12 @@
     .thumb-row { display: flex; flex-wrap: wrap; gap: 10px; }
     .thumb { width: 104px; height: 104px; border-radius: 12px; border: 1px solid #e3e9f2; object-fit: cover; background: #f1f5f9; }
     .locked-tip { background: #f0f9ff; border: 1px solid #bae6fd; color: #0369a1; border-radius: 12px; padding: 12px 14px; font-size: 13px; font-weight: 600; margin-top: 10px; }
+    /* 2026-11-13 用户拍板：提交成功 → 醒目绿色反馈 + 自动关窗；宿主拦截关窗时切全屏完成视图 */
+    .submit-success-banner { background: #ecfdf5; border: 1.5px solid #6ee7b7; color: #047857; border-radius: 14px; padding: 16px; font-size: 18px; font-weight: 800; text-align: center; margin-top: 12px; box-shadow: 0 2px 10px rgba(5, 150, 105, 0.12); }
+    .submit-done-mask { position: fixed; inset: 0; z-index: 9999; background: #ffffff; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 28px; text-align: center; }
+    .submit-done-icon { font-size: 66px; line-height: 1; }
+    .submit-done-title { font-size: 21px; font-weight: 800; color: #047857; }
+    .submit-done-sub { font-size: 13px; color: #64748b; line-height: 1.6; }
     /* 已提交锁定态：控件变灰、上传块禁止点击 */
     input:disabled, textarea:disabled, select:disabled { background: #f1f5f9 !important; color: #94a3b8 !important; cursor: not-allowed; }
     label.upload-tile:has(input:disabled), label.upload-file:has(input:disabled) { opacity: 0.55; cursor: not-allowed; }
@@ -127,9 +133,10 @@
 
           /* 顶部任务卡：标题 + 截止徽章 + 提醒正文（与预览版式一致） */
           document.getElementById("headTitle").textContent = data.template.name;
-          /* 2026-11-12 下午（用户拍板）：截止徽章统一**规则样式**（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
-             来自后端 format_deadline_rule —— 模板编辑保存后旧链接顶部实时跟随最新配置。 */
-          const __rule = String(data.template.deadline_rule || "").trim();
+          /* 2026-11-13 用户拍板：截止徽章统一显示**具体日期**（如「11月30日 17:00」/「不限」），
+             优先用实例自身的 deadline_display（旧周期链接不随当前月份漂移）；
+             deadline_rule 仅作兜底（模板未建实例时的旧字段）。 */
+          const __rule = String(data.template.deadline_display || data.template.deadline_rule || "").trim();
           document.getElementById("headDeadline").textContent = "截止 " + (__rule || "不限");
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
@@ -409,7 +416,41 @@
             content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
             submitBtn.disabled = true;
             submitBtn.style.display = "none";
-            showMsg(data.message || "提交成功！", "success");
+            /* 2026-11-13 用户拍板（原话）：提交收到 200 成功后 →
+               ① 立即展示醒目绿色成功反馈「✅ 提交成功！」；
+               ② 延迟 800~1000ms 自动尝试关闭当前页面（微信 WebView / 浏览器四条路径依次尝试）；
+               ③ 若宿主 WebView 拦截脚本关窗（页面仍在），切换为全屏干净的
+                  「✅ 提交成功，可安全关闭页面」完成视图。 */
+            showMsg(data.message || "✅ 提交成功！", "success");
+            const successBanner = document.createElement("div");
+            successBanner.className = "submit-success-banner";
+            successBanner.textContent = "✅ 提交成功！";
+            content.insertBefore(successBanner, submitBtn);
+            window.setTimeout(function () {
+              try {
+                if (window.WeixinJSBridge && typeof window.WeixinJSBridge.call === "function") {
+                  window.WeixinJSBridge.call("closeWindow");
+                }
+              } catch (e) { /* 宿主拦截：继续下一条路径 */ }
+              try {
+                if (window.wx && typeof window.wx.closeWindow === "function") {
+                  window.wx.closeWindow();
+                }
+              } catch (e) { /* 宿主拦截：继续下一条路径 */ }
+              try { window.history.back(); } catch (e) { /* 无历史/被拦截 */ }
+              try { window.close(); } catch (e) { /* 仅允许脚本关闭的页面生效 */ }
+              /* 兜底：关窗被拦截（页面仍在运行）→ 全屏完成视图，引导用户手动关闭 */
+              window.setTimeout(function () {
+                if (document.querySelector(".submit-done-mask")) return;
+                const mask = document.createElement("div");
+                mask.className = "submit-done-mask";
+                mask.innerHTML =
+                  '<div class="submit-done-icon">✅</div>'
+                  + '<div class="submit-done-title">✅ 提交成功，可安全关闭页面</div>'
+                  + '<div class="submit-done-sub">本条已锁定，请勿重复提交；如需修改请联系管理员驳回后重新提交。</div>';
+                document.body.appendChild(mask);
+              }, 500);
+            }, 900);
           })
           .catch(() => {
             submitBtn.disabled = false;

@@ -170,7 +170,7 @@ def test_menu_scenario_texts_exact() -> None:
 
         # 场景 3a：数字越界 → 未找到
         _, _, box = _run(store, UID, "99")
-        assert box[0][0] == "【OPS任务调度助手】未找到编号为 99 的事项，请回复【菜单】查看最新列表。", box[0][0]
+        assert box[0][0] == "【德阳量密助手】未找到编号为 99 的事项，请回复【菜单】查看最新列表。", box[0][0]
 
         # 场景 3b：数字命中 → 签发一次性链接（模板文案）
         _, body, box = _run(store, UID, "1")
@@ -188,7 +188,7 @@ def test_menu_scenario2_empty_list_text() -> None:
     try:
         _seed_zdxlx(store)
         _, _, box = _run(store, UID, "菜单")
-        assert box[0][0] == "【OPS任务调度助手】当前暂无可自主上报的任务事项。", box[0][0]
+        assert box[0][0] == "【德阳量密助手】当前暂无可自主上报的任务事项。", box[0][0]
     finally:
         store.close()
 

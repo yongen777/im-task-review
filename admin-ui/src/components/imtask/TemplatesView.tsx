@@ -144,16 +144,33 @@ interface UploadH5PreviewProps {
 
 /* 与后端 format_deadline_rule 同口径的规则样式由 formatDeadlineRuleLabel 提供（见下）。 */
 
-/* 2026-11-12 下午（用户拍板）：截止规则统一展示样式 —— 「本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限」。
-   与后端 format_deadline_rule 一字不差；列表徽章 / 编辑弹窗两处预览 / H5 任务页徽章全部用它。 */
+/* 2026-11-13 用户拍板：截止时间统一显示为**当前周期对应的具体日期**「11月30日 17:00」，
+   废除此前的「本月月底 17:00 / 本周日 17:00 / 今天 17:00」抽象规则词。
+   换算口径与后端 state.format_deadline_rule 一字不差：same_day=当天、weekend=本周日、
+   month_end=当月最后一天；无截止=不限。列表徽章 / 编辑弹窗两处预览 / H5 任务页徽章统一。 */
 export const formatDeadlineRuleLabel = (
   type: 'same_day' | 'weekend' | 'month_end' | null | undefined,
   hhmm: string,
+  ref?: Date,
 ): string => {
   if (!hhmm) return '不限';
-  const label =
-    type === 'weekend' ? '本周日' : type === 'month_end' ? '本月月底' : '今天';
-  return `${label} ${hhmm}`;
+  const now = ref || new Date();
+  let y = now.getFullYear();
+  let m = now.getMonth();
+  let d = now.getDate();
+  if (type === 'month_end') {
+    const lastDay = new Date(y, m + 1, 0); // 下月 0 号 = 本月最后一天
+    y = lastDay.getFullYear();
+    m = lastDay.getMonth();
+    d = lastDay.getDate();
+  } else if (type === 'weekend') {
+    const iso = now.getDay() === 0 ? 7 : now.getDay(); // 周日=7（当天是周日即今天）
+    const target = new Date(y, m, d + ((7 - iso) % 7));
+    y = target.getFullYear();
+    m = target.getMonth();
+    d = target.getDate();
+  }
+  return `${m + 1}月${d}日 ${hhmm}`;
 };
 
 const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
