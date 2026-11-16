@@ -1008,9 +1008,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return forbidden
         cfg = getattr(request.app.state, "config", None)
         uploads_dir = cfg.uploads_dir if cfg is not None else None
-        # 2026-11-05 级联删除（不可逆）：执行前先做一次 DB 文件级备份 —— 备份是唯一恢复手段，失败即拒绝删除。
+        # 2026-11-05 级联删除（不可逆）：执行前先做**作用域恢复快照** —— 备份是唯一恢复手段，
+        # 失败即拒绝删除（2026-11-16 方案B：原 .db 文件备份改为 JSON 快照，护栏语义不变）。
         try:
-            backup_path = state.backup_database(tag=f"purge-{int(admin_id)}")
+            backup_path = state.snapshot_admin_scope_json(
+                admin_id=int(admin_id), tag=f"purge-{int(admin_id)}")
         except Exception as exc:  # noqa: BLE001 - 备份失败必须拦住不可逆删除
             return error_response(500, "BACKUP_FAILED", f"删除前备份失败，已中止删除：{exc}")
         try:
@@ -1123,7 +1125,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         try:
             # 2026-11-12 下午：删除模板 = 物理清除（含磁盘附件），需要 uploads_dir
             cfg = getattr(request.app.state, "config", None)
-            uploads_dir = cfg.uploads_dir if cfg is not None else (state.db.db_path.parent / "uploads")
+            uploads_dir = cfg.uploads_dir if cfg is not None else (state.data_dir / "uploads")
             res = state.delete_template(template_id, actor=sess["username"], uploads_dir=uploads_dir)
         except BizError as exc:
             return biz_error_response(exc)
@@ -1163,7 +1165,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             return error_response(400, "FILE_TYPE_REJECTED", "文件内容不是有效图片")
 
         cfg = getattr(request.app.state, "config", None)
-        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.db.db_path).parent
+        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.data_dir)
         out_dir = data_dir / "notice_attach"
         out_dir.mkdir(parents=True, exist_ok=True)
         safe_ext = "jpg" if ext == "jpeg" else ext
@@ -1185,7 +1187,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         if not safe_name:
             return error_response(404, "NOT_FOUND", "素材不存在")
         cfg = getattr(request.app.state, "config", None)
-        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.db.db_path).parent
+        data_dir = Path(cfg.data_dir) if cfg is not None else Path(state.data_dir)
         path = data_dir / "notice_attach" / safe_name
         if not path.exists() or not path.is_file():
             return error_response(404, "NOT_FOUND", "素材不存在")
@@ -2297,7 +2299,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                     f"当前通道（{state.platform}）不支持图片消息；只有企业微信智能机器人支持",
                 )
             # 找一张现成的图：优先今天刚发的附图副本，其次看板图
-            data_dir = Path(state.db.db_path).parent
+            data_dir = Path(state.data_dir)
             candidates = []
             for sub in ("public_img", "dashboards"):
                 d = data_dir / sub
@@ -2375,7 +2377,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 if in_own_role is None:
                     return error_response(404, "NOT_FOUND", "附件不存在")
         cfg = getattr(request.app.state, "config", None)
-        uploads_dir = cfg.uploads_dir if cfg is not None else (state.db.db_path.parent / "uploads")
+        uploads_dir = cfg.uploads_dir if cfg is not None else (state.data_dir / "uploads")
         disk_path = uploads_dir / up["rel_path"]
         if not disk_path.is_file():
             return error_response(404, "NOT_FOUND", "附件文件不存在")
@@ -2639,7 +2641,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
     # ==================================================================
     def _channel_store():
         """按当前 state 拼一个配置读写门面；data_dir 取数据库同级的父目录。"""
-        data_dir = Path(state.db.db_path).parent
+        data_dir = Path(state.data_dir)
         return ChannelConfigStore(state.conn, state.lock, data_dir)
 
     def _env_fallback(cfg: Any, channel: str) -> Dict[str, str]:

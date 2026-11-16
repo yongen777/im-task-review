@@ -24,6 +24,10 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -95,7 +99,7 @@ class FakeWecomNoCreds:
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_org_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_org_")))
 
 
 def _app(store: StateStore) -> FastAPI:

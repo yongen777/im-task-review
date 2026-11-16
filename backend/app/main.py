@@ -127,7 +127,7 @@ def create_apps(
     cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
     setup_logging(cfg)
 
-    store = state or StateStore(cfg.db_path, now_fn=now_fn)
+    store = state or StateStore(now_fn=now_fn, data_dir=cfg.data_dir)
     # 2026-10-30 通道配置向导：DB 里配过就用 DB（加密存储），没配过照样用 env —— 现网零变化。
     # ⛔ 只在这里合并一次：配置改动重启后生效，不做热更新（避免运行中换凭证导致半截状态）。
     if channel is None and state is None:

@@ -10,6 +10,10 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.config import MISSING_PORT_MSG, SAME_PORT_MSG, SHANGHAI_TZ, Config
 from app.scheduler import FakeNotifier, Scheduler, calc_deadline_at, effective_month_dom, is_anchor_day, period_key
 from app.state import BizError, StateStore
@@ -38,7 +42,7 @@ class TestStage2A(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmp.name)
         self.current_dt = make_dt("2026-10-25 09:00:00")
-        self.store = StateStore(self.tmp_path / "im_task.db", now_fn=lambda: self.current_dt)
+        self.store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=self.tmp_path, now_fn=lambda: self.current_dt)
 
     def tearDown(self) -> None:
         try:

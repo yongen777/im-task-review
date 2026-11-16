@@ -26,13 +26,15 @@ from app.state import StateStore  # noqa: E402
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", required=True, help="SQLite 路径")
     ap.add_argument("--username", required=True, help="分级管理员登录名")
     ap.add_argument("--display-name", required=True, help="分级管理员显示名")
     ap.add_argument("--rollback", action="store_true", help="把历史数据改回 owner_id=1（admin）")
     args = ap.parse_args()
 
-    store = StateStore(Path(args.db))
+    from app.config import load_project_dotenv  # noqa: PLC0415
+
+    load_project_dotenv()  # 方案B：纯 MySQL，连接参数走 .env 的 IMT_MYSQL_*
+    store = StateStore()
     try:
         if args.rollback:
             moved = {}

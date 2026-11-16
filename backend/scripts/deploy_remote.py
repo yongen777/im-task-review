@@ -331,18 +331,22 @@ def main() -> int:
         print("✗ 备份失败，中止部署")
         return 1
 
-    # DB 一致性快照：用 sqlite3 .backup 而不是 cp（workbuddy 分支 165a3bc 合入）。
-    # 线上库是 WAL 模式，直接 cp 拿到的是「主库 + 未 checkpoint 的 -wal」半一致状态；
-    # .backup 走 SQLite 在线备份 API，产出单文件且已 checkpoint。
-    # 备份失败不阻断部署（DB 内容未变），但必须显式告警。
-    print("   DB 一致性快照（sqlite3 .backup，不用 cp）")
+    # DB 一致性快照：2026-11-16 方案B（全栈纯 MySQL）——data/im_task.db 若还存在
+    # （历史 SQLite 残留文件，服务已不再读写它）仍按 sqlite3 .backup 留一份一致性快照；
+    # 文件归档移除后本步骤自动跳过（生产数据在远端 MySQL im_task 库，备份走
+    # 云数据库快照 / 宝塔计划任务体系，部署脚本不伪造 DB 备份点）。
+    print("   DB 快照（存在历史 SQLite 残留才做；纯 MySQL 自动跳过）")
     db_bak_cmd = (
         f"cd {REMOTE_DIR}/data && "
-        f"sqlite3 im_task.db \".backup 'im_task.db.bak-{ts}'\" 2>/dev/null && echo DBBAK_OK"
+        f"if [ -f im_task.db ]; then "
+        f"sqlite3 im_task.db \".backup 'im_task.db.bak-{ts}'\" 2>/dev/null && echo DBBAK_OK; "
+        f"else echo DBBAK_SKIP_MYSQL; fi"
     )
     code, _ = ssh_run(H, P, U, K, db_bak_cmd, timeout=180, show=2)
-    if "DBBAK_OK" not in _:
-        print("   ⚠ DB 快照失败（不阻断部署，但本次部署没有新的 DB 回滚点）")
+    if "DBBAK_SKIP_MYSQL" in _:
+        print("   · data/im_task.db 不存在（纯 MySQL），跳过 SQLite 快照")
+    elif "DBBAK_OK" not in _:
+        print("   ⚠ DB 快照失败（不阻断部署，仅历史残留文件未留快照）")
 
     print("④ 上传并覆盖（tar 只覆盖不删除，data/ 不在包内）")
     if scp_upload(H, P, U, K, tar_path, "/tmp/imtask_app.tar.gz") != 0:
@@ -458,7 +462,8 @@ def main() -> int:
     print("\n" + ("✅ 部署完成且验收通过" if ok else "⚠️ 部署完成但有验收项异常，请人工复核"))
     print(f"   备份：{REMOTE_DIR}/app.bak-{ts}（回滚：rm -rf app && mv app.bak-{ts} app && systemctl restart imtask）")
     print(f"   DB 快照：{REMOTE_DIR}/data/im_task.db.bak-{ts}"
-          f"（回滚：先 systemctl stop imtask，再 cp data/im_task.db.bak-{ts} data/im_task.db，然后 start）")
+          "（仅历史 SQLite 残留文件才产出；方案B 后数据本体在远端 MySQL im_task 库，"
+          "DB 回滚走云数据库快照，不靠该文件）")
     return 0 if ok else 2
 
 

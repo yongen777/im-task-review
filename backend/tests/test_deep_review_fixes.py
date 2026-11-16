@@ -13,13 +13,15 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api import admin as admin_module  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_deep_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_deep_")))
 
 
 def test_parse_admin_account_blank_role_level() -> None:

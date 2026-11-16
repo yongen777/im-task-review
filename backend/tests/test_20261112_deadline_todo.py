@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api.events import handle_inbound_text  # noqa: E402
 from app.api.h5 import process_h5_task_info, process_h5_task_submit  # noqa: E402
@@ -40,7 +42,7 @@ UNIFIED_PREFIX = "当前任务已过期（截止时间："
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_e_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_e_")), now_fn=lambda: CLOCK["now"])
 
 
 def _sched(store: StateStore, notifier: FakeNotifier | None = None) -> Scheduler:

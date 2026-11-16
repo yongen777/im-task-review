@@ -29,7 +29,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402  # noqa: E402
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.api.h5 import process_h5_task_info  # noqa: E402
@@ -46,7 +48,7 @@ CLOCK = {"now": datetime(2026, 11, 13, 8, 0, 0)}
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_p2_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_p2_")), now_fn=lambda: CLOCK["now"])
 
 
 def _app(store: StateStore, scheduler: Scheduler) -> FastAPI:

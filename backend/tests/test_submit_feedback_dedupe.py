@@ -21,6 +21,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.h5 import _push_submit_feedback  # noqa: E402
 from app.config import format_dt  # noqa: E402
 from app.scheduler import FakeNotifier  # noqa: E402
@@ -30,7 +34,7 @@ PHONE = "13600001234"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_ack_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_ack_")))
 
 
 def _instance(store: StateStore, platform: str):

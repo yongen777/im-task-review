@@ -6,7 +6,7 @@
 三条硬约束（用户红线）：
 1. ⛔ 凭证明文入库 —— payload 一律 AES-256-GCM 加密后再落库；
 2. ⛔ 密钥与密文分离 —— 密钥在 env `IMT_ENC_KEY` 或 `data/config_key.hex`（chmod 600），
-   数据库里只有密文；别人只拿到 im_task.db 解不开；
+   数据库里只有密文；别人只拿到数据库文件/快照解不开；
 3. ⛔ 不改调度/发送/回调逻辑 —— 本模块只负责「读出来拼成一个 Config」，
    上层拿到的东西和从 env 读出来的完全同构。
 
@@ -401,11 +401,11 @@ def apply_db_channel_config(cfg: Config, store=None) -> Config:
     try:
         store_conn = getattr(store, "conn", None) if store is not None else None
         if store_conn is None:
-            import sqlite3
+            # 2026-11-16 方案B：纯 MySQL——降级直连走连接池代理（不再旁路单文件连接）
+            from .db import MySQLConnProxy, _NoLock, mysql_config_from_env
 
-            conn = sqlite3.connect(str(cfg.db_path))
-            conn.row_factory = sqlite3.Row
-            lock = __import__("threading").RLock()
+            conn = MySQLConnProxy(mysql_config_from_env())
+            lock = _NoLock()
             own = True
         else:
             conn, lock, own = store_conn, getattr(store, "lock"), False

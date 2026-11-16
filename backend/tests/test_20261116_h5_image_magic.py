@@ -21,7 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402  # noqa: E402
 
 from app.api.h5 import (  # noqa: E402
     MIME_TO_IMAGE_EXT,
@@ -54,7 +56,7 @@ def _setup():
     """图片任务（无截止）→ tick 预生成实例 → 签发 H5 token。返回 (store, uploads_dir, token)。"""
     CLOCK["now"] = datetime(2026, 11, 16, 8, 40, 0)
     root = Path(mkdtemp(prefix="imtask_imgsniff_"))
-    store = StateStore(root / "im.db", now_fn=lambda: CLOCK["now"])
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=root, now_fn=lambda: CLOCK["now"])
     rid = store.create_role("拍照组", actor="t", platform="zdxlz")["role_id"]
     store.add_role_member(rid, PHONE, "甲一", "一部", actor="t")
     store.upsert_delivery_target(PHONE, "uid_5001", platform="zdxlz", external_type="union_id")

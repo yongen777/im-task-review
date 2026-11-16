@@ -18,7 +18,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from app.config import resolve_data_dir
+from app.config import load_project_dotenv
 from app.state import StateStore, validate_new_password
 
 
@@ -62,8 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误：{pwd_err}", file=sys.stderr)
         return 1
 
-    db_path = resolve_data_dir() / "im_task.db"
-    store = StateStore(db_path)
+    load_project_dotenv(ROOT_DIR / ".env")  # 方案B：连接参数走 .env 的 IMT_MYSQL_*
+    store = StateStore()
     try:
         user_id = store.upsert_admin_user(
             username=username,
@@ -71,9 +71,10 @@ def main(argv: list[str] | None = None) -> int:
             must_change=bool(args.must_change),
             actor="cli",
         )
+        cfg_desc = f"{store.db.conn._cfg['host']}:{store.db.conn._cfg['port']}/{store.db.conn._cfg['database']}"
         print(
             f"管理员账号已就绪: id={user_id}, username={username}, "
-            f"must_change={bool(args.must_change)}, db={db_path}"
+            f"must_change={bool(args.must_change)}, db(mysql)={cfg_desc}"
         )
         return 0
     finally:

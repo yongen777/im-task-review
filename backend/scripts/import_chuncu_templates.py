@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.config import resolve_data_dir  # noqa: E402
+from app.config import load_project_dotenv, resolve_data_dir  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
 ROLE_NAME = "片长/分支局长"
@@ -129,7 +129,8 @@ def main() -> int:
     args = parser.parse_args()
 
     data_dir = resolve_data_dir()
-    store = StateStore(data_dir / "im_task.db")
+    load_project_dotenv()  # 方案B：纯 MySQL，连接参数走 .env 的 IMT_MYSQL_*
+    store = StateStore(data_dir=data_dir)
 
     existing = store.list_templates(q=NAME_PREFIX, kind="notice", page=1, size=50)
     existing_by_name = {t["name"]: t for t in existing["items"]}

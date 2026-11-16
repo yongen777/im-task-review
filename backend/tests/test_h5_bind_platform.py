@@ -9,6 +9,10 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.h5 import process_h5_bind
 from app.scheduler import FakeNotifier
 from app.state import StateStore
@@ -18,7 +22,7 @@ DEPT = "一支局"
 
 
 def _store() -> StateStore:
-    store = StateStore(Path(tempfile.mkdtemp(prefix="imtask_h5bind_")) / "im.db")
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_h5bind_")))
     role = store.create_role("绑定测试组", actor="t", platform="wecom")
     store.add_role_member(role["role_id"], phone=PHONE, name="李四", dept=DEPT)
     store.create_department(DEPT, actor="t")

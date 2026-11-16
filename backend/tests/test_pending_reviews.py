@@ -16,6 +16,10 @@ from typing import Any, Dict, Tuple
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.admin import create_admin_router
 from app.config import format_dt
 from app.state import StateStore
@@ -25,7 +29,7 @@ PHONE = "13900009201"
 
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp()
-    return StateStore(Path(tmp) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _env(store: StateStore) -> TestClient:

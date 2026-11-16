@@ -16,13 +16,17 @@ from pathlib import Path
 
 import pytest
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.state import StateStore
 
 PHONE = "13900007001"
 
 
 def _mk(platform: str = "zdxlz") -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp()) / "im.db", platform=platform)
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp()), platform=platform)
 
 
 def _role(store: StateStore) -> str:
@@ -147,7 +151,7 @@ def test_business_data_is_shared_across_channels() -> None:
 
 def test_default_platform_is_zdxlz() -> None:
     """默认参数必须还是 zdxlz —— 现网零行为变化。"""
-    store = StateStore(Path(tempfile.mkdtemp()) / "im.db")
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp()))
     try:
         assert store.platform == "zdxlz"
         store.upsert_delivery_target(PHONE, "uid_default")

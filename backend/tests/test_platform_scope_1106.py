@@ -20,6 +20,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -43,7 +45,7 @@ PHONE_Y = "13700001002"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_plat_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_plat_")))
 
 
 def _app(store: StateStore) -> FastAPI:

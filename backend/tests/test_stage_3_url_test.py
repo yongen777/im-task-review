@@ -23,6 +23,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.events import process_app_event  # noqa: E402
 from app.channels.zdxlz import ZdxlzChannel, encrypt_event_payload  # noqa: E402
 from app.config import Config  # noqa: E402
@@ -73,7 +77,7 @@ class TestPlatformUrlTest(unittest.TestCase):
             data_dir=tmp_path / "data",
         )
         self.cfg.data_dir.mkdir(parents=True, exist_ok=True)
-        self.store = StateStore(self.cfg.db_path)
+        self.store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=self.cfg.data_dir)
         self.channel = ZdxlzChannel(self.cfg)
         self.notifier = FakeNotifier()
 

@@ -22,6 +22,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.admin import create_admin_router, register_admin_guard
 from app.main import _register_admin_spa_pages, load_admin_index_html
 
@@ -43,7 +47,7 @@ def store():
     from app.state import StateStore
 
     tmp = tempfile.mkdtemp()
-    st = StateStore(Path(tmp) / "im.db")
+    st = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
     yield st
     st.close()
 

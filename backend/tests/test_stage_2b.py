@@ -13,6 +13,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.events import process_app_event
 from app.api.h5 import load_h5_html, process_h5_bind, process_h5_task_info, process_h5_task_submit, process_h5_task_upload, reset_bind_rate
 from app.channels.zdxlz import ZdxlzChannel, encrypt_event_payload
@@ -130,7 +134,7 @@ class TestStage2B(unittest.TestCase):
         self.cfg.uploads_dir.mkdir(parents=True, exist_ok=True)
 
         self.notifier = FakeNotifier(now_fn=lambda: self.current_dt)
-        self.store = StateStore(self.cfg.db_path, now_fn=lambda: self.current_dt)
+        self.store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=self.cfg.data_dir, now_fn=lambda: self.current_dt)
         self.channel = ZdxlzChannel(self.cfg)
         self.scheduler = Scheduler(
             state=self.store, public_base_url=self.cfg.public_base_url, notifier=self.notifier, now_fn=lambda: self.current_dt

@@ -524,9 +524,10 @@ class Scheduler:
         """幂等与退避门控：
         - 已 sent/missed/skipped 或 NO_SESSION_500 或超 MAX_RETRIES -> 返回 None
         - 仅有 failed -> 计算下次 retry (1..3)，并校验距最近一次 attempted_at 是否已满 RETRY_DELAYS[retry_no-1] 秒
+
+        2026-11-16 方案B：去掉冗余的 has_sent_reminder 预查（sent ⊂ 循环判定集，一次
+        list_reminder_attempts 全覆盖）——MySQL 下 2665 人批量投递少 2665 次往返。
         """
-        if self.state.has_sent_reminder(idem_key):
-            return None
         attempts = self.state.list_reminder_attempts(idem_key)
         if not attempts:
             return 0
@@ -568,8 +569,7 @@ class Scheduler:
             src = Path(src_path)
             if not src.is_file():
                 return None
-            db_path = getattr(getattr(self.state, "db", None), "db_path", None)
-            data_dir = Path(db_path).parent if db_path else Path("data").resolve()
+            data_dir = Path(self.state.data_dir)
             pub_dir = data_dir / "public_img"
             pub_dir.mkdir(parents=True, exist_ok=True)
             suffix = src.suffix.lower()
@@ -778,7 +778,24 @@ class Scheduler:
                 elif res is not None and not res.ok:
                     breaker.record_failure()
                 results[idx] = (tasks[idx], res)
-        return [self._record_delivery(t, res, stats) for t, res in results]
+
+        # 2026-11-16 方案B：MySQL 下逐条「INSERT+commit」每条 ~6ms fsync（SQLite 同进程写
+        # 几乎零开销，2665 条批量投递曾从 ~110s 涨到 ~150s）——记账改走**同线程事务段 +
+        # 每 500 条分片提交**：常规路径 fsync 从 2665 次降到 ~6 次；崩溃窗口（已发送未记账
+        # 的最大行数）从单条扩到 ≤500 条，幂等护栏（发送前的查重判断）不受影响。
+        if not results:
+            return []
+        ok_flags: List[bool] = []
+        n_in_tx = 0
+        with self.state.conn:
+            for t, res in results:
+                ok_flags.append(self._record_delivery(t, res, stats))
+                n_in_tx += 1
+                if n_in_tx >= 500:
+                    self.state.conn.commit()  # 分片落盘（控崩溃窗口）
+                    n_in_tx = 0
+        # `with` 退出时最后一片自动 commit
+        return ok_flags
 
     def _deliver_with_log(
         self,
@@ -991,23 +1008,27 @@ class Scheduler:
 
             # 2026-11-13 冲刺模块二：一键推送改走受控并发引擎（8 线程 + 25QPS 桶 + 熔断）——
             # 2665 人整点高峰单轮投递压进 2 分钟内；幂等占位/消息渲染/记账全在主线程。
+            # 2026-11-16 方案B：prepare 段包事务（同连接复用）；⛔ 保持「逐实例投递 +
+            # 逐实例 pushed_instances 计数」语义不变（分片聚合会把计数压成每批 1，
+            # test_d_push_now / livesync / fix1_split 三组用例实锤拦截）。
             batch: List[Dict[str, Any]] = []
-            for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
-                # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
-                base_idem = make_idem_key(
-                    tpl["template_id"], inst["phone"], p_key, "manual_push", seq, f"{now_s}|push|{seq}"
-                )
-                idem = self._idem_for(base_idem, platform)
-                task = self._prepare_delivery(
-                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
-                    external_id=ext_id, kind="manual_push", planned_str=now_s, delay_sec=0,
-                    idem_key=idem, msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                )
-                if task is None:
-                    continue
-                task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
-                batch.append(task)
+            with self.state.conn:
+                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                    # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
+                    # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
+                    base_idem = make_idem_key(
+                        tpl["template_id"], inst["phone"], p_key, "manual_push", seq, f"{now_s}|push|{seq}"
+                    )
+                    idem = self._idem_for(base_idem, platform)
+                    task = self._prepare_delivery(
+                        template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                        external_id=ext_id, kind="manual_push", planned_str=now_s, delay_sec=0,
+                        idem_key=idem, msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                    )
+                    if task is None:
+                        continue
+                    task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                    batch.append(task)
             oks = self._deliver_batch_concurrent(batch, stats)
             if any(oks):
                 stats["pushed_instances"] += 1
@@ -1070,34 +1091,38 @@ class Scheduler:
                     # 2026-11-13 冲刺模块二：改走受控并发引擎（8 线程 + 25QPS 令牌桶 + 熔断）——
                     # 主线程先完成全部幂等占位/前置记账，worker 只做网络发送，结果回主线程串行记账。
                     batch: List[Dict[str, Any]] = []
-                    for inst in instances:
+                    # 2026-11-16 方案B：prepare 段改分片事务（每 400 实例一批 commit；
+                    # 逐实例 commit 在 MySQL 下 ~6ms fsync/次）。
+                    for _c0 in range(0, len(instances), 400):
+                      with self.state.conn:
+                        for inst in instances[_c0:_c0 + 400]:
 
-                        def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
-                            # 2026-10-29 用户定档：通知类消息**只发管理员配置的正文**。
-                            # ⛔ 不加「今日通知：」标题、不加【模板名】、不加发送时间、不加任何其它内容。
-                            body = render_text_tpl(
-                                template["text_tpl"], member_name=instance["name_snap"],
-                                member_dept=instance.get("dept_snap"),
-                                template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
-                                extra_vars=snap_values,
-                            )
-                            return body.strip()
+                            def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
+                                # 2026-10-29 用户定档：通知类消息**只发管理员配置的正文**。
+                                # ⛔ 不加「今日通知：」标题、不加【模板名】、不加发送时间、不加任何其它内容。
+                                body = render_text_tpl(
+                                    template["text_tpl"], member_name=instance["name_snap"],
+                                    member_dept=instance.get("dept_snap"),
+                                    template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
+                                    extra_vars=snap_values,
+                                )
+                                return body.strip()
 
-                        # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-                        for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                            idem = self._idem_for(
-                                make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str),
-                                platform,
-                            )
-                            task = self._prepare_delivery(
-                                template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
-                                external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
-                                idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                            )
-                            if task is None:
-                                continue
-                            task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
-                            batch.append(task)
+                            # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+                            for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                                idem = self._idem_for(
+                                    make_idem_key(tpl["template_id"], inst["phone"], p_key, "notice", seq_idx, planned_str),
+                                    platform,
+                                )
+                                task = self._prepare_delivery(
+                                    template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                                    external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
+                                    idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                                )
+                                if task is None:
+                                    continue
+                                task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                                batch.append(task)
                     oks = self._deliver_batch_concurrent(batch, stats)
                     # 批量回写：实例任一通道成功 → pending 置 sent（2026-10-28 方案A）
                     by_inst: Dict[int, bool] = {}
@@ -1119,8 +1144,7 @@ class Scheduler:
                         img_src_path: Optional[str] = None
                         if attach_rel:
                             try:
-                                db_path = getattr(getattr(self.state, "db", None), "db_path", None)
-                                base_dir = Path(db_path).parent if db_path else Path("data").resolve()
+                                base_dir = Path(self.state.data_dir)
                                 # 2026-10-29 P2-1：运行时再兜一道，越界路径直接跳过，不外读
                                 _target = (base_dir / attach_rel).resolve()
                                 # 2026-10-29 补丁3：is_relative_to 比字符串前缀更可靠（data_other 不会被误判在 data 内）
@@ -1138,8 +1162,7 @@ class Scheduler:
                                 try:
                                     from .dashboard import render_snapshot_dashboard
 
-                                    db_path = getattr(getattr(self.state, "db", None), "db_path", None)
-                                    data_dir = Path(db_path).parent if db_path else Path("data").resolve()
+                                    data_dir = Path(self.state.data_dir)
                                     out_dir = data_dir / "dashboards"
                                     out_png = str(out_dir / f"{tpl['template_id']}_{p_key}_{seq_idx}.png")
                                     note_text = f"数据截至 {now_s} · 数据来源：人工填报"
@@ -1223,44 +1246,48 @@ class Scheduler:
 
             # 2026-11-13 冲刺模块二：定时提醒主链改走受控并发引擎（8 线程 + 25QPS 桶 + 熔断）。
             # 消息渲染（含 H5 链接签发）与幂等占位在主线程完成，worker 只做网络发送。
+            # 2026-11-16 方案B：prepare 段改**分片事务**（每 400 实例一批）——逐条借还/逐实例
+            # commit 在 MySQL 下每 commit ~6ms fsync，2665 人曾把 prepare 段拖到 23s；
+            # 整批单事务又把崩溃窗口（已发消息的 token 未落盘）放大到全批，取 400 分片平衡。
             remind_batch: List[Dict[str, Any]] = []
-            for inst in instances:
-                if inst["status"] != "pending":
-                    continue
+            _pending = [i for i in instances if i["status"] == "pending"]
+            for _c0 in range(0, len(_pending), 400):
+                with self.state.conn:
+                    for inst in _pending[_c0:_c0 + 400]:
 
-                def _make_remind_msg(instance=inst, template=tpl) -> str:
-                    rendered = render_text_tpl(
-                        template["text_tpl"], member_name=instance["name_snap"], member_dept=instance["dept_snap"],
-                        template_name=template["name"], deadline_at=instance["deadline_at"], period=template["period"], ref_dt=cur_dt,
-                    )
-                    h5_url, _ = self.build_h5_submit_url(
-                        phone=instance["phone"], template_id=template["template_id"],
-                        period_key_val=instance["period_key"], instance_id=int(instance["id"]),
-                    )
-                    # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示点击打开；
-                    # 版式与后台「实时预览」严格一致（预览为纯文本，不再有模块徽章/卡片）。
-                    dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                    return (
-                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
-                        f"截止时间：{dl_disp}\n"
-                        f"提交入口（点击链接打开上传任务）：\n{h5_url}"
-                    )
+                        def _make_remind_msg(instance=inst, template=tpl) -> str:
+                            rendered = render_text_tpl(
+                                template["text_tpl"], member_name=instance["name_snap"], member_dept=instance["dept_snap"],
+                                template_name=template["name"], deadline_at=instance["deadline_at"], period=template["period"], ref_dt=cur_dt,
+                            )
+                            h5_url, _ = self.build_h5_submit_url(
+                                phone=instance["phone"], template_id=template["template_id"],
+                                period_key_val=instance["period_key"], instance_id=int(instance["id"]),
+                            )
+                            # 2026-10-28：密信不支持文本超链接，链接单独占一行并提示点击打开；
+                            # 版式与后台「实时预览」严格一致（预览为纯文本，不再有模块徽章/卡片）。
+                            dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
+                            return (
+                                f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                                f"截止时间：{dl_disp}\n"
+                                f"提交入口（点击链接打开上传任务）：\n{h5_url}"
+                            )
 
-                # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                    idem = self._idem_for(
-                        make_idem_key(tpl["template_id"], inst["phone"], p_key, "remind", 1, planned_str),
-                        platform,
-                    )
-                    task = self._prepare_delivery(
-                        template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
-                        kind="remind", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem,
-                        msg_text_fn=_make_remind_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                    )
-                    if task is None:
-                        continue
-                    task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
-                    remind_batch.append(task)
+                        # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+                        for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                            idem = self._idem_for(
+                                make_idem_key(tpl["template_id"], inst["phone"], p_key, "remind", 1, planned_str),
+                                platform,
+                            )
+                            task = self._prepare_delivery(
+                                template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
+                                kind="remind", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem,
+                                msg_text_fn=_make_remind_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                            )
+                            if task is None:
+                                continue
+                            task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                            remind_batch.append(task)
             self._deliver_batch_concurrent(remind_batch, stats)
 
         adv = self.state.advance_instance_statuses(cur_dt)
@@ -1270,41 +1297,45 @@ class Scheduler:
         # R14：deadline 后 10 分钟对未交者（overdue）发 1 次逾期通知（kind='overdue'，不重复）
         # 2026-11-13 冲刺模块二：同样走受控并发引擎（批量收集 → 并发投递）。
         overdue_batch: List[Dict[str, Any]] = []
-        for inst in self.state.list_overdue_instances():
-            deadline_dt = parse_dt(inst["deadline_at"])
-            overdue_planned_dt = deadline_dt + timedelta(minutes=self.OVERDUE_NOTICE_DELAY_MINUTES)
-            if cur_dt < overdue_planned_dt:
-                continue
-            tpl = self.state.get_template(inst["template_id"])
-            if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
-                continue
+        _overdue = [i for i in self.state.list_overdue_instances()]
+        for _c0 in range(0, len(_overdue), 400):
+            # 2026-11-16 方案B：prepare 段分片事务（每 400 实例一批 commit；同 remind/push/notice）。
+            with self.state.conn:
+                for inst in _overdue[_c0:_c0 + 400]:
+                    deadline_dt = parse_dt(inst["deadline_at"])
+                    overdue_planned_dt = deadline_dt + timedelta(minutes=self.OVERDUE_NOTICE_DELAY_MINUTES)
+                    if cur_dt < overdue_planned_dt:
+                        continue
+                    tpl = self.state.get_template(inst["template_id"])
+                    if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
+                        continue
 
-            planned_str = format_dt(overdue_planned_dt)
-            delay_sec = (cur_dt - overdue_planned_dt).total_seconds()
-            def _make_overdue_msg(instance=inst, template=tpl, dl_dt=deadline_dt) -> str:
-                # 2026-11-12 任务E3：「申请补交」全链路下线，逾期通知改为纯截止告知
-                # （不引导任何补交通道）；文案口径与 H5/后端校验统一
-                # 「当前任务已过期（截止时间：…），无法提交」，不区分链接过期与任务截止。
-                return (
-                    f"【{template['name']}】已逾期\n"
-                    f"你尚未提交。当前任务已过期（截止时间：{instance['deadline_at']}），无法提交。"
-                )
+                    planned_str = format_dt(overdue_planned_dt)
+                    delay_sec = (cur_dt - overdue_planned_dt).total_seconds()
+                    def _make_overdue_msg(instance=inst, template=tpl, dl_dt=deadline_dt) -> str:
+                        # 2026-11-12 任务E3：「申请补交」全链路下线，逾期通知改为纯截止告知
+                        # （不引导任何补交通道）；文案口径与 H5/后端校验统一
+                        # 「当前任务已过期（截止时间：…），无法提交」，不区分链接过期与任务截止。
+                        return (
+                            f"【{template['name']}】已逾期\n"
+                            f"你尚未提交。当前任务已过期（截止时间：{instance['deadline_at']}），无法提交。"
+                        )
 
-            # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-            for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                idem_platform = self._idem_for(
-                    make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
-                    platform,
-                )
-                task = self._prepare_delivery(
-                    template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
-                    kind="overdue", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_platform,
-                    msg_text_fn=_make_overdue_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                )
-                if task is None:
-                    continue
-                task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
-                overdue_batch.append(task)
+                    # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+                    for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                        idem_platform = self._idem_for(
+                            make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
+                            platform,
+                        )
+                        task = self._prepare_delivery(
+                            template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
+                            kind="overdue", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_platform,
+                            msg_text_fn=_make_overdue_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                        )
+                        if task is None:
+                            continue
+                        task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
+                        overdue_batch.append(task)
         self._deliver_batch_concurrent(overdue_batch, stats)
 
         return stats

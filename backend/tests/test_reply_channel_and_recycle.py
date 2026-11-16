@@ -20,6 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.config import SHANGHAI_TZ  # noqa: E402
 from app.main import _channel_notifier  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -44,7 +48,7 @@ DEPT = "云中台"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_fix_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_fix_")))
 
 
 # ── 1. 回复通道按平台 ─────────────────────────────────────────────
@@ -73,7 +77,7 @@ def test_zdxlz_attach_image_goes_link_not_native() -> None:
         store.add_role_member(role, PHONE, NAME, DEPT, actor="t")
         store.upsert_delivery_target(PHONE, "zd_uid_img", platform="zdxlz")
 
-        data_dir = Path(store.db.db_path).parent
+        data_dir = Path(store.data_dir)
         (data_dir / "notice_attach").mkdir(parents=True, exist_ok=True)
         img_file = data_dir / "notice_attach" / "x.png"
         img_file.write_bytes(b"\x89PNG\r\n\x1a\nfake")

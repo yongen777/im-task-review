@@ -27,6 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.events import handle_inbound_text  # noqa: E402
 from app.api.h5 import process_h5_bind  # noqa: E402
 from app.config import SHANGHAI_TZ  # noqa: E402
@@ -39,7 +43,7 @@ NAME = "张三"
 
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp(prefix="imtask_multi_")
-    return StateStore(Path(tmp) / "im_task.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _setup(store: StateStore, *, zdxlz: bool, wecom: bool, tpl_platform: str = "zdxlz") -> str:

@@ -20,6 +20,10 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.channels.zdxlz import SendResult
 from app.config import SHANGHAI_TZ
 from app.scheduler import FakeNotifier, Scheduler, render_text_tpl
@@ -28,7 +32,7 @@ from app.state import BizError, StateStore
 
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp(prefix="imtask_t3_")
-    return StateStore(Path(tmp) / "im_task.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _mk_scheduler(store: StateStore, notifier=None, image_sender=None) -> Scheduler:
@@ -397,7 +401,7 @@ def test_notice_image_link_only_once_across_multiple_ticks() -> None:
         assert kinds.count("notice_img_link") == 1, kinds
 
         # 副本目录只应有 1 个 png + 1 个 .title（每 tick 复制一次是刷屏的另一半）
-        pub_dir = Path(store.db.db_path).parent / "public_img"
+        pub_dir = store.data_dir / "public_img"
         pngs = list(pub_dir.glob("*.png"))
         assert len(pngs) == 1, f"副本应只生成 1 个，实际 {len(pngs)} 个"
     finally:

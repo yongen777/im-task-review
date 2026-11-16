@@ -541,13 +541,13 @@ export function StatisticsView() {
                           <td className="py-2 px-3 text-slate-500">{String(r.dept || '—')}</td>
                           {viewTab === 'numbers' ? (
                             <>
-                              <td className="py-2 px-3 text-slate-500">{String((r as NumberRow).field)}</td>
-                              <td className="py-2 px-3 font-bold text-slate-800 tabular-nums">{String((r as NumberRow).value)}</td>
+                              <td className="py-2 px-3 text-slate-500">{String((r as unknown as NumberRow).field)}</td>
+                              <td className="py-2 px-3 font-bold text-slate-800 tabular-nums">{String((r as unknown as NumberRow).value)}</td>
                             </>
                           ) : viewTab === 'texts' ? (
-                            <td className="py-2 px-3 text-slate-600 max-w-[420px]">{String((r as TextRow).text)}</td>
+                            <td className="py-2 px-3 text-slate-600 max-w-[420px]">{String((r as unknown as TextRow).text)}</td>
                           ) : (
-                            <td className="py-2 px-3 text-slate-600">{String((r as FileRow).file_count)} 个附件</td>
+                            <td className="py-2 px-3 text-slate-600">{String((r as unknown as FileRow).file_count)} 个附件</td>
                           )}
                         </tr>
                       ))

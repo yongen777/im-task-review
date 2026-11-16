@@ -16,7 +16,7 @@
   .venv\\Scripts\\python.exe scripts/purge_business_data.py --apply     # 真清库（先自动备份）
 
 注意：运行时请先停服务（systemctl stop imtask），避免写入与清库互相覆盖；
-      --apply 会先把 im_task.db 复制成 im_task.db.bak-purge-<时间戳> 再动手。
+      --apply 前请先在数据库侧留快照（方案B 后为纯 MySQL，脚本不做文件级备份）。
 """
 from __future__ import annotations
 
@@ -51,17 +51,13 @@ def main() -> int:
     from app.state import StateStore  # noqa: PLC0415
 
     data_dir = resolve_data_dir(ROOT / ".env").resolve()
-    db_path = data_dir / "im_task.db"
-    if not db_path.is_file():
-        print(f"✗ 找不到数据库文件：{db_path}")
-        return 1
-
-    store = StateStore(db_path)
+    store = StateStore()  # 方案B：纯 MySQL，连接参数走 .env 的 IMT_MYSQL_*
     try:
         with store.lock:
             missing = [t for t in PURGE_TABLES + KEEP_TABLES
                        if not store.conn.execute(
-                           "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()]
+                           "SELECT 1 FROM information_schema.tables "
+                           "WHERE table_schema = DATABASE() AND table_name = ?", (t,)).fetchone()]
             if missing:
                 print(f"✗ 库里缺表（先跑服务完成初始化再清）：{missing}")
                 return 1
@@ -82,11 +78,10 @@ def main() -> int:
             print("\n[ dry-run ] 未改动任何数据；确认无误后加 --apply 执行清库。")
             return 0
 
-        # 自动备份
+        # 方案B：纯 MySQL——本脚本不再做文件级备份（原 im_task.db 已退役），
+        # --apply 前请先在云数据库侧打快照（生产回滚口径已改为 DB 快照体系）。
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup_path = db_path.with_name(f"im_task.db.bak-purge-{stamp}")
-        shutil.copyfile(db_path, backup_path)
-        print(f"✓ 已备份：{backup_path}")
+        print(f"✓ 回滚保障：请确认已为 MySQL 库留有快照（本次操作时间 {stamp}）")
 
         with store.lock, store.conn:
             for t in PURGE_TABLES:

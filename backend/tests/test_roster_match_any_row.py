@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.h5 import process_h5_bind  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -34,7 +38,7 @@ DEPT_B = "渠道部"
 
 
 def _store() -> StateStore:
-    store = StateStore(Path(tempfile.mkdtemp(prefix="imtask_roster_")) / "im.db")
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_roster_")))
     for d in (DEPT_A, DEPT_B):
         store.create_department(d, actor="t")
     return store

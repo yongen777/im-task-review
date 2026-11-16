@@ -25,6 +25,10 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.admin import create_admin_router  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -33,7 +37,7 @@ PWD = "Hds22999!"
 
 
 def _app():
-    store = StateStore(Path(tempfile.mkdtemp()) / "t.db")
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp()))
     store.upsert_admin_user("admin", "Admin@2026", must_change=False)
     app = FastAPI()
     app.include_router(create_admin_router(store, notifier=None, public_base_url="http://x"))

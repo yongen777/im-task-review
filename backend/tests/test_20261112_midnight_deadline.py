@@ -19,6 +19,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.scheduler import calc_deadline_at, calc_instance_deadline  # noqa: E402
 from app.state import BizError, StateStore  # noqa: E402
@@ -28,7 +30,7 @@ CLOCK = {"now": datetime(2026, 11, 12, 14, 0, 0)}  # 2026-11-12 周四 14:00
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_mid_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_mid_")), now_fn=lambda: CLOCK["now"])
 
 
 def _seed(store: StateStore) -> str:

@@ -16,6 +16,10 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import sys as _sys
+from pathlib import Path
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
 
@@ -23,7 +27,7 @@ def _store():
     tmp = tempfile.mkdtemp(prefix="imt1109b_")
     os.environ["TEMP"] = tmp
     os.environ["TMP"] = tmp
-    return StateStore(db_path=os.path.join(tmp, "t.db"))
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _bind(store, phone, external_id, platform, activated_at="2026-10-20 09:00:00"):

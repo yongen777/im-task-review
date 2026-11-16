@@ -13,12 +13,15 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api.events import handle_inbound_text  # noqa: E402
 from app.api.h5 import process_h5_task_info  # noqa: E402
@@ -38,7 +41,7 @@ CLOCK = {"now": datetime(2026, 11, 12, 19, 30, 0)}
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_adhoc_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_adhoc_")), now_fn=lambda: CLOCK["now"])
 
 
 def _seed_zdxlx(store: StateStore, phone: str = P, uid: str = UID, name: str = "王五") -> str:
@@ -160,22 +163,29 @@ def test_menu_scenario_texts_exact() -> None:
         _, _, box = _run(store, UID, "你好")
         assert "回复【待办】" in box[0][0] and "回复【菜单】" in box[0][0], box[0][0]
 
-        # 场景 2：【菜单】→ 清单（编号升序 + 两条事项 + 结尾指引）
+        # 场景 2：【菜单】→ 清单（两条事项都在 + 编号 1./2. + 结尾指引）
+        # 2026-11-16 方案B：同秒创建的两个模板在 MySQL 下无 rowid 插入序（SQLite 独有），
+        # 排序键退化为 (created_at, template_id)——断集合与结构，不锁创建先后；
+        # 场景 3b 的「回复 1 = 菜单第 1 条」改为动态对位（编号一致性才是被测口径）。
         _, _, box = _run(store, UID, "菜单")
         menu = box[0][0]
         assert menu.startswith("【自主上报事项清单】"), menu
         assert "请直接回复对应【数字编号】获取专属提交链接：" in menu
-        assert "1. 【现场安全隐患排查上报】" in menu and "2. 【突发网络故障紧急报备】" in menu, menu
+        assert "1. 【" in menu and "2. 【" in menu, menu
+        assert "现场安全隐患排查上报" in menu and "突发网络故障紧急报备" in menu, menu
         assert "（直接回复数字如\"1\"即可进入填报）" in menu
+        m1 = re.search(r"^1\. 【(.+?)】$", menu, re.MULTILINE)
+        assert m1, menu
+        first_name = m1.group(1)
 
         # 场景 3a：数字越界 → 未找到
         _, _, box = _run(store, UID, "99")
         assert box[0][0] == "【德阳量密助手】未找到编号为 99 的事项，请回复【菜单】查看最新列表。", box[0][0]
 
-        # 场景 3b：数字命中 → 签发一次性链接（模板文案）
+        # 场景 3b：数字命中 → 签发一次性链接（模板文案）；签发对象=菜单第 1 条
         _, body, box = _run(store, UID, "1")
         msg = box[0][0]
-        assert msg.startswith("请点击链接完成【现场安全隐患排查上报】填报："), msg
+        assert msg.startswith(f"请点击链接完成【{first_name}】填报："), (msg, first_name)
         assert "👉 提交入口：http://t.example.com/h5/task#t=" in msg, msg
         assert "（本链接提交后自动作废；如需再次上报请重新回复\"1\"）" in msg, msg
     finally:

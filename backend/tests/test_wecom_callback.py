@@ -23,6 +23,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.wecom_callback import create_wecom_router, parse_wecom_xml, reset_dedupe_cache
 from app.channels.wecom_crypto import (
     SHA1,
@@ -96,7 +100,7 @@ class FakeNotifier:
 
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp()
-    return StateStore(Path(tmp) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _mk_overdue(store: StateStore, *, hours_late: float = 2.0) -> Dict[str, Any]:

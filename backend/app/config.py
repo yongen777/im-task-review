@@ -142,10 +142,7 @@ class Config:
         if self.public_port == self.admin_port:
             _abort_same_port()
 
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "im_task.db"
-
+    # 2026-11-16 方案B：SQLite 单文件（db_path）随双引擎一并移除——库连接走 IMT_MYSQL_*。
     @property
     def uploads_dir(self) -> Path:
         return self.data_dir / "uploads"

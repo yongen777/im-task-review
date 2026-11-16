@@ -15,7 +15,7 @@ for line in ENV.read_text(encoding="utf-8").splitlines():
 sys.path.insert(0, "/opt/imtask")
 from app.state import StateStore  # noqa: E402
 
-store = StateStore(Path("/opt/imtask/data/im_task.db"))
+store = StateStore()  # 方案B：纯 MySQL（连接参数来自 /opt/imtask/.env 的 IMT_MYSQL_*）
 try:
     for plat in ("zdxlz", "wecom", ""):
         items = store.list_member_pool(platform=plat or None)

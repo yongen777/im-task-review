@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -23,6 +24,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -34,7 +37,7 @@ PHONE_Z = "13900001003"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_super_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_super_")))
 
 
 def _app(store: StateStore) -> FastAPI:
@@ -178,8 +181,16 @@ def test_cascade_purge_admin_account() -> None:
                            (tpl["template_id"], PHONE_X))
         store.conn.commit()
 
-        backup = store.backup_database(tag="purge-test")
-        assert Path(backup).is_file()
+        # 方案B（2026-11-16）：backup_database 不再落文件备份（返回空串，DB 回滚走
+        # 数据库侧快照体系）；不可逆级联删除的护栏改由 snapshot_admin_scope_json 承担——
+        # 删除前把该管理员名下业务行导出为 JSON 恢复快照，失败即中止删除。
+        assert store.backup_database(tag="purge-test") == ""
+        snap_path = store.snapshot_admin_scope_json(admin_id=a_id, tag="purge-test")
+        assert Path(snap_path).is_file(), snap_path
+        snap = json.loads(Path(snap_path).read_text(encoding="utf-8"))
+        assert snap["admin_id"] == a_id
+        assert len(snap["role"]) >= 2 and len(snap["member"]) >= 3
+        assert len(snap["task_instance"]) >= 1 and len(snap["submission"]) >= 1
 
         res = store.delete_admin_account(a_id, actor="admin", uploads_dir=uploads)
         assert res["deleted"]["role"] >= 2 and res["deleted"]["member"] >= 3

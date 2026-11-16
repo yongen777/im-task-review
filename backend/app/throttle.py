@@ -99,7 +99,10 @@ class TokenBucket:
                 self._tokens = min(self.capacity, self._tokens + wait_s * self.rate)
                 self._tokens = max(0.0, self._tokens - need)
             return waited
-        # 真实路径：Condition 等待（等待释放锁，醒来由统一 refill 精确补足）
+        # 真实路径：Condition 等待 + 尾段自旋。
+        # 2026-11-16 方案B：Windows 定时器粒度 ~15ms 会把 25QPS 的 40ms 令牌周期
+        # 实际拉长到 ~46-56ms（2665 人实测发送段 123s vs 理论 106.6s，超 120s 闸门）——
+        # 长等待照旧走 cond.wait（让出 CPU），残余 ≤3ms 用自旋补精确，令牌节奏回到亚毫秒。
         while True:
             with self._cond:
                 self._refill_locked(self._clock())
@@ -107,10 +110,16 @@ class TokenBucket:
                     self._tokens -= need
                     return waited
                 wait_s = (need - self._tokens) / self.rate
-            t0 = time.monotonic()
-            with self._cond:
-                self._cond.wait(timeout=max(wait_s, 0.001))
-            waited += time.monotonic() - t0
+            if wait_s > 0.003:
+                t0 = time.monotonic()
+                with self._cond:
+                    self._cond.wait(timeout=max(wait_s - 0.002, 0.001))
+                waited += time.monotonic() - t0
+            else:
+                # 尾段自旋（≤3ms/次）：消除定时器粒度，不改变限流语义
+                deadline2 = time.monotonic() + wait_s
+                while time.monotonic() < deadline2:
+                    pass
 
     def try_acquire(self, n: float = 1.0, timeout: float = 0.0) -> bool:
         """带超时让位的获取：熔断开启时批次收尾线程用它退出，不无限挂桶。"""

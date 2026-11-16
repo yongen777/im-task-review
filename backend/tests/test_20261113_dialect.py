@@ -50,12 +50,19 @@ def test_on_conflict_to_on_duplicate_key() -> None:
 
 
 def test_rowid_and_last_insert_rowid() -> None:
-    out = _translate_sql(
-        "AND kind != 'notice' ORDER BY created_at ASC, rowid ASC")
-    assert "ORDER BY created_at ASC, id ASC" in out
+    # 方案B（2026-11-16）：rowid 翻译已移除——业务 SQL 全部改用 MySQL 合法列
+    # （实测 task_template 无自增主键，ORDER BY rowid 翻译成 id 会直接 1054）
+    out = _translate_sql("AND kind != 'notice' ORDER BY created_at ASC, template_id ASC")
+    assert "ORDER BY created_at ASC, template_id ASC" in out
     assert _translate_sql("SELECT last_insert_rowid()") == "SELECT LAST_INSERT_ID()"
     # 词边界：rowidx 之类的列名不被误替换
     assert _translate_sql("SELECT rowidx FROM t") == "SELECT rowidx FROM t"
+
+
+def test_percent_in_string_literal_escaped() -> None:
+    # 方案B 补丁：pymysql 对带参 SQL 做 % 格式化，字面量里的 % 必须转义为 %%
+    out = _translate_sql("SELECT * FROM member WHERE name LIKE '%张%' AND phone = ?")
+    assert "'%%张%%'" in out and out.count("%s") == 1
 
 
 def test_backtick_and_double_quote_literals() -> None:

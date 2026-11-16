@@ -35,7 +35,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402  # noqa: E402
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.db import MySQLConnProxy  # noqa: E402
@@ -51,7 +53,7 @@ CLOCK = {"now": datetime(2026, 11, 13, 8, 0, 0)}  # 绑定时刻须早于 15:00 
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_fix3_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_fix3_")), now_fn=lambda: CLOCK["now"])
 
 
 def _app(store: StateStore, scheduler: Scheduler) -> FastAPI:
@@ -82,9 +84,13 @@ def _new_sub_admin(app: FastAPI, super_admin: TestClient, username: str) -> Test
 
 # ═══════════════════ 修复一：push_now 防卡死 ═══════════════════
 
-def _push_setup():
+def _push_setup(tag: str = "") -> tuple:
     """通用脚手架：超管 + 属主分级 sa + 双成员（已激活）+ upload 模板（每月 1 号 / 月底 17:00 截止）。
-    同时充当修复三的模板底座（exec_dom_days=[1] + deadline_type=month_end）。"""
+    同时充当修复三的模板底座（exec_dom_days=[1] + deadline_type=month_end）。
+
+    tag：方案B 后多套脚手架共用 im_task_test 库，同用例二度 setup 必须靠 tag 错开
+    管理员用户名 / 角色名（SQLite 临时库时代各建各库，无此约束）。
+    """
     CLOCK["now"] = datetime(2026, 11, 13, 8, 0, 0)  # 重置共享时钟（绑定早于当日推送）
     store = _store()
     store.upsert_admin_user("admin", "Admin@2026", must_change=False)
@@ -93,10 +99,13 @@ def _push_setup():
                       now_fn=lambda: CLOCK["now"])
     app = _app(store, sched)
     sa = _login(app, "admin", "Admin@2026")
-    sub = _new_sub_admin(app, sa, "sa")
-    rid = store.create_role("月报组", actor="t", platform="zdxlz", owner_id=2)["role_id"]
-    store.add_role_member(rid, PHONE_A, "甲一", "一部", owner_id=2, actor="sub")
-    store.add_role_member(rid, PHONE_B, "乙二", "一部", owner_id=2, actor="sub")
+    sub = _new_sub_admin(app, sa, f"sa{tag}")
+    # 共享库下新管理员的 id 不再恒为 2（SQLite 临时库时代 hard-code=2）→ 动态取真实 id
+    sid = int(store.conn.execute(
+        "SELECT id FROM admin_user WHERE username = ?", (f"sa{tag}",)).fetchone()[0])
+    rid = store.create_role(f"月报组{tag}", actor="t", platform="zdxlz", owner_id=sid)["role_id"]
+    store.add_role_member(rid, PHONE_A, "甲一", "一部", owner_id=sid, actor="sub")
+    store.add_role_member(rid, PHONE_B, "乙二", "一部", owner_id=sid, actor="sub")
     store.upsert_delivery_target(PHONE_A, f"uid_{PHONE_A[-4:]}", platform="zdxlz", external_type="union_id")
     store.upsert_delivery_target(PHONE_B, f"uid_{PHONE_B[-4:]}", platform="zdxlz", external_type="union_id")
     r = sub.post("/api/admin/templates", json={
@@ -141,8 +150,8 @@ def test_fix1_split_equivalent_and_prep_replay_idempotent() -> None:
         stats1 = sched.push_now(tpl_id, actor="sub")
         assert stats1["sent"] == 2 and stats1["pushed_instances"] == 2, stats1
 
-        # 拆分路径等价（新 store 重新走一遍同场景）
-        store2, _app2, _sa2, sub2, sched2, ntf2, tpl2 = _push_setup()
+        # 拆分路径等价（新 store 重新走一遍同场景；tag 错开用户名/角色名防共享库撞车）
+        store2, _app2, _sa2, sub2, sched2, ntf2, tpl2 = _push_setup(tag="2")
         try:
             CLOCK["now"] = datetime(2026, 11, 13, 15, 0, 0)
             prep = sched2.push_now_prepare(tpl2, actor="sub")
@@ -330,15 +339,26 @@ def test_fix2_in_txn_execute_does_not_commit_early() -> None:
 
 
 def test_fix2_autocommit_path_borrow_execute_commit_release() -> None:
-    """无事务段 execute：借→执→交→还一次完成，返回的立即可用。"""
+    """无事务段 execute：借→执→（写提交/读回滚收事务）→还一次完成，返回的立即可用。
+
+    2026-11-16 方案B 语义更新：只读语句走 rollback 收隐式事务（省一次 InnoDB fsync），
+    写语句照旧 commit ——两条路径都必须「一次借还、绝不残留线程事务栈」。
+    """
     pool = _FakePool()
     proxy = _proxy(pool)
     cur = proxy.execute("SELECT 1 AS ok")
     row = cur.fetchone()
     assert row and row["ok"] == 1, row
     conn: _FakeConn = pool.conns[0]
-    assert conn.commits == 1 and conn.closes == 1, (conn.commits, conn.closes)
+    assert conn.rollbacks == 1 and conn.closes == 1, (conn.rollbacks, conn.commits, conn.closes)
     assert not getattr(proxy._tls, "stack", None), "自动提交路径不得残留线程事务栈"
+
+    pool2 = _FakePool()
+    proxy2 = _proxy(pool2)
+    proxy2.execute("INSERT INTO t(a) VALUES (?)", (1,))
+    conn2: _FakeConn = pool2.conns[0]
+    assert conn2.commits == 1 and conn2.closes == 1, (conn2.commits, conn2.closes)
+    assert not getattr(proxy2._tls, "stack", None)
 
 
 def test_fix2_exception_rolls_back_and_releases() -> None:

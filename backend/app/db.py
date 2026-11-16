@@ -1,493 +1,58 @@
 # -*- coding: utf-8 -*-
-"""数据层连接工厂：双引擎（sqlite 默认 / mysql 8.0 兼容 5.7.43）。
+"""数据层：纯 MySQL（5.7.43 兼容；2026-11-16 方案B 彻底移除 SQLite 双引擎）。
 
-sqlite：单文件 + WAL + DEFERRED 事务（历史行为不变，全量单测跑这一层）。
-mysql（2026-11-13 冲刺模块一）：
-  · `Database` 按环境变量 IMT_DB_ENGINE 分支，生产换引擎零改码；
-  · 连接走 dbutils.PooledDB 连接池（每事务借还，InnoDB 行级锁）；
-  · SQL 方言翻译器 `_translate_sql`（?→%s、INSERT OR IGNORE→INSERT IGNORE、
-    ON CONFLICT→ON DUPLICATE KEY UPDATE、rowid→id、last_insert_rowid→LAST_INSERT_ID）；
-  · 5.7 三坑规范（用户拍板）：索引列显式 VARCHAR(64/128)；TEXT 列禁 DEFAULT；
+架构（方案B，用户拍板 2026-11-16）：
+  · 唯一引擎 = pymysql + dbutils.PooledDB 连接池（每事务借还，InnoDB 行级锁并发）；
+  · `MySQLConnProxy` 是 state.py 的 `self.conn` 鸭子替身：
+      - `with proxy:` 事务段（可重入计数；首个进入借连接，最后退出 commit/归还）；
+      - execute / executemany 无事务段时：借连接 → 执行 → 立即 commit → 归还；
+      - 连接按 threading.local 线程本地存储（FastAPI 线程池 + 调度线程各自独立事务）；
+  · `_translate_sql`：SQL 适配层（? 占位符 → %s、INSERT OR IGNORE → INSERT IGNORE、
+    ON CONFLICT(...) DO UPDATE → ON DUPLICATE KEY UPDATE、last_insert_rowid() → LAST_INSERT_ID()、
+    :name → %(name)s；
+  · 5.7 方言三坑规范（用户拍板）：索引列显式 VARCHAR(64/128)；TEXT 列禁 DEFAULT；
     索引行长在 innodb_large_prefix=ON + DYNAMIC 行格式下 3072 字节无忧。
+  · ⛔ SQLite 双引擎分支（IMT_DB_ENGINE / DDL_SCRIPT / _ensure_column / _migrate_*
+    / executescript / WAL PRAGMA）已于 2026-11-16 方案B 整体移除——
+    彻底消灭「测试（sqlite）绿、上线（mysql）红」的方言差异隐患。
+  · ⛔ 进程级全局写锁（threading.RLock）同步退役：并发安全改由
+    **每线程独立连接事务 + InnoDB 行级锁 + 唯一键幂等（INSERT IGNORE）**兜底；
+    `_NoLock` 仅保留 `with store.lock:` 语法兼容（空上下文，零排队）。
+
+连接参数（.env）：IMT_MYSQL_HOST / IMT_MYSQL_PORT / IMT_MYSQL_USER /
+IMT_MYSQL_PASSWORD / IMT_MYSQL_DATABASE（默认 im_task）。
+池参数（可选）：IMT_MYSQL_MINCACHED（默认 2）/ IMT_MYSQL_MAXCONNECTIONS（默认 16）；
+测试底座用小池（见 tests/conftest.py）。
 """
 from __future__ import annotations
 
 import os
-import sqlite3
+import re
 import threading
-from pathlib import Path
+
+# state 层唯一键竞态兜底用的稳定异常名（pymysql.err.IntegrityError）。
+# 2026-11-16 方案B：原 sqlite3.IntegrityError 捕获点统一改捕本名。
+from pymysql.err import IntegrityError  # noqa: F401  (re-export)
+
+# 只读语句判定（方案B 性能修复 2026-11-16）：autocommit=False 的连接上，
+# 只读查询若也 commit 会白付一次 InnoDB fsync（本机实测 ~6ms/次，2665 条批量
+# 投递的 prepare 段因此多耗 23s）——只读一律 rollback 收隐式事务（零 fsync）。
+_READ_ONLY_RE = re.compile(r"^\s*(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|WITH)\b", re.IGNORECASE)
+
+
+def _is_read_only(sql: str) -> bool:
+    return bool(_READ_ONLY_RE.match(sql or ""))
 
 SCHEMA_VERSION = 1
 
-# §16 P6 台账约定：全库 14 张 = 10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit) + 1 版本门表(schema_version)
-# BUSINESS_TABLES 保留 13 项（10 业务表 + 3 支撑表）
+# §16 P6 台账约定：10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit)
+# + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
 BUSINESS_TABLES = (
     "scope", "role", "member", "delivery_target", "task_template",
     "task_instance", "submission", "reminder_log", "upload_ref", "h5_token",
     "admin_user", "admin_session", "admin_audit",
 )
 VERSION_TABLE = "schema_version"
-
-DDL_SCRIPT = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA synchronous=NORMAL;
-
-CREATE TABLE IF NOT EXISTS schema_version (
-  version     INTEGER NOT NULL,
-  updated_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS scope (
-  scope_id   TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  type       TEXT NOT NULL DEFAULT 'dept',
-  parent_id  TEXT,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS role (
-  role_id    TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  note       TEXT,
-  platform   TEXT NOT NULL DEFAULT 'zdxlz',
-  created_at TEXT NOT NULL,
-  UNIQUE(platform, name)
-);
-
-CREATE TABLE IF NOT EXISTS member (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  role_id    TEXT NOT NULL,
-  phone      TEXT NOT NULL,
-  name       TEXT NOT NULL,
-  dept       TEXT,
-  enabled    INTEGER NOT NULL DEFAULT 1,
-  source     TEXT NOT NULL DEFAULT 'manual',
-  created_at TEXT NOT NULL,
-  UNIQUE(role_id, phone)
-);
-
--- 2026-11-10 方案A：external_id 的 id 体系 —— 'user'=IM 会话 userId（历史值，存量绑定不动）
--- / 'union_id'=通讯录 union_id（官方口径：可不建会话直接投递，receive_type="union_id"）。
-CREATE TABLE IF NOT EXISTS delivery_target (
-  platform      TEXT NOT NULL DEFAULT 'zdxlz',
-  phone         TEXT NOT NULL,
-  external_id   TEXT NOT NULL,
-  external_type TEXT NOT NULL DEFAULT 'user',
-  usable        INTEGER NOT NULL DEFAULT 1,
-  activated_at  TEXT NOT NULL,
-  last_event_at TEXT NOT NULL,
-  PRIMARY KEY (platform, phone)
-);
-
-CREATE TABLE IF NOT EXISTS task_template (
-  template_id     TEXT PRIMARY KEY,
-  name            TEXT NOT NULL,
-  kind            TEXT NOT NULL,
-  role_ids        TEXT NOT NULL,
-  schema_json     TEXT,
-  allow_note      INTEGER NOT NULL DEFAULT 0,
-  text_tpl        TEXT NOT NULL,
-  remind_at       TEXT,
-  notice_times    TEXT,
-  deadline        TEXT,
-  period          TEXT NOT NULL,
-  anchor_weekday  INTEGER,
-  anchor_dom      INTEGER,
-  deadline_offset INTEGER NOT NULL DEFAULT 0,
-  need_review     INTEGER NOT NULL DEFAULT 0,
-  max_file_mb     INTEGER,
-  enabled         INTEGER NOT NULL DEFAULT 1,
-  deleted         INTEGER NOT NULL DEFAULT 0,
-  created_by      TEXT NOT NULL,
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  /* 2026-11-12 任务E1：截止配置三件套。
-     has_deadline=0（无截止）时实例截止时间统一存哨兵 9999-12-31 23:59:59
-     （deadline_at 列 NOT NULL 不动，字符串比较天然永不过期，展示层特判「不限」）。
-     deadline_type ∈ {same_day, weekend, month_end}；NULL = 旧模板回落
-     旧列 deadline(HH:MM) + deadline_offset 的算法，行为不变。 */
-  has_deadline    INTEGER NOT NULL DEFAULT 1,
-  deadline_type   TEXT,
-  deadline_time   TEXT
-);
-
-CREATE TABLE IF NOT EXISTS task_instance (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  template_id   TEXT NOT NULL,
-  phone         TEXT NOT NULL,
-  name_snap     TEXT NOT NULL,
-  dept_snap     TEXT,
-  period_key    TEXT NOT NULL,
-  status        TEXT NOT NULL,
-  deadline_at   TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  submitted_at  TEXT,
-  reviewed_at   TEXT,
-  reviewer      TEXT,
-  reject_reason TEXT,
-  reject_count  INTEGER NOT NULL DEFAULT 0,
-  late_submit   INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(template_id, phone, period_key)
-);
-CREATE INDEX IF NOT EXISTS ix_inst_status ON task_instance(status, deadline_at);
-CREATE INDEX IF NOT EXISTS ix_inst_period ON task_instance(period_key);
-
-CREATE TABLE IF NOT EXISTS submission (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  instance_id INTEGER NOT NULL,
-  fields_json TEXT,
-  file_ref    TEXT,
-  file_name   TEXT,
-  mime        TEXT,
-  size        INTEGER,
-  note        TEXT,
-  refs_json   TEXT,
-  source      TEXT NOT NULL,
-  status      TEXT NOT NULL,
-  created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_sub_inst ON submission(instance_id, id);
-
-CREATE TABLE IF NOT EXISTS reminder_log (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  template_id  TEXT NOT NULL,
-  instance_id  INTEGER,
-  phone        TEXT NOT NULL,
-  kind         TEXT NOT NULL,
-  planned_at   TEXT NOT NULL,
-  attempted_at TEXT,
-  sent_at      TEXT,
-  result       TEXT NOT NULL,
-  error        TEXT,
-  retry        INTEGER NOT NULL DEFAULT 0,
-  idem_key     TEXT NOT NULL,
-  UNIQUE(idem_key, retry)
-);
-CREATE INDEX IF NOT EXISTS ix_rem_idem ON reminder_log(idem_key, result);
-
-CREATE TABLE IF NOT EXISTS upload_ref (
-  ref         TEXT PRIMARY KEY,
-  phone       TEXT NOT NULL,
-  template_id TEXT,
-  file_name   TEXT NOT NULL,
-  mime        TEXT NOT NULL,
-  size        INTEGER NOT NULL,
-  rel_path    TEXT NOT NULL,
-  consumed    INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS h5_token (
-  token_id    TEXT PRIMARY KEY,
-  phone       TEXT NOT NULL,
-  template_id TEXT NOT NULL,
-  period_key  TEXT NOT NULL,
-  instance_id INTEGER,
-  purpose     TEXT NOT NULL,
-  created_at  TEXT NOT NULL,
-  expires_at  TEXT NOT NULL,
-  consumed    INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS admin_user (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  username    TEXT NOT NULL UNIQUE,
-  pwd_hash    TEXT NOT NULL,
-  must_change INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS admin_session (
-  sid        TEXT PRIMARY KEY,
-  user_id    INTEGER NOT NULL,
-  csrf       TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  last_seen  TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
-
--- 2026-10-30 通道配置向导：凭证加密存库（AES-GCM），换一家公司部署只填表单、不改代码。
--- payload 是密文（v1:base64(nonce+ct)），⛔ 任何情况下都不落明文；channel 只有 zdxlz / wecom。
-CREATE TABLE IF NOT EXISTS channel_config (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  channel    TEXT NOT NULL UNIQUE,
-  payload    TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS admin_audit (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  username    TEXT NOT NULL,
-  action      TEXT NOT NULL,
-  target_type TEXT,
-  target_id   TEXT,
-  detail      TEXT,
-  created_at  TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS data_snapshot (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  source_key  TEXT NOT NULL,
-  period_key  TEXT NOT NULL,
-  values_json TEXT NOT NULL DEFAULT '{}',
-  note        TEXT,
-  updated_by  TEXT,
-  updated_at  TEXT NOT NULL,
-  UNIQUE(source_key, period_key)
-);
-
-CREATE INDEX IF NOT EXISTS ix_data_snapshot_lookup ON data_snapshot(source_key, period_key);
-
-CREATE TABLE IF NOT EXISTS pending_member (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  external_id  TEXT NOT NULL UNIQUE,
-  phone        TEXT,
-  name         TEXT,
-  dept         TEXT,
-  last_message TEXT,
-  activated_at TEXT NOT NULL,
-  updated_at   TEXT NOT NULL
-);
-
--- 2026-11-03 部门选项：后台管理员配置，供成员表单与 H5 登记页下拉选择
-CREATE TABLE IF NOT EXISTS dept_option (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  name       TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL
-);
-"""
-
-
-def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_def: str) -> None:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    if column not in {row[1] for row in rows}:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
-
-
-def _ensure_member_columns(conn: sqlite3.Connection) -> None:
-    """2026-11-11 用户拍板：member.dept_path —— 官方通讯录完整组织路径（层级统计归集）。
-
-    · dept 仍存**末级部门名**（激活列表展示口径不变）；
-    · dept_path 存官方全路径（段分隔 "/"，如 四川/德阳/市公司本部/云中台（…）/产数支撑中心）——
-      统计「云中台」时按路径段归一化匹配，直属（周艳）与下级部门（郑佳）都能卷进来。
-    """
-    _ensure_column(conn, "member", "dept_path", "TEXT")
-
-
-def _migrate_multi_admin(conn: sqlite3.Connection) -> None:
-    """2026-11-04 多管理员分级：超级管理员（只读+账号管理）+ 分级管理员（数据按 owner_id 隔离）。
-
-    幂等：全部是 ADD COLUMN / UPDATE，重复执行安全；历史数据 owner_id 默认 1（admin），
-    由运维脚本决定是否改挂到某个具体分级管理员名下。
-
-    ⚠️ 业务表名以本仓库为准：role / member / task_template / task_instance
-    （外部方案里写的 `roster` 表在本仓库不存在，成员表叫 member）。
-    """
-    _ensure_column(conn, "admin_user", "display_name", "TEXT NOT NULL DEFAULT ''")
-    _ensure_column(conn, "admin_user", "role_level", "TEXT NOT NULL DEFAULT 'sub_admin'")
-    # 2026-11-05 代登录（assume/unassume）：代管会话记录原超管会话 sid，供一键切回
-    _ensure_column(conn, "admin_session", "parent_sid", "TEXT")
-    _ensure_column(conn, "admin_user", "allowed_platforms", "TEXT NOT NULL DEFAULT '[\"zdxlz\",\"wecom\"]'")
-    _ensure_column(conn, "admin_user", "enabled", "INTEGER NOT NULL DEFAULT 1")
-    _ensure_column(conn, "admin_user", "last_login_at", "TEXT")
-    for _t in ("role", "member", "task_template", "task_instance"):
-        _ensure_column(conn, _t, "owner_id", "INTEGER NOT NULL DEFAULT 1")
-    # 主账号 admin 固定为超级管理员 + 双平台
-    conn.execute(
-        "UPDATE admin_user SET role_level = 'super_admin', "
-        "display_name = CASE WHEN display_name = '' THEN '超级管理员' ELSE display_name END, "
-        "allowed_platforms = '[\"zdxlz\",\"wecom\"]' "
-        "WHERE username = 'admin'"
-    )
-    conn.commit()
-
-
-def _migrate_reminder_log_unique(conn: sqlite3.Connection) -> None:
-    """若旧库 reminder_log 为单列 idem_key UNIQUE，使用显式事务 BEGIN IMMEDIATE 原子迁移为 UNIQUE(idem_key, retry)。"""
-    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='reminder_log'").fetchone()
-    if not row or not row[0] or "UNIQUE(idem_key, retry)" in str(row[0]):
-        return
-
-    old_cols = {r[1] for r in conn.execute("PRAGMA table_info(reminder_log)").fetchall()}
-    attempted_expr = "COALESCE(attempted_at, sent_at, planned_at)" if "attempted_at" in old_cols else "COALESCE(sent_at, planned_at)"
-
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("DROP TABLE IF EXISTS reminder_log_new")
-        conn.execute(
-            "CREATE TABLE reminder_log_new ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, template_id TEXT NOT NULL, instance_id INTEGER, "
-            "phone TEXT NOT NULL, kind TEXT NOT NULL, planned_at TEXT NOT NULL, attempted_at TEXT, sent_at TEXT, "
-            "result TEXT NOT NULL, error TEXT, retry INTEGER NOT NULL DEFAULT 0, idem_key TEXT NOT NULL, "
-            "UNIQUE(idem_key, retry))"
-        )
-        conn.execute(
-            f"INSERT OR IGNORE INTO reminder_log_new("
-            f"id, template_id, instance_id, phone, kind, planned_at, attempted_at, sent_at, result, error, retry, idem_key"
-            f") SELECT id, template_id, instance_id, phone, kind, planned_at, {attempted_expr}, sent_at, result, error, retry, idem_key "
-            f"FROM reminder_log"
-        )
-        conn.execute("DROP TABLE reminder_log")
-        conn.execute("ALTER TABLE reminder_log_new RENAME TO reminder_log")
-        conn.execute("CREATE INDEX IF NOT EXISTS ix_rem_idem ON reminder_log(idem_key, result)")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def _migrate_role_platform(conn: sqlite3.Connection) -> None:
-    """2026-11-02 角色按办公软件隔离：role 表补 platform 列，唯一键由 name 改为 (platform, name)。
-
-    旧库是 name 单列 UNIQUE，SQLite 不能直接改约束，只能重建表；
-    历史角色全部属于量子密信（当时只有这一条通道），因此统一回填 'zdxlz'。
-    """
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(role)").fetchall()}
-    if "platform" in cols:
-        return
-
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        conn.execute("DROP TABLE IF EXISTS role_new")
-        conn.execute(
-            "CREATE TABLE role_new ("
-            "role_id TEXT PRIMARY KEY, name TEXT NOT NULL, note TEXT, "
-            "platform TEXT NOT NULL DEFAULT 'zdxlz', created_at TEXT NOT NULL, "
-            "UNIQUE(platform, name))"
-        )
-        conn.execute(
-            "INSERT INTO role_new(role_id, name, note, platform, created_at) "
-            "SELECT role_id, name, note, 'zdxlz', created_at FROM role"
-        )
-        conn.execute("DROP TABLE role")
-        conn.execute("ALTER TABLE role_new RENAME TO role")
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-class Database:
-    """连接管理（sqlite 单文件 WAL / mysql 连接池，双引擎按 IMT_DB_ENGINE 切换）。"""
-
-    def __init__(self, db_path: Path, now_str_fn) -> None:
-        self.db_path = Path(db_path)
-        self.engine = (os.environ.get("IMT_DB_ENGINE", "").strip().lower() or "sqlite")
-        self.lock = threading.RLock()
-        self._now_str_fn = now_str_fn
-        if self.engine == "mysql":
-            self._init_mysql()
-            return
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        # 2026-10-29 P1-1：改为 DEFERRED 隔离级别，使 `with self.conn:` 真正开事务、
-        # 中途异常能整体回滚；原来 isolation_level=None 是自动提交，多条写操作没有原子性。
-        # 2026-11-05：补写锁等待。调度线程与请求线程共用一个连接，WAL 下写写仍互斥；
-        # 不设 timeout 时遇到瞬时竞争会立刻抛 database is locked，这里统一等 15s。
-        self.conn = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            isolation_level="DEFERRED",
-            timeout=15.0,
-        )
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA busy_timeout=15000")
-        self.init_schema()
-
-    def _init_mysql(self) -> None:
-        """mysql 引擎装配：连接池 + schema 初始化（表结构见 MYSQL_DDL）。"""
-        cfg = mysql_config_from_env()
-        self.conn = MySQLConnProxy(cfg)
-        self.init_schema()
-
-    def init_schema(self) -> None:
-        with self.lock:
-            if self.engine == "mysql":
-                _init_mysql_schema(self.conn, self._now_str_fn, self.lock)
-                return
-            self.conn.executescript(DDL_SCRIPT)
-            _ensure_column(self.conn, "task_template", "allow_note", "INTEGER NOT NULL DEFAULT 0")
-            _ensure_column(self.conn, "task_template", "anchor_weekday", "INTEGER")
-            _ensure_column(self.conn, "task_template", "anchor_dom", "INTEGER")
-            _ensure_column(self.conn, "task_template", "deadline_offset", "INTEGER NOT NULL DEFAULT 0")
-            _ensure_column(self.conn, "delivery_target", "usable", "INTEGER NOT NULL DEFAULT 1")
-            # 2026-11-10 方案A：绑定补 external_type（'user' | 'union_id'）；存量行默认 'user'，行为不变
-            _ensure_column(self.conn, "delivery_target", "external_type", "TEXT NOT NULL DEFAULT 'user'")
-            _migrate_reminder_log_unique(self.conn)
-            _ensure_column(self.conn, "reminder_log", "attempted_at", "TEXT")
-            # 2026-10-27 春促数据看板：模板附带数据图开关 + 依赖的数据变量清单
-            _ensure_column(self.conn, "task_template", "attach_image", "INTEGER NOT NULL DEFAULT 0")
-            _ensure_column(self.conn, "task_template", "data_keys", "TEXT")
-            # 2026-10-28 上报任务多模块：文字说明 + 图片/文件可同时提交，附件从单个扩展为多个
-            _ensure_column(self.conn, "submission", "refs_json", "TEXT")
-            # 2026-10-28 通知类「数据图片提醒」：管理员上传图片，到点直接随消息推送
-            _ensure_column(self.conn, "task_template", "attach_image_path", "TEXT")
-            # 2026-10-29 H5 图文页：管理员填写的图片名称（描述），用于直链文案与 H5 页面标题
-            _ensure_column(self.conn, "task_template", "attach_image_name", "TEXT")
-            # 2026-10-29 执行日：day 周期模板可指定「只在周几执行」（JSON 数组，1=周一…7=周日）；
-            # 空/NULL = 全周执行（调度层 fail-open）。
-            _ensure_column(self.conn, "task_template", "exec_weekdays", "TEXT")
-            # 2026-11-10 月度执行日：day 周期模板可指定「每月几号执行」（JSON 数组，1~31 多选）；
-            # NULL/空 = 不启用月度模式（回落每周 exec_weekdays 判定）。选中 31 = 当月最后一天
-            # 也执行（调度层自动适配 2 月 28/29、4/6/9/11 月 30、大月 31）。
-            _ensure_column(self.conn, "task_template", "exec_dom_days", "TEXT")
-            # 2026-11-02 多通道并行：待归纳池记录来源通道（zdxlz/wecom），
-            # 提示管理员「这个人从哪个办公软件来」。唯一键暂不变（后续单独重建表）。
-            _ensure_column(self.conn, "pending_member", "platform", "TEXT")
-            # 2026-11-03 H5 登记表单：待归纳池落库部门（部门选项由后台配置）
-            _ensure_column(self.conn, "pending_member", "dept", "TEXT")
-            # 2026-10-28 前端完整配置回显：存储 AI Studio 前端的完整模板 spec（upload_modules/text_label 等）
-            _ensure_column(self.conn, "task_template", "spec_json", "TEXT")
-            # 2026-10-29 逾期补交审核制的 resubmit_* 四列：链路已于 2026-11-12 任务E3 彻底下线，
-            # 列保留仅为存量历史数据兼容（不再读写）；列定义动不了（SQLite 不能 DROP COLUMN 前的时代习惯）。
-            _ensure_column(self.conn, "task_instance", "resubmit_req_at", "TEXT")
-            _ensure_column(self.conn, "task_instance", "resubmit_status", "TEXT")
-            _ensure_column(self.conn, "task_instance", "resubmit_decided_by", "TEXT")
-            _ensure_column(self.conn, "task_instance", "resubmit_decided_at", "TEXT")
-            # 2026-11-12 任务E1：模板截止配置三件套（旧库补列，历史模板 has_deadline 默认 1、
-            # deadline_type 留空 = 回落旧 deadline+deadline_offset 算法）。
-            _ensure_column(self.conn, "task_template", "has_deadline", "INTEGER NOT NULL DEFAULT 1")
-            _ensure_column(self.conn, "task_template", "deadline_type", "TEXT")
-            _ensure_column(self.conn, "task_template", "deadline_time", "TEXT")
-            # 2026-11-12 晚 · 不定期任务（菜单自选）：无推送时刻、无截止、调度链物理隔离，
-            # 用户私聊回复【菜单】/ 数字按需签发一次性填报链接（Pull 模式）。
-            _ensure_column(self.conn, "task_template", "is_adhoc", "INTEGER NOT NULL DEFAULT 0")
-            # 2026-11-02 角色按办公软件隔离：历史角色回填 zdxlz，唯一键改为 (platform, name)
-            _migrate_role_platform(self.conn)
-            # 2026-11-11：member.dept_path（官方通讯录完整组织路径，层级统计归集）
-            _ensure_member_columns(self.conn)
-            # 2026-11-04 多管理员分级（超级管理员 + 分级管理员，数据按 owner_id 隔离）
-            _migrate_multi_admin(self.conn)
-
-            now_str = self._now_str_fn()
-            row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            if row is None:
-                self.conn.execute("INSERT INTO schema_version(version, updated_at) VALUES (?, ?)", (SCHEMA_VERSION, now_str))
-            elif int(row["version"]) < SCHEMA_VERSION:
-                self.conn.execute("UPDATE schema_version SET version = ?, updated_at = ?", (SCHEMA_VERSION, now_str))
-
-            if self.conn.execute("SELECT scope_id FROM scope WHERE scope_id = 'root'").fetchone() is None:
-                self.conn.execute("INSERT INTO scope(scope_id, name, type, parent_id, created_at) VALUES ('root', '默认组织', 'dept', NULL, ?)", (now_str,))
-
-            # 2026-10-29 P1-1：DEFERRED 模式下迁移语句会挂在未提交事务里，这里显式落盘
-            self.conn.commit()
-
-    def get_schema_version(self) -> int:
-        with self.lock:
-            row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            return int(row["version"]) if row else 0
-
-    def close(self) -> None:
-        with self.lock:
-            if self.engine == "mysql":
-                self.conn.close()  # 关闭连接池
-                return
-            self.conn.close()
-
-
-# ---------------------------------------------------------------------------
-# MySQL 引擎（2026-11-13 冲刺模块一）：方言翻译 + 连接池代理 + 5.7 兼容 DDL
-# ---------------------------------------------------------------------------
 
 MYSQL_DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -520,8 +85,8 @@ CREATE TABLE IF NOT EXISTS member (
   role_id    VARCHAR(64)  NOT NULL,
   phone      VARCHAR(32)  NOT NULL,
   name       VARCHAR(128) NOT NULL,
-  dept       VARCHAR(128) DEFAULT NULL,
-  dept_path  VARCHAR(512) DEFAULT NULL,
+  dept       VARCHAR(200) DEFAULT NULL,
+  dept_path  VARCHAR(1024) DEFAULT NULL,
   enabled    TINYINT      NOT NULL DEFAULT 1,
   source     VARCHAR(32)  NOT NULL DEFAULT 'manual',
   owner_id   INT          NOT NULL DEFAULT 1,
@@ -584,8 +149,8 @@ CREATE TABLE IF NOT EXISTS task_instance (
   template_id   VARCHAR(64)  NOT NULL,
   phone         VARCHAR(32)  NOT NULL,
   name_snap     VARCHAR(128) NOT NULL,
-  dept_snap     VARCHAR(128),
-  period_key    VARCHAR(16)  NOT NULL,
+  dept_snap     VARCHAR(200),
+  period_key    VARCHAR(64)  NOT NULL,
   status        VARCHAR(16)  NOT NULL,
   deadline_at   VARCHAR(32)  NOT NULL,
   owner_id      INT          NOT NULL DEFAULT 1,
@@ -660,7 +225,7 @@ CREATE TABLE IF NOT EXISTS h5_token (
   token_id    VARCHAR(64) NOT NULL,
   phone       VARCHAR(32) NOT NULL,
   template_id VARCHAR(64) NOT NULL,
-  period_key  VARCHAR(16) NOT NULL,
+  period_key  VARCHAR(64) NOT NULL,
   instance_id INT         DEFAULT NULL,
   purpose     VARCHAR(16) NOT NULL,
   created_at  VARCHAR(32) NOT NULL,
@@ -721,7 +286,7 @@ CREATE TABLE IF NOT EXISTS admin_audit (
 CREATE TABLE IF NOT EXISTS data_snapshot (
   id          INT AUTO_INCREMENT,
   source_key  VARCHAR(128) NOT NULL,
-  period_key  VARCHAR(16)  NOT NULL,
+  period_key  VARCHAR(64)  NOT NULL,
   values_json MEDIUMTEXT  NOT NULL,
   note        VARCHAR(512) DEFAULT NULL,
   updated_by  VARCHAR(64) DEFAULT NULL,
@@ -736,7 +301,7 @@ CREATE TABLE IF NOT EXISTS pending_member (
   platform     VARCHAR(16)  DEFAULT NULL,
   phone        VARCHAR(32)  DEFAULT NULL,
   name         VARCHAR(128) DEFAULT NULL,
-  dept         VARCHAR(128) DEFAULT NULL,
+  dept         VARCHAR(200) DEFAULT NULL,
   last_message TEXT,
   activated_at VARCHAR(32)  NOT NULL,
   updated_at   VARCHAR(32)  NOT NULL,
@@ -746,7 +311,7 @@ CREATE TABLE IF NOT EXISTS pending_member (
 
 CREATE TABLE IF NOT EXISTS dept_option (
   id         INT AUTO_INCREMENT,
-  name       VARCHAR(128) NOT NULL,
+  name       VARCHAR(200) NOT NULL,
   created_at VARCHAR(32)  NOT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_dept_option (name)
@@ -762,7 +327,7 @@ def mysql_config_from_env() -> dict:
     password = os.environ.get("IMT_MYSQL_PASSWORD", "")
     database = os.environ.get("IMT_MYSQL_DATABASE", "").strip() or "im_task"
     if not user:
-        raise RuntimeError("IMT_DB_ENGINE=mysql 但未配置 IMT_MYSQL_USER（检查 .env）")
+        raise RuntimeError("未配置 IMT_MYSQL_USER（检查 .env）")
     return {
         "host": host, "port": port, "user": user, "password": password,
         "database": database, "charset": "utf8mb4",
@@ -770,15 +335,16 @@ def mysql_config_from_env() -> dict:
 
 
 def _translate_sql(sql: str) -> str:
-    """sqlite 方言 → mysql 方言（state.py 全部 SQL 的在线翻译层）。
+    """SQL 适配层（业务层 SQL → MySQL 方言，语句边界内在线翻译）。
 
-    五族规则（覆盖 state.py 的既有用法，grep 实证过）：
+    六族规则（覆盖 state.py 的既有用法，grep 实证过）：
       1. ? 占位符 → %s（跳过引号内字符——文本里可能带 ?，如 JSON）；
       2. INSERT OR IGNORE INTO t → INSERT IGNORE INTO t；
       3. ON CONFLICT(cols) DO UPDATE SET a=excluded.a,... →
          ON DUPLICATE KEY UPDATE a=VALUES(a),...（全库唯一键已在表上，冲突集等价）；
-      4. rowid → id（仅 task_instance 等自增主键表用 ORDER BY rowid）；
-      5. last_insert_rowid() → LAST_INSERT_ID()。
+      4. last_insert_rowid() → LAST_INSERT_ID()（业务 SQL 已全部改用 MySQL 合法列，
+       ⛔ 不再翻译 rowid：2026-11-16 方案B 实测 task_template 等无自增主键表用 rowid 排序会 1054）；
+      6. :name 命名占位符 → %(name)s（参数 dict 两边原生兼容）。
     """
     out: list[str] = []
     i, n = 0, len(sql)
@@ -786,10 +352,13 @@ def _translate_sql(sql: str) -> str:
     while i < n:
         ch = sql[i]
         if in_str:
-            out.append(ch)
+            # 方案B 补丁（2026-11-16）：pymysql 对带参 SQL 做 % 格式化，
+            # 字符串字面量里的 %（LIKE 模式等）必须转义为 %%，否则
+            # "not enough arguments for format string"。占位符都在引号外，不受影响。
+            out.append("%%" if ch == "%" else ch)
             if ch == in_str:
                 in_str = None
-            elif ch == "\\" and in_str == "'" and i + 1 < n:  # sqlite 转义 ''
+            elif ch == "\\" and in_str == "'" and i + 1 < n:
                 out.append(sql[i + 1])
                 i += 1
             i += 1
@@ -804,8 +373,8 @@ def _translate_sql(sql: str) -> str:
             out.append("INSERT IGNORE INTO")
             i += len("INSERT OR IGNORE INTO")
             continue
-        # 规则 6（2026-11-13 member-pool 实锤补丁）：sqlite 命名占位符 :name → pymysql 的 %(name)s；
-        # 参数 dict 两边原生兼容（sqlite 认 :name，pymysql 认 %(name)s），无需转换参数结构。
+        # 规则 6（2026-11-13 member-pool 实锤补丁）：命名占位符 :name → %(name)s；
+        # 参数 dict 两边原生兼容（业务层认 :name，pymysql 认 %(name)s），无需转换参数结构。
         if ch == ":" and i + 1 < n and (sql[i + 1].isalpha() or sql[i + 1] == "_"):
             j = i + 1
             while j < n and (sql[j].isalnum() or sql[j] == "_"):
@@ -831,11 +400,8 @@ def _translate_sql(sql: str) -> str:
             out.append("ON DUPLICATE KEY UPDATE " + ", ".join(mysql_sets))
             i = j + len("DO UPDATE SET") + len(set_part)
             continue
-        # 规则 4/5（词边界）
-        if sql.startswith("rowid", i) and (i + 5 >= n or not (sql[i + 5].isalnum() or sql[i + 5] == "_")):
-            out.append("id")
-            i += 5
-            continue
+        # 规则 5（2026-11-16 方案B：rowid 翻译已移除——业务 SQL 全部改用 MySQL 合法列；
+        # 仅保留 last_insert_rowid() → LAST_INSERT_ID() 的历史兼容）
         if sql.startswith("last_insert_rowid()", i):
             out.append("LAST_INSERT_ID()")
             i += len("last_insert_rowid()")
@@ -850,12 +416,20 @@ def _translate_sql(sql: str) -> str:
 
 
 class RowLike(dict):
-    """pymysql 行 → sqlite3.Row 的鸭子形态（支持 ['k']、[0]、dict()、keys()）。"""
+    """pymysql 行 → sqlite3.Row 的鸭子形态（支持 ['k']、[0]、dict()、keys()、tuple(row)）。
+
+    2026-11-16 方案B 补丁：`tuple(row)`/`list(row)` 在 sqlite3.Row 下得到**值**序列，
+    而 dict 子类默认迭代键名 —— 这里 override __iter__ 返回值迭代以对齐旧语义
+    （dict(row) 的 fast-path / **row 解包 / json.dumps 都不受影响）。
+    """
 
     def __getitem__(self, key):
         if isinstance(key, int):
             return tuple(self.values())[key]
         return super().__getitem__(key)
+
+    def __iter__(self):  # noqa: D401 - 对齐 sqlite3.Row 的迭代语义
+        return iter(self.values())
 
 
 class _CursorWrap:
@@ -889,14 +463,16 @@ class _CursorWrap:
 
 
 class MySQLConnProxy:
-    """state.py 的 `self.conn` 鸭子替身（mysql 引擎）。
+    """state.py 的 `self.conn` 鸭子替身（纯 MySQL，方案B 后的唯一连接层）。
 
-    语义对齐 sqlite3.Connection：
-      · `with proxy:` —— 事务段（可重入计数；首个进入借连接，最后退出 commit/归还）；
-      · execute/executemany —— 无事务段时：借连接 → 执行 → 立即 commit → 归还；
-      · 翻译在每条语句边界内完成（参数无需处理——qmark 顺序两方一致）。
-    线程模型：sticky 连接按线程本地存储（FastAPI 线程池 + 调度线程各自独立事务），
-    池由 dbutils.PooledDB 管理（mincached=2 / maxconnections=16，够 8 投递线程+Web 并发）。
+    事务模型：
+      · `with proxy:` —— 事务段（可重入计数；首个进入借连接，最后退出 commit/归还，
+        异常路径整体回滚再归还）；
+      · execute / executemany —— 无事务段时：借连接 → 执行 → 立即 commit → 归还；
+      · 翻译在每条语句边界内完成（参数无需处理——占位符顺序两边一致）。
+    线程模型：连接栈按 threading.local（FastAPI 线程池 + 调度线程各自独立事务），
+    池由 dbutils.PooledDB 管理（默认 mincached=2 / maxconnections=16，
+    可用 IMT_MYSQL_MINCACHED / IMT_MYSQL_MAXCONNECTIONS 调整——测试底座用小池）。
     """
 
     def __init__(self, cfg: dict) -> None:
@@ -905,13 +481,26 @@ class MySQLConnProxy:
 
         self._cfg = cfg
         self._tls = threading.local()
+        mincached = int(cfg.get("mincached") or os.environ.get("IMT_MYSQL_MINCACHED", "2"))
+        maxconnections = int(cfg.get("maxconnections") or os.environ.get("IMT_MYSQL_MAXCONNECTIONS", "16"))
+        shared_pool = cfg.get("pool")
+        if shared_pool is not None:
+            # 2026-11-16 方案B：测试底座注入共享池（500+ 用例复用同一池，防连接爆量）
+            self._pool = shared_pool
+            self._owns_pool = False
+            return
+        self._owns_pool = True
         self._pool = PooledDB(
             creator=pymysql,
-            mincached=2, maxconnections=16, blocking=True,
+            mincached=mincached, maxconnections=maxconnections, blocking=True,
             ping=1,  # 每次借出 ping 检活（8 小时断连自愈）
             host=cfg["host"], port=cfg["port"], user=cfg["user"], password=cfg["password"],
             database=cfg["database"], charset=cfg["charset"],
             cursorclass=pymysql.cursors.DictCursor, autocommit=False,
+            # 方案B 语义对齐（2026-11-16）：默认 rowcount=实际改变行；SQLite 时代
+            # 业务/用例按「匹配行数」口径（如全局停用返回 rows=3）。
+            # FOUND_ROWS 让 UPDATE 的 rowcount 等于命中行数，行为与旧引擎一致。
+            client_flag=pymysql.constants.CLIENT.FOUND_ROWS,
         )
 
     # ---- 连接借还 ----
@@ -927,7 +516,7 @@ class MySQLConnProxy:
         finally:
             conn.close()  # PooledDB: 归还池
 
-    # ---- 事务段（sqlite `with conn:` 对齐）----
+    # ---- 事务段 ----
     def __enter__(self):
         st = getattr(self._tls, "stack", None)
         if st:
@@ -959,14 +548,23 @@ class MySQLConnProxy:
         st = getattr(self._tls, "stack", None)
         if st:
             cur = st[-1].cursor()
-            cur.execute(msql, params)
+            if params:
+                cur.execute(msql, params)
+            else:
+                cur.execute(msql)  # 空参不触发 % 格式化（字面 % 已转义，双保险）
             return _CursorWrap(cur)
         conn = self._borrow()
         try:
             cur = conn.cursor()
-            cur.execute(msql, params)
+            if params:
+                cur.execute(msql, params)
+            else:
+                cur.execute(msql)
             wrapped = _CursorWrap(cur)
-            conn.commit()
+            if _is_read_only(msql):
+                conn.rollback()  # 只读：关隐式事务，零 fsync（commit 白付一次磁盘同步）
+            else:
+                conn.commit()
             return wrapped
         except Exception:
             conn.rollback()
@@ -977,14 +575,19 @@ class MySQLConnProxy:
     def executemany(self, sql: str, seq_of_params):
         msql = _translate_sql(sql)
         st = getattr(self._tls, "stack", None)
+        seq = list(seq_of_params or [])
         if st:
             cur = st[-1].cursor()
-            cur.executemany(msql, seq_of_params)
+            if seq:
+                cur.executemany(msql, seq)
+            else:
+                return _CursorWrap(cur)
             return _CursorWrap(cur)
         conn = self._borrow()
         try:
             cur = conn.cursor()
-            cur.executemany(msql, seq_of_params)
+            if seq:
+                cur.executemany(msql, seq)
             wrapped = _CursorWrap(cur)
             conn.commit()
             return wrapped
@@ -994,7 +597,7 @@ class MySQLConnProxy:
         finally:
             conn.close()
 
-    # sqlite 兼容杂项
+    # 事务段之外的手动 commit/rollback（对齐 sqlite3.Connection 旧语法）
     def commit(self):
         st = getattr(self._tls, "stack", None)
         if st:
@@ -1006,28 +609,104 @@ class MySQLConnProxy:
             st[-1].rollback()
 
     def close(self):
-        self._pool.close()  # 关池（进程退出/测试清理）
+        # 共享池（测试底座注入）绝不由单个 store 关闭
+        if getattr(self, "_owns_pool", True):
+            self._pool.close()  # 关池（进程退出/测试清理）
 
 
-def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn, lock: threading.RLock) -> None:
-    """mysql 建库初始化：DDL（幂等）+ 种子行（与 sqlite init_schema 尾段对齐）。"""
+class _NoLock:
+    """方案B（2026-11-16）：进程级全局锁退役——并发安全改由
+    每线程独立连接事务 + InnoDB 行级锁 + 唯一键幂等（INSERT IGNORE，主发送路径
+    task_instance / reminder_log / dept_option 全走唯一键兜底）承担。
+
+    保留 `with store.lock:` 魔法上下文（state / admin / tests 约 220 处调用面）：
+    空实现、零排队，语义 = 「这里曾经是个临界区，现在由数据库自己保证」。
+    """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
+    """列宽升级（幂等）：业务演进中 VARCHAR 上限不够的列自动扩宽。
+
+    2026-11-16 方案B 首批（SQLite TEXT 时代无感、MySQL 严格模式 1406 拒绝写入）：
+      · period_key 16 → 64——adhoc 一次性任务 period_key 为
+        `adhoc-<YYYYmmdd-HHMMSS>-<hex6>`（28 字符），16 装不下。
+    按当前库实际列宽对比后才 ALTER，已是目标宽度则零操作（生产热库无感）。
+    """
+    upgrades = (
+        # (table, column, 目标宽度, 空值语义) —— ⚠️ MODIFY 不带空值说明会重置为 NOT NULL（实测踩坑）
+        ("task_instance", "period_key", 64, "NOT NULL"),
+        ("h5_token", "period_key", 64, "NOT NULL"),
+        ("data_snapshot", "period_key", 64, "NOT NULL"),
+        # 2026-11-16 方案B 第二批：部门名业务上限 200 字（MAX_DEPT_NAME_LEN），
+        # SQLite TEXT 时代无感；首批 DDL 误设 VARCHAR(128) → 1406 拒绝 200 字部门名。
+        ("member", "dept", 200, "DEFAULT NULL"),
+        ("member", "dept_path", 1024, "DEFAULT NULL"),
+        ("task_instance", "dept_snap", 200, "DEFAULT NULL"),
+        ("pending_member", "dept", 200, "DEFAULT NULL"),
+        ("dept_option", "name", 200, "NOT NULL"),
+    )
+    for table, col, want, null_spec in upgrades:
+        row = proxy.execute(
+            "SELECT CHARACTER_MAXIMUM_LENGTH AS maxlen FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?",
+            (table, col)).fetchone()
+        if row is None:
+            continue  # 表不存在（DDL 阶段失败会先行抛出）
+        cur_len = int(row["maxlen"] or 0)
+        if cur_len < want:
+            proxy.execute(
+                f"ALTER TABLE `{table}` MODIFY COLUMN `{col}` VARCHAR({want}) {null_spec}")
+
+
+def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn) -> None:
+    """建库初始化：DDL（幂等）+ 列宽升级 + 种子行。"""
     stmts = [s.strip() for s in MYSQL_DDL.split(";") if s.strip()]
     # CREATE TABLE ... 独立事务执行（DDL 隐式提交，逐条执行即可）
-    with lock:
-        for stmt in stmts:
-            proxy.execute(stmt)
-        with proxy as conn_tx:
-            now_str = now_str_fn()
-            row = conn_tx.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-            if row is None:
-                conn_tx.execute(
-                    "INSERT INTO schema_version(version, updated_at) VALUES (?, ?)",
-                    (SCHEMA_VERSION, now_str))
-            elif int(row["version"]) < SCHEMA_VERSION:
-                conn_tx.execute(
-                    "UPDATE schema_version SET version = ?, updated_at = ?",
-                    (SCHEMA_VERSION, now_str))
-            if conn_tx.execute("SELECT scope_id FROM scope WHERE scope_id = 'root'").fetchone() is None:
-                conn_tx.execute(
-                    "INSERT INTO scope(scope_id, name, type, parent_id, created_at) "
-                    "VALUES ('root', ?, 'dept', NULL, ?)", ("默认组织", now_str))
+    for stmt in stmts:
+        proxy.execute(stmt)
+    _upgrade_mysql_schema(proxy)
+    with proxy as conn_tx:
+        now_str = now_str_fn()
+        row = conn_tx.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        if row is None:
+            conn_tx.execute(
+                "INSERT INTO schema_version(version, updated_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, now_str))
+        elif int(row["version"]) < SCHEMA_VERSION:
+            conn_tx.execute(
+                "UPDATE schema_version SET version = ?, updated_at = ?",
+                (SCHEMA_VERSION, now_str))
+        if conn_tx.execute("SELECT scope_id FROM scope WHERE scope_id = 'root'").fetchone() is None:
+            conn_tx.execute(
+                "INSERT INTO scope(scope_id, name, type, parent_id, created_at) "
+                "VALUES ('root', ?, 'dept', NULL, ?)", ("默认组织", now_str))
+
+
+class Database:
+    """纯 MySQL 连接管理（PooledDB 连接池 + 每线程独立事务）。"""
+
+    def __init__(self, now_str_fn, *, mysql_cfg: dict | None = None,
+                 db_path=None) -> None:
+        # db_path 为历史签名兼容位（纯 MySQL 无文件库概念，传入即忽略）
+        self._now_str_fn = now_str_fn
+        cfg = dict(mysql_cfg) if mysql_cfg else mysql_config_from_env()
+        self.conn = MySQLConnProxy(cfg)
+        # 方案B：全局写锁退役（并发由行级锁 + 唯一键兜底；_NoLock 仅保语法兼容）
+        self.lock = _NoLock()
+        self.init_schema()
+
+    def init_schema(self) -> None:
+        _init_mysql_schema(self.conn, self._now_str_fn)
+
+    def get_schema_version(self) -> int:
+        row = self.conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        return int(row["version"]) if row else 0
+
+    def close(self) -> None:
+        self.conn.close()  # 关闭连接池

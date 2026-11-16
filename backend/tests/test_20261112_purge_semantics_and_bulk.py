@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.state import BizError, StateStore, MAX_DEPT_NAME_LEN  # noqa: E402
 
@@ -31,7 +33,7 @@ LONG_DEPT_40 = "综合运营管理部华东区域中心第十分部市场营销�
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_p_")) / "im.db", now_fn=lambda: CLOCK["now"])
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_p_")), now_fn=lambda: CLOCK["now"])
 
 
 def _dir() -> Path:

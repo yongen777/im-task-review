@@ -9,13 +9,12 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import NowFn, default_now, format_dt, parse_dt
-from .db import Database
+from .db import Database, IntegrityError
 
 PBKDF2_ITERATIONS = 260_000
 SESSION_TTL_HOURS = 24 * 7
@@ -470,11 +469,26 @@ def _lt_time(a: str, b: str) -> bool:
 
 
 class StateStore:
-    def __init__(self, db_path: Path, now_fn: NowFn = default_now, platform: str = "zdxlz") -> None:
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        now_fn: NowFn = default_now,
+        platform: str = "zdxlz",
+        *,
+        mysql_cfg: Optional[Dict[str, Any]] = None,
+        data_dir: Optional[Path] = None,
+    ) -> None:
         self._now_fn = now_fn
         # 当前通道（zdxlz / wecom）：投递绑定按通道分开存，读写默认都走它。
         self.platform = (platform or "zdxlz").strip().lower()
-        self.db = Database(db_path, self.now_str)
+        # 2026-11-16 方案B：纯 MySQL——db_path 仅为历史签名兼容位（传入即忽略），
+        # 连接参数走 IMT_MYSQL_*（.env / 环境变量）。
+        self.db = Database(self.now_str, mysql_cfg=mysql_cfg, db_path=db_path)
+        # 文件类数据（uploads / public_img / dashboards / notice_attach / 密钥）统一根目录
+        self.data_dir = (
+            Path(data_dir) if data_dir is not None
+            else Path(os.environ.get("IMT_DATA_DIR", "data").strip() or "data")
+        )
         # 2026-11-10 方案A：通讯录查询客户端（导入即激活 / 首条消息自动识别）。
         # 由 main.create_apps 在生产装配；测试/降级环境为 None → 所有自动激活路径静默跳过。
         self.contacts = None
@@ -867,7 +881,9 @@ class StateStore:
             "SELECT m.phone AS phone, COUNT(1) AS row_count, COUNT(DISTINCT m.role_id) AS role_count, "
             "COUNT(DISTINCT m.owner_id) AS admin_count, SUM(COALESCE(m.enabled, 1)) AS enabled_count, "
             "COUNT(DISTINCT m.name) AS distinct_names, COUNT(DISTINCT COALESCE(m.dept, '')) AS distinct_depts, "
-            "p.name AS display_name, p.dept AS display_dept, "
+            # 方案B（2026-11-16）：p.name/p.dept 由每组唯一的 p.id 决定（函数依赖），
+            # 但 MySQL only_full_group_by 识别不了这种表达式依赖 → ANY_VALUE 明示组内唯一取值
+            "ANY_VALUE(p.name) AS display_name, ANY_VALUE(p.dept) AS display_dept, "
             "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 "
             " JOIN role r2 ON r2.role_id = m2.role_id JOIN admin_user u ON u.id = m2.owner_id "
             f" WHERE m2.phone = m.phone {pf('r2')}) AS owner_names, "
@@ -1119,19 +1135,53 @@ class StateStore:
         return {"ok": True, "username": str(row["username"]), "must_change_password": True}
 
     def backup_database(self, tag: str = "manual") -> str:
-        """SQLite 文件级备份（先 WAL checkpoint 保证备份完整，落在 data/ 目录），返回备份路径。
+        """库级备份：纯 MySQL（2026-11-16 方案B 后已无单文件可拷）。
 
-        mysql 引擎：库内备份走宝塔/云快照体系，这里返回空串（不伪造备份）。
+        MySQL 备份走云数据库快照 / 宝塔计划任务体系；这里**不伪造备份**，返回空串，
+        调用方据此提示「当前引擎由数据库侧备份」。原 SQLite 文件备份 + WAL checkpoint
+        逻辑已随双引擎一并移除；**级联删除等不可逆操作请改用 `snapshot_admin_scope_json`**
+        （作用域级 JSON 恢复快照，保留删除前的恢复手段）。
         """
-        if getattr(self.db, "engine", "sqlite") == "mysql":
-            return ""
-        import shutil
+        del tag
+        return ""
 
-        with self.lock:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            ts = self.now_str().replace(":", "").replace("-", "").replace(" ", "-")
-            dest = self.db.db_path.parent / f"{self.db.db_path.name}.bak-{tag}-{ts}"
-            shutil.copy2(self.db.db_path, dest)
+    def snapshot_admin_scope_json(self, admin_id: int, tag: str = "purge") -> str:
+        """级联删除前的**作用域恢复快照**（2026-11-16 方案B：替代 SQLite 文件备份）。
+
+        `delete_admin_account` 是不可逆级联删除，原护栏是「先拷 .db 文件再删」；
+        纯 MySQL 后没有文件库可拷——把该管理员名下的核心业务行
+        （role/member/task_template/task_instance/submission）导出为 JSON
+        落在 `data/backups/`，作为删除失败后的人工恢复依据。
+        任何 IO 异常向上抛（调用方据此中止删除，保持原护栏语义）。
+        """
+        admin_id = int(admin_id)
+        inst_ids = [int(r["id"]) for r in self.conn.execute(
+            "SELECT id FROM task_instance WHERE owner_id = ?", (admin_id,)).fetchall()]
+
+        def _rows(sql, params):
+            return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+        data = {
+            "snapshot_version": 1,
+            "admin_id": admin_id,
+            "created_at": self.now_str(),
+            "role": _rows("SELECT * FROM role WHERE owner_id = ?", (admin_id,)),
+            "member": _rows("SELECT * FROM member WHERE owner_id = ?", (admin_id,)),
+            "task_template": _rows("SELECT * FROM task_template WHERE owner_id = ?", (admin_id,)),
+            "task_instance": _rows("SELECT * FROM task_instance WHERE owner_id = ?", (admin_id,)),
+        }
+        if inst_ids:
+            ph = ",".join("?" for _ in inst_ids)
+            data["submission"] = _rows(
+                f"SELECT * FROM submission WHERE instance_id IN ({ph})", tuple(inst_ids))
+        else:
+            data["submission"] = []
+
+        dest_dir = self.data_dir / "backups"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        ts = self.now_str().replace(":", "").replace("-", "").replace(" ", "-")
+        dest = dest_dir / f"{(tag or 'purge').replace('/', '_')}-{ts}.json"
+        dest.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         return str(dest)
 
     @staticmethod
@@ -2236,7 +2286,7 @@ class StateStore:
                          "contacts_verified": len(verified), "verification_skipped": verification_skipped},
                         now_s,
                     )
-                except sqlite3.IntegrityError:
+                except IntegrityError:
                     # 阶段一→阶段三之间名册被并发修改（同手机号被别的请求先加进来）。
                     # 事务上下文会整体回滚 → 严格保持「要么全写入，要么一条都不写」。
                     raise BizError(409, "DUPLICATE", "导入过程中名册已发生变化（手机号冲突），本次导入已全部取消，请重试")
@@ -2480,7 +2530,7 @@ class StateStore:
             return {str(r["phone"]) for r in self.conn.execute(
                 "SELECT phone FROM member WHERE role_id = ?", ((role_id or "").strip(),)).fetchall()}
 
-    def _deserialize_template_row(self, row: sqlite3.Row) -> Dict[str, Any]:
+    def _deserialize_template_row(self, row: Any) -> Dict[str, Any]:
         d = dict(row)
         # 2026-11-04 多管理员分级：模板归属（owner_id）随模板一起带出，调度建实例时继承
         d["owner_id"] = int(d.get("owner_id") or 1)
@@ -2809,7 +2859,7 @@ class StateStore:
             _p = Path(attach_image_path)
             if _p.is_absolute():
                 raise BizError(400, "VALIDATION_FAILED", "attach_image_path 必须是相对 data 目录的路径")
-            _data_root = Path(self.db.db_path).parent.resolve()
+            _data_root = self.data_dir.resolve()
             _resolved = (_data_root / attach_image_path).resolve()
             # 2026-10-29 补丁3：用 is_relative_to 替代字符串前缀比较，
             # 否则 /app/data_other 会命中 /app/data 前缀，越界判断失效。
@@ -3626,7 +3676,7 @@ class StateStore:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT * FROM task_template WHERE deleted = 0 AND enabled = 1 AND is_adhoc = 1 "
-                "AND kind != 'notice' ORDER BY created_at ASC, rowid ASC").fetchall()
+                "AND kind != 'notice' ORDER BY created_at ASC, template_id ASC").fetchall()
             tpls = [self._deserialize_template_row(r) for r in rows]
         out: List[Dict[str, Any]] = []
         for tpl in tpls:

@@ -22,6 +22,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
@@ -32,7 +34,7 @@ PHONE_B = "13600002222"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_scope_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_scope_")))
 
 
 def _app(store: StateStore) -> FastAPI:
@@ -245,7 +247,7 @@ def test_sub_admin_cannot_download_other_admins_upload() -> None:
             "name": "甲的任务", "kind": "notice", "role_ids": [role_a],
             "text_tpl": "干活", "notice_times": ["09:00"], "period": "day"}).json()["template_id"]
 
-        uploads = store.db.db_path.parent / "uploads"
+        uploads = store.data_dir / "uploads"
         uploads.mkdir(parents=True, exist_ok=True)
         (uploads / "a-report.txt").write_text("甲的上报", encoding="utf-8")
         store.create_upload_ref(

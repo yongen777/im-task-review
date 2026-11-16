@@ -17,6 +17,10 @@ from typing import Any, Dict
 
 import pytest
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.config import SHANGHAI_TZ, format_dt
 from app.scheduler import FakeNotifier, Scheduler
 from app.state import BizError, StateStore
@@ -26,7 +30,7 @@ PHONE = "13900009101"
 
 def _mk_store() -> StateStore:
     tmp = tempfile.mkdtemp()
-    return StateStore(Path(tmp) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tmp))
 
 
 def _dt(day: int = 29, hour: int = 9, minute: int = 0, month: int = 10) -> datetime:

@@ -50,8 +50,10 @@ def main():
 
     print("=== ① 源码静态检查 ===")
     check("定义了 DB_BACKUP_KEEP 常量", "DB_BACKUP_KEEP = " in src)
-    check("备份步骤用 sqlite3 .backup 取 DB 快照",
+    check("备份步骤保留 sqlite3 .backup 快照（仅历史残留文件时才做）",
           ".backup" in src and "im_task.db.bak-{ts}" in src)
+    check("纯 MySQL 下 DB 快照自动跳过（DBBAK_SKIP_MYSQL 分支）",
+          "DBBAK_SKIP_MYSQL" in src and "if [ -f im_task.db ]" in src)
     # 判据：DB 快照命令行里必须出现 .backup，且备份动作本身不能是 cp 本体
     # （回滚时用 cp 把快照拷回去是对的，不在此列）
     snap_lines = [ln for ln in src.splitlines()
@@ -60,8 +62,8 @@ def main():
           any(".backup" in ln for ln in snap_lines) and
           not any(re.search(r"\bcp\b", ln) for ln in snap_lines),
           str(snap_lines)[:200])
-    check("回滚步骤里用 cp 恢复 DB 是正确的（本来就该 cp 回去）",
-          "cp data/im_task.db.bak-{ts} data/im_task.db" in src)
+    check("回滚提示已说明数据本体在远端 MySQL（方案B：不再靠 .db 文件回滚 DB）",
+          "数据本体在远端 MySQL" in src)
     check("轮转前先打印将删除的清单",
           "将删除" in src and "[轮转/" in src)
     # 2026-11-06 teleagent 验收补充：排序修正的强断言（防回退）——

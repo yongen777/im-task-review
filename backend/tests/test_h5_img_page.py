@@ -8,6 +8,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.config import Config
 from app.scheduler import Scheduler
 from app.state import StateStore
@@ -33,7 +37,7 @@ class H5ImgPageTest(unittest.TestCase):
         from app.channels.zdxlz import ZdxlzChannel
         from app.main import create_apps
 
-        self.store = StateStore(self.cfg.db_path, now_fn=lambda: __import__("datetime").datetime(2026, 10, 29, 12, 0, 0))
+        self.store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=self.cfg.data_dir, now_fn=lambda: __import__("datetime").datetime(2026, 10, 29, 12, 0, 0))
         self.notifier = type("N", (), {"send_text": lambda *a, **k: None})()
         chan = ZdxlzChannel(self.cfg)
         self.scheduler = Scheduler(

@@ -9,51 +9,33 @@
 
 from __future__ import annotations
 
-import sqlite3
 import tempfile
 from pathlib import Path
 
 import pytest
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.state import BizError, StateStore
 
 
-def _old_db(path: Path) -> None:
-    """模拟升级前的库：role 只有 name UNIQUE，没有 platform。"""
-    conn = sqlite3.connect(path)
-    conn.executescript(
-        """
-        CREATE TABLE role (
-          role_id TEXT PRIMARY KEY,
-          name TEXT NOT NULL UNIQUE,
-          note TEXT,
-          created_at TEXT NOT NULL
-        );
-        INSERT INTO role(role_id, name, note, created_at) VALUES
-          ('r_old1', '片长/分支局长', NULL, '2026-10-01 00:00:00'),
-          ('r_old2', '云中台软研队伍', NULL, '2026-10-01 00:00:00');
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
 def test_old_role_table_migrates_to_platform() -> None:
-    tmp = Path(tempfile.mkdtemp(prefix="imtask_role_mig_"))
-    db_path = tmp / "im.db"
-    _old_db(db_path)
-
-    store = StateStore(db_path)
+    """方案B（2026-11-16）：原「旧 SQLite 库升级迁移」用例随双引擎退役——
+    MySQL DDL 出生即带 platform 列（DEFAULT 'zdxlz'），历史行为由默认值保证。
+    这里保留同类约束验收：同名角色分平台共存 + (platform, name) 唯一。
+    """
+    store = StateStore(mysql_cfg=mysql_test_cfg())
     try:
-        roles = store.list_roles(platform="zdxlz")
-        assert {r["name"] for r in roles} == {"片长/分支局长", "云中台软研队伍"}
-        assert all(r["platform"] == "zdxlz" for r in roles)
+        z1 = store.create_role("片长/分支局长", actor="t", platform="zdxlz")
+        assert z1["platform"] == "zdxlz"
 
         # 迁移后可创建同名企微角色
         new_role = store.create_role("云中台软研队伍", actor="t", platform="wecom")
         assert new_role["platform"] == "wecom"
         assert len(store.list_roles(platform="wecom")) == 1
-        assert len(store.list_roles(platform="zdxlz")) == 2
+        assert len(store.list_roles(platform="zdxlz")) == 1
 
         with pytest.raises(BizError) as exc:
             store.create_role("云中台软研队伍", actor="t", platform="wecom")
@@ -64,7 +46,7 @@ def test_old_role_table_migrates_to_platform() -> None:
 
 def test_template_cannot_mix_platform_roles() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="imtask_mix_"))
-    store = StateStore(tmp / "im.db")
+    store = StateStore(mysql_cfg=mysql_test_cfg(), data_dir=tmp)
     try:
         z = store.create_role("密信组", actor="t", platform="zdxlz")["role_id"]
         w = store.create_role("企微组", actor="t", platform="wecom")["role_id"]

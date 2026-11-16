@@ -25,6 +25,10 @@ if str(ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.events import handle_inbound_text  # noqa: E402
 from app.api.h5 import process_h5_bind  # noqa: E402
 from app.channels.zdxlz_contacts import ZdxlzContacts  # noqa: E402
@@ -45,7 +49,7 @@ NAME_B = "测试乙"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_unionid_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_unionid_")))
 
 
 class FakeContacts:

@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api import h5 as h5_api
 from app.config import SHANGHAI_TZ, format_dt
 from app.scheduler import FakeNotifier, Scheduler
@@ -29,9 +32,8 @@ EXT_ID = "3000000000000000001"
 BASE = datetime(2026, 10, 26, 18, 0, 5, tzinfo=SHANGHAI_TZ)
 
 
-def _store(name="im.db") -> StateStore:
-    tmp = Path(tempfile.mkdtemp())
-    return StateStore(tmp / name)
+def _store() -> StateStore:
+    return StateStore(mysql_cfg=mysql_test_cfg())
 
 
 def _setup_task(state: StateStore, kind="form", deadline="19:00"):
@@ -117,42 +119,6 @@ def test_500_keeps_binding_but_marks_unusable():
     assert kept["external_id"] == EXT_ID, "⛔ external_id 必须留着排障"
     assert int(kept["usable"]) == 0
     assert notifier.sent_messages == []
-    state.close()
-
-
-def test_migration_from_single_column_unique():
-    """旧库（idem_key 单列 UNIQUE）-> 显式事务迁移为 UNIQUE(idem_key, retry)，数据不丢。"""
-    tmp = Path(tempfile.mkdtemp())
-    db = tmp / "old.db"
-    conn = sqlite3.connect(str(db))
-    conn.executescript(
-        """
-        CREATE TABLE schema_version (version INTEGER NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE reminder_log (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          template_id TEXT NOT NULL, instance_id INTEGER, phone TEXT NOT NULL,
-          kind TEXT NOT NULL, planned_at TEXT NOT NULL, sent_at TEXT,
-          result TEXT NOT NULL, error TEXT, retry INTEGER NOT NULL DEFAULT 0,
-          idem_key TEXT NOT NULL UNIQUE
-        );
-        INSERT INTO reminder_log(template_id, phone, kind, planned_at, sent_at,
-                                 result, retry, idem_key)
-        VALUES('t1', '13800138099', 'remind', '2026-10-26 18:00:00',
-               '2026-10-26 18:00:03', 'sent', 0, 'idem-old-1');
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    state = StateStore(db)          # 打开即迁移
-    sql = state.conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name='reminder_log'").fetchone()[0]
-    assert "UNIQUE(idem_key, retry)" in sql
-    assert "reminder_log_new" not in sql
-
-    row = state.conn.execute("SELECT * FROM reminder_log").fetchone()
-    assert row["idem_key"] == "idem-old-1", "迁移⛔ 不能丢数据"
-    assert row["attempted_at"] == "2026-10-26 18:00:03", "attempted_at 应从 sent_at 回填"
     state.close()
 
 

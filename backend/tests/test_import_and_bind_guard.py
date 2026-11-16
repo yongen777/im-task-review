@@ -23,6 +23,10 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.h5 import create_h5_router, process_h5_bind  # noqa: E402
 from app.scheduler import FakeNotifier  # noqa: E402
 from app.state import StateStore  # noqa: E402
@@ -34,7 +38,7 @@ DEPT = "市场部"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_imp_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_imp_")))
 
 
 # ── 1. CSV 导入：部门校验 ───────────────────────────────────────────

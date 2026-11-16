@@ -25,6 +25,10 @@ if str(ROOT) not in sys.path:
 
 import httpx  # noqa: E402
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.channels.wecom import WecomClient  # noqa: E402
 from app.channels.wecom_contacts import WecomContacts  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -61,7 +65,7 @@ class FakeWecomContacts:
 
 def _store() -> StateStore:
     # 企微通道：单通道调度按 store.platform 查绑定
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_wecom_")) / "im.db", platform="wecom")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_wecom_")), platform="wecom")
 
 
 def _csv(phone: str, name: str) -> dict:

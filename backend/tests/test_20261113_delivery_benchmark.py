@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 
 from app.channels.zdxlz import SendResult  # noqa: E402
 from app.config import format_dt  # noqa: E402
@@ -53,13 +55,10 @@ class SlowFakeNotifier(FakeNotifier):
 
 
 def _store() -> StateStore:
-    store = StateStore(Path(tempfile.mkdtemp(prefix="imtask_bench_")) / "im.db", now_fn=lambda: CLOCK["now"])
-    # 压测专用：本地 sqlite 事务 fsync 在 2665 人规模下是分钟级纯磁盘开销
-    # （生产 MySQL/InnoDB 无此问题）——压测库关闭同步以保证用例秒级、只测并发与限流本身。
-    with store.lock:
-        store.conn.execute("PRAGMA synchronous = OFF")
-        store.conn.execute("PRAGMA journal_mode = MEMORY")
-    return store
+    # 方案B（2026-11-16）：原 SQLite 的 PRAGMA synchronous=OFF / journal_mode=MEMORY
+    # 压测提速开关已随双引擎移除（MySQL 无对应语义，发 PRAGMA 会 1064）；
+    # 2665 行造数走单事务批量插入（见 _seed_2665），InnoDB 下本身是秒级。
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_bench_")), now_fn=lambda: CLOCK["now"])
 
 
 def _seed_2665(store: StateStore) -> str:
@@ -139,16 +138,18 @@ def test_engine_burst_mode_concurrent_beats_serial() -> None:
     os.environ["IMT_DELIVERY_QPS"] = "10000"  # 瓶颈让位给网络/线程调度，只测并发加速
     store = _store()
     try:
-        rid = _seed_2665(store)
-        _form_tpl(store, rid)
-
+        # 方案B（2026-11-16）：原这里还在外层 store 上 _seed_2665 + _form_tpl——
+        # SQLite 分文件库时代是死代码；共享 im_task_test 库后会成为污染源
+        # （fresh.run_once 会连同一库把外层 2665 人模板一起发掉）。已移除。
         def run_round(threads_env: str) -> float:
             os.environ["IMT_DELIVERY_THREADS"] = threads_env
             fresh = _store()
             try:
-                rid2 = fresh.create_role("并发轮", actor="t", platform="zdxlz")["role_id"]
+                rid2 = fresh.create_role(f"并发轮{threads_env}", actor="t", platform="zdxlz")["role_id"]
                 now_s = format_dt(CLOCK["now"])
-                phones = [f"137{idx:08d}" for idx in range(400)]
+                # 方案B（共享库）：两轮（serial=1 / concurrent=8）用各自尾缀错开手机号，
+                # 防止第二轮 INSERT 撞 delivery_target 主键（SQLite 分库时代无此问题）。
+                phones = [f"137{threads_env}{idx:07d}" for idx in range(400)]
                 with fresh.lock, fresh.conn:
                     fresh.conn.executemany(
                         "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at) VALUES (?, ?, ?, '局', 1, 'manual', ?)",
@@ -160,9 +161,13 @@ def test_engine_burst_mode_concurrent_beats_serial() -> None:
                 tpl2["template_id"]  # noqa: B018
                 p_key = format_dt(CLOCK["now"])[:10]
                 fresh.ensure_template_instances(tpl2["template_id"], p_key, "2026-11-13 18:00:00")
-                # 关闭补偿窗内的重复判定干扰：直接清 reminder_log 保证两轮同基线
+                # 关闭补偿窗内的重复判定干扰：保证两轮同基线。
+                # 方案B（共享库）：连带清掉上一轮的模板/实例/幂等记录——只清 reminder_log
+                # 会让上一轮 400 实例在第二轮 run_once 里复投（SQLite 分库时代各自独立无害）。
                 with fresh.lock, fresh.conn:
-                    fresh.conn.execute("DELETE FROM reminder_log")
+                    fresh.conn.execute("DELETE FROM reminder_log WHERE template_id != ?", (tpl2["template_id"],))
+                    fresh.conn.execute("DELETE FROM task_instance WHERE template_id != ?", (tpl2["template_id"],))
+                    fresh.conn.execute("DELETE FROM task_template WHERE template_id != ?", (tpl2["template_id"],))
                 ntf = SlowFakeNotifier(now_fn=lambda: CLOCK["now"], latency=0.004)
                 sch = Scheduler(state=fresh, public_base_url="http://t.example.com", notifier=ntf,
                                 now_fn=lambda: CLOCK["now"])

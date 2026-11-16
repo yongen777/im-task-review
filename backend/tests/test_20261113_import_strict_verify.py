@@ -36,6 +36,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.channels.contacts_cache import TtlCache  # noqa: E402
 from app.channels.wecom import WecomClient  # noqa: E402
 from app.channels.wecom_contacts import WecomContacts  # noqa: E402
@@ -50,7 +54,7 @@ P_D = "13800002004"
 
 
 def _store() -> StateStore:
-    return StateStore(Path(tempfile.mkdtemp(prefix="imtask_strict_verify_")) / "im.db")
+    return StateStore(mysql_cfg=mysql_test_cfg(), data_dir=Path(tempfile.mkdtemp(prefix="imtask_strict_verify_")))
 
 
 def _z_user(union_id: str, phone: str, name: str, department: str = "市公司本部",
