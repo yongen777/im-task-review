@@ -104,6 +104,15 @@ def _platform_allowed(admin: Dict[str, Any], platform: Optional[str]) -> bool:
     return plat in [str(p).lower() for p in (admin.get("allowed_platforms") or [])]
 
 
+def _stats_export_escape(v: Any) -> Any:
+    """Excel 公式注入防御（2026-11-16 统计面板导出）：
+    = + - @ 开头的文本前置单引号（Excel 文本约定，打开不执行公式）。"""
+    s = "" if v is None else str(v)
+    if s and s[0] in ("=", "+", "-", "@"):
+        return "'" + s
+    return s
+
+
 def _check_path_ownership(state: StateStore, admin: Dict[str, Any], path: str) -> Optional[JSONResponse]:
     """分级管理员：路径里带角色/模板/实例 id 的接口，校验资源归属；不是自己的 → 403。"""
     if _is_super_admin(admin):
@@ -2635,6 +2644,208 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                     counts[st] = cnt
 
         return {"ok": True, "stats": counts}
+
+    # ==================================================================
+    # 2026-11-16 · 上传任务数据统计分析面板（仅分级管理员；单任务独占；
+    # 定期/不定期自适应；任务专属动态部门树；Excel 实时导出）
+    # ⛔ 权限红线（用户拍板）：超管五端点一律 403；跨属主一律 403。
+    # ==================================================================
+    def _require_stats_panel_admin(sess: Dict[str, Any]) -> Dict[str, Any]:
+        admin = _admin_profile(state, sess)
+        if _is_super_admin(admin):
+            raise BizError(403, "SUPER_ADMIN_FORBIDDEN", "任务数据统计仅对分级管理员开放")
+        return admin
+
+    @router.get("/stats-panel/tasks")
+    async def stats_panel_tasks(request: Request, platform: Optional[str] = None):
+        """任务选择器数据：当前分级管理员名下的上传任务（kind != 'notice'）。
+
+        ⛔ 严禁出现「全部任务」——面板单任务独占；平台参数沿用模板列表口径
+        （zdxlz/wecom 隔离由 state.list_templates 的角色平台 EXISTS 过滤完成）。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            res = state.list_templates(
+                q=None, kind=None, enabled=None, page=1, size=500,
+                platform=platform, owner_id=int(admin.get("id") or 0),
+            )
+            items = []
+            for t in res["items"]:
+                if str(t.get("kind") or "") == "notice":
+                    continue
+                items.append({
+                    "template_id": t["template_id"], "name": t["name"],
+                    "kind": t.get("kind"), "period": t.get("period"),
+                    "is_adhoc": bool(t.get("is_adhoc")),
+                    "has_deadline": bool(t.get("has_deadline")),
+                    "deadline_type": t.get("deadline_type"),
+                    "deadline_time": t.get("deadline_time"),
+                    "need_review": bool(t.get("need_review")),
+                })
+            return {"ok": True, "items": items}
+        except BizError as exc:
+            return biz_error_response(exc)
+
+    @router.get("/stats-panel/overview")
+    async def stats_panel_overview(
+        request: Request,
+        template_id: str,
+        period_key: str = "",
+        dept_path: str = "",
+    ):
+        """面板总览：模板元信息 + 任务专属动态部门树 + KPI（模式A/B 自适应）。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            data = state.stats_panel_overview(
+                template_id, period_key, int(admin.get("id") or 0),
+                dept_path=(dept_path or "").strip(),
+            )
+            return data
+        except BizError as exc:
+            return biz_error_response(exc)
+
+    @router.get("/stats-panel/instances")
+    async def stats_panel_instances(
+        request: Request,
+        template_id: str,
+        period_key: str = "",
+        dept_path: str = "",
+        status_group: str = "all",
+        q: str = "",
+        page: int = 1,
+        size: int = 50,
+    ):
+        """模式A 员工明细：DB 层分页/状态组筛选/姓名手机号搜索/部门子树过滤。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            return state.stats_panel_instances(
+                template_id, period_key, int(admin.get("id") or 0),
+                dept_path=(dept_path or "").strip(),
+                status_group=(status_group or "all").strip().lower(),
+                q=(q or "").strip(), page=page, size=size,
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+
+    @router.get("/stats-panel/submissions-day")
+    async def stats_panel_submissions_day(
+        request: Request,
+        template_id: str,
+        date: str = "",
+        dept_path: str = "",
+        q: str = "",
+        page: int = 1,
+        size: int = 50,
+    ):
+        """模式B 当天上报流水：每条提交一行（支持部门树过滤 + 搜索 + 分页）。"""
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            return state.stats_panel_submissions_day(
+                template_id, date, int(admin.get("id") or 0),
+                dept_path=(dept_path or "").strip(),
+                q=(q or "").strip(), page=page, size=size,
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+
+    @router.get("/stats-panel/export")
+    async def stats_panel_export(
+        request: Request,
+        template_id: str,
+        period_key: str = "",
+        dept_path: str = "",
+    ):
+        """实时导出 .xlsx：当前任务 + 周期（+部门范围）全部参与人员的执行状态。
+
+        表格刚性（用户拍板）：无任何合并单元格；首行冻结；全列 AutoFilter，
+        `完整部门路径` / `完成状态` 打开即可点下拉筛选。
+        完成状态统一收敛 4 种（submitted/approved→已提交）；图片附件不导出。
+        文件名 = 任务名 + 导出时间（年月日几点几分，不带秒）。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            bundle = state.stats_panel_export_rows(
+                template_id, period_key, int(admin.get("id") or 0),
+                dept_path=(dept_path or "").strip(),
+            )
+        except BizError as exc:
+            return biz_error_response(exc)
+
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        tpl = bundle["template"]
+        headers: List[str] = bundle["headers"]
+        content_fields = bundle["content_fields"]
+        has_note = bundle["has_note_col"]
+        status_cn = StateStore.STATS_PANEL_STATUS_CN
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "统计数据"
+        # 表头（无合并单元格；冻结首行；全列 AutoFilter）
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="E8F0FE")
+        ws.freeze_panes = "A2"
+        widths = [6, 12, 13, 18, 44, 10, 17] + [16] * len(content_fields) + ([30] if has_note else [])
+        for idx, w in enumerate(widths[:len(headers)], start=1):
+            ws.column_dimensions[get_column_letter(idx)].width = w
+
+        for idx, r in enumerate(bundle["rows"], start=1):
+            values: List[Any] = [
+                idx,
+                _stats_export_escape(r.get("name")),
+                _stats_export_escape(r.get("phone")),
+                _stats_export_escape(r.get("dept_snap") or (str(r.get("dept_path") or "").split("/")[-1])),
+                _stats_export_escape(r.get("dept_path")),
+                status_cn.get(str(r.get("status") or ""), str(r.get("status") or "")),
+                (str(r.get("submitted_at") or "")[:16] if r.get("submitted_at") else ""),
+            ]
+            for f in content_fields:
+                values.append(_stats_export_escape(r.get("fields", {}).get(str(f.get("key")))))
+            if has_note:
+                values.append(_stats_export_escape(r.get("note")))
+            ws.append(values)
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(bundle['rows']) + 1}"
+
+        out = io.BytesIO()
+        wb.save(out)
+        payload = out.getvalue()
+        from datetime import datetime as _dt
+        fname = f"{tpl['name']}_统计导出_{_dt.now().strftime('%Y年%m月%d日%H点%M分')}.xlsx"
+        return Response(
+            content=payload,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename=\"stats.xlsx\"; filename*=UTF-8''{quote(fname)}",
+                "Cache-Control": "no-store",
+            },
+        )
+
 
     # ==================================================================
     # 2026-10-30 通道配置向导（首次安装填表即用，⛔ 不写 .env）

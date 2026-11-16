@@ -4489,3 +4489,562 @@ class StateStore:
                 "deadline_at": r["deadline_at"], "period_key": r["period_key"],
             })
         return {"total": len(items), "items": items}
+
+    # ══════════════════════════════════════════════════════════════════
+    # 2026-11-16 · 上传任务数据统计分析面板（仅分级管理员；单任务独占；
+    # 定期/不定期自适应；任务专属动态部门树；Excel 实时导出）
+    # ══════════════════════════════════════════════════════════════════
+
+    STATS_PANEL_DONE = ("submitted", "approved")
+    STATS_PANEL_TODO = ("pending", "rejected", "overdue", "expired")
+    # Excel 完成状态统一收敛（用户拍板）：已提交未被打回一律「已提交」，不区分待审/通过
+    STATS_PANEL_STATUS_CN = {
+        "submitted": "已提交", "approved": "已提交",
+        "pending": "待上传", "overdue": "已逾期", "expired": "已逾期", "rejected": "被驳回",
+    }
+    STATS_PANEL_NO_DEPT = "未分配部门"
+
+    def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
+        """面板模板定位 + 归属校验（404 / 非上传任务 / 跨属主 403）。
+
+        面板只对分级管理员开放（admin 层再拦超管）；这里保证：
+        · 模板存在且未删除；· kind != 'notice'（通知类无「参与/完成」语义）；
+        · owner_id 严格等于当前分级管理员（跨属主一律 403，不含同名巧合）。
+        """
+        tpl = self.get_template((template_id or "").strip(), include_deleted=False)
+        if not tpl:
+            raise BizError(404, "NOT_FOUND", "任务模板不存在")
+        if str(tpl.get("kind") or "") == "notice":
+            raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
+        if int(tpl.get("owner_id") or 0) != int(owner_id):
+            raise BizError(403, "FORBIDDEN_OWNER", "只能查看自己名下任务的统计数据")
+        return tpl
+
+    @staticmethod
+    def _stats_like_escape(text: str) -> str:
+        t = str(text or "")
+        return t.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _stats_period_keys_for(self, period_key: str) -> Dict[str, Any]:
+        """统计周期 → 实例 period_key 匹配范围（统计视角与实例生成视角解耦）。
+
+        日 'YYYY-MM-DD' → 单键；ISO 周 'YYYY-Www' → 周内 7 个日键 + 周键
+        （deadline_type=weekend 的任务是**按日推送**的，周视图必须聚整周日实例）；
+        月 'YYYY-MM' → 月键 + 'YYYY-MM-' 前缀（兼容按日推送/月推送两种实例）。
+        """
+        pk = (period_key or "").strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", pk):
+            return {"keys": [pk], "like": ""}
+        m = re.match(r"^(\d{4})-W(\d{1,2})$", pk)
+        if m:
+            year, week = int(m.group(1)), int(m.group(2))
+            jan4 = datetime(year, 1, 4)
+            week1_mon = jan4 - timedelta(days=jan4.isoweekday() - 1)
+            monday = week1_mon + timedelta(weeks=week - 1)
+            keys = [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+            keys.append(pk)
+            return {"keys": keys, "like": ""}
+        m = re.match(r"^(\d{4})-(\d{2})$", pk)
+        if m:
+            return {"keys": [pk], "like": f"{pk}-"}
+        raise BizError(400, "VALIDATION_FAILED", "周期格式应为 YYYY-MM-DD / YYYY-Www / YYYY-MM")
+
+    def _stats_period_where(self, period_key: str, alias: str = "i") -> tuple:
+        info = self._stats_period_keys_for(period_key)
+        ph = ",".join("?" for _ in info["keys"])
+        prefix = f"{alias}." if alias else ""
+        if info["like"]:
+            return (f"({prefix}period_key IN ({ph}) OR {prefix}period_key LIKE ?)",
+                    [*info["keys"], info["like"] + "%"])
+        return f"{prefix}period_key IN ({ph})", list(info["keys"])
+
+    @classmethod
+    def _stats_dedup_persons(cls, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """周/月聚合视角：同一人多条实例 → 一人一行。
+
+        状态取「周期内最优」：已提交(submitted/approved) > 被驳回 > 已逾期 > 待提交
+        （周期内交过一次就算完成；交过的取最晚提交的那条做代表实例）。
+        日视图因唯一键 (template, phone, period_key) 天然一人一条，此函数为恒等变换。
+        """
+        def _rank(st: str) -> int:
+            if st in ("submitted", "approved"):
+                return 0
+            if st == "rejected":
+                return 1
+            if st in ("overdue", "expired"):
+                return 2
+            return 3
+
+        best: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            phone = str(r["phone"])
+            rk = _rank(str(r["status"]))
+            cur = best.get(phone)
+            if cur is None or rk < cur["_rank"] or (rk == cur["_rank"] and int(r["id"]) > int(cur["id"])):
+                cand = dict(r)
+                cand["_rank"] = rk
+                best[phone] = cand
+        return list(best.values())
+
+
+    def _stats_dept_exists_sql(self, role_ids: List[str], dept_path: str,
+                               phone_expr: str = "i.phone") -> tuple:
+        """部门过滤 EXISTS 片段（DB 层）：命中模板角色且 dept_path 在选中子树内。
+
+        返回 (sql, params)；dept_path 为空 = 全部覆盖部门 → 不加过滤 ("", [])。
+        """
+        roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
+        if not roles:
+            return "1=0", []
+        clean = str(dept_path or "").strip().strip("/")
+        if not clean:
+            return "", []
+        ph = ",".join("?" for _ in roles)
+        like = self._stats_like_escape(clean) + "/%"
+        sql = (f"EXISTS (SELECT 1 FROM member sm WHERE sm.phone = {phone_expr} "
+               f"AND sm.role_id IN ({ph}) AND sm.dept_path IS NOT NULL "
+               f"AND sm.dept_path <> '' AND (sm.dept_path = ? OR sm.dept_path LIKE ?))")
+        return sql, [*roles, clean, like]
+
+    def _stats_member_dept_map(self, role_ids: List[str]) -> Dict[str, str]:
+        """模板角色名册 → {手机号: 完整部门路径}。
+
+        同一手机号在多个角色出现时，按模板 role_ids 的顺序优先（先配的角色优先），
+        保证任务→成员的部门归属稳定可复现；名册行不按 enabled 过滤（统计看的是
+        实例/名册的真实部门，停用成员的历史实例同样要能归到部门）。
+        """
+        roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
+        out: Dict[str, str] = {}
+        if not roles:
+            return out
+        order = {r: idx for idx, r in enumerate(roles)}
+        ph = ",".join("?" for _ in roles)
+        rows = self.conn.execute(
+            f"SELECT role_id, phone, dept_path FROM member WHERE role_id IN ({ph})",
+            tuple(roles)).fetchall()
+        for r in rows:
+            phone = str(r["phone"] or "").strip()
+            if not phone:
+                continue
+            path = str(r["dept_path"] or "").strip()
+            cur = out.get(phone)
+            cand_prio = order.get(str(r["role_id"]), 999)
+            if cur is None or cand_prio < cur[0]:
+                out[phone] = path
+        return out
+
+    @classmethod
+    def _stats_phone_path(cls, phone: str, dept_map: Dict[str, str]) -> str:
+        """手机号 → 任务内完整部门路径（无路径归「未分配部门」）。"""
+        p = str(dept_map.get(phone) or "").strip()
+        return p if p else cls.STATS_PANEL_NO_DEPT
+
+    @classmethod
+    def _stats_dept_tree(cls, phone_paths: Dict[str, str]) -> List[Dict[str, Any]]:
+        """任务专属动态部门树：只聚合实际覆盖成员的路径链（不展示全量组织架构）。
+
+        phone_paths: {手机号: 完整路径}；返回按层级+字典序的节点列表
+        [{path, name, depth, count}]，count=该节点下覆盖成员数（含子孙）。
+        """
+        counts: Dict[str, int] = {}
+        for path in phone_paths.values():
+            segs = [s.strip() for s in str(path or "").split("/") if s.strip()]
+            if not segs:
+                counts[cls.STATS_PANEL_NO_DEPT] = counts.get(cls.STATS_PANEL_NO_DEPT, 0) + 1
+                continue
+            acc: List[str] = []
+            for seg in segs:
+                acc.append(seg)
+                node = "/".join(acc)
+                counts[node] = counts.get(node, 0) + 1
+        nodes: List[Dict[str, Any]] = []
+        for path, cnt in sorted(counts.items(), key=lambda kv: (kv[0].count("/"), kv[0])):
+            segs = path.split("/")
+            nodes.append({"path": path, "name": segs[-1], "depth": len(segs), "count": cnt})
+        return nodes
+
+    def stats_panel_overview(self, template_id: str, period_key: str, owner_id: int,
+                             dept_path: str = "") -> Dict[str, Any]:
+        """面板总览：模板元信息 + 任务专属部门树 + KPI（+不定期 7 天趋势）。
+
+        定期（模式A）KPI 按所选部门子树过滤；部门树恒为全周期覆盖（供下钻导航）。
+        不定期（模式B）：覆盖成员=模板名册（潜在上报人）；KPI/趋势按部门子树过滤。
+        """
+        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
+        dept_map = self._stats_member_dept_map(role_ids)
+        sel = str(dept_path or "").strip().strip("/")
+
+        def _phone_in_scope(phone: str) -> bool:
+            if not sel:
+                return True
+            p = self._stats_phone_path(phone, dept_map)
+            return p == sel or p.startswith(sel + "/")
+
+        tpl_meta = {
+            "template_id": tpl["template_id"], "name": tpl["name"], "kind": tpl.get("kind"),
+            "period": tpl.get("period"), "is_adhoc": bool(tpl.get("is_adhoc")),
+            "has_deadline": bool(tpl.get("has_deadline")),
+            "deadline_type": tpl.get("deadline_type"), "deadline_time": tpl.get("deadline_time"),
+            "need_review": bool(tpl.get("need_review")),
+            "modules": effective_h5_modules(tpl),
+            "schema_fields": [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")],
+        }
+
+        if tpl_meta["is_adhoc"]:
+            date_str = (period_key or "").strip()
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                raise BizError(400, "VALIDATION_FAILED", "不定期任务统计需要具体日期（YYYY-MM-DD）")
+            day_start = f"{date_str} 00:00:00"
+            day_end = f"{date_str} 23:59:59"
+            tree = self._stats_dept_tree({p: self._stats_phone_path(p, dept_map) for p in dept_map})
+            ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, sel, phone_expr="i.phone")
+            ex_and = f" AND {ex_sql}" if ex_sql else ""
+            base = "FROM submission s JOIN task_instance i ON i.id = s.instance_id WHERE i.template_id = ?"
+            base_params: List[Any] = [tpl["template_id"]]
+            if ex_sql:
+                base += ex_and
+                base_params += ex_params
+            day_row = self.conn.execute(
+                f"SELECT COUNT(1) AS cnt, COUNT(DISTINCT i.phone) AS uniq {base} "
+                "AND s.created_at >= ? AND s.created_at <= ?",
+                tuple(base_params + [day_start, day_end])).fetchone()
+            total_row = self.conn.execute(
+                f"SELECT COUNT(1) AS cnt, COUNT(DISTINCT i.phone) AS uniq {base}",
+                tuple(base_params)).fetchone()
+            # 近 7 天趋势（以所选日期为终点，含当日）
+            trend_start_dt = datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=6)
+            trend_start = trend_start_dt.strftime("%Y-%m-%d 00:00:00")
+            trend_rows = self.conn.execute(
+                f"SELECT DATE_FORMAT(s.created_at, '%Y-%m-%d') AS d, COUNT(1) AS cnt, "
+                f"COUNT(DISTINCT i.phone) AS uniq {base} AND s.created_at >= ? AND s.created_at <= ? GROUP BY d",
+                tuple(base_params + [trend_start, day_end])).fetchall()
+            by_day = {str(r["d"]): (int(r["cnt"] or 0), int(r["uniq"] or 0)) for r in trend_rows}
+            trend = []
+            for i in range(7):
+                d = (trend_start_dt + timedelta(days=i)).strftime("%Y-%m-%d")
+                cnt, uniq = by_day.get(d, (0, 0))
+                trend.append({"date": d, "count": cnt, "unique": uniq})
+            return {
+                "ok": True, "mode": "adhoc", "template": tpl_meta, "dept_tree": tree,
+                "selected_dept_path": sel,
+                "kpis": {
+                    "day_count": int(day_row["cnt"] or 0),
+                    "day_unique": int(day_row["uniq"] or 0),
+                    "total_count": int(total_row["cnt"] or 0),
+                    "total_unique": int(total_row["uniq"] or 0),
+                },
+                "trend": trend,
+            }
+
+        # ── 定期（模式A）──
+        if not (period_key or "").strip():
+            raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
+        per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
+        rows = self.conn.execute(
+            "SELECT id, phone, name_snap, dept_snap, status, submitted_at, deadline_at "
+            f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
+            (tpl["template_id"], *per_params)).fetchall()
+        # 周/月聚合视角：同人多实例去重成一人一行（日视图唯一键保证恒等）
+        persons = self._stats_dedup_persons([dict(r) for r in rows])
+        covered_paths = {str(r["phone"]): self._stats_phone_path(str(r["phone"]), dept_map) for r in persons}
+        tree = self._stats_dept_tree(covered_paths)
+        # KPI（部门子树过滤；按去重后的人计）
+        scoped = [r for r in persons if _phone_in_scope(str(r["phone"]))]
+        total = len(scoped)
+        by_status: Dict[str, int] = {}
+        for r in scoped:
+            st = str(r["status"])
+            by_status[st] = by_status.get(st, 0) + 1
+        done = sum(by_status.get(s, 0) for s in self.STATS_PANEL_DONE)
+        not_done = sum(by_status.get(s, 0) for s in self.STATS_PANEL_TODO)
+        need_review = bool(tpl.get("need_review"))
+        rate = round(done / total * 100, 1) if total else 0.0
+        # 部门节点统计（供下级对比图；按全周期覆盖行计算——图表展示的是选中节点的直接子级）
+        node_stats: Dict[str, Dict[str, int]] = {}
+
+        def _touch(node: str, is_done: bool) -> None:
+            d = node_stats.setdefault(node, {"covered": 0, "done": 0})
+            d["covered"] += 1
+            if is_done:
+                d["done"] += 1
+
+        for r in persons:
+            phone = str(r["phone"])
+            p = covered_paths.get(phone) or self.STATS_PANEL_NO_DEPT
+            is_done = str(r["status"]) in self.STATS_PANEL_DONE
+            if p == self.STATS_PANEL_NO_DEPT:
+                _touch(p, is_done)
+                continue
+            segs = p.split("/")
+            acc: List[str] = []
+            for seg in segs:
+                acc.append(seg)
+                _touch("/".join(acc), is_done)
+        dept_stats = {k: v for k, v in node_stats.items()}
+        return {
+            "ok": True, "mode": "periodic", "template": tpl_meta, "dept_tree": tree,
+            "selected_dept_path": sel,
+            "kpis": {
+                "total": total, "done": done, "not_done": not_done, "rate": rate,
+                "need_review": need_review,
+                "pending_review": by_status.get("submitted", 0),
+                "approved": by_status.get("approved", 0),
+                "pending": by_status.get("pending", 0),
+                "rejected": by_status.get("rejected", 0),
+                "overdue": by_status.get("overdue", 0) + by_status.get("expired", 0),
+                "by_status": {k: v for k, v in by_status.items()},
+            },
+            "dept_stats": dept_stats,
+        }
+
+    def stats_panel_instances(self, template_id: str, period_key: str, owner_id: int, *,
+                              dept_path: str = "", status_group: str = "all",
+                              q: str = "", page: int = 1, size: int = 50) -> Dict[str, Any]:
+        """模式A 员工明细（一人一行；周/月视图按「周期内最优状态」去重代表实例）。"""
+        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        if not (period_key or "").strip():
+            raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
+        role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
+        sel = str(dept_path or "").strip().strip("/")
+        per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
+        rows = [dict(r) for r in self.conn.execute(
+            "SELECT id, phone, name_snap, dept_snap, status, submitted_at, late_submit "
+            f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
+            (tpl["template_id"], *per_params)).fetchall()]
+
+        def _keep(r: Dict[str, Any]) -> bool:
+            group = str(status_group or "all").strip().lower()
+            st = str(r["status"])
+            if group == "done":
+                if st not in self.STATS_PANEL_DONE:
+                    return False
+            elif group == "todo":
+                if st not in self.STATS_PANEL_TODO:
+                    return False
+            elif group == "pending":
+                if st != "pending":
+                    return False
+            elif group == "overdue":
+                if st not in ("overdue", "expired"):
+                    return False
+            elif group == "rejected":
+                if st != "rejected":
+                    return False
+            kw = str(q or "").strip()
+            if kw and kw not in str(r["name_snap"] or "") and kw not in str(r["phone"] or ""):
+                return False
+            return True
+
+        dept_map = self._stats_member_dept_map(role_ids)
+        persons = self._stats_dedup_persons(rows)
+        scoped: List[Dict[str, Any]] = []
+        for r in persons:
+            path = self._stats_phone_path(str(r["phone"]), dept_map)
+            if sel and not (path == sel or path.startswith(sel + "/")):
+                continue
+            if not _keep(r):
+                continue
+            r = dict(r)
+            r["dept_path"] = path
+            scoped.append(r)
+        # 展示排序：未完成优先提醒（待上传→已逾期→被驳回→已完成），同组姓名
+        def _sort_key(r: Dict[str, Any]) -> tuple:
+            st = str(r["status"])
+            order = {"pending": 0, "overdue": 1, "expired": 1, "rejected": 2}.get(st, 3)
+            return (order, str(r["name_snap"] or ""), int(r["id"]))
+
+        scoped.sort(key=_sort_key)
+        total = len(scoped)
+        p_no, p_size = _clamp_page_size(page, size)
+        start = (p_no - 1) * p_size
+        page_rows = scoped[start:start + p_size]
+        # 当前页代表实例的最近一次提交（内容预览用；不翻全库）
+        previews: Dict[int, Dict[str, Any]] = {}
+        ids = [int(r["id"]) for r in page_rows]
+        if ids:
+            ph = ",".join("?" for _ in ids)
+            subs = self.conn.execute(
+                f"SELECT instance_id, fields_json, note FROM submission WHERE instance_id IN ({ph}) ORDER BY id ASC",
+                tuple(ids)).fetchall()
+            for s in subs:
+                previews[int(s["instance_id"])] = {"fields_json": s["fields_json"], "note": s["note"]}
+        items: List[Dict[str, Any]] = []
+        for r in page_rows:
+            phone = str(r["phone"])
+            preview = self._stats_submission_preview(previews.get(int(r["id"])), tpl_meta_fields=tpl.get("schema_json") or [])
+            items.append({
+                "id": int(r["id"]), "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
+                "dept_path": r.get("dept_path") or "",
+                "status": str(r["status"]), "submitted_at": r["submitted_at"],
+                "late_submit": bool(r.get("late_submit")),
+                "preview": preview,
+            })
+        return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
+
+    @classmethod
+    def _stats_submission_preview(cls, sub: Optional[Dict[str, Any]],
+                                  tpl_meta_fields: List[Dict[str, Any]]) -> str:
+        """内容预览：按模板字段顺序取首个非空值，退回补充说明；整体截断 40 字。"""
+        if not sub:
+            return ""
+        try:
+            fields = json.loads(str(sub.get("fields_json") or "") or "{}") or {}
+        except Exception:  # noqa: BLE001
+            fields = {}
+        for f in tpl_meta_fields:
+            key = str((f or {}).get("key") or "")
+            if key and str(fields.get(key) or "").strip():
+                return str(fields[key]).strip()[:40]
+        for v in fields.values():
+            if str(v or "").strip():
+                return str(v).strip()[:40]
+        note = str(sub.get("note") or "").strip()
+        return note[:40]
+
+    def stats_panel_submissions_day(self, template_id: str, date_str: str, owner_id: int, *,
+                                    dept_path: str = "", q: str = "",
+                                    page: int = 1, size: int = 50) -> Dict[str, Any]:
+        """模式B 当天流水明细（每条提交一行；DB 层分页/搜索/部门过滤）。"""
+        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", (date_str or "").strip()):
+            raise BizError(400, "VALIDATION_FAILED", "请选择具体日期（YYYY-MM-DD）")
+        date_str = date_str.strip()
+        role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
+        where = ["i.template_id = ?",
+                 "s.created_at >= ?", "s.created_at <= ?"]
+        params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
+        ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, dept_path, "i.phone")
+        if ex_sql:
+            where.append(ex_sql)
+            params += ex_params
+        kw = str(q or "").strip()
+        if kw:
+            like = f"%{kw}%"
+            where.append("(i.name_snap LIKE ? OR i.phone LIKE ?)")
+            params += [like, like]
+        where_sql = "WHERE " + " AND ".join(where)
+        p_no, p_size = _clamp_page_size(page, size)
+        offset = (p_no - 1) * p_size
+        with self.lock:
+            total = int(self.conn.execute(
+                f"SELECT COUNT(1) AS cnt FROM submission s JOIN task_instance i ON i.id = s.instance_id {where_sql}",
+                tuple(params)).fetchone()["cnt"] or 0)
+            rows = self.conn.execute(
+                f"SELECT s.id AS submission_id, s.instance_id, s.fields_json, s.note, s.created_at, "
+                f"i.phone, i.name_snap, i.dept_snap, i.status AS instance_status "
+                f"FROM submission s JOIN task_instance i ON i.id = s.instance_id {where_sql} "
+                f"ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?",
+                tuple(params + [p_size, offset])).fetchall()
+        dept_map = self._stats_member_dept_map(role_ids)
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            phone = str(r["phone"])
+            items.append({
+                "submission_id": int(r["submission_id"]), "instance_id": int(r["instance_id"]),
+                "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
+                "dept_path": self._stats_phone_path(phone, dept_map),
+                "submitted_at": r["created_at"], "instance_status": str(r["instance_status"]),
+                "preview": self._stats_submission_preview(
+                    {"fields_json": r["fields_json"], "note": r["note"]},
+                    tpl.get("schema_json") or []),
+            })
+        return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
+
+    def stats_panel_export_rows(self, template_id: str, period_key: str, owner_id: int, *,
+                                dept_path: str = "") -> Dict[str, Any]:
+        """导出数据装配：当前任务 + 周期（不定期=所选日期）+ 部门范围的全部实时行。
+
+        完成状态统一收敛为 4 种（submitted/approved→已提交；pending→待上传；
+        overdue/expired→已逾期；rejected→被驳回）；cancelled 不导出。
+        返回 {template, headers, rows}，Excel 组装由 API 层完成。
+        """
+        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
+        dept_map = self._stats_member_dept_map(role_ids)
+        sel = str(dept_path or "").strip().strip("/")
+        modules = effective_h5_modules(tpl)
+        schema_fields = [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")]
+        # 动态内容列：自定义报数/文本字段（图片与附件明确不导出）；文字补充说明另列
+        content_fields = [f for f in schema_fields if str(f.get("type") or "").lower() not in ("file", "image")]
+        has_note_col = bool(tpl.get("allow_note")) or ("text" in modules)
+
+        if bool(tpl.get("is_adhoc")):
+            date_str = (period_key or "").strip()
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+                raise BizError(400, "VALIDATION_FAILED", "不定期任务导出需要具体日期（YYYY-MM-DD）")
+            params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
+            rows = self.conn.execute(
+                "SELECT i.id AS instance_id, s.fields_json, s.note, s.created_at AS submitted_at, "
+                "i.phone, i.name_snap, i.status AS status, i.dept_snap "
+                "FROM submission s JOIN task_instance i ON i.id = s.instance_id "
+                "WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at DESC, s.id DESC",
+                tuple(params)).fetchall()
+            out_rows: List[Dict[str, Any]] = []
+            for r in rows:
+                phone = str(r["phone"])
+                path = self._stats_phone_path(phone, dept_map)
+                if sel and not (path == sel or path.startswith(sel + "/")):
+                    continue
+                fields = self._parse_fields_json(r["fields_json"])
+                out_rows.append({
+                    "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
+                    "dept_path": path, "status": str(r["status"]),
+                    "submitted_at": r["submitted_at"], "fields": fields, "note": str(r["note"] or ""),
+                })
+        else:
+            if not (period_key or "").strip():
+                raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
+            ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, sel, "i.phone")
+            per_sql, per_params = self._stats_period_where(period_key.strip())
+            where = ["i.template_id = ?", per_sql, "i.status != 'cancelled'"]
+            params: List[Any] = [tpl["template_id"], *per_params]
+            if ex_sql:
+                where.append(ex_sql)
+                params += ex_params
+            where_sql = "WHERE " + " AND ".join(where)
+            raw_rows = [dict(r) for r in self.conn.execute(
+                f"SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at "
+                f"FROM task_instance i {where_sql}", tuple(params)).fetchall()]
+            persons = self._stats_dedup_persons(raw_rows)
+            # 已提交行取代表实例的最近一次提交内容（一次 IN 查询，不逐行往返）
+            done_ids = [int(r["id"]) for r in persons if str(r["status"]) in self.STATS_PANEL_DONE]
+            subs: Dict[int, Dict[str, Any]] = {}
+            for start in range(0, len(done_ids), 900):
+                chunk = done_ids[start:start + 900]
+                ph = ",".join("?" for _ in chunk)
+                for s in self.conn.execute(
+                        f"SELECT instance_id, fields_json, note FROM submission "
+                        f"WHERE instance_id IN ({ph}) ORDER BY id ASC", tuple(chunk)).fetchall():
+                    subs[int(s["instance_id"])] = {"fields_json": s["fields_json"], "note": s["note"]}
+            out_rows = []
+            for r in persons:
+                phone = str(r["phone"])
+                sub = subs.get(int(r["id"]))
+                fields = self._parse_fields_json((sub or {}).get("fields_json"))
+                out_rows.append({
+                    "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
+                    "dept_path": self._stats_phone_path(phone, dept_map),
+                    "status": str(r["status"]),
+                    "submitted_at": r["submitted_at"] if str(r["status"]) in self.STATS_PANEL_DONE else None,
+                    "fields": fields, "note": str((sub or {}).get("note") or ""),
+                })
+            # 展示排序与明细表一致：未完成在前
+            out_rows.sort(key=lambda r: (
+                {"pending": 0, "overdue": 1, "expired": 1, "rejected": 2}.get(str(r["status"]), 3),
+                str(r["name"] or "")))
+        headers = (["序号", "姓名", "手机号", "所属部门（末级）", "完整部门路径", "完成状态", "提交时间"]
+                   + [str(f.get("label") or f.get("key")) for f in content_fields]
+                   + (["补充说明"] if has_note_col else []))
+        return {
+            "template": tpl, "headers": headers, "rows": out_rows,
+            "content_fields": content_fields, "has_note_col": has_note_col,
+        }
+
+    @staticmethod
+    def _parse_fields_json(raw: Any) -> Dict[str, Any]:
+        try:
+            d = json.loads(str(raw or "") or "{}")
+            return d if isinstance(d, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}

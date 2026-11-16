@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   ClipboardCheck,
   BarChart3,
@@ -25,8 +25,13 @@ interface MainAppProps {
 }
 
 const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
-  const { loading, templates, roles, stats, platform } = useAppStore();
+  const { loading, templates, roles, stats, platform, statsFocus } = useAppStore();
   const [activeTab, setActiveTab] = useState<TabKey>('instances');
+
+  /* 2026-11-16 模板行「统计」按钮：跨面板联动切到统计页并选中该任务 */
+  useEffect(() => {
+    if (statsFocus.seq > 0) setActiveTab('stats');
+  }, [statsFocus.seq]);
 
   const isSuperAdmin = me.role_level !== 'sub_admin';
   const submittedCount = stats?.by_status?.submitted || 0;
@@ -60,13 +65,17 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
       badge: roles.length,
       badgeTone: 'slate',
     },
-    {
+  ];
+
+  /* 2026-11-16 任务数据统计：⛔ 超管左侧导航不显示（后端五端点对超管也一律 403） */
+  if (!isSuperAdmin) {
+    navItems.push({
       id: 'stats',
-      label: '统计看板',
+      label: '任务数据统计',
       icon: BarChart3,
       badgeTone: 'slate',
-    },
-  ];
+    });
+  }
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[#f7f8fa] text-slate-900">
@@ -199,7 +208,8 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               {activeTab === 'instances' && <InstancesView />}
               {activeTab === 'templates' && <TemplatesView />}
               {activeTab === 'roles' && <RolesMembersView />}
-          {activeTab === 'stats' && <StatisticsView />}
+          {/* 2026-11-16 任务数据统计：仅分级管理员（超管导航不显示本菜单，直访也拦） */}
+          {activeTab === 'stats' && !isSuperAdmin && <StatisticsView />}
               {activeTab === 'accounts' && isSuperAdmin && <AdminAccountsView />}
               {activeTab === 'channels' && isSuperAdmin && <ChannelSettingsView />}
             </>

@@ -15,3 +15,5 @@ wecom-aibot-python-sdk>=1.0.2
 # 2026-11-16 方案B：纯 MySQL 数据层（PooledDB 连接池 + 事务代理），SQLite 已彻底移除
 pymysql>=1.2.4,<2.0.0
 dbutils>=3.2.0,<4.0.0
+# 2026-11-16 任务：上传任务数据统计分析面板 Excel 实时导出（.xlsx 原生生成）
+openpyxl>=3.1.0,<4.0.0

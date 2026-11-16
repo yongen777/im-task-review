@@ -26,6 +26,7 @@ import {
   Check,
   Send,
   ArrowRight,
+  BarChart3,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { AdminScopeHeader } from './AdminScopeHeader';
@@ -437,6 +438,7 @@ export const TemplatesView: React.FC = () => {
     ownerFilter,
     setOwnerFilter,
     adminAccounts,
+    setStatsFocus,
   } = useAppStore();
   const toast = useToast();
 
@@ -1441,6 +1443,18 @@ export const TemplatesView: React.FC = () => {
                           </span>
                         ) : (
                           <div className="inline-flex items-center justify-end gap-2">
+                            {/* 2026-11-16 任务数据统计面板：上传任务行内「统计」入口（分级管理员专属；
+                                通知类无「参与/完成」语义，不显示；点击跳统计页并自动选中该任务） */}
+                            {tpl.kind !== 'notice' && (
+                              <button
+                                onClick={() => setStatsFocus(String(tpl.id))}
+                                title="查看该任务的数据统计（进度 / 部门对比 / 明细 / Excel 导出）"
+                                className="px-3 py-1.5 rounded-lg bg-violet-50 hover:bg-violet-100 text-violet-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                              >
+                                <BarChart3 className="w-3.5 h-3.5 shrink-0" />
+                                <span>统计</span>
+                              </button>
+                            )}
                             {/* 2026-11-12 任务D：一键推送（上传任务专属；notice 按时刻自动发）。 */}
                             {tpl.kind !== 'notice' && (
                               <button
