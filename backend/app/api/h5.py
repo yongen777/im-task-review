@@ -25,8 +25,8 @@ from ..state import BizError, StateStore, calc_resubmit_deadline, format_deadlin
 logger = logging.getLogger(__name__)
 
 # 2026-10-28：补齐日常拍照格式——jpeg（Windows/相机常见）与 webp（微信转发常见）
-ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp"}
-IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp", "bmp", "gif"}
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "gif"}
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 MAX_HARD_UPLOAD_MB = 20
 
@@ -82,19 +82,66 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPG_MAGIC = b"\xff\xd8\xff"
 PDF_MAGIC = b"%PDF-"
 PK_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+GIF_MAGICS = (b"GIF87a", b"GIF89a")
+# BMP 无唯一魔数（只有 "BM" 前缀），用 DIB 头尺寸字段（偏移 14~18 的合法枚举值）兜底防纯文本误判
+BMP_DIB_HEADER_SIZES = {12, 40, 52, 56, 64, 108, 124}
+MIME_TO_IMAGE_EXT = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "image/bmp": "bmp",
+}
+# iPhone 原图 HEIC/HEIF（ISO-BMFF 容器）的 ftyp brand
+HEIC_BRANDS = (b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1", b"hevc", b"hevx")
+
+
+def sniff_image_mime(header_bytes: bytes) -> Optional[str]:
+    """2026-11-16 体验修复：按**内容**嗅探任意合法图片格式（JPEG/PNG/WEBP/GIF/BMP）。
+
+    背景：微信/密信转存图、截图工具导出图、手机兼容图常出现「.jpg 里装 PNG/WEBP」——
+    旧的「扩展名↔魔数一一硬绑定」把大量真实图片误杀（用户报障：文件头魔数与扩展名不匹配）。
+    现在：扩展名在图片白名单内 + 内容嗅探出任意合法图片魔数 → 放行，真实 MIME 以嗅探为准；
+    ⛔ 非图片魔数（HTML/脚本/ZIP/EXE 伪装成 .jpg）一律 None → 上层拒绝。
+    """
+    if not header_bytes:
+        return None
+    if header_bytes.startswith(JPG_MAGIC):
+        return "image/jpeg"
+    if header_bytes.startswith(PNG_MAGIC):
+        return "image/png"
+    if header_bytes[:4] == b"RIFF" and header_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if header_bytes[:6] in GIF_MAGICS:
+        return "image/gif"
+    if (
+        header_bytes[:2] == b"BM"
+        and len(header_bytes) >= 18
+        and int.from_bytes(header_bytes[14:18], "little") in BMP_DIB_HEADER_SIZES
+    ):
+        return "image/bmp"
+    return None
+
+
+def sniff_heic_like(header_bytes: bytes) -> bool:
+    """识别 iPhone 原图 HEIC/HEIF（ISO-BMFF 容器，ftyp brand）——只用于给出友好提示，绝不放行。"""
+    if len(header_bytes) >= 12 and header_bytes[4:8] == b"ftyp":
+        return header_bytes[8:12] in HEIC_BRANDS
+    return False
 
 
 def sniff_magic_mime(ext: str, header_bytes: bytes) -> Optional[str]:
-    """R35：通过文件头魔数嗅探真实 MIME，绝不信任客户端上传的 Content-Type。"""
+    """R35：通过文件头魔数嗅探真实 MIME，绝不信任客户端上传的 Content-Type。
+
+    2026-11-16 体验修复：图片白名单（jpg/jpeg/png/webp/bmp/gif）改为**按内容判定**——
+    内容为任意合法图片格式即放行（返回真实 MIME），非图片魔数一律拒绝。
+    PDF / ZIP / Office 文档仍保持「扩展名↔魔数一一对应」的严格绑定。
+    """
     e = (ext or "").lower().lstrip(".")
     if not header_bytes:
         return None
-    if e in ("jpg", "jpeg"):
-        return "image/jpeg" if header_bytes.startswith(JPG_MAGIC) else None
-    if e == "png":
-        return "image/png" if header_bytes.startswith(PNG_MAGIC) else None
-    if e == "webp":
-        return "image/webp" if (header_bytes[:4] == b"RIFF" and header_bytes[8:12] == b"WEBP") else None
+    if e in IMAGE_EXTENSIONS:
+        return sniff_image_mime(header_bytes)
     if e == "pdf":
         return "application/pdf" if header_bytes.startswith(PDF_MAGIC) else None
     if e in ZIP_BASED_MIMES:
@@ -308,7 +355,7 @@ def _validate_upload_target_and_limits(
     if ext not in ALLOWED_EXTENSIONS:
         return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": f"不支持的文件类型: .{ext}"})
     if tpl["kind"] == "image" and ext not in IMAGE_EXTENSIONS:
-        return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": "图片类任务仅允许上传 jpg 或 png 格式"})
+        return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": "图片类任务仅允许上传 jpg/png/webp/bmp/gif 格式"})
 
     default_max_mb = 9 if tpl["kind"] == "image" else MAX_HARD_UPLOAD_MB
     max_mb = min(int(tpl.get("max_file_mb") or default_max_mb), default_max_mb)
@@ -410,13 +457,23 @@ def process_h5_task_upload(
     if len(content_bytes) > max_bytes:
         return 400, {"code": "FILE_TOO_LARGE", "message": f"文件大小超出上限（最大 {max_mb}MB）"}
 
-    detected_mime = sniff_magic_mime(ext, content_bytes[:32])
+    # 2026-11-16 体验修复：图片按**内容**判定（.jpg 里装 PNG/WEBP 照常放行），
+    # 非图片魔数一律拒绝；HEIC/HEIF 原图给「请截图或转 JPG/PNG」友好提示而非晦涩术语。
+    header = content_bytes[:32]
+    detected_mime = sniff_magic_mime(ext, header)
     if not detected_mime:
-        return 400, {"code": "FILE_TYPE_REJECTED", "message": "文件头魔数与扩展名不匹配，拒绝上传"}
+        if sniff_heic_like(header):
+            return 400, {"code": "FILE_TYPE_REJECTED",
+                         "message": "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传"}
+        return 400, {"code": "FILE_TYPE_REJECTED",
+                     "message": "文件内容校验未通过（内容与扩展名不符或格式暂不支持），"
+                                "请改用 JPG/PNG/WEBP/BMP/GIF 图片或 PDF/Office 文档后重试"}
 
+    # 按实际嗅探出的 MIME 与真实扩展名落盘：.jpg 里装 PNG 就存成 .png（避免后续预览/下载歧义）
+    save_ext = MIME_TO_IMAGE_EXT.get(detected_mime, ext)
     ref = uuid.uuid4().hex
-    rel_path = f"{inst['period_key']}/{tpl['template_id']}/{ref}.{ext}"
-    disk_path = uploads_dir / inst["period_key"] / tpl["template_id"] / f"{ref}.{ext}"
+    rel_path = f"{inst['period_key']}/{tpl['template_id']}/{ref}.{save_ext}"
+    disk_path = uploads_dir / inst["period_key"] / tpl["template_id"] / f"{ref}.{save_ext}"
     disk_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:

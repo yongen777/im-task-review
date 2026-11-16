@@ -218,13 +218,31 @@
               refList.textContent = "";
               grid.querySelectorAll("img.thumb").forEach((el) => el.remove());
               for (const f of fileInp.files) {
+                /* 2026-11-16 体验修复：苹果 HEIC/HEIF 原图（iPhone 拍摄默认格式）浏览器无法
+                   直接渲染、后端也不支持——上传前先拦下并给友好提示，
+                   绝不让用户看到「文件头魔数」这种晦涩术语。跳过该文件，继续处理其余文件。 */
+                const fname = (f.name || "").toLowerCase();
+                const ftype = (f.type || "").toLowerCase();
+                if (fname.endsWith(".heic") || fname.endsWith(".heif") || ftype.indexOf("heic") >= 0 || ftype.indexOf("heif") >= 0) {
+                  showMsg("暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传", "error");
+                  continue;
+                }
                 const fd = new FormData();
                 fd.append("token", token);
                 fd.append("file", f);
                 try {
                   const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
                   const res = await r.json();
-                  if (!r.ok) { showMsg(res.message || "上传失败", "error"); return; }
+                  if (!r.ok) {
+                    /* 图片模块的校验失败给人话提示（多为格式问题），文件模块透传后端信息 */
+                    showMsg(
+                      previewImages && res.code === "FILE_TYPE_REJECTED"
+                        ? "图片校验未通过：请改用 JPG/PNG/WEBP/BMP/GIF 格式（HEIC 原图可截图后上传）"
+                        : (res.message || "上传失败"),
+                      "error",
+                    );
+                    return;
+                  }
                   myRefs.push(res.ref);
                   const line = document.createElement("div");
                   line.textContent = "已上传：" + (res.file_name || res.ref);
@@ -291,7 +309,10 @@
               body.appendChild(ta);
             }
             if (modules.includes("image")) {
-              makeUploadBlock("图片上传", "🖼", ["#eff6ff", "#2563eb"], "JPG / PNG / WEBP", "image/*", true, "image");
+              /* 2026-11-16 体验修复：accept 收窄到后端支持的图片格式（不含 HEIC——
+                 iOS Safari 会因此自动把 HEIC 原图转码成 JPEG，从源头减少报错）；
+                 兜底的 HEIC 预检在 change 事件里再拦一次并给友好提示。 */
+              makeUploadBlock("图片上传", "🖼", ["#eff6ff", "#2563eb"], "JPG / PNG / WEBP / BMP / GIF", "image/jpeg,image/png,image/webp,image/bmp,image/gif", true, "image");
             }
             if (modules.includes("file")) {
               makeUploadBlock("文件上传", "📎", ["#f5f3ff", "#7c3aed"], "Excel / PDF / Word", "", false, "file");
@@ -299,7 +320,7 @@
           } else {
             makeUploadBlock(
               data.template.kind === "image" ? "图片上传 *" : "文件上传 *",
-              "📎", ["#f5f3ff", "#7c3aed"], "", data.template.kind === "image" ? "image/*" : "", data.template.kind === "image", "single",
+              "📎", ["#f5f3ff", "#7c3aed"], "", data.template.kind === "image" ? "image/jpeg,image/png,image/webp,image/bmp,image/gif" : "", data.template.kind === "image", "single",
             );
           }
           /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
