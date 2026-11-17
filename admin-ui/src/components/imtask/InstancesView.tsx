@@ -82,7 +82,7 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
   switch (inst.status) {
     case 'submitted':
       return {
-        label: '待审核',
+        label: inst.need_review === false ? '已提交' : '待审核',
         className: 'bg-blue-50 text-blue-700 border-blue-200',
         icon: <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
       };
@@ -200,8 +200,94 @@ const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }>
   );
 };
 
+function ManualSubmissionForm({
+  detail, busy, onCancel, onConfirm,
+}: {
+  detail: TaskInstanceDetail;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (body: FormData) => void;
+}) {
+  const modules = detail.instance.modules ?? [];
+  const fields = modules.includes('fields') ? detail.template?.schema_json ?? [] : [];
+  const spec = detail.template?.spec_json;
+  const inputClass = 'w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs outline-none focus:border-blue-500';
+
+  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busy) return;
+    const input = new FormData(event.currentTarget);
+    const values = Object.fromEntries(fields.flatMap((field) => {
+      const value = String(input.get(`field:${field.key}`) ?? '').trim();
+      return value ? [[field.key, value]] : [];
+    }));
+    const body = new FormData();
+    body.set('payload', JSON.stringify({ fields: values, note: String(input.get('note') ?? '').trim() }));
+    for (const file of [...input.getAll('images'), ...input.getAll('files')]) {
+      if (file instanceof File && file.name) body.append('attachments', file);
+    }
+    onConfirm(body);
+  };
+
+  return (
+    <form onSubmit={handleSubmit} aria-labelledby="manual-submit-title" className="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-3">
+      <div>
+        <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">标记已提交</h4>
+        <p className="mt-1 text-slate-600">所有内容均可选，可直接确认。标记后，员工原提交链接将作废。</p>
+      </div>
+      <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
+        {fields.map((field) => (
+          <label key={field.key} className="grid gap-1 font-medium text-slate-700">
+            <span>{field.label}{field.unit ? `（${field.unit}）` : ''}</span>
+            {field.type === 'select' ? (
+              <select name={`field:${field.key}`} defaultValue="" className={inputClass}>
+                <option value="">请选择</option>
+                {field.options?.map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+            ) : (
+              <input
+                name={`field:${field.key}`}
+                type={field.type === 'number' || field.type === 'date' ? field.type : 'text'}
+                step={field.type === 'number' ? 'any' : undefined}
+                maxLength={field.type === 'text' ? field.max_len : undefined}
+                className={inputClass}
+              />
+            )}
+          </label>
+        ))}
+        {modules.includes('text') && (
+          <label className="grid gap-1 font-medium text-slate-700 sm:col-span-2">
+            <span>{spec?.text_label || '文字说明'}</span>
+            <textarea name="note" rows={2} maxLength={500} placeholder={spec?.text_placeholder} className={inputClass} />
+          </label>
+        )}
+        {modules.includes('image') && (
+          <label className="grid gap-1 font-medium text-slate-700">
+            <span>图片凭证</span>
+            <input name="images" type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.gif" className={inputClass} />
+          </label>
+        )}
+        {modules.includes('file') && (
+          <label className="grid gap-1 font-medium text-slate-700">
+            <span>文件凭证</span>
+            <input name="files" type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" className={inputClass} />
+          </label>
+        )}
+      </fieldset>
+      <div className="flex justify-end gap-2">
+        <button type="button" disabled={busy} onClick={onCancel} className="rounded-lg px-3 py-2 font-semibold text-slate-600 hover:bg-white disabled:opacity-50">
+          取消代交
+        </button>
+        <button type="submit" disabled={busy} className="rounded-lg bg-blue-600 px-3 py-2 font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+          {busy ? '正在标记…' : '确认标记为已提交'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 export const InstancesView: React.FC = () => {
-  const { roles, refreshStats, platform, isSuperAdmin, ownerFilter, setOwnerFilter, adminAccounts } = useAppStore();
+  const { roles, refreshStats, platform, isSuperAdmin, ownerFilter, setOwnerFilter, adminAccounts, me } = useAppStore();
   const toast = useToast();
 
   // 筛选条件：按日期（默认今天）、按角色、按任务类型、按执行状态、按用户名/手机号
@@ -234,6 +320,12 @@ export const InstancesView: React.FC = () => {
 
   // P2-2: 实例详情弹窗状态
   const [detailData, setDetailData] = useState<TaskInstanceDetail | null>(null);
+  const [manualSubmissionOpen, setManualSubmissionOpen] = useState(false);
+  const [manualSubmissionBusy, setManualSubmissionBusy] = useState(false);
+  const canMarkSubmitted = !isSuperAdmin && me.role_level === 'sub_admin'
+    && me.id != null && detailData?.instance.owner_id === me.id
+    && detailData.instance.kind !== 'notice'
+    && ['pending', 'overdue', 'rejected'].includes(detailData.instance.status);
   const [loadingDetailId, setLoadingDetailId] = useState<number | null>(null);
 
   const roleMap = useMemo(() => {
@@ -488,6 +580,7 @@ export const InstancesView: React.FC = () => {
     setLoadingDetailId(instId);
     try {
       const res = await api.get<TaskInstanceDetail>(`/api/admin/instances/${instId}`);
+      setManualSubmissionOpen(false);
       setDetailData(res);
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '读取实例详情失败');
@@ -498,6 +591,35 @@ export const InstancesView: React.FC = () => {
 
   /* 2026-10-30 审核待办：动作完成后同时刷新待办卡片、主列表与统计卡片 */
   const [pendingRefresh, setPendingRefresh] = useState(0);
+
+  const handleMarkSubmitted = async (body: FormData) => {
+    if (!detailData || !canMarkSubmitted || manualSubmissionBusy) return;
+    const id = detailData.instance.id;
+    const path = `/api/admin/instances/${id}`;
+    setManualSubmissionBusy(true);
+    try {
+      const result = await api.post<{ submitted_at: string }>(`${path}/mark-submitted`, body);
+      setManualSubmissionOpen(false);
+      setDetailData((current) => current?.instance.id === id ? {
+        ...current,
+        instance: { ...current.instance, status: 'submitted', submitted_at: result.submitted_at, reject_reason: null },
+      } : current);
+      toast.success('任务已标记为已提交。');
+      setPendingRefresh((value) => value + 1);
+      const [, , detailResult] = await Promise.allSettled([
+        loadData(page), refreshStats(), api.get<TaskInstanceDetail>(path),
+      ]);
+      if (detailResult.status === 'fulfilled') {
+        setDetailData((current) => current?.instance.id === id ? detailResult.value : current);
+      } else {
+        toast.warning('标记已保存，请重新打开详情查看代交记录。');
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '标记已提交失败');
+    } finally {
+      setManualSubmissionBusy(false);
+    }
+  };
   const handlePendingChanged = useCallback(() => {
     setPendingRefresh((n) => n + 1);
     void Promise.all([loadData(page), refreshStats()]);
@@ -999,7 +1121,9 @@ export const InstancesView: React.FC = () => {
               </div>
               <button
                 onClick={() => setDetailData(null)}
-                className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400"
+                disabled={manualSubmissionBusy}
+                aria-label="关闭详情"
+                className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 disabled:opacity-50"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1087,6 +1211,9 @@ export const InstancesView: React.FC = () => {
                 </div>
               ) : (
                 <div className="p-4 rounded-xl bg-white border border-slate-200 space-y-3">
+                  {detailData.submission.source === 'admin' && (
+                    <span className="inline-flex rounded-md bg-blue-50 px-2 py-1 font-semibold text-blue-700">管理员代交</span>
+                  )}
                   {(() => {
                     const sub = detailData.submission!;
                     const fieldRows =
@@ -1294,11 +1421,20 @@ export const InstancesView: React.FC = () => {
               )}
             </div>
 
+            {canMarkSubmitted && manualSubmissionOpen && (
+              <ManualSubmissionForm
+                detail={detailData}
+                busy={manualSubmissionBusy}
+                onCancel={() => setManualSubmissionOpen(false)}
+                onConfirm={(body) => void handleMarkSubmitted(body)}
+              />
+            )}
+
             {/* 弹窗底部：仅分级管理员可审核通过/驳回；超管只读查看 */}
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 {isSuperAdmin ? (
-                  detailData.instance.status === 'submitted' && (
+                  detailData.instance.status === 'submitted' && detailData.instance.need_review && (
                     <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-violet-50 border border-violet-200 text-violet-800 text-xs font-semibold">
                       <ShieldCheck className="w-3.5 h-3.5 text-violet-600 shrink-0" />
                       <span>超管只读查看（由创建该任务的分级管理员审核）</span>
@@ -1306,6 +1442,15 @@ export const InstancesView: React.FC = () => {
                   )
                 ) : (
                   <>
+                    {canMarkSubmitted && !manualSubmissionOpen && (
+                      <button
+                        type="button"
+                        onClick={() => setManualSubmissionOpen(true)}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-4 py-2 font-semibold text-blue-700 hover:bg-blue-100"
+                      >
+                        <Check className="w-3.5 h-3.5" /> 标记已提交
+                      </button>
+                    )}
                     {detailData.instance.kind !== 'notice' &&
                       detailData.instance.need_review === true &&
                       detailData.instance.status === 'submitted' && (
@@ -1335,7 +1480,8 @@ export const InstancesView: React.FC = () => {
               </div>
               <button
                 onClick={() => setDetailData(null)}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl cursor-pointer transition-colors"
+                disabled={manualSubmissionBusy}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl cursor-pointer transition-colors disabled:opacity-50"
               >
                 关闭详情
               </button>

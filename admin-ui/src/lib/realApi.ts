@@ -66,7 +66,9 @@ const dataKeysCache = new Map<string, Array<{ key: string; label: string; unit: 
 /* ---------- 基础请求 ---------- */
 async function rawFetch<T = any>(method: string, url: string, body?: any): Promise<T> {
   const opt: RequestInit = { method, credentials: 'same-origin', headers: {} as Record<string, string> };
-  if (body !== undefined) {
+  if (body instanceof FormData) {
+    opt.body = body;
+  } else if (body !== undefined) {
     (opt.headers as Record<string, string>)['Content-Type'] = 'application/json';
     opt.body = JSON.stringify(body);
   }

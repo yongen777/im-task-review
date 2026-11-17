@@ -8,9 +8,9 @@ import os
 import re
 import threading
 import time
-import uuid
+from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple
 
 try:
     from fastapi import APIRouter, File, Form, Request, UploadFile
@@ -20,7 +20,10 @@ except ImportError:  # pragma: no cover
     FileResponse = None  # type: ignore[assignment]
 
 from ..scheduler import NotifierProtocol, format_deadline_display
-from ..state import BizError, StateStore, calc_resubmit_deadline, format_deadline_rule, submission_expired_message
+from ..state import (
+    BizError, StateStore, TaskUpload, calc_resubmit_deadline, format_deadline_rule,
+    submission_expired_message, task_upload_max_mb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,6 @@ logger = logging.getLogger(__name__)
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp", "bmp", "gif"}
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "gif"}
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
-MAX_HARD_UPLOAD_MB = 20
 
 # 2026-10-29 P2-2：绑定接口按 IP 限流（内存计数，单进程生效；默认 5 次/分钟，设 0 关闭）
 _BIND_RATE_LOCK = threading.Lock()
@@ -319,6 +321,12 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
     return tok, inst, None
 
 
+def _manually_completed(state: StateStore, instance: Dict[str, Any]) -> bool:
+    if instance["status"] not in ("submitted", "approved"):
+        return False
+    return (state.get_latest_valid_submission(instance["id"]) or {}).get("source") == "admin"
+
+
 def _validate_upload_target_and_limits(
     state: StateStore, raw_token: str, filename: str
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str, int, int, Optional[Tuple[int, Dict[str, Any]]]]:
@@ -334,6 +342,9 @@ def _validate_upload_target_and_limits(
     if close_reason:
         return None, None, "", "", 0, 0, (403, {"code": "TASK_CLOSED", "message": close_reason})
 
+    if _manually_completed(state, inst):
+        return None, None, "", "", 0, 0, (400, {"code": "ALREADY_SUBMITTED", "message": "该任务已由管理员标记为已提交"})
+
     window_open, window_reason = _check_submission_window(state, inst, tok)
     if not window_open:
         # 2026-11-12 任务E2：到点后统一错误码 SUBMISSION_CLOSED + 统一文案
@@ -347,20 +358,47 @@ def _validate_upload_target_and_limits(
     if not allows_upload:
         return None, None, "", "", 0, 0, (400, {"code": "VALIDATION_FAILED", "message": "当前任务类型不支持上传文件"})
 
-    orig_name = os.path.basename(filename or "").strip()
-    if "." not in orig_name:
-        return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": "文件缺少扩展名"})
-    ext = orig_name.rsplit(".", 1)[-1].lower().strip()
-
-    if ext not in ALLOWED_EXTENSIONS:
-        return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": f"不支持的文件类型: .{ext}"})
-    if tpl["kind"] == "image" and ext not in IMAGE_EXTENSIONS:
-        return None, None, "", "", 0, 0, (400, {"code": "FILE_TYPE_REJECTED", "message": "图片类任务仅允许上传 jpg/png/webp/bmp/gif 格式"})
-
-    default_max_mb = 9 if tpl["kind"] == "image" else MAX_HARD_UPLOAD_MB
-    max_mb = min(int(tpl.get("max_file_mb") or default_max_mb), default_max_mb)
-    max_bytes = max_mb * 1024 * 1024
+    try:
+        orig_name, ext, max_mb, max_bytes = task_upload_limits(tpl, filename)
+    except BizError as exc:
+        return None, None, "", "", 0, 0, (exc.status_code, {"code": exc.code, "message": exc.message})
     return inst, tpl, orig_name, ext, max_mb, max_bytes, None
+
+
+def task_upload_limits(template: Dict[str, Any], filename: str) -> Tuple[str, str, int, int]:
+    orig_name = os.path.basename((filename or "").replace("\\", "/")).strip()
+    if "." not in orig_name or len(orig_name) > 255:
+        msg = "文件名不能超过 255 字" if len(orig_name) > 255 else "文件缺少扩展名"
+        raise BizError(400, "FILE_TYPE_REJECTED", msg)
+    ext = orig_name.rsplit(".", 1)[-1].lower().strip()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise BizError(400, "FILE_TYPE_REJECTED", f"不支持的文件类型: .{ext}")
+    if template["kind"] == "image" and ext not in IMAGE_EXTENSIONS:
+        raise BizError(400, "FILE_TYPE_REJECTED", "图片类任务仅允许上传 jpg/png/webp/bmp/gif 格式")
+    max_mb = task_upload_max_mb(template)
+    return orig_name, ext, max_mb, max_mb * 1024 * 1024
+
+
+def prepare_task_upload(
+    stream: BinaryIO, size: int, limits: Tuple[str, str, int, int],
+) -> TaskUpload:
+    orig_name, ext, max_mb, max_bytes = limits
+    if not size:
+        raise BizError(400, "FILE_TYPE_REJECTED", "禁止上传空文件")
+    if size > max_bytes:
+        raise BizError(400, "FILE_TOO_LARGE", f"文件大小超出上限（最大 {max_mb}MB）")
+    stream.seek(0)
+    header = stream.read(32)
+    mime = sniff_magic_mime(ext, header)
+    if not mime:
+        if sniff_heic_like(header):
+            raise BizError(400, "FILE_TYPE_REJECTED", "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传")
+        raise BizError(
+            400, "FILE_TYPE_REJECTED",
+            "文件内容校验未通过（内容与扩展名不符或格式暂不支持），"
+            "请改用 JPG/PNG/WEBP/BMP/GIF 图片或 PDF/Office 文档后重试",
+        )
+    return TaskUpload(orig_name, MIME_TO_IMAGE_EXT.get(mime, ext), mime, size, stream)
 
 
 async def read_upload_file_bounded(file: UploadFile, max_bytes: int) -> Tuple[Optional[bytes], bool]:
@@ -399,7 +437,10 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
     # 2026-11-12 晚 · 不定期任务（菜单自选）例外：链接一次性（需求五-3）——
     # 提交成功后刷新只显示「您已完成本次提交」，禁止同一链接二次提交（页面锁死）。
     if inst.get("status") in ("submitted", "approved"):
-        if bool((tpl or {}).get("is_adhoc")):
+        if _manually_completed(state, inst):
+            window_open = False
+            window_reason = "该任务已由管理员标记为已提交"
+        elif bool((tpl or {}).get("is_adhoc")):
             window_open = False
             window_reason = "您已完成本次提交"
         else:
@@ -452,48 +493,11 @@ def process_h5_task_upload(
         return err
     assert inst is not None and tpl is not None
 
-    if len(content_bytes) == 0:
-        return 400, {"code": "FILE_TYPE_REJECTED", "message": "禁止上传空文件"}
-    if len(content_bytes) > max_bytes:
-        return 400, {"code": "FILE_TOO_LARGE", "message": f"文件大小超出上限（最大 {max_mb}MB）"}
-
-    # 2026-11-16 体验修复：图片按**内容**判定（.jpg 里装 PNG/WEBP 照常放行），
-    # 非图片魔数一律拒绝；HEIC/HEIF 原图给「请截图或转 JPG/PNG」友好提示而非晦涩术语。
-    header = content_bytes[:32]
-    detected_mime = sniff_magic_mime(ext, header)
-    if not detected_mime:
-        if sniff_heic_like(header):
-            return 400, {"code": "FILE_TYPE_REJECTED",
-                         "message": "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传"}
-        return 400, {"code": "FILE_TYPE_REJECTED",
-                     "message": "文件内容校验未通过（内容与扩展名不符或格式暂不支持），"
-                                "请改用 JPG/PNG/WEBP/BMP/GIF 图片或 PDF/Office 文档后重试"}
-
-    # 按实际嗅探出的 MIME 与真实扩展名落盘：.jpg 里装 PNG 就存成 .png（避免后续预览/下载歧义）
-    save_ext = MIME_TO_IMAGE_EXT.get(detected_mime, ext)
-    ref = uuid.uuid4().hex
-    rel_path = f"{inst['period_key']}/{tpl['template_id']}/{ref}.{save_ext}"
-    disk_path = uploads_dir / inst["period_key"] / tpl["template_id"] / f"{ref}.{save_ext}"
-    disk_path.parent.mkdir(parents=True, exist_ok=True)
-
     try:
-        try:
-            disk_path.write_bytes(content_bytes)
-        except FileNotFoundError:
-            # 孤儿清理可能在 mkdir 与写入之间刚好移除了空目录。
-            disk_path.parent.mkdir(parents=True, exist_ok=True)
-            disk_path.write_bytes(content_bytes)
-        rec = state.create_upload_ref(
-            ref=ref, phone=inst["phone"], template_id=tpl["template_id"],
-            file_name=orig_name, mime=detected_mime, size=len(content_bytes), rel_path=rel_path,
-        )
-    except Exception:
-        if disk_path.exists():
-            try:
-                disk_path.unlink()
-            except OSError:
-                pass
-        raise
+        upload = prepare_task_upload(BytesIO(content_bytes), len(content_bytes), (orig_name, ext, max_mb, max_bytes))
+        rec = state.store_task_upload(inst, upload, uploads_dir)
+    except BizError as exc:
+        return exc.status_code, {"code": exc.code, "message": exc.message}
 
     return 200, {
         "ok": True, "ref": rec["ref"], "file_name": rec["file_name"], "orig_name": rec["file_name"],

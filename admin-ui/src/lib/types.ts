@@ -272,6 +272,7 @@ export interface SubmissionData {
   attachment_size?: number | null;
   submitted_at?: string;
   status?: string;
+  source?: string;
 }
 
 export interface ReminderLogItem {
@@ -299,7 +300,15 @@ export interface TaskInstanceDetail {
   template?: {
     name?: string;
     kind?: string;
-    schema_json?: Array<{ key: string; label: string }>;
+    schema_json?: Array<{
+      key: string;
+      label: string;
+      type?: 'text' | 'number' | 'date' | 'select';
+      max_len?: number;
+      unit?: string;
+      options?: string[];
+    }>;
+    spec_json?: { text_label?: string; text_placeholder?: string } | null;
     [k: string]: unknown;
   } | null;
 }

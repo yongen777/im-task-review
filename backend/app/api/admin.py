@@ -21,6 +21,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from starlette.datastructures import UploadFile
 
 from ..channel_config import (
     CHANNEL_SCHEMA,
@@ -44,6 +45,8 @@ from ..state import (
     validate_new_password,
     verify_password,
 )
+
+from .h5 import prepare_task_upload, task_upload_limits
 
 COOKIE_NAME = "sid"
 CSRF_HEADER = "X-CSRF-Token"
@@ -2085,18 +2088,21 @@ def create_admin_router(
             plat_sql = ("AND EXISTS (SELECT 1 FROM role r WHERE r.platform = ? "
                         "AND instr(t.role_ids, r.role_id) > 0) ")
             plat_params = [platform.strip().lower()]
+        owner_id = _owner_filter(_admin_profile(state, sess), None)
+        scope_sql, scope_params = ("AND i.owner_id = ? ", [owner_id]) if owner_id is not None else ("", [])
         base = (
             # name_snap 是实例表列名，前端统一叫 member_name_snap，这里直接给别名省一层换算
-            "SELECT i.*, i.name_snap AS member_name_snap, t.name AS template_name, t.kind AS template_kind "
+            "SELECT i.*, i.name_snap AS member_name_snap, t.name AS template_name, "
+            "t.kind AS template_kind, t.need_review "
             "FROM task_instance i JOIN task_template t ON t.template_id = i.template_id "
-            "WHERE t.enabled = 1 AND t.deleted = 0 "
+            "WHERE t.enabled = 1 AND t.deleted = 0 AND t.need_review = 1 "
         )
         with state.lock:
             sub_rows = state.conn.execute(
                 base + "AND i.status = 'submitted' AND COALESCE(i.submitted_at, i.created_at) >= ? "
-                       + plat_sql +
+                       + scope_sql + plat_sql +
                        "ORDER BY COALESCE(i.submitted_at, i.created_at) DESC, i.id DESC LIMIT ?",
-                (start_s, *plat_params, limit + 1),
+                (start_s, *scope_params, *plat_params, limit + 1),
             ).fetchall()
 
         def _row(r):
@@ -2202,6 +2208,7 @@ def create_admin_router(
                 "attachment_name": latest.get("file_name"),
                 "submitted_at": latest.get("created_at"),
                 "status": latest.get("status"),
+                "source": latest.get("source"),
             }
 
         return {
@@ -2283,6 +2290,54 @@ def create_admin_router(
             "ok": bool(res.ok), "kind": "text", "to": userid, "receive_type": ext_type,
             "detail": "文本已发送" if res.ok else f"发送失败：{res.error}",
         }
+
+    @router.post("/instances/{instance_id}/mark-submitted")
+    async def mark_instance_submitted(instance_id: int, request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        assert sess is not None
+        admin = _admin_profile(state, sess)
+        if admin.get("role_level") != "sub_admin":
+            return error_response(403, "SUPER_ADMIN_READONLY", "仅归属分级管理员可以标记已提交")
+        owner_id = int(admin["id"])
+
+        async def save(raw, uploads=()):
+            try:
+                data = json.loads(raw or "{}")
+            except (ValueError, TypeError):
+                raise BizError(400, "VALIDATION_FAILED", "提交内容必须为合法 JSON 对象")
+            if not isinstance(data, dict):
+                raise BizError(400, "VALIDATION_FAILED", "提交内容必须为合法 JSON 对象")
+            fields, note = data.get("fields"), data.get("note")
+            if fields is not None and not isinstance(fields, dict):
+                raise BizError(400, "VALIDATION_FAILED", "报数字段必须为对象")
+            if note is not None and not isinstance(note, str):
+                raise BizError(400, "VALIDATION_FAILED", "文字说明必须为文本")
+            cfg = getattr(request.app.state, "config", None)
+            return await asyncio.to_thread(
+                state.manual_mark_submitted, instance_id, owner_id, sess["username"],
+                uploads_dir=cfg.uploads_dir if cfg else state.data_dir / "uploads",
+                fields=fields, note=note, uploads=uploads,
+            )
+
+        try:
+            _, template = state.manual_submission_target(instance_id, owner_id)
+            if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+                async with request.form(max_files=20, max_fields=1) as form:
+                    uploads = []
+                    for key, part in form.multi_items():
+                        if key == "payload" and isinstance(part, str):
+                            continue
+                        if key != "attachments" or not isinstance(part, UploadFile):
+                            raise BizError(400, "VALIDATION_FAILED", "附件表单格式不正确")
+                        limits = task_upload_limits(template, part.filename or "")
+                        upload = await asyncio.to_thread(prepare_task_upload, part.file, part.size or 0, limits)
+                        uploads.append(upload)
+                    return await save(form.get("payload"), tuple(uploads))
+            return await save(await request.body())
+        except BizError as exc:
+            return biz_error_response(exc)
 
     @router.post("/instances/{instance_id}/review")
     async def review_instance(instance_id: int, request: Request):

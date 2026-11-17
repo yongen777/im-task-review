@@ -10,9 +10,11 @@ import logging
 import os
 import re
 import secrets
+import shutil
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
 
 from .config import NowFn, default_now, format_dt, parse_dt
 from .db import Database, IntegrityError
@@ -68,6 +70,23 @@ def parse_role_ids(raw: Any) -> List[str]:
         return found
     # 极端脏数据：连切分都提不出来 → 保守放行解析为空，由调用方做字符串包含兜底
     return []
+
+MANUAL_SUBMISSION_STATUSES = ("pending", "overdue", "rejected")
+
+
+@dataclass(frozen=True)
+class TaskUpload:
+    file_name: str
+    extension: str
+    mime: str
+    size: int
+    stream: BinaryIO
+
+
+def task_upload_max_mb(template: Dict[str, Any]) -> int:
+    hard_limit = 9 if template["kind"] == "image" else 20
+    return min(int(template.get("max_file_mb") or hard_limit), hard_limit)
+
 
 VALID_TEMPLATE_KINDS = ("form", "image", "file", "notice")
 VALID_PERIODS = ("day", "week", "month")
@@ -406,7 +425,9 @@ def effective_h5_modules(template: Dict[str, Any]) -> List[str]:
     return ["fields", "image", "text"]
 
 
-def validate_form_submission_fields(schema: List[Dict[str, Any]], fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def validate_form_submission_fields(
+    schema: List[Dict[str, Any]], fields: Optional[Dict[str, Any]], *, enforce_required: bool = True,
+) -> Dict[str, Any]:
     input_fields = fields if isinstance(fields, dict) else {}
     cleaned: Dict[str, Any] = {}
     for fdef in schema:
@@ -414,7 +435,7 @@ def validate_form_submission_fields(schema: List[Dict[str, Any]], fields: Option
         raw_val = input_fields.get(key)
         str_val = "" if raw_val is None else str(raw_val).strip()
         if str_val == "":
-            if fdef.get("required", False):
+            if enforce_required and fdef.get("required", False):
                 raise BizError(400, "VALIDATION_FAILED", f"请填写{label}")
             cleaned[key] = ""
             continue
@@ -3785,6 +3806,33 @@ class StateStore:
         with self.lock, self.conn:
             self.conn.execute("UPDATE h5_token SET consumed = 1 WHERE token_id = ?", (token_id,))
 
+    def store_task_upload(self, instance: Dict[str, Any], upload: TaskUpload, uploads_dir: Path) -> Dict[str, Any]:
+        ref = secrets.token_hex(16)
+        base = uploads_dir.resolve()
+        target = (base / instance["period_key"] / instance["template_id"] / f"{ref}.{upload.extension}").resolve()
+        rel_path = target.relative_to(base).as_posix()
+        created = False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                output = target.open("xb")
+            except FileNotFoundError:
+                # 定期清理可能在创建文件前恰好移除了空目录。
+                target.parent.mkdir(parents=True, exist_ok=True)
+                output = target.open("xb")
+            with output:
+                created = True
+                upload.stream.seek(0)
+                shutil.copyfileobj(upload.stream, output)
+            return self.create_upload_ref(
+                ref=ref, phone=instance["phone"], template_id=instance["template_id"],
+                file_name=upload.file_name, mime=upload.mime, size=upload.size, rel_path=rel_path,
+            )
+        except Exception:
+            if created:
+                self._purge_upload_file(base, rel_path)
+            raise
+
     def create_upload_ref(self, *, ref: str, phone: str, template_id: str, file_name: str, mime: str, size: int, rel_path: str) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
@@ -4080,6 +4128,88 @@ class StateStore:
                 out.append(d)
         return out
 
+    def manual_submission_target(
+        self, instance_id: int, owner_id: int, *, for_update: bool = False,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM task_instance WHERE id = ?" + (" FOR UPDATE" if for_update else ""),
+            (instance_id,),
+        ).fetchone()
+        if not row:
+            raise BizError(404, "NOT_FOUND", "任务实例不存在")
+        if int(row["owner_id"]) != owner_id:
+            raise BizError(403, "FORBIDDEN_OWNER", "只能标记自己名下的任务实例")
+        if row["status"] not in MANUAL_SUBMISSION_STATUSES:
+            raise BizError(400, "VALIDATION_FAILED", "仅待上传、已逾期或被驳回的任务可以标记为已提交")
+        template = self.get_template(row["template_id"])
+        if not template or template["kind"] == "notice":
+            raise BizError(400, "VALIDATION_FAILED", "仅上传任务可以标记为已提交")
+        return dict(row), template
+
+    def manual_mark_submitted(
+        self, instance_id: int, owner_id: int, actor: str, *, uploads_dir: Path,
+        fields: Optional[Dict[str, Any]] = None, note: Optional[str] = None,
+        uploads: Tuple[TaskUpload, ...] = (),
+    ) -> Dict[str, Any]:
+        saved_uploads = []
+        try:
+            with self.conn:
+                instance, template = self.manual_submission_target(instance_id, owner_id, for_update=True)
+                now_s = self.now_str()
+                modules = effective_h5_modules(template)
+                if ("fields" not in modules and fields) or ("text" not in modules and note):
+                    raise BizError(400, "VALIDATION_FAILED", "任务模板没有启用填入内容对应的模块")
+                values = validate_form_submission_fields(
+                    template.get("schema_json") or [], fields, enforce_required=False,
+                ) if "fields" in modules else {}
+                provided = {key: value for key, value in values.items() if value != ""}
+                try:
+                    fields_json = json.dumps(provided, ensure_ascii=False, allow_nan=False) if provided else None
+                except ValueError:
+                    raise BizError(400, "VALIDATION_FAILED", "报数字段必须为有限数字") from None
+                clean_note = (note or "").strip()[:500] or None
+                max_mb = task_upload_max_mb(template)
+                for upload in uploads:
+                    module = "image" if upload.mime.startswith("image/") else "file"
+                    if module not in modules:
+                        raise BizError(400, "FILE_TYPE_REJECTED", "任务模板没有启用此类附件")
+                    if upload.size > max_mb * 1024 * 1024:
+                        raise BizError(400, "FILE_TOO_LARGE", f"文件大小超出上限（最大 {max_mb}MB）")
+                self.conn.execute(
+                    "UPDATE h5_token SET consumed = 1 WHERE phone = ? AND template_id = ? "
+                    "AND instance_id = ? AND consumed = 0",
+                    (instance["phone"], instance["template_id"], instance_id),
+                )
+                for upload in uploads:
+                    saved_uploads.append(self.store_task_upload(instance, upload, uploads_dir))
+                refs = [row["ref"] for row in saved_uploads]
+                for ref in refs:
+                    self.conn.execute("UPDATE upload_ref SET consumed = 1 WHERE ref = ?", (ref,))
+                first = saved_uploads[0] if saved_uploads else {}
+                submission = self.conn.execute(
+                    "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, "
+                    "refs_json, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin', 'submitted', ?)",
+                    (instance_id, fields_json, first.get("ref"), first.get("file_name"), first.get("mime"),
+                     first.get("size"), clean_note, json.dumps(refs) if refs else None, now_s),
+                )
+                submission_id = int(submission.lastrowid)
+                late = bool(instance["late_submit"] or now_s > instance["deadline_at"])
+                self.conn.execute(
+                    "UPDATE task_instance SET status = 'submitted', submitted_at = ?, late_submit = ?, "
+                    "reviewed_at = NULL, reviewer = NULL, reject_reason = NULL WHERE id = ?",
+                    (now_s, int(late), instance_id),
+                )
+                self._insert_audit_unlocked(
+                    actor, "instance.manual_mark_submitted", "task_instance", str(instance_id),
+                    {"submission_id": submission_id, "previous_status": instance["status"],
+                     "field_count": len(provided), "attachment_count": len(refs)}, now_s,
+                )
+        except Exception:
+            for upload in saved_uploads:
+                self._purge_upload_file(uploads_dir, upload["rel_path"])
+            raise
+        return {"ok": True, "status": "submitted", "submission_id": submission_id, "submitted_at": now_s}
+
     def submit_h5_task(
         self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
         note: Optional[str] = None, refs: Optional[List[str]] = None
@@ -4172,6 +4302,16 @@ class StateStore:
         late_submit = 1 if (now_s > inst["deadline_at"] or int(inst.get("late_submit") or 0) == 1) else 0
 
         with self.lock, self.conn:
+            # 与后台代交共用实例行锁，再消费令牌，避免两个有效链接并发写入。
+            locked = self.conn.execute(
+                "SELECT * FROM task_instance WHERE id = ? FOR UPDATE", (inst["id"],),
+            ).fetchone()
+            if not locked or locked["status"] == "cancelled":
+                raise BizError(403, "TASK_CLOSED", "任务已关闭")
+            if locked["status"] in ("submitted", "approved"):
+                raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
+            if locked["status"] == "expired" or self.is_instance_window_closed(dict(locked), cur_dt):
+                raise BizError(400, "SUBMISSION_CLOSED", submission_expired_message(dict(locked)))
             # 2026-11-13 冲刺模块四压测实锤修复：「读状态→检查→写」跨锁段组合在多线程并发下
             # 存在竞态（同一令牌并发提交可全部通过前置闸门），同一 H5 链接出现双写。
             # 修复 = **原子 CAS 消费令牌**：UPDATE ... WHERE consumed = 0，抢不到即已被
@@ -4214,7 +4354,7 @@ class StateStore:
         now_s = self.now_str()
         with self.lock, self.conn:
             inst_row = self.conn.execute(
-                "SELECT status FROM task_instance WHERE id = ?", (int(instance_id),)
+                "SELECT status FROM task_instance WHERE id = ? FOR UPDATE", (int(instance_id),)
             ).fetchone()
             if not inst_row:
                 raise BizError(404, "NOT_FOUND", "任务实例不存在")
