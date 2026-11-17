@@ -1039,6 +1039,7 @@ def create_admin_router(
         q: Optional[str] = None,
         platform: Optional[str] = None,
         limit: int = 50,
+        role_id: Optional[str] = None,
     ):
         """全局搜索**已激活**成员：激活关系（delivery_target）全平台共享，跨管理员免二次激活。"""
         sess, err = require_session(request, state, check_csrf=False)
@@ -1047,9 +1048,19 @@ def create_admin_router(
         assert sess is not None
         _admin = _admin_profile(state, sess)
         _plat = (platform or "").strip().lower()
+        if role_id:
+            role = state.get_role(role_id)
+            if role is None:
+                return error_response(404, "NOT_FOUND", "角色不存在")
+            owner_id = int(_admin.get("id") or 0)
+            if not _is_super_admin(_admin) and role["owner_id"] != owner_id:
+                return error_response(403, "FORBIDDEN_OWNER", "该角色分组不属于当前管理员")
+            if _plat and _plat != role["platform"]:
+                return error_response(400, "VALIDATION_FAILED", "角色不属于所选办公软件")
+            _plat = role["platform"]
         if not _platform_allowed(_admin, _plat):
             return error_response(403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权该办公软件平台")
-        items = state.search_global_activated(q=q or "", platform=_plat or None, limit=limit)
+        items = state.search_global_activated(q=q or "", platform=_plat or None, limit=limit, role_id=role_id)
         return {"ok": True, "items": items}
 
     # ==================================================================

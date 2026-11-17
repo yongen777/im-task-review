@@ -1343,7 +1343,9 @@ class StateStore:
                                         {"moved": moved}, now_s)
         return {"ok": True, "owner_id": int(owner_id), "moved": moved}
 
-    def search_global_activated(self, q: str = "", platform: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def search_global_activated(
+        self, q: str = "", platform: Optional[str] = None, limit: int = 50, *, role_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """全局搜索**已激活**（delivery_target 有绑定）的成员 —— 跨管理员共享，免二次激活。
 
         2026-11-09 修正（用户口径「全量池也要做办公软件隔离」）：
@@ -1371,10 +1373,14 @@ class StateStore:
             else:
                 where.append("(dt.phone LIKE ? OR EXISTS (SELECT 1 FROM member m WHERE m.phone = dt.phone AND m.name LIKE ?))")
                 params.extend([like, like])
+        select_membership = ", rm.id IS NOT NULL AS in_role" if role_id else ""
+        membership_join = " LEFT JOIN member rm ON rm.role_id = ? AND rm.phone = dt.phone" if role_id else ""
+        if role_id:
+            params.insert(0, role_id)
         sql = (
-            "SELECT dt.platform, dt.phone, dt.external_id, dt.activated_at, dt.last_event_at "
-            "FROM delivery_target dt WHERE " + " AND ".join(where) +
-            " ORDER BY dt.last_event_at DESC LIMIT ?"
+            "SELECT dt.platform, dt.phone, dt.external_id, dt.activated_at, dt.last_event_at"
+            + select_membership + " FROM delivery_target dt" + membership_join
+            + " WHERE " + " AND ".join(where) + " ORDER BY dt.last_event_at DESC LIMIT ?"
         )
         with self.lock:
             rows = self.conn.execute(sql, tuple(params + [int(limit)])).fetchall()
@@ -1395,6 +1401,7 @@ class StateStore:
                     "phone": r["phone"], "platform": r["platform"], "external_id": r["external_id"],
                     "name": (m["name"] if m else "") or "", "dept": (m["dept"] if m else "") or "",
                     "activated_at": r["activated_at"], "last_event_at": r["last_event_at"],
+                    **({"in_role": bool(r["in_role"])} if role_id else {}),
                 })
         return out
 

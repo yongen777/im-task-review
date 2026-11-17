@@ -25,6 +25,7 @@ export interface AdminAccountItem {
 
 export interface GlobalActivatedMemberItem {
   phone: string;
+  in_role?: boolean;
   name: string;
   dept: string;
   activations: { zdxlz: boolean; wecom: boolean };

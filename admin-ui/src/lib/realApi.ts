@@ -554,7 +554,7 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
     return { ok: true, items, member_distinct_total: Number(d.member_distinct_total || 0) } as unknown as T;
   }
   if (rawPath.startsWith('/api/admin/roles/') && rawPath.endsWith('/members') && method === 'GET') {
-    return { ok: true, items: (d.items || []).map(memberToMock) } as unknown as T;
+    return { ok: true, total: Number(d.total ?? 0), items: (d.items || []).map(memberToMock) } as unknown as T;
   }
   if (rawPath === '/api/admin/templates' && method === 'GET') {
     return { ok: true, items: (d.items || []).map(tplToMock) } as unknown as T;

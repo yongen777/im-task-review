@@ -119,6 +119,8 @@ interface MemberPoolItem {
 /* 成员池分页：每页 10 人（2026-11-06 用户要求，防数据量大时列表过长） */
 const POOL_PAGE_SIZE = 10;
 
+const MEMBER_PAGE_SIZE = 20;
+
 export const RolesMembersView: React.FC = () => {
   const {
     roles,
@@ -133,14 +135,49 @@ export const RolesMembersView: React.FC = () => {
   const toast = useToast();
 
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
-  const rosterScope = useRef({ roleId: '', platform });
-  const rosterRequestId = useRef(0);
-  useEffect(() => {
-    rosterScope.current = { roleId: selectedRoleId, platform };
-  }, [selectedRoleId, platform]);
-  const [members, setMembers] = useState<RoleMemberItem[]>([]);
-  const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberKeyword, setMemberKeyword] = useState('');
+  const [memberQuery, setMemberQuery] = useState('');
+  const [rosterPager, setRosterPager] = useState({ roleId: '', platform, page: 1, q: '' });
+  const memberPage = rosterPager.roleId === selectedRoleId && rosterPager.platform === platform
+    && rosterPager.q === memberQuery ? rosterPager.page : 1;
+  const activeRoster = useMemo(
+    () => ({ roleId: selectedRoleId, platform, page: memberPage, q: memberQuery }),
+    [selectedRoleId, platform, memberPage, memberQuery],
+  );
+  const rosterScope = useRef(activeRoster);
+  const rosterRequestId = useRef(0);
+  const [memberResult, setMemberResult] = useState<{
+    scope: typeof activeRoster;
+    items: RoleMemberItem[];
+    total: number;
+    error?: string;
+  } | null>(null);
+  const [loadingMembers, setLoadingMembers] = useState(false);
+
+  useEffect(() => {
+    rosterScope.current = activeRoster;
+    if (rosterPager.roleId !== activeRoster.roleId || rosterPager.platform !== activeRoster.platform
+      || rosterPager.q !== activeRoster.q) {
+      setRosterPager(activeRoster);
+    }
+  }, [activeRoster, rosterPager]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setMemberQuery(memberKeyword.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [memberKeyword]);
+
+  const visibleMemberResult = memberResult?.scope === activeRoster ? memberResult : null;
+  const rosterLoading = loadingMembers || memberKeyword.trim() !== memberQuery || !visibleMemberResult;
+  const members = rosterLoading ? [] : visibleMemberResult?.items ?? [];
+  const memberTotal = memberResult?.scope.roleId === selectedRoleId && memberResult.scope.platform === platform
+    && memberResult.scope.q === memberQuery ? memberResult.total : 0;
+  const memberPageCount = Math.max(1, Math.ceil(memberTotal / MEMBER_PAGE_SIZE));
+
+  const goToMemberPage = (page: number) => {
+    setRosterPager({ ...activeRoster, page });
+    document.getElementById('role-members-table')?.scrollIntoView({ block: 'start' });
+  };
+
   // 从当前角色移除成员交互确认弹窗状态
   const [confirmRemoveRoleMember, setConfirmRemoveRoleMember] = useState<RoleMemberItem | null>(null);
   const [removingRoleMember, setRemovingRoleMember] = useState(false);
@@ -275,6 +312,7 @@ export const RolesMembersView: React.FC = () => {
   const [globalKeyword, setGlobalKeyword] = useState('');
   const [globalList, setGlobalList] = useState<GlobalActivatedMemberItem[]>([]);
   const [loadingGlobal, setLoadingGlobal] = useState(false);
+  const globalRequestId = useRef(0);
   const [pullingPhone, setPullingPhone] = useState<string | null>(null);
   const [selectedGlobalPhones, setSelectedGlobalPhones] = useState<string[]>([]);
   const [batchPulling, setBatchPulling] = useState(false);
@@ -292,23 +330,31 @@ export const RolesMembersView: React.FC = () => {
 
   const loadMembers = useCallback(
     async (roleId: string) => {
-      if (!roleId || roleId !== rosterScope.current.roleId || platform !== rosterScope.current.platform) return;
+      const scope = rosterScope.current;
+      if (!roleId || roleId !== scope.roleId || platform !== scope.platform) return;
       const requestId = ++rosterRequestId.current;
-      const isCurrent = () => requestId === rosterRequestId.current
-        && roleId === rosterScope.current.roleId && platform === rosterScope.current.platform;
+      const isCurrent = () => requestId === rosterRequestId.current && scope === rosterScope.current;
       setLoadingMembers(true);
       try {
-        const res = await api.get<{ ok: boolean; total?: number; items: RoleMemberItem[] }>(
-          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}&size=0`,
+        const query = new URLSearchParams({
+          platform: scope.platform, q: scope.q, page: String(scope.page), size: String(MEMBER_PAGE_SIZE),
+        });
+        const res = await api.get<{ ok: boolean; total: number; items: RoleMemberItem[] }>(
+          `/api/admin/roles/${encodeURIComponent(roleId)}/members?${query}`,
         );
-        if (isCurrent()) setMembers(res.items || []);
+        if (!isCurrent()) return;
+        setMemberResult({ scope, items: res.items, total: res.total });
+        const lastPage = Math.max(1, Math.ceil(res.total / MEMBER_PAGE_SIZE));
+        if (scope.page > lastPage) setRosterPager({ ...scope, page: lastPage });
       } catch (err) {
-        if (isCurrent()) toast.error(err instanceof Error ? plainError(err.message) : '加载角色成员失败');
+        if (isCurrent()) {
+          setMemberResult({ scope, items: [], total: 0, error: err instanceof Error ? plainError(err.message) : '加载角色成员失败' });
+        }
       } finally {
         if (isCurrent()) setLoadingMembers(false);
       }
     },
-    [toast, platform],
+    [platform],
   );
 
   const loadDeptTree = async () => {
@@ -346,12 +392,12 @@ export const RolesMembersView: React.FC = () => {
     if (selectedRoleId) {
       loadMembers(selectedRoleId);
     }
-  }, [selectedRoleId, loadMembers]);
+  }, [selectedRoleId, activeRoster, loadMembers]);
 
   /* 2026-11-12 下午：切换角色时清空批量勾选（避免把上一个角色的选择带到新角色上误删） */
   useEffect(() => {
     setSelectedMemberPhones(new Set());
-  }, [selectedRoleId]);
+  }, [selectedRoleId, platform]);
 
   const currentRole: RoleItem | undefined = useMemo(
     () => roles.find((r) => r.role_id === selectedRoleId),
@@ -379,13 +425,6 @@ export const RolesMembersView: React.FC = () => {
     return order.map((k) => by.get(k)!);
   }, [roles, isSuperAdmin, ownerFilter]);
 
-  const filteredMembers = useMemo(() => {
-    if (!memberKeyword.trim()) return members;
-    const kw = memberKeyword.trim().toLowerCase();
-    return members.filter(
-      (m) => m.phone.includes(kw) || m.name.toLowerCase().includes(kw),
-    );
-  }, [members, memberKeyword]);
 
   const handleOpenCreateRole = () => {
     setEditingRoleId('');
@@ -488,24 +527,30 @@ export const RolesMembersView: React.FC = () => {
 
   const loadGlobalActivated = useCallback(
     async (q = '') => {
+      if (!selectedRoleId) return;
+      const requestId = ++globalRequestId.current;
+      const isCurrent = () => requestId === globalRequestId.current
+        && rosterScope.current.roleId === selectedRoleId && rosterScope.current.platform === platform;
       setLoadingGlobal(true);
       try {
+        const query = new URLSearchParams({ q, platform, role_id: selectedRoleId });
         const res = await api.get<{ ok: boolean; items: GlobalActivatedMemberItem[] }>(
-          `/api/admin/global-activated-members?q=${encodeURIComponent(q)}&platform=${encodeURIComponent(platform)}`,
+          `/api/admin/global-activated-members?${query}`,
         );
-        setGlobalList(res.items || []);
+        if (isCurrent()) setGlobalList(res.items || []);
       } catch (err) {
-        toast.error(err instanceof Error ? plainError(err.message) : '全局检索已激活成员失败');
+        if (isCurrent()) toast.error(err instanceof Error ? plainError(err.message) : '全局检索已激活成员失败');
       } finally {
-        setLoadingGlobal(false);
+        if (isCurrent()) setLoadingGlobal(false);
       }
     },
-    [platform, toast],
+    [platform, selectedRoleId, toast],
   );
 
   const openGlobalSearchModal = () => {
     setGlobalKeyword('');
     setSelectedGlobalPhones([]);
+    setGlobalList([]);
     setGlobalSearchOpen(true);
     void loadGlobalActivated('');
   };
@@ -522,13 +567,14 @@ export const RolesMembersView: React.FC = () => {
       return;
     }
     const targets = globalList.filter(
-      (g) => selectedGlobalPhones.includes(g.phone) && !members.some((m) => m.phone === g.phone),
+      (g) => selectedGlobalPhones.includes(g.phone) && !g.in_role,
     );
     if (targets.length === 0) {
       toast.warning('请先勾选尚未在当前角色中的已激活员工');
       return;
     }
     setBatchPulling(true);
+    let addedCount = 0;
     try {
       for (const person of targets) {
         await api.post(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members`, {
@@ -536,9 +582,9 @@ export const RolesMembersView: React.FC = () => {
           name: person.name,
           dept: person.dept || '',
         });
+        addedCount += 1;
+        markGlobalMemberInRole(person.phone);
       }
-      setSelectedGlobalPhones([]);
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
         `已批量将 ${targets.length} 名已激活成员拉入角色「${currentRole?.role_name || ''}」，直接保持已激活状态无需二次绑定。`,
         '批量复用激活成功',
@@ -546,8 +592,14 @@ export const RolesMembersView: React.FC = () => {
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '批量拉入成员失败');
     } finally {
+      if (addedCount > 0) await Promise.allSettled([loadMembers(selectedRoleId), refreshRoles()]);
       setBatchPulling(false);
     }
+  };
+
+  const markGlobalMemberInRole = (phone: string) => {
+    setGlobalList((list) => list.map((member) => member.phone === phone ? { ...member, in_role: true } : member));
+    setSelectedGlobalPhones((selected) => selected.filter((value) => value !== phone));
   };
 
   const handlePullGlobalMember = async (person: GlobalActivatedMemberItem) => {
@@ -562,6 +614,7 @@ export const RolesMembersView: React.FC = () => {
         name: person.name,
         dept: person.dept || '',
       });
+      markGlobalMemberInRole(person.phone);
       await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
         `已将全局已激活成员「${person.name}」(${person.phone}) 拉入角色「${currentRole?.role_name || ''}」，直接保持已激活状态无需二次绑定。`,
@@ -692,6 +745,11 @@ export const RolesMembersView: React.FC = () => {
         `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/${encodeURIComponent(member.phone)}`,
       );
       setConfirmRemoveRoleMember(null);
+      setSelectedMemberPhones((previous) => {
+        const next = new Set(previous);
+        next.delete(member.phone);
+        return next;
+      });
       await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
         `已将「${member.name}」(${member.phone}) 从角色「${roleName}」中移除（该平台上已无其它角色归属时，激活绑定一并清除）。`,
@@ -1073,7 +1131,8 @@ export const RolesMembersView: React.FC = () => {
                     {currentRole.role_name}
                   </h3>
                   <span className="text-xs text-slate-400 font-normal tabular-nums">
-                    · 共 {members.length} 名成员{memberKeyword.trim() ? `（匹配 ${filteredMembers.length}）` : ''}
+                    · 共 {currentRole.member_count} 名成员
+                    {memberQuery && !rosterLoading && !visibleMemberResult?.error ? `（匹配 ${memberTotal} 人）` : ''}
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5">
@@ -1088,7 +1147,7 @@ export const RolesMembersView: React.FC = () => {
                     type="text"
                     value={memberKeyword}
                     onChange={(e) => setMemberKeyword(e.target.value)}
-                    placeholder="搜索用户名或手机号…"
+                    placeholder="搜索姓名、手机号或部门…"
                     className="bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-1.5 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 w-44 sm:w-52 transition-colors"
                   />
                 </div>
@@ -1201,7 +1260,7 @@ export const RolesMembersView: React.FC = () => {
             )}
 
             {/* 第三层：成员列表表格 */}
-            <div className="overflow-x-auto">
+            <div id="role-members-table" className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-slate-200/80 text-[11px] font-semibold text-slate-500 bg-white">
@@ -1209,19 +1268,22 @@ export const RolesMembersView: React.FC = () => {
                       <th className="py-3 pl-5 pr-2 w-10">
                         <input
                           type="checkbox"
-                          aria-label="全选/取消全选当前列表成员"
-                          checked={
-                            filteredMembers.length > 0 &&
-                            filteredMembers.every((m) => selectedMemberPhones.has(m.phone))
-                          }
+                          aria-label="全选/取消全选当前页成员"
+                          disabled={members.length === 0}
+                          checked={members.length > 0 && members.every((m) => selectedMemberPhones.has(m.phone))}
+                          ref={(input) => {
+                            if (input) input.indeterminate = !input.checked && members.some((m) => selectedMemberPhones.has(m.phone));
+                          }}
                           onChange={(e) => {
-                            if (e.target.checked) {
-                              setSelectedMemberPhones(
-                                new Set(filteredMembers.map((m) => m.phone)),
-                              );
-                            } else {
-                              setSelectedMemberPhones(new Set());
-                            }
+                            const checked = e.currentTarget.checked;
+                            setSelectedMemberPhones((previous) => {
+                              const next = new Set(previous);
+                              for (const member of members) {
+                                if (checked) next.add(member.phone);
+                                else next.delete(member.phone);
+                              }
+                              return next;
+                            });
                           }}
                           className="w-3.5 h-3.5 accent-rose-600 cursor-pointer"
                         />
@@ -1236,20 +1298,29 @@ export const RolesMembersView: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 text-xs">
-                  {loadingMembers ? (
+                  {rosterLoading ? (
                     <tr>
                       <td colSpan={isSuperAdmin ? 6 : 7} className="py-12 text-center text-slate-400">
                         正在加载角色成员名册…
                       </td>
                     </tr>
-                  ) : filteredMembers.length === 0 ? (
+                  ) : visibleMemberResult?.error ? (
+                    <tr>
+                      <td colSpan={isSuperAdmin ? 6 : 7} className="py-8 text-center text-slate-600">
+                        {visibleMemberResult.error}
+                        <button type="button" onClick={() => void loadMembers(selectedRoleId)} className="ml-3 font-semibold text-blue-700 hover:underline">
+                          重试
+                        </button>
+                      </td>
+                    </tr>
+                  ) : members.length === 0 ? (
                     <tr>
                       <td colSpan={isSuperAdmin ? 6 : 7} className="py-12 text-center text-slate-400">
                         该角色下暂无匹配成员，可在上方直接添加、CSV 批量导入或点击「全局搜索已激活成员」拉入。
                       </td>
                     </tr>
                   ) : (
-                    filteredMembers.map((m) => (
+                    members.map((m) => (
                       <tr
                         key={m.phone}
                         className="hover:bg-slate-50/70 transition-colors group"
@@ -1400,6 +1471,26 @@ export const RolesMembersView: React.FC = () => {
               </table>
             </div>
 
+            {memberTotal > 0 && (
+              <nav aria-label="角色成员分页" className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-5 py-3 text-xs">
+                <span className="text-slate-500 tabular-nums">共 {memberTotal} 人 · 每页 {MEMBER_PAGE_SIZE} 人</span>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button type="button" disabled={rosterLoading || memberPage <= 1}
+                    onClick={() => goToMemberPage(1)}
+                    className="rounded-lg bg-slate-100 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-200 disabled:opacity-45">首页</button>
+                  <button type="button" disabled={rosterLoading || memberPage <= 1}
+                    onClick={() => goToMemberPage(memberPage - 1)}
+                    className="rounded-lg bg-slate-100 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-200 disabled:opacity-45">上一页</button>
+                  <span aria-live="polite" className="px-1 font-semibold tabular-nums text-slate-600">{memberPage} / {memberPageCount} 页</span>
+                  <button type="button" disabled={rosterLoading || memberPage >= memberPageCount}
+                    onClick={() => goToMemberPage(memberPage + 1)}
+                    className="rounded-lg bg-slate-100 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-200 disabled:opacity-45">下一页</button>
+                  <button type="button" disabled={rosterLoading || memberPage >= memberPageCount}
+                    onClick={() => goToMemberPage(memberPageCount)}
+                    className="rounded-lg bg-slate-100 px-3 py-1.5 font-semibold text-slate-700 hover:bg-slate-200 disabled:opacity-45">末页</button>
+                </div>
+              </nav>
+            )}
           </>
         ) : (
           <div className="p-14 text-center text-slate-400 text-xs">
@@ -1824,7 +1915,7 @@ export const RolesMembersView: React.FC = () => {
                 </div>
               ) : (
                 globalList.map((g) => {
-                  const alreadyInRole = members.some((m) => m.phone === g.phone);
+                  const alreadyInRole = Boolean(g.in_role);
                   const isPulling = pullingPhone === g.phone;
                   const checked = selectedGlobalPhones.includes(g.phone);
                   return (

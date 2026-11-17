@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """2026-11-17 · 用户四条指令（2026-11-16 17:23 下达、当晚解析成待办、次日执行）的专项用例：
 
-  ① 角色分组成员上限移除 —— 前端请求 `/roles/{id}/members?size=5000` 必须真取全量。
-     实测根因：后端 `_clamp_page_size` 硬钳 200（size=5000 被静默截断为 200 人），
-     前端 20/页内存分页又在全量数据上再切一刀 —— 角色卡显示 2600 人、表里只有前 200。
+  ① 角色名册展示全部可达，兼容 `size=5000` 全量调用；管理页按后续要求服务端每页 20 人。
+     翻页和搜索均以完整名册为范围，独立于单页渲染数量。
   ② CSV 批量导入 loading —— 纯前端（静态契约用例守护：spinner + 进行中提示）。
   ③ 统计面板任务清单带出执行时间 + 执行周期（每天 / 每周几 / 每月几号）——
      `/stats-panel/tasks` 返回 remind_at / exec_weekdays / exec_dom_days。
@@ -121,6 +120,40 @@ def test_role_member_full_fetch_not_clamped_to_200() -> None:
     [role] = store.list_roles()
     assert role["member_count"] == role["active_count"] == n
     assert role["activated_count"] == 0
+
+
+def test_role_members_server_pagination_search_and_lookup_membership() -> None:
+    store, _, owner, rid = _seed_stats_ctx()
+    try:
+        owner_id = store.get_role(rid)["owner_id"]
+        ids = [f"1390003{i:04d}" for i in range(43)]
+        with store.conn:
+            store.conn.executemany(
+                "INSERT INTO member(role_id, phone, name, source, owner_id, created_at) "
+                "VALUES (?, ?, ?, 'manual', ?, '2026-11-17 08:00:00')",
+                [(rid, phone, f"分页成员{i:02d}", owner_id) for i, phone in enumerate(ids)],
+            )
+        store.upsert_delivery_target(ids[-1], "u_paginated")
+        path = f"/api/admin/roles/{rid}/members"
+        for page, expected in enumerate((ids[:20], ids[20:40], ids[40:], []), start=1):
+            response = owner.get(path, params={"page": page, "size": 20})
+            assert response.status_code == 200, response.text
+            assert response.json()["total"] == 43
+            assert [item["phone"] for item in response.json()["items"]] == expected
+        search = owner.get(path, params={"page": 1, "size": 20, "q": ids[-1]})
+        assert search.json()["total"] == 1 and search.json()["items"][0]["phone"] == ids[-1]
+        search_by_name = owner.get(path, params={"page": 1, "size": 20, "q": "分页成员42"})
+        assert search_by_name.json()["total"] == 1
+        global_search = "/api/admin/global-activated-members"
+        query = {"q": ids[-1], "platform": "zdxlz", "role_id": rid}
+        result = owner.get(global_search, params=query)
+        assert result.status_code == 200 and result.json()["items"][0]["in_role"] is True
+        second = owner.post("/api/admin/roles", json={"name": "独立角色"}).json()["role_id"]
+        assert owner.get(global_search, params={**query, "role_id": second}).json()["items"][0]["in_role"] is False
+        foreign = store.create_role("其他管理员", owner_id=1)["role_id"]
+        assert owner.get(global_search, params={**query, "role_id": foreign}).status_code == 403
+    finally:
+        store.close()
 
 
 # ════════════════ ④ 删除角色：不再 409，模板同步移除角色 ════════════════
@@ -308,9 +341,11 @@ def test_frontend_static_contract() -> None:
     if rmv is None or stats is None or tpls is None:
         pytest.skip("前端源码目录不在本机，跳过静态契约检查")
     rmv_c = _strip_comments(rmv)
-    # ① 成员上限移除：不得再有分页切片/页大小常量
-    assert "MEMBER_PAGE_SIZE" not in rmv_c, "成员列表不得再设分页上限（用户口径：显示完整）"
-    assert "pagedMembers" not in rmv_c and "filteredMembers.slice(" not in rmv_c
+    # 穿透后端分页，避免为渲染 20 条记录预先拉全量。
+    assert "const MEMBER_PAGE_SIZE = 20" in rmv_c
+    assert "String(MEMBER_PAGE_SIZE)" in rmv_c and "String(scope.page)" in rmv_c
+    assert "size=0" not in rmv_c and "filteredMembers.slice(" not in rmv_c
+    assert "全选/取消全选当前页成员" in rmv_c
     # ② CSV 导入 loading：必须有 spinner 与「进行中」提示
     assert "Loader2" in rmv_c and "animate-spin" in rmv_c, "CSV 批量导入必须有 loading 动画"
     assert "正在导入" in rmv_c, "导入中必须有明确文案提示，避免管理员以为卡住"
