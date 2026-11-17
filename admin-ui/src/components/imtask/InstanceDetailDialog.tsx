@@ -48,15 +48,15 @@ export function getInstanceStatusMeta(inst: Pick<TaskInstanceItem, 'kind' | 'sta
     case 'submitted':
       if (inst.need_review !== false) {
         return {
-          label: '待审核',
+          label: '已提交（待审核）',
           className: 'bg-blue-50 text-blue-700 border-blue-200',
           icon: <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
         };
       }
       // 免审任务的管理员代交和员工自交共用提交徽章。
-      return completedStatus('已提交');
+      return completedStatus('已完成');
     case 'approved':
-      return completedStatus(inst.need_review ? '审核通过' : '已提交');
+      return completedStatus(inst.need_review ? '审核通过' : '已完成');
     case 'rejected':
       return {
         label: '已驳回',
@@ -179,6 +179,7 @@ function ManualSubmissionForm({
   onConfirm: (body: FormData) => void;
 }) {
   const modules = detail.instance.modules ?? [];
+  const resultLabel = detail.instance.need_review ? '已提交' : '已完成';
   const fields = modules.includes('fields') ? detail.template?.schema_json ?? [] : [];
   const spec = detail.template?.spec_json;
   const inputClass = 'w-full rounded-lg border border-slate-200 px-2.5 py-2 text-xs outline-none focus:border-blue-500';
@@ -202,7 +203,7 @@ function ManualSubmissionForm({
   return (
     <form onSubmit={handleSubmit} aria-labelledby="manual-submit-title" className="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-3">
       <div>
-        <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">标记已提交</h4>
+        <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">标记{resultLabel}</h4>
         <p className="mt-1 text-slate-600">所有内容均可选，可直接确认。标记后，员工原提交链接将作废。</p>
       </div>
       <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
@@ -249,7 +250,7 @@ function ManualSubmissionForm({
           取消代交
         </button>
         <button type="submit" disabled={busy} className="rounded-lg bg-blue-600 px-3 py-2 font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
-          {busy ? '正在标记…' : '确认标记为已提交'}
+          {busy ? '正在标记…' : `确认标记为${resultLabel}`}
         </button>
       </div>
     </form>
@@ -325,16 +326,19 @@ export function InstanceDetailDialog({
     setManualSubmissionBusy(true);
     try {
       if (action === 'manual') {
-        const result = await api.post<{ submitted_at: string }>(`${path}/mark-submitted`, body);
+        const result = await api.post<{ status: 'submitted' | 'approved'; submitted_at: string }>(`${path}/mark-submitted`, body);
         setManualSubmissionOpen(false);
         setDetailData({
           ...detailData,
-          instance: { ...detailData.instance, status: 'submitted', submitted_at: result.submitted_at, reject_reason: null },
+          instance: { ...detailData.instance, status: result.status, submitted_at: result.submitted_at, reject_reason: null },
         });
       } else {
         await api.post(`${path}/review`, { action, reason });
       }
-      const messages = { manual: '任务已标记为已提交。', approve: '审核已通过。', reject: '任务已驳回，系统将通知员工重交。' };
+      const messages = {
+        manual: detailData.instance.need_review ? '任务已提交，等待审核。' : '任务已标记为已完成。',
+        approve: '审核已通过。', reject: '任务已驳回，系统将通知员工重交。',
+      };
       toast.success(messages[action]);
       onChanged();
       if (action === 'reject') {
@@ -781,7 +785,7 @@ export function InstanceDetailDialog({
                         onClick={() => setManualSubmissionOpen(true)}
                         className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-4 py-2 font-semibold text-blue-700 hover:bg-blue-100"
                       >
-                        <Check className="w-3.5 h-3.5" /> 标记已提交
+                        <Check className="w-3.5 h-3.5" /> 标记{detailData.instance.need_review ? '已提交' : '已完成'}
                       </button>
                     )}
                     {detailData.instance.kind !== 'notice' &&

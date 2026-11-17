@@ -91,10 +91,11 @@ def test_mark_with_no_content_stores_submission_and_revokes_all_instance_tokens(
     response = owner.post(endpoint(inst))
     assert response.status_code == 200, response.text
     item = store.get_instance(inst["id"])
-    assert item["status"] == "submitted" and item["submitted_at"] == "2026-11-17 10:00:00"
+    assert item["status"] == response.json()["status"] == "approved"
+    assert item["submitted_at"] == "2026-11-17 10:00:00"
     assert not item["reject_reason"] and not item["reviewer"]
     [saved] = store.list_submissions_for_instance(inst["id"])
-    assert saved["source"] == "admin" and saved["status"] == "submitted"
+    assert saved["source"] == "admin" and saved["status"] == "approved"
     assert not saved["note"] and not saved["refs_json"]
     assert all(store.get_h5_token(token)["consumed"] for token in tokens)
     assert not store.get_h5_token(other_token)["consumed"]
@@ -140,6 +141,24 @@ def test_marks_require_owner_sub_admin_and_preserve_no_side_effects(ctx):
     assert not notifier.sent_messages
 
 
+def test_reviewed_task_waits_and_legacy_no_review_submission_filters_as_completed(ctx):
+    store, _, _, _, owner, _, tpl, inst = ctx
+    store.update_template(tpl["template_id"], {"need_review": True})
+    response = owner.post(endpoint(inst))
+    assert response.status_code == 200 and response.json()["status"] == "submitted"
+    assert store.get_instance(inst["id"])["status"] == "submitted"
+    assert store.list_submissions_for_instance(inst["id"])[0]["status"] == "submitted"
+    filters = {"template_id": tpl["template_id"], "period_key": PERIOD}
+    assert owner.get("/api/admin/instances", params={**filters, "status": "submitted"}).json()["total"] == 1
+
+    # 模拟存量免审代交，页面按当前模板口径筛选与统计。
+    store.update_template(tpl["template_id"], {"need_review": False})
+    assert owner.get("/api/admin/instances", params={**filters, "status": "submitted"}).json()["total"] == 0
+    assert owner.get("/api/admin/instances", params={**filters, "status": "approved,sent"}).json()["total"] == 1
+    stats = owner.get("/api/admin/stats", params=filters).json()["stats"]
+    assert (stats["submitted"], stats["approved"]) == (0, 1)
+
+
 def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx):
     store, _, notifier, _, owner, _, tpl, inst = ctx
     response = owner.post(endpoint(inst), data={"payload": '{"fields":{"qty":0},"note":"线下统一代交"}'}, files=[
@@ -148,7 +167,7 @@ def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx
     ])
     assert response.status_code == 200, response.text
     detail = owner.get(f"/api/admin/instances/{inst['id']}").json()
-    assert detail["instance"]["status"] == "submitted"
+    assert detail["instance"]["status"] == "approved"
     saved = detail["submission"]
     assert saved["source"] == "admin"
     assert saved["form_values"] == {"qty": 0}

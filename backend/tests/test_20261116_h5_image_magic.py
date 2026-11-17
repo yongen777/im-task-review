@@ -247,7 +247,7 @@ def test_heic_rename_to_jpg_gets_friendly_message() -> None:
     store, uploads, tok, _ = _setup()
     try:
         code, res = _upload(store, uploads, tok, "IMG_0001.jpg", HEIC_BYTES)
-        assert code == 400 and res["code"] == "FILE_TYPE_REJECTED", res
+        assert code == 400 and res["code"] == "HEIC_NOT_SUPPORTED", res
         assert res["message"] == "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传", res["message"]
         # mif1（HEIF 序列）同理
         code2, res2 = _upload(store, uploads, tok, "IMG_0002.jpg", HEIF_MIF1_BYTES)

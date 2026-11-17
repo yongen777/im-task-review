@@ -4163,6 +4163,7 @@ class StateStore:
             with self.conn:
                 instance, template = self.manual_submission_target(instance_id, owner_id, for_update=True)
                 now_s = self.now_str()
+                new_status = "submitted" if template["need_review"] else "approved"
                 modules = effective_h5_modules(template)
                 if ("fields" not in modules and fields) or ("text" not in modules and note):
                     raise BizError(400, "VALIDATION_FAILED", "任务模板没有启用填入内容对应的模块")
@@ -4195,16 +4196,16 @@ class StateStore:
                 first = saved_uploads[0] if saved_uploads else {}
                 submission = self.conn.execute(
                     "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, "
-                    "refs_json, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin', 'submitted', ?)",
+                    "refs_json, source, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'admin', ?, ?)",
                     (instance_id, fields_json, first.get("ref"), first.get("file_name"), first.get("mime"),
-                     first.get("size"), clean_note, json.dumps(refs) if refs else None, now_s),
+                     first.get("size"), clean_note, json.dumps(refs) if refs else None, new_status, now_s),
                 )
                 submission_id = int(submission.lastrowid)
                 late = bool(instance["late_submit"] or now_s > instance["deadline_at"])
                 self.conn.execute(
-                    "UPDATE task_instance SET status = 'submitted', submitted_at = ?, late_submit = ?, "
+                    "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, "
                     "reviewed_at = NULL, reviewer = NULL, reject_reason = NULL WHERE id = ?",
-                    (now_s, int(late), instance_id),
+                    (new_status, now_s, int(late), instance_id),
                 )
                 self._insert_audit_unlocked(
                     actor, "instance.manual_mark_submitted", "task_instance", str(instance_id),
@@ -4215,16 +4216,19 @@ class StateStore:
             for upload in saved_uploads:
                 self._purge_upload_file(uploads_dir, upload["rel_path"])
             raise
-        return {"ok": True, "status": "submitted", "submission_id": submission_id, "submitted_at": now_s}
+        return {"ok": True, "status": new_status, "submission_id": submission_id, "submitted_at": now_s}
 
     def submit_h5_task(
         self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
-        note: Optional[str] = None, refs: Optional[List[str]] = None
+        note: Optional[str] = None, refs: Optional[List[str]] = None,
+        on_instance_resolved: Optional[Callable[[int], None]] = None,
     ) -> Dict[str, Any]:
         tok = self.get_h5_token(raw_token)
         # 2026-11-12 任务E3：purpose 收窄为 submit（原「补交链接」机制已下线）
         if not tok or tok.get("purpose") != "submit":
             raise BizError(404, "NOT_FOUND", "提交链接无效或不存在")
+        if on_instance_resolved is not None and tok.get("instance_id") is not None:
+            on_instance_resolved(int(tok["instance_id"]))
         cur_dt = self.now()
         now_s = format_dt(cur_dt)
         self.advance_instance_statuses(cur_dt)

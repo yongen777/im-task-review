@@ -381,6 +381,10 @@ def register_admin_guard(app: FastAPI, state: StateStore) -> None:
         return await call_next(request)
 
 
+# 兼容旧版免审代交留下的 submitted，筛选与统计按完成状态处理。
+_INSTANCE_STATUS_SQL = "CASE WHEN i.status = 'submitted' AND t.kind <> 'notice' AND t.need_review = 0 THEN 'approved' ELSE i.status END"
+
+
 def _instance_filter_sql(
     state: StateStore,
     *,
@@ -432,10 +436,11 @@ def _instance_filter_sql(
         # 否则统计卡片上的数字与点进去的列表条数对不上。
         _parts = [x.strip() for x in status.split(",") if x.strip()]
         if len(_parts) == 1:
-            where.append("i.status = ?")
+            where.append(f"({_INSTANCE_STATUS_SQL}) = ?")
             params.append(_parts[0])
         elif _parts:
-            where.append("i.status IN (%s)" % ",".join("?" * len(_parts)))
+            placeholders = ",".join("?" for _ in _parts)
+            where.append(f"({_INSTANCE_STATUS_SQL}) IN ({placeholders})")
             params.extend(_parts)
     # 2026-11-12 任务E3：「补交申请状态」筛选随申请补交链路一并下线。
 
@@ -2665,9 +2670,9 @@ def create_admin_router(
         }
         with state.lock:
             rows = state.conn.execute(
-                f"SELECT i.status AS status, COUNT(1) AS cnt, "
+                f"SELECT {_INSTANCE_STATUS_SQL} AS status, COUNT(1) AS cnt, "
                 f"SUM(CASE WHEN i.late_submit = 1 THEN 1 ELSE 0 END) AS late_cnt "
-                f"{from_sql} {where_sql} GROUP BY i.status",
+                f"{from_sql} {where_sql} GROUP BY {_INSTANCE_STATUS_SQL}",
                 tuple(params),
             ).fetchall()
             for r in rows:

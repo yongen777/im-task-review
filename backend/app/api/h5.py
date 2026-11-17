@@ -10,15 +10,16 @@ import threading
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
 
 try:
-    from fastapi import APIRouter, File, Form, Request, UploadFile
+    from fastapi import APIRouter, BackgroundTasks, File, Form, Request, UploadFile
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 except ImportError:  # pragma: no cover
-    APIRouter = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
+    APIRouter = BackgroundTasks = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
     FileResponse = None  # type: ignore[assignment]
 
+from ..h5log import H5_ACCESS_META
 from ..scheduler import NotifierProtocol, format_deadline_display
 from ..state import (
     BizError, StateStore, TaskUpload, calc_resubmit_deadline, format_deadline_rule,
@@ -290,13 +291,17 @@ def process_h5_bind(
     }
 
 
-def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
+def _resolve_token_and_instance(
+    state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
     token_str = (raw_token or "").strip()
     if not token_str:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "缺少 H5 访问令牌"})
     tok = state.get_h5_token(token_str)
     if not tok:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
+    if on_instance_resolved is not None and tok.get("instance_id") is not None:
+        on_instance_resolved(int(tok["instance_id"]))
     if tok["expires_at"] < state.now_str():
         # 2026-11-12 任务E2：链接过期提示与任务截止统一口径（用户拍板「不区分」），
         # 尽力解析实例拿真实截止时间；实例都没了才说「令牌已过期」。
@@ -306,6 +311,8 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
         if expired_inst is None and tok.get("template_id") and tok.get("period_key"):
             expired_inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
         if expired_inst is not None:
+            if on_instance_resolved is not None and tok.get("instance_id") is None:
+                on_instance_resolved(int(expired_inst["id"]))
             return None, None, (401, {"code": "TOKEN_EXPIRED", "message": submission_expired_message(expired_inst)})
         return None, None, (401, {"code": "TOKEN_EXPIRED", "message": "H5 访问令牌已过期"})
 
@@ -318,6 +325,8 @@ def _resolve_token_and_instance(state: StateStore, raw_token: str) -> Tuple[Opti
         # 2026-11-12 下午（四）：令牌有效但实例已不存在（模板物理删除/移除角色清理）→
         # 统一「任务已关闭」（不暴露「任务实例不存在」技术报错）
         return None, None, (403, {"code": "TASK_CLOSED", "message": "任务已关闭"})
+    if on_instance_resolved is not None and tok.get("instance_id") is None:
+        on_instance_resolved(int(inst["id"]))
     return tok, inst, None
 
 
@@ -328,10 +337,10 @@ def _manually_completed(state: StateStore, instance: Dict[str, Any]) -> bool:
 
 
 def _validate_upload_target_and_limits(
-    state: StateStore, raw_token: str, filename: str
+    state: StateStore, raw_token: str, filename: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str, int, int, Optional[Tuple[int, Dict[str, Any]]]]:
     """前置校验令牌、窗口、模板类型与扩展名，计算该模板允许的最大字节数（未通过前绝不读取或落盘文件体）。"""
-    tok, inst, err = _resolve_token_and_instance(state, raw_token)
+    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
     if err:
         return None, None, "", "", 0, 0, err
 
@@ -343,7 +352,8 @@ def _validate_upload_target_and_limits(
         return None, None, "", "", 0, 0, (403, {"code": "TASK_CLOSED", "message": close_reason})
 
     if _manually_completed(state, inst):
-        return None, None, "", "", 0, 0, (400, {"code": "ALREADY_SUBMITTED", "message": "该任务已由管理员标记为已提交"})
+        label = "已提交" if tpl["need_review"] else "已完成"
+        return None, None, "", "", 0, 0, (400, {"code": "ALREADY_SUBMITTED", "message": f"该任务已由管理员标记为{label}"})
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
     if not window_open:
@@ -371,6 +381,8 @@ def task_upload_limits(template: Dict[str, Any], filename: str) -> Tuple[str, st
         msg = "文件名不能超过 255 字" if len(orig_name) > 255 else "文件缺少扩展名"
         raise BizError(400, "FILE_TYPE_REJECTED", msg)
     ext = orig_name.rsplit(".", 1)[-1].lower().strip()
+    if ext in ("heic", "heif"):
+        raise BizError(400, "HEIC_NOT_SUPPORTED", "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传")
     if ext not in ALLOWED_EXTENSIONS:
         raise BizError(400, "FILE_TYPE_REJECTED", f"不支持的文件类型: .{ext}")
     if template["kind"] == "image" and ext not in IMAGE_EXTENSIONS:
@@ -392,7 +404,7 @@ def prepare_task_upload(
     mime = sniff_magic_mime(ext, header)
     if not mime:
         if sniff_heic_like(header):
-            raise BizError(400, "FILE_TYPE_REJECTED", "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传")
+            raise BizError(400, "HEIC_NOT_SUPPORTED", "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传")
         raise BizError(
             400, "FILE_TYPE_REJECTED",
             "文件内容校验未通过（内容与扩展名不符或格式暂不支持），"
@@ -414,7 +426,9 @@ async def read_upload_file_bounded(file: UploadFile, max_bytes: int) -> Tuple[Op
     return bytes(buf), False
 
 
-def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dict[str, Any]]:
+def process_h5_task_info(
+    *, state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+) -> Tuple[int, Dict[str, Any]]:
     """§9.8 H5 加载任务实例与模板详情。
 
     2026-11-12 下午（用户拍板，一-1/二-3/四）：旧链接**实时**读模板最新配置——
@@ -422,7 +436,7 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
     已提交/已审核通过实例 H5 **打开放行**（正常渲染表单，window_open=True），
     重复提交只在最后一步「提交」时由后端终审拦截「已上传，请勿重复提交」。
     """
-    tok, inst, err = _resolve_token_and_instance(state, raw_token)
+    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
     if err:
         return err
     tpl = state.get_template(inst["template_id"], include_deleted=True)
@@ -439,7 +453,8 @@ def process_h5_task_info(*, state: StateStore, raw_token: str) -> Tuple[int, Dic
     if inst.get("status") in ("submitted", "approved"):
         if _manually_completed(state, inst):
             window_open = False
-            window_reason = "该任务已由管理员标记为已提交"
+            label = "已提交" if tpl["need_review"] else "已完成"
+            window_reason = f"该任务已由管理员标记为{label}"
         elif bool((tpl or {}).get("is_adhoc")):
             window_open = False
             window_reason = "您已完成本次提交"
@@ -554,8 +569,7 @@ def _push_submit_feedback(
 
 def process_h5_task_submit(
     *, state: StateStore, raw_token: str, data: Any,
-    notifier: Optional[NotifierProtocol] = None,
-    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
+    on_instance_resolved: Optional[Callable[[int], None]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """§8 & §9.8 H5 任务提交核心逻辑。"""
     if not isinstance(data, dict):
@@ -573,14 +587,13 @@ def process_h5_task_submit(
     try:
         # ⭐ 2026-10-28：上报类模板可同时提交「字段 + 文字说明 + 多张图片/文件」，
         # 之前只透传单个 file_ref，勾了图片/文件模块也存不下来。
-        res = state.submit_h5_task(raw_token=raw_token, fields=fields, file_ref=file_ref, note=note, refs=refs)
+        res = state.submit_h5_task(raw_token=raw_token, fields=fields, file_ref=file_ref, note=note, refs=refs,
+                                   on_instance_resolved=on_instance_resolved)
     except BizError as exc:
         return exc.status_code, {"code": exc.code, "message": exc.message}
 
     tok = state.get_h5_token(raw_token)
     inst = state.get_instance(int(tok["instance_id"])) if tok and tok.get("instance_id") else None
-    # 2026-11-03 用户口径：提交成功后回推一条「【任务名】提交成功」
-    _push_submit_feedback(state=state, inst=inst, submission_id=res.get("submission_id"), notifier=notifier, notifiers=notifiers)
     return 200, {**res, "instance": inst}
 
 
@@ -591,6 +604,14 @@ def create_h5_router(
     contacts: Optional[Any] = None,
 ) -> APIRouter:
     router = APIRouter()
+
+    def track_instance(request: Request) -> Callable[[int], None]:
+        metadata = request.scope.setdefault(H5_ACCESS_META, {})
+
+        def remember(instance_id: int) -> None:
+            metadata["instance_id"] = instance_id
+
+        return remember
 
     @router.get("/h5/task", response_class=HTMLResponse)
     async def h5_task_page():
@@ -704,6 +725,7 @@ def create_h5_router(
         status_code, content = process_h5_bind(state=state, data=data, notifier=notifier, notifiers=notifiers, contacts=contacts)
         return JSONResponse(status_code=status_code, content=content)
 
+    @router.post("/api/h5/info", include_in_schema=False)
     @router.post("/api/h5/task/info")
     async def api_h5_task_info(request: Request):
         try:
@@ -711,18 +733,26 @@ def create_h5_router(
         except Exception:
             data = {}
         raw_token = _extract_token_from_request(request, data.get("token") if isinstance(data, dict) else None)
-        status_code, content = process_h5_task_info(state=state, raw_token=raw_token)
+        status_code, content = process_h5_task_info(state=state, raw_token=raw_token, on_instance_resolved=track_instance(request))
         return JSONResponse(status_code=status_code, content=content)
 
+    @router.post("/api/h5/upload", include_in_schema=False)
     @router.post("/api/h5/task/upload")
     async def api_h5_task_upload(request: Request, file: UploadFile = File(...), token: Optional[str] = Form(default=None)):
         raw_token = _extract_token_from_request(request, token)
         filename = file.filename or ""
-        _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename)
+        metadata = request.scope.setdefault(H5_ACCESS_META, {})
+        basename = os.path.basename(filename.replace("\\", "/"))
+        ext = basename.rsplit(".", 1)[1].lower().strip() if "." in basename else ""
+        metadata["upload_ext"] = ext if re.fullmatch(r"[a-z0-9]{1,12}", ext) else "-"
+        metadata["upload_bytes"] = file.size
+        _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, track_instance(request))
         if err:
             return JSONResponse(status_code=err[0], content=err[1])
 
         content_bytes, too_large = await read_upload_file_bounded(file, max_bytes)
+        if file.size is None:
+            metadata["upload_bytes"] = file.file.tell()
         if too_large or content_bytes is None:
             return JSONResponse(
                 status_code=400,
@@ -734,8 +764,9 @@ def create_h5_router(
         )
         return JSONResponse(status_code=status_code, content=content)
 
+    @router.post("/api/h5/submit", include_in_schema=False)
     @router.post("/api/h5/task/submit")
-    async def api_h5_task_submit(request: Request):
+    async def api_h5_task_submit(request: Request, background_tasks: BackgroundTasks):
         try:
             data = await request.json()
         except Exception:
@@ -744,8 +775,13 @@ def create_h5_router(
             return JSONResponse(status_code=400, content={"code": "VALIDATION_FAILED", "message": "请求体必须为 JSON 对象"})
         raw_token = _extract_token_from_request(request, data.get("token"))
         status_code, content = process_h5_task_submit(
-            state=state, raw_token=raw_token, data=data, notifier=notifier, notifiers=notifiers
+            state=state, raw_token=raw_token, data=data, on_instance_resolved=track_instance(request),
         )
-        return JSONResponse(status_code=status_code, content=content)
+        if status_code == 200:
+            background_tasks.add_task(
+                _push_submit_feedback, state=state, inst=content.get("instance"), submission_id=content.get("submission_id"),
+                notifier=notifier, notifiers=notifiers,
+            )
+        return JSONResponse(status_code=status_code, content=content, background=background_tasks)
 
     return router

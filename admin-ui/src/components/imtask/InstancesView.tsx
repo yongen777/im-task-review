@@ -43,6 +43,9 @@ export const InstancesView: React.FC = () => {
   const [roleFilter, setRoleFilter] = useState<string>('');
   const [kindFilter, setKindFilter] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('');
+  const combinedStatusLabel = statusFilter === 'approved,sent'
+    ? '已提醒 / 已完成'
+    : statusFilter === 'rejected,overdue' ? '已驳回 / 已逾期' : '';
   const [phoneFilter, setPhoneFilter] = useState<string>('');
   const [periodKeyFilter, setPeriodKeyFilter] = useState<string>(() => getTodayDateString());
 
@@ -283,7 +286,7 @@ export const InstancesView: React.FC = () => {
                 : 'bg-white border-slate-200/90 hover:border-blue-200'
             }`}
           >
-            <div className="text-xs text-blue-700 font-semibold">待人工审核</div>
+            <div className="text-xs text-blue-700 font-semibold">已提交（待审核）</div>
             <div className="text-xl font-bold text-blue-600 font-mono mt-1">
               {localStats.by_status.submitted || 0}
             </div>
@@ -429,21 +432,26 @@ export const InstancesView: React.FC = () => {
 
           {/* 3. 按状态查询（已移除已过期 expired） */}
           <select
-            value={statusFilter}
+            aria-label="执行状态"
+            value={combinedStatusLabel ? '' : statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
             className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-medium outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
           >
             <option value="">全部执行状态</option>
             <option value="pending">待提醒 / 待上传</option>
             <option value="sent">已提醒（通知类已送达）</option>
+            <option value="submitted">已提交（待审核）</option>
             <option value="approved">已完成（审核通过）</option>
-            <option value="submitted">待人工审核</option>
             <option value="rejected">已驳回待重交</option>
             <option value="overdue">已逾期未交</option>
-            <option value="approved,sent">已提醒 / 已完成</option>
-            <option value="rejected,overdue">已驳回 / 已逾期</option>
             <option value="cancelled">已取消</option>
           </select>
+          {combinedStatusLabel && (
+            <button type="button" onClick={() => setStatusFilter('')} aria-label={`清除筛选：${combinedStatusLabel}`}
+              className="inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2 py-1 font-medium text-blue-700 hover:bg-blue-100">
+              {combinedStatusLabel}<X className="h-3.5 w-3.5" />
+            </button>
+          )}
 
           <input
             type="text"

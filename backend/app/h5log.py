@@ -8,26 +8,29 @@
   · token/手机号等敏感参数**脱敏**（不落原文；不记录请求体与请求头）；
   · 只挂在**业务端口（H5 入口）**，不记录后台管理端口。
 
-实现为纯 ASGI 中间件（不缓冲响应体、不属于 Starlette 的 BaseHTTPMiddleware），
-单行写入用 O_APPEND（POSIX 下单行原子），异常中断也会落一行（status 记 0）。
+纯 ASGI 中间件在发送完响应后计时落日志，错误 JSON 只收集有限的字节用于提取错误码。
 """
 from __future__ import annotations
 
-import asyncio
+import hmac
+import json
 import os
 import re
+import secrets
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs
 
 from .config import SHANGHAI_TZ
 
 SLOW_MS = 500.0
+H5_ACCESS_META = "imtask.h5_access"
+_ERROR_JSON_LIMIT = 4096
+_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 _SENSITIVE_KEYS = {"token", "raw", "phone", "mobile", "idem", "sig", "sign", "key"}
-_TOKEN_RE = re.compile(r"^(.{4})(.*)$")
 
 
 def _mask_qs(query: str) -> str:
@@ -36,8 +39,8 @@ def _mask_qs(query: str) -> str:
         return ""
     try:
         pairs = parse_qs(query, keep_blank_values=True)
-    except Exception:  # noqa: BLE001 - 畸形 query 原样截断返回
-        return query[:200]
+    except ValueError:
+        return "[invalid]"
     out = []
     for k, vals in pairs.items():
         v = (vals or [""])[0]
@@ -66,6 +69,10 @@ def _client_ip(scope: Dict[str, Any]) -> str:
     return str(client[0]) if client else "-"
 
 
+def _log_field(value: str) -> str:
+    return value.replace("\r", "%0D").replace("\n", "%0A").replace("|", "%7C")
+
+
 class H5AccessLogMiddleware:
     """单行访问日志中间件（按天文件自动切换；写失败绝不打断请求）。"""
 
@@ -76,6 +83,7 @@ class H5AccessLogMiddleware:
         self._lock = threading.Lock()
         self._current_day: Optional[str] = None
         self._fh = None
+        self._instance_key = secrets.token_bytes(32)
 
     def _write_line(self, line: str) -> None:
         try:
@@ -110,29 +118,75 @@ class H5AccessLogMiddleware:
         if scope.get("type") != "http":
             return await self.app(scope, receive, send)
         start = time.perf_counter()
-        status_holder: Dict[str, int] = {}
+        status = 0
+        written = False
+        error_json: Optional[bytearray] = None
+        metadata = scope.setdefault(H5_ACCESS_META, {})
+        path = str(scope.get("path") or "/")
         tz = SHANGHAI_TZ
         started_at = datetime.now(tz)
         ts = started_at.strftime("%Y-%m-%d %H:%M:%S.") + f"{started_at.microsecond // 1000:03d}"
 
-        async def send_wrapper(message):
-            if message.get("type") == "http.response.start":
-                status_holder["status"] = int(message.get("status", 0))
-            await send(message)
-
-        try:
-            await self.app(scope, receive, send_wrapper)
-        finally:
+        def write_access_line():
+            if path == "/favicon.ico" and status == 404:
+                return
             elapsed_ms = (time.perf_counter() - start) * 1000.0
-            status = status_holder.get("status", 0)
-            path = str(scope.get("path") or "/")
             raw_qs = scope.get("query_string") or b""
             qs = _mask_qs(bytes(raw_qs).decode("latin-1") if isinstance(raw_qs, (bytes, bytearray)) else str(raw_qs))
             target = f"{path}?{qs}" if qs else path
             line = (
-                f"{ts} | {_client_ip(scope)} | {str(scope.get('method') or 'GET')} {target} | "
+                f"{ts} | {_log_field(_client_ip(scope))} | {str(scope.get('method') or 'GET')} {_log_field(target)} | "
                 f"{status} | {elapsed_ms:.0f}ms"
             )
+            if status >= 400:
+                code = None
+                if error_json:
+                    try:
+                        payload = json.loads(error_json)
+                        error = payload.get("error") if isinstance(payload, dict) else None
+                        code = payload.get("code") if isinstance(payload, dict) else None
+                        if code is None and isinstance(error, dict):
+                            code = error.get("code")
+                    except (ValueError, RecursionError):
+                        pass
+                if not isinstance(code, str) or not _ERROR_CODE.fullmatch(code):
+                    code = "VALIDATION_FAILED" if status == 422 else f"HTTP_{status}"
+                line += f" | err={code}"
+            if path in ("/api/h5/task/upload", "/api/h5/upload"):
+                size = metadata.get("upload_bytes")
+                kb = f"{size / 1024:.1f}" if size is not None else "-"
+                line += f" | ext={metadata.get('upload_ext', '-')} | kb={kb}"
+            instance_id = metadata.get("instance_id")
+            if instance_id is not None:
+                opaque = hmac.digest(self._instance_key, str(instance_id).encode("ascii"), "sha256").hex()[:16]
+                line += f" | inst={opaque}"
             if elapsed_ms >= self.slow_ms:
                 line += " | SLOW"
             self._write_line(line)
+
+        async def send_wrapper(message):
+            nonlocal status, error_json, written
+            message_type = message.get("type")
+            if message_type == "http.response.start":
+                status = int(message.get("status", 0))
+                if status >= 400 and any(
+                    name.lower() == b"content-type" and b"json" in value.lower()
+                    for name, value in message.get("headers", [])
+                ):
+                    error_json = bytearray()
+            if message_type == "http.response.body" and error_json is not None:
+                body = message.get("body", b"")
+                if len(error_json) + len(body) <= _ERROR_JSON_LIMIT:
+                    error_json.extend(body)
+                else:
+                    error_json = None
+            await send(message)
+            if message_type == "http.response.body" and not message.get("more_body", False) and not written:
+                written = True
+                write_access_line()
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            if not written:
+                write_access_line()

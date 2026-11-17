@@ -27,7 +27,7 @@ _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
 from app.api.admin import create_admin_router  # noqa: E402
 from app.api.events import handle_inbound_text  # noqa: E402
-from app.api.h5 import process_h5_bind, process_h5_task_submit  # noqa: E402
+from app.api.h5 import create_h5_router, process_h5_bind  # noqa: E402
 from app.config import format_dt  # noqa: E402
 from app.scheduler import FakeNotifier  # noqa: E402
 from app.state import BizError, StateStore  # noqa: E402
@@ -94,10 +94,11 @@ def _submit_once(store: StateStore, template_id: str, *, fields: dict, notifier=
     insts = store.ensure_template_instances(template_id, p_key, format_dt(now + timedelta(hours=8)))
     inst = insts[0]
     token = store.issue_h5_token(phone=inst["phone"], template_id=template_id, period_key=p_key, instance_id=int(inst["id"]))
-    return process_h5_task_submit(
-        state=store, raw_token=token, data={"token": token, "fields": fields},
-        notifier=notifier, notifiers=notifiers,
-    )
+    app = FastAPI()
+    app.include_router(create_h5_router(store, store.data_dir / "uploads", notifier=notifier, notifiers=notifiers))
+    with TestClient(app) as client:
+        response = client.post("/api/h5/task/submit", json={"token": token, "fields": fields})
+    return response.status_code, response.json()
 
 
 def test_submit_feedback_pushed_once_on_task_platform() -> None:
