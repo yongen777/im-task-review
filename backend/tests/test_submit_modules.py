@@ -100,6 +100,52 @@ def _submit(store: StateStore, tpl: Dict[str, Any], inst: Dict[str, Any], *,
 
 
 # ── 1/2. 状态口径 ──────────────────────────────────────────────────
+@pytest.mark.parametrize(("name", "multiple", "accepted"), [
+    ("新图片任务", False, False), ("TA使用统计", None, True), ("多图任务", True, True),
+])
+def test_image_task_attachment_limits_and_boolean_fields(name, multiple, accepted) -> None:
+    store = _mk_store()
+    try:
+        rid = _role(store)
+        tpl = _tpl(store, rid, need_review=False, kind="image", modules=["image"])
+        schema = [{"key": "confirmed", "label": "已确认", "type": "boolean", "required": True}]
+        spec = {"upload_modules": ["image", "fields"], "fields": schema}
+        if multiple is not None:
+            spec["allow_multiple_images"] = multiple
+        tpl = store.update_template(tpl["template_id"], {"name": name, "spec": spec})
+        inst = _inst(store, tpl)
+        refs = [_ref(store, tpl, mime="image/png", name=f"{i}.png") for i in range(2)]
+        with pytest.raises(BizError, match="只能选择是或否"):
+            _submit(store, tpl, inst, refs=refs[:1], fields={"confirmed": "也许"})
+        if not accepted:
+            with pytest.raises(BizError, match="最多上传 1 张图片"):
+                _submit(store, tpl, inst, refs=refs, fields={"confirmed": "否"})
+            assert all(not store.get_upload_ref(ref)["consumed"] for ref in refs)
+            refs = refs[:1]
+        result = _submit(store, tpl, inst, refs=refs, fields={"confirmed": False})
+        assert result["status"] == "approved"
+        submission = store.list_submissions_for_instance(inst["id"])[0]
+        assert store.submission_refs(submission) == refs
+        assert submission["fields"] == {"confirmed": "否"}
+    finally:
+        store.close()
+
+
+def test_multiple_files_are_opt_in() -> None:
+    store = _mk_store()
+    try:
+        tpl = _tpl(store, _role(store), need_review=False, kind="file", modules=["file"])
+        inst = _inst(store, tpl)
+        refs = [_ref(store, tpl, mime="application/pdf", name=f"{i}.pdf") for i in range(2)]
+        with pytest.raises(BizError, match="最多上传 1 个文件"):
+            _submit(store, tpl, inst, refs=refs)
+        tpl = store.update_template(tpl["template_id"], {"spec": {"upload_modules": ["file"], "allow_multiple_files": True}})
+        assert _submit(store, tpl, inst, refs=refs)["status"] == "approved"
+        assert store.submission_refs(store.list_submissions_for_instance(inst["id"])[0]) == refs
+    finally:
+        store.close()
+
+
 def test_no_review_submit_becomes_approved_immediately() -> None:
     """免审核：提交成功 = 已完成（status=approved），不进待审队列。"""
     store = _mk_store()

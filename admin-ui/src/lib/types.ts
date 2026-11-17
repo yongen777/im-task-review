@@ -39,7 +39,7 @@ export interface GlobalActivatedMemberItem {
 export interface FormFieldSpec {
   key: string;
   label: string;
-  type: 'text' | 'number' | 'select';
+  type: 'text' | 'number' | 'select' | 'boolean';
   required: boolean;
   unit?: string;
   options?: string[];
@@ -72,6 +72,8 @@ export interface TemplateSpec {
   text_label?: string; // 文本反馈标题
   text_placeholder?: string; // 文本反馈占位提示
   image_max_count?: number; // 图片上传最大张数
+  allow_multiple_images?: boolean;
+  allow_multiple_files?: boolean;
   file_allow_ext?: string[]; // 允许的文件后缀
   max_count?: number;
   max_size_mb?: number;
@@ -89,6 +91,7 @@ export interface TemplateItem {
   /** 支持关联多个业务角色（向后兼容单角色 role_id） */
   role_ids?: string[];
   remind_at: string;
+  notice_times?: string[] | null;
   deadline: string | null;
   /* 2026-11-12 任务E1：截止配置三件套（has_deadline=false = 无截止，展示「不限」） */
   has_deadline?: boolean;
@@ -107,6 +110,8 @@ export interface TemplateItem {
   attach_image_name?: string | null;
   /* 2026-10-29 执行日：day 周期模板只在选中的周几执行；null/空 = 每天（周一=1…周日=7） */
   exec_weekdays?: number[] | null;
+  anchor_weekday?: number | null;
+  anchor_dom?: number | null;
   /* 2026-11-10 月度执行日：每月几号执行（1~31 多选）；null/空 = 未启用月度（回落每周判定）。
      选中 31 = 当月最后一天也执行（自动适配 2 月 28/29、小月 30） */
   exec_dom_days?: number[] | null;
@@ -213,6 +218,7 @@ export interface TaskInstanceItem {
   need_review?: boolean;
   /* 2026-10-30：模板实际启用的 H5 上传模块（fields/text/image/file），详情按它决定显示哪些区块 */
   modules?: string[];
+  attachment_limits?: { image: number; file: number };
   status: InstanceStatus;
   submitted_at: string | null;
   reviewed_by: string | null;
@@ -296,6 +302,7 @@ export interface TaskInstanceDetail {
   ok: boolean;
   instance: TaskInstanceItem;
   submission: SubmissionData | null;
+  submissions?: Array<{ id: number; status: InstanceStatus; source?: string; created_at: string }>;
   reminders: ReminderLogItem[];
   /** 模板快照（详情页用来把字段 key 还原成中文标签） */
   template?: {
@@ -304,7 +311,7 @@ export interface TaskInstanceDetail {
     schema_json?: Array<{
       key: string;
       label: string;
-      type?: 'text' | 'number' | 'date' | 'select';
+      type?: 'text' | 'number' | 'date' | 'select' | 'boolean';
       max_len?: number;
       unit?: string;
       options?: string[];

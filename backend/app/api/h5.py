@@ -23,7 +23,7 @@ from ..h5log import H5_ACCESS_META
 from ..scheduler import NotifierProtocol, format_deadline_display
 from ..state import (
     BizError, StateStore, TaskUpload, calc_resubmit_deadline, format_deadline_rule,
-    submission_expired_message, task_upload_max_mb,
+    effective_h5_modules, submission_expired_message, task_attachment_limits, task_upload_max_mb,
 )
 
 logger = logging.getLogger(__name__)
@@ -359,12 +359,7 @@ def _validate_upload_target_and_limits(
     if not window_open:
         # 2026-11-12 任务E2：到点后统一错误码 SUBMISSION_CLOSED + 统一文案
         return None, None, "", "", 0, 0, (400, {"code": "SUBMISSION_CLOSED", "message": window_reason or "当前任务提交窗口已关闭"})
-    spec = tpl.get("spec_json") if isinstance(tpl.get("spec_json"), dict) else {}
-    modules = spec.get("upload_modules") or []
-    # 2026-10-28：上报类（form）勾了「图片 / 文件」模块也要允许上传，之前只放行 image/file 两种模板
-    allows_upload = tpl["kind"] in ("image", "file") or (
-        tpl["kind"] == "form" and any(m in modules for m in ("image", "file"))
-    )
+    allows_upload = any(module in effective_h5_modules(tpl) for module in ("image", "file"))
     if not allows_upload:
         return None, None, "", "", 0, 0, (400, {"code": "VALIDATION_FAILED", "message": "当前任务类型不支持上传文件"})
 
@@ -385,7 +380,7 @@ def task_upload_limits(template: Dict[str, Any], filename: str) -> Tuple[str, st
         raise BizError(400, "HEIC_NOT_SUPPORTED", "暂不支持 HEIC 原图格式，请截图或转为 JPG/PNG 后上传")
     if ext not in ALLOWED_EXTENSIONS:
         raise BizError(400, "FILE_TYPE_REJECTED", f"不支持的文件类型: .{ext}")
-    if template["kind"] == "image" and ext not in IMAGE_EXTENSIONS:
+    if template["kind"] == "image" and "file" not in effective_h5_modules(template) and ext not in IMAGE_EXTENSIONS:
         raise BizError(400, "FILE_TYPE_REJECTED", "图片类任务仅允许上传 jpg/png/webp/bmp/gif 格式")
     max_mb = task_upload_max_mb(template)
     return orig_name, ext, max_mb, max_mb * 1024 * 1024
@@ -491,6 +486,7 @@ def process_h5_task_info(
             # 2026-10-28：H5 要按后台勾选的模块（字段 / 文字说明 / 图片 / 文件）逐个渲染，
             # 之前只读 schema_json，导致勾了图片和文字说明也只有一个数字输入框。
             "upload_modules": list(((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("upload_modules") or []),
+            "attachment_limits": task_attachment_limits(tpl),
             "text_label": ((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("text_label") or "文字情况说明",
             "text_placeholder": ((tpl.get("spec_json") or {}) if isinstance(tpl.get("spec_json"), dict) else {}).get("text_placeholder") or "请填写补充说明…",
             "max_file_mb": tpl.get("max_file_mb"),
@@ -510,6 +506,9 @@ def process_h5_task_upload(
 
     try:
         upload = prepare_task_upload(BytesIO(content_bytes), len(content_bytes), (orig_name, ext, max_mb, max_bytes))
+        module = "image" if upload.mime.startswith("image/") else "file"
+        if module not in effective_h5_modules(tpl):
+            raise BizError(400, "FILE_TYPE_REJECTED", "任务模板未启用此类附件")
         rec = state.store_task_upload(inst, upload, uploads_dir)
     except BizError as exc:
         return exc.status_code, {"code": exc.code, "message": exc.message}

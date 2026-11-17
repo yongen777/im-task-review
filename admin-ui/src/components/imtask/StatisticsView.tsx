@@ -295,7 +295,12 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const deptNodes = overviewData?.dept_tree;
   const tree = useMemo(() => makeTree(deptNodes ?? []), [deptNodes]);
   const deptName = deptPath.split('/').pop() || '全部覆盖部门';
-  const deptChildren = deptNodes?.filter((node) => parentPath(node.path) === deptPath) ?? [];
+  const deptChildren = overviewData?.mode === 'periodic'
+    ? (deptNodes ?? []).filter((node) => parentPath(node.path) === deptPath).map((node) => {
+        const counts = overviewData.dept_stats[node.path] ?? { covered: node.count, done: 0 };
+        return { ...node, ...counts, rate: counts.covered ? 100 * counts.done / counts.covered : 0 };
+      }).sort((a, b) => b.rate - a.rate || b.done - a.done || a.name.localeCompare(b.name, 'zh-CN'))
+    : [];
 
   useEffect(() => {
     if (list && page > totalPages) setFilter((current) => ({ ...current, page: totalPages }));
@@ -383,7 +388,10 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   return (
     <div className="space-y-4">
       <AdminScopeHeader title="任务数据统计"
-        description={lastUpdated ? '更新于 ' + lastUpdated.toLocaleTimeString('zh-CN', { hour12: false }) : '查看上报进度和提交内容'}
+        description={<>
+          按任务、周期和部门查看上报进度、核对提交内容并导出明细。
+          {lastUpdated && <span className="ml-2 whitespace-nowrap text-slate-500">更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}</span>}
+        </>}
         actions={<>
           <button type="button" onClick={refresh} disabled={refreshing} className={secondaryButton}>
             <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
@@ -446,22 +454,40 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           </div>
 
           {deptChildren.length > 0 && (
-            <section className={panelClass}>
-              <h3 className="border-b border-slate-100 px-4 py-3 text-sm font-semibold text-slate-900">部门完成情况</h3>
-              <div className="grid max-h-52 grid-cols-1 gap-x-5 overflow-y-auto px-4 py-2 lg:grid-cols-2">
-                {deptChildren.map((node) => {
-                  const counts = overviewData.dept_stats[node.path] || { covered: node.count, done: 0 };
-                  const rate = counts.covered ? Math.round(100 * counts.done / counts.covered) : 0;
-                  return (
-                    <button type="button" key={node.path} onClick={() => selectDept(node.path)}
-                      className="group grid grid-cols-[minmax(0,1fr)_minmax(2.25rem,0.45fr)_auto_auto] items-center gap-2 rounded-lg p-2 text-left text-xs hover:bg-blue-50">
-                      <span className="truncate font-medium text-slate-700 group-hover:text-blue-700" title={node.name}>{node.name}</span>
-                      <span className="h-1.5 overflow-hidden rounded-full bg-slate-100"><span className="block h-full rounded-full bg-blue-500" style={{ width: rate + '%' }} /></span>
-                      <span className="whitespace-nowrap tabular-nums text-slate-600">{counts.done}/{counts.covered} · {rate}%</span>
-                      <ChevronRight className="h-3.5 w-3.5 text-slate-400" />
-                    </button>
-                  );
-                })}
+            <section className={panelClass + ' overflow-hidden'} aria-labelledby="department-progress-title">
+              <div className="flex flex-wrap items-baseline justify-between gap-2 px-5 py-4">
+                <h3 id="department-progress-title" className="text-base font-bold text-slate-900">部门完成情况</h3>
+                <span className="text-xs text-slate-500">按完成率从高到低 · 点击部门查看明细</span>
+              </div>
+              <div className="max-h-[26rem] overflow-auto">
+                <table className="w-full min-w-[560px] table-fixed text-sm">
+                  <thead className="sticky top-0 bg-slate-50 text-left text-xs text-slate-600">
+                    <tr><th className="w-[26%] px-5 py-2.5">部门</th><th className="px-4 py-2.5">完成率</th>
+                      <th className="w-[19%] px-4 py-2.5 text-right">已提交 / 应提交</th><th className="w-[15%] px-5 py-2.5 text-right">未提交</th></tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {deptChildren.map((node) => (
+                      <tr key={node.path} className="hover:bg-blue-50/60">
+                        <td className="px-5 py-3">
+                          <button type="button" onClick={() => selectDept(node.path)} title={node.name}
+                            className="group flex max-w-full items-center gap-1 text-left font-semibold text-slate-900 hover:text-blue-700">
+                            <span className="min-w-0 truncate">{node.name}</span><ChevronRight className="h-4 w-4 shrink-0 text-blue-500" />
+                          </button>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-3">
+                            <span className="w-14 shrink-0 text-right text-base font-bold tabular-nums text-blue-800">{node.rate.toFixed(1)}%</span>
+                            <div className="h-3 flex-1 overflow-hidden rounded bg-slate-100" aria-hidden="true">
+                              <div className="h-full rounded bg-blue-600" style={{ width: node.rate + '%' }} />
+                            </div>
+                          </div>
+                        </td>
+                        <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums text-slate-500"><strong className="text-base text-slate-900">{node.done}</strong> / {node.covered}</td>
+                        <td className="px-5 py-3 text-right font-semibold tabular-nums text-amber-800">{node.covered - node.done}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </section>
           )}

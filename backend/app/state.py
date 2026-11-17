@@ -90,7 +90,7 @@ def task_upload_max_mb(template: Dict[str, Any]) -> int:
 
 VALID_TEMPLATE_KINDS = ("form", "image", "file", "notice")
 VALID_PERIODS = ("day", "week", "month")
-VALID_FIELD_TYPES = ("text", "number", "date", "select")
+VALID_FIELD_TYPES = ("text", "number", "date", "select", "boolean")
 # 任务E1：截止类型枚举（same_day=当天 / weekend=本周日 / month_end=本月最后一天）
 VALID_DEADLINE_TYPES = ("same_day", "weekend", "month_end")
 # 2026-11-12 下午：部门名长度上限放开到 200（官方通讯录部门名常超 30 字；
@@ -359,7 +359,7 @@ def _validate_form_schema(schema_raw: Any) -> List[Dict[str, Any]]:
         if not label:
             raise BizError(400, "VALIDATION_FAILED", f"字段 {key} 的 label 不能为空")
         if ftype not in VALID_FIELD_TYPES:
-            raise BizError(400, "VALIDATION_FAILED", f"字段 {key} 的 type 仅支持 text/number/date/select")
+            raise BizError(400, "VALIDATION_FAILED", f"字段 {key} 的 type 仅支持 text/number/date/select/boolean")
 
         field_obj: Dict[str, Any] = {"key": key, "label": label, "type": ftype, "required": bool(item.get("required", False))}
         unit = item.get("unit")
@@ -425,6 +425,26 @@ def effective_h5_modules(template: Dict[str, Any]) -> List[str]:
     return ["fields", "image", "text"]
 
 
+def task_attachment_limits(template: Dict[str, Any]) -> Dict[str, int]:
+    spec = template.get("spec_json")
+    spec = spec if isinstance(spec, dict) else {}
+    # 已有 TA 模板没有多图开关。首次从后台保存时会写入显式配置。
+    legacy_ta = str(template.get("name") or "").strip().casefold() == "ta使用统计"
+    return {
+        "image": 10 if spec.get("allow_multiple_images", legacy_ta) is True else 1,
+        "file": 10 if spec.get("allow_multiple_files") is True else 1,
+    }
+
+
+def _validate_attachment_counts(template: Dict[str, Any], mimes: List[str]) -> None:
+    limits = task_attachment_limits(template)
+    image_count = sum(mime.startswith("image/") for mime in mimes)
+    if image_count > limits["image"]:
+        raise BizError(400, "VALIDATION_FAILED", f"最多上传 {limits['image']} 张图片")
+    if len(mimes) - image_count > limits["file"]:
+        raise BizError(400, "VALIDATION_FAILED", f"最多上传 {limits['file']} 个文件")
+
+
 def validate_form_submission_fields(
     schema: List[Dict[str, Any]], fields: Optional[Dict[str, Any]], *, enforce_required: bool = True,
 ) -> Dict[str, Any]:
@@ -457,6 +477,12 @@ def validate_form_submission_fields(
                 datetime.strptime(str_val, "%Y-%m-%d")
             except ValueError:
                 raise BizError(400, "VALIDATION_FAILED", f"{label}日期格式不正确")
+            cleaned[key] = str_val
+        elif ftype == "boolean":
+            if isinstance(raw_val, bool):
+                str_val = "是" if raw_val else "否"
+            if str_val not in ("是", "否"):
+                raise BizError(400, "VALIDATION_FAILED", f"{label}只能选择是或否")
             cleaned[key] = str_val
         elif ftype == "select":
             if str_val not in (fdef.get("options") or []):
@@ -2995,7 +3021,10 @@ class StateStore:
                 deadline_type = None
 
             need_review, allow_note = bool(merged.get("need_review", False)), bool(merged.get("allow_note", False))
-            if kind == "form":
+            fields_spec = merged.get("spec") if isinstance(merged.get("spec"), dict) else merged.get("spec_json")
+            fields_spec = fields_spec if isinstance(fields_spec, dict) else {}
+            fields_enabled = "fields" in required_h5_modules({"spec_json": fields_spec})
+            if kind == "form" or fields_enabled:
                 # 2026-11-12 任务B：schema 来源两路——
                 # 旧前端/测试直传 schema_json，优先用；重构前端只传 spec.fields（不传
                 # schema_json），为空时回落到 spec.fields（字段结构与 schema_json 项一致：
@@ -3007,14 +3036,11 @@ class StateStore:
                     or (isinstance(_schema_src, list) and not _schema_src)
                 )
                 if _schema_empty:
-                    _spec_for_fields = merged.get("spec") if isinstance(merged.get("spec"), dict) else (
-                        merged.get("spec_json") if isinstance(merged.get("spec_json"), dict) else {}
-                    )
-                    _spec_fields = _spec_for_fields.get("fields")
+                    _spec_fields = fields_spec.get("fields")
                     if isinstance(_spec_fields, list) and _spec_fields:
                         _schema_src = _spec_fields
                 schema_json_str = json.dumps(_validate_form_schema(_schema_src), ensure_ascii=False)
-            elif kind in ("image", "file"):
+            if kind in ("image", "file"):
                 m_raw = merged.get("max_file_mb")
                 if m_raw is not None and str(m_raw).strip() != "":
                     try:
@@ -3154,6 +3180,9 @@ class StateStore:
         # text_tpl 早就有这层归一，但 notice_items.text_content 一直漏了，
         # 结果后台卡片和预览里显示成「一、文字提醒：\n1、开晨会前…」。
         if isinstance(_spec_payload, dict):
+            for key in ("allow_multiple_images", "allow_multiple_files"):
+                if key in _spec_payload and not isinstance(_spec_payload[key], bool):
+                    raise BizError(400, "VALIDATION_FAILED", "多附件设置必须为布尔值")
             _items = _spec_payload.get("notice_items")
             if isinstance(_items, list):
                 for _it in _items:
@@ -4177,6 +4206,7 @@ class StateStore:
                     raise BizError(400, "VALIDATION_FAILED", "报数字段必须为有限数字") from None
                 clean_note = (note or "").strip()[:500] or None
                 max_mb = task_upload_max_mb(template)
+                _validate_attachment_counts(template, [upload.mime for upload in uploads])
                 for upload in uploads:
                     module = "image" if upload.mime.startswith("image/") else "file"
                     if module not in modules:
@@ -4267,39 +4297,35 @@ class StateStore:
         clean_refs = [str(r).strip() for r in (refs or []) if str(r or "").strip()] if isinstance(refs, list) else []
         if not clean_refs and file_ref:
             clean_refs = [str(file_ref).strip()]
+        clean_refs = list(dict.fromkeys(clean_refs))
+        if len(clean_refs) > sum(task_attachment_limits(tpl).values()):
+            raise BizError(400, "VALIDATION_FAILED", "附件数量超过任务上限")
         ref_rows: List[Dict[str, Any]] = []
+        _mods = required_h5_modules(tpl)
 
-        if tpl["kind"] == "form":
+        if "fields" in effective_h5_modules(tpl):
             # 2026-11-12 任务B：字段校验与 H5 实际渲染对齐。
             # H5 只在 upload_modules 含 "fields"（或老模板无 upload_modules 时 form 默认渲染
             # fields）时才渲染字段输入框；此前这里无条件校验 schema_json 的 required 字段，
             # 「schema 有字段但 H5 没渲染」的老模板会把提交死锁（页面没有输入源，服务端却要必填）。
             # effective_h5_modules 与 task.html 的 modules 推导同一口径。
-            if "fields" in effective_h5_modules(tpl):
-                fields_json_str = json.dumps(validate_form_submission_fields(tpl.get("schema_json") or [], fields), ensure_ascii=False)
-            else:
-                fields_json_str = None  # 未渲染字段模块：不校验、不落 fields（H5 本来就没有输入源）
-            for r in clean_refs:
-                row = self.get_upload_ref(r)
-                if not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]:
-                    raise BizError(400, "VALIDATION_FAILED", "上传文件引用无效")
-                if row["consumed"]:
-                    raise BizError(400, "VALIDATION_FAILED", "该文件已被使用，请重新上传")
-                ref_rows.append(row)
-        elif tpl["kind"] in ("image", "file"):
-            clean_ref = (clean_refs[0] if clean_refs else "").strip()
-            if not clean_ref:
-                raise BizError(400, "VALIDATION_FAILED", "请先上传文件后再提交")
-            up_row = self.get_upload_ref(clean_ref)
-            if not up_row or up_row["phone"] != inst["phone"] or up_row["template_id"] != inst["template_id"]:
+            fields_json_str = json.dumps(validate_form_submission_fields(tpl.get("schema_json") or [], fields), ensure_ascii=False)
+        if tpl["kind"] in ("image", "file") and not clean_refs and not _mods:
+            raise BizError(400, "VALIDATION_FAILED", "请先上传文件后再提交")
+
+        for ref in clean_refs:
+            row = self.get_upload_ref(ref)
+            if not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]:
                 raise BizError(400, "VALIDATION_FAILED", "上传文件引用无效")
-            if up_row["consumed"]:
+            if row["consumed"]:
                 raise BizError(400, "VALIDATION_FAILED", "该文件已被使用，请重新上传")
-            ref_rows = [up_row]
+            ref_rows.append(row)
+        _validate_attachment_counts(tpl, [str(row.get("mime") or "") for row in ref_rows])
+        if tpl["kind"] in ("image", "file") and ref_rows:
+            up_row = ref_rows[0]
 
         refs_json_str = json.dumps([r["ref"] for r in ref_rows], ensure_ascii=False) if ref_rows else None
         # 2026-10-30：管理员勾选的模块，用户必须真的完成（服务端硬校验，H5 前端只是先提示一遍）
-        _mods = required_h5_modules(tpl)
         if _mods:
             _imgs = [r for r in ref_rows if str(r.get("mime") or "").startswith("image/")]
             _others = [r for r in ref_rows if not str(r.get("mime") or "").startswith("image/")]
@@ -4878,11 +4904,6 @@ class StateStore:
 
     STATS_PANEL_DONE = ("submitted", "approved")
     STATS_PANEL_TODO = ("pending", "rejected", "overdue", "expired")
-    # Excel 完成状态统一收敛（用户拍板）：已提交未被打回一律「已提交」，不区分待审/通过
-    STATS_PANEL_STATUS_CN = {
-        "submitted": "已提交", "approved": "已提交",
-        "pending": "待上传", "overdue": "已逾期", "expired": "已逾期", "rejected": "被驳回",
-    }
     STATS_PANEL_NO_DEPT = "未分配部门"
 
     @staticmethod
@@ -5292,16 +5313,11 @@ class StateStore:
         by_id = {int(s.get("submission_id") or s["instance_id"]): s for s in submissions}
         refs_by_id = {sid: self.submission_refs(s) for sid, s in by_id.items()}
         refs = sorted({ref for group in refs_by_id.values() for ref in group})
-        attachments: Dict[str, Dict[str, Any]] = {}
-        for start in range(0, len(refs), 900):
-            batch = refs[start:start + 900]
-            ph = ",".join("?" for _ in batch)
-            for row in self.conn.execute(f"SELECT ref, file_name, mime FROM upload_ref WHERE ref IN ({ph})", tuple(batch)).fetchall():
-                ref = row["ref"]
-                attachments[ref] = {
-                    "ref": ref, "file_name": row["file_name"] or ref,
-                    "is_image": str(row["mime"] or "").startswith("image/"), "url": f"/api/admin/uploads/{ref}",
-                }
+        attachments = {
+            ref: {"ref": ref, "file_name": row["file_name"] or ref,
+                  "is_image": str(row["mime"] or "").startswith("image/"), "url": f"/api/admin/uploads/{ref}"}
+            for ref, row in self._stats_upload_refs(refs).items()
+        }
         content = {}
         for sid, sub in by_id.items():
             values = self._parse_fields_json(sub.get("fields_json"))
@@ -5312,6 +5328,17 @@ class StateStore:
                 "attachments": [attachments[ref] for ref in refs_by_id[sid] if ref in attachments],
             }
         return content
+
+    def _stats_upload_refs(self, refs: List[str]) -> Dict[str, Dict[str, Any]]:
+        uploads = {}
+        for start in range(0, len(refs), 900):
+            batch = refs[start:start + 900]
+            ph = ",".join("?" for _ in batch)
+            rows = self.conn.execute(
+                f"SELECT ref, file_name, mime, rel_path, phone, template_id FROM upload_ref WHERE ref IN ({ph})", tuple(batch),
+            ).fetchall()
+            uploads.update((str(row["ref"]), dict(row)) for row in rows)
+        return uploads
 
     @staticmethod
     def _stats_submission_preview(content: Optional[Dict[str, Any]]) -> str:
@@ -5371,19 +5398,13 @@ class StateStore:
 
     def stats_panel_export_rows(self, template_id: str, period_key: str, owner_id: int, *,
                                 dept_path: str = "") -> Dict[str, Any]:
-        """导出数据装配：当前任务 + 周期（不定期=所选日期）+ 部门范围的全部实时行。
-
-        完成状态统一收敛为 4 种（submitted/approved→已提交；pending→待上传；
-        overdue/expired→已逾期；rejected→被驳回）；cancelled 不导出。
-        返回 {template, headers, rows}，Excel 组装由 API 层完成。
-        """
+        """按任务、周期和部门范围装配完整明细及提交附件。"""
         tpl = self.stats_panel_guard_template(template_id, owner_id)
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         dept_map = self._stats_member_dept_map(role_ids)
         sel = str(dept_path or "").strip().strip("/")
         modules = effective_h5_modules(tpl)
         schema_fields = [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")]
-        # 动态内容列：自定义报数/文本字段（图片与附件明确不导出）；文字补充说明另列
         content_fields = [f for f in schema_fields if str(f.get("type") or "").lower() not in ("file", "image")]
         has_note_col = bool(tpl.get("allow_note")) or ("text" in modules)
 
@@ -5393,7 +5414,7 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", "不定期任务导出需要具体日期（YYYY-MM-DD）")
             params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
             rows = self.conn.execute(
-                "SELECT i.id AS instance_id, s.fields_json, s.note, s.created_at AS submitted_at, "
+                "SELECT i.id AS instance_id, s.fields_json, s.note, s.refs_json, s.file_ref, s.created_at AS submitted_at, "
                 "i.phone, i.name_snap, s.status AS status, i.dept_snap "
                 "FROM submission s JOIN task_instance i ON i.id = s.instance_id "
                 "WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at DESC, s.id DESC",
@@ -5409,6 +5430,7 @@ class StateStore:
                     "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
                     "dept_path": path, "status": str(r["status"]),
                     "submitted_at": r["submitted_at"], "fields": fields, "note": str(r["note"] or ""),
+                    "refs": self.submission_refs(dict(r)),
                 })
         else:
             if not (period_key or "").strip():
@@ -5425,16 +5447,16 @@ class StateStore:
                 f"SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at "
                 f"FROM task_instance i {where_sql}", tuple(params)).fetchall()]
             persons = self._stats_dedup_persons(raw_rows)
-            # 已提交行取代表实例的最近一次提交内容（一次 IN 查询，不逐行往返）
-            done_ids = [int(r["id"]) for r in persons if str(r["status"]) in self.STATS_PANEL_DONE]
+            # 按代表实例取最近一次实际提交，保留被驳回的原始内容。
+            instance_ids = [int(r["id"]) for r in persons]
             subs: Dict[int, Dict[str, Any]] = {}
-            for start in range(0, len(done_ids), 900):
-                chunk = done_ids[start:start + 900]
+            for start in range(0, len(instance_ids), 900):
+                chunk = instance_ids[start:start + 900]
                 ph = ",".join("?" for _ in chunk)
                 for s in self.conn.execute(
-                        f"SELECT instance_id, fields_json, note FROM submission "
+                        f"SELECT instance_id, fields_json, note, refs_json, file_ref, created_at FROM submission "
                         f"WHERE instance_id IN ({ph}) ORDER BY id ASC", tuple(chunk)).fetchall():
-                    subs[int(s["instance_id"])] = {"fields_json": s["fields_json"], "note": s["note"]}
+                    subs[int(s["instance_id"])] = dict(s)
             out_rows = []
             for r in persons:
                 phone = str(r["phone"])
@@ -5444,19 +5466,25 @@ class StateStore:
                     "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
                     "dept_path": self._stats_phone_path(phone, dept_map),
                     "status": str(r["status"]),
-                    "submitted_at": r["submitted_at"] if str(r["status"]) in self.STATS_PANEL_DONE else None,
+                    "submitted_at": r["submitted_at"] or (sub or {}).get("created_at"),
                     "fields": fields, "note": str((sub or {}).get("note") or ""),
+                    "refs": self.submission_refs(sub or {}),
                 })
             # 展示排序与明细表一致：未完成在前
             out_rows.sort(key=lambda r: (
                 {"pending": 0, "overdue": 1, "expired": 1, "rejected": 2}.get(str(r["status"]), 3),
                 str(r["name"] or "")))
-        headers = (["序号", "姓名", "手机号", "所属部门（末级）", "完整部门路径", "完成状态", "提交时间"]
-                   + [str(f.get("label") or f.get("key")) for f in content_fields]
-                   + (["补充说明"] if has_note_col else []))
+        uploads = self._stats_upload_refs(sorted({ref for row in out_rows for ref in row["refs"]}))
+        fields_by_key = {str(field["key"]): field for field in content_fields}
+        for row in out_rows:
+            for key in row["fields"]:
+                fields_by_key.setdefault(key, {"key": key, "label": key})
+            row["uploads"] = [uploads[ref] for ref in row.pop("refs") if ref in uploads
+                              and uploads[ref]["phone"] == row["phone"] and uploads[ref]["template_id"] == tpl["template_id"]]
         return {
-            "template": tpl, "headers": headers, "rows": out_rows,
-            "content_fields": content_fields, "has_note_col": has_note_col,
+            "template": tpl, "rows": out_rows, "modules": modules,
+            "content_fields": list(fields_by_key.values()),
+            "has_note_col": has_note_col or any(row["note"] for row in out_rows),
         }
 
     @staticmethod

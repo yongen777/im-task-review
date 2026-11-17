@@ -10,9 +10,7 @@ import hmac
 import io
 import json
 import logging
-import math
 import os
-import re
 import threading
 import time
 import uuid
@@ -38,6 +36,7 @@ from ..channel_config import (
     validate_payload,
 )
 from ..config import format_dt
+from ..stats_export import build_stats_xlsx, export_filename
 from ..scheduler import period_key
 from ..state import (
     SESSION_TTL_HOURS,
@@ -45,6 +44,7 @@ from ..state import (
     StateStore,
     calc_resubmit_deadline,
     effective_h5_modules,
+    task_attachment_limits,
     validate_new_password,
     verify_password,
 )
@@ -105,26 +105,6 @@ def _platform_allowed(admin: Dict[str, Any], platform: Optional[str]) -> bool:
     if not plat or _is_super_admin(admin):
         return True
     return plat in [str(p).lower() for p in (admin.get("allowed_platforms") or [])]
-
-
-def _stats_export_escape(v: Any) -> Any:
-    """Excel 公式注入防御（2026-11-16 统计面板导出）：
-    = + - @ 开头的文本前置单引号（Excel 文本约定，打开不执行公式）。"""
-    s = "" if v is None else re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", str(v))
-    if s and s[0] in ("=", "+", "-", "@"):
-        return "'" + s
-    return s
-
-
-def _stats_export_field(value: Any, field_type: str) -> Any:
-    if field_type == "number" and value is not None and not isinstance(value, bool):
-        try:
-            number = float(value)
-            if math.isfinite(number) and abs(number) < 10**15:
-                return number
-        except (ValueError, TypeError, OverflowError):
-            pass
-    return _stats_export_escape(value)
 
 
 def _check_path_ownership(state: StateStore, admin: Dict[str, Any], path: str) -> Optional[JSONResponse]:
@@ -2177,6 +2157,7 @@ def create_admin_router(
         inst["role_id"] = _role_ids[0] if _role_ids else ""
         inst["role_ids"] = list(_role_ids)
         inst["modules"] = effective_h5_modules(_tpl)
+        inst["attachment_limits"] = task_attachment_limits(_tpl)
         submissions = state.list_submissions_for_instance(instance_id)
         reminders = state.list_reminder_logs(instance_id=instance_id)
         inst["late_submit"] = bool(inst.get("late_submit", 0))
@@ -2819,77 +2800,29 @@ def create_admin_router(
         period_key: str = "",
         dept_path: str = "",
     ):
-        """实时导出 .xlsx：当前任务 + 周期（+部门范围）全部参与人员的执行状态。
-
-        表格刚性（用户拍板）：无任何合并单元格；首行冻结；全列 AutoFilter，
-        `完整部门路径` / `完成状态` 打开即可点下拉筛选。
-        完成状态统一收敛 4 种（submitted/approved→已提交）；图片附件不导出。
-        文件名 = 任务名 + 导出时间（年月日几点几分，不带秒）。
-        """
+        """导出当前任务、周期及部门范围的完整提交明细。"""
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
         assert sess is not None
         try:
             admin = _require_stats_panel_admin(sess)
-            bundle = state.stats_panel_export_rows(
-                template_id, period_key, int(admin.get("id") or 0),
-                dept_path=(dept_path or "").strip(),
+            bundle = await asyncio.to_thread(
+                state.stats_panel_export_rows,
+                template_id, period_key, int(admin.get("id") or 0), dept_path=dept_path,
             )
         except BizError as exc:
             return biz_error_response(exc)
 
-        from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill
-        from openpyxl.utils import get_column_letter
-
-        tpl = bundle["template"]
-        headers: List[str] = bundle["headers"]
-        content_fields = bundle["content_fields"]
-        has_note = bundle["has_note_col"]
-        status_cn = StateStore.STATS_PANEL_STATUS_CN
-
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "统计数据"
-        # 表头（无合并单元格；冻结首行；全列 AutoFilter）
-        ws.append([_stats_export_escape(header) for header in headers])
-        for c in range(1, len(headers) + 1):
-            cell = ws.cell(row=1, column=c)
-            cell.font = Font(bold=True)
-            cell.fill = PatternFill("solid", fgColor="E8F0FE")
-        ws.freeze_panes = "A2"
-        widths = [6, 12, 13, 18, 44, 10, 17] + [16] * len(content_fields) + ([30] if has_note else [])
-        for idx, w in enumerate(widths[:len(headers)], start=1):
-            ws.column_dimensions[get_column_letter(idx)].width = w
-
-        for idx, r in enumerate(bundle["rows"], start=1):
-            values: List[Any] = [
-                idx,
-                _stats_export_escape(r.get("name")),
-                _stats_export_escape(r.get("phone")),
-                _stats_export_escape(str(r.get("dept_path") or "").rsplit("/", 1)[-1]),
-                _stats_export_escape(r.get("dept_path")),
-                status_cn.get(str(r.get("status") or ""), str(r.get("status") or "")),
-                (str(r.get("submitted_at") or "")[:16] if r.get("submitted_at") else ""),
-            ]
-            for f in content_fields:
-                values.append(_stats_export_field(r.get("fields", {}).get(str(f.get("key"))), f.get("type")))
-            if has_note:
-                values.append(_stats_export_escape(r.get("note")))
-            ws.append(values)
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(bundle['rows']) + 1}"
-
-        out = io.BytesIO()
-        wb.save(out)
-        payload = out.getvalue()
-        from datetime import datetime as _dt
-        fname = f"{tpl['name']}_统计导出_{_dt.now().strftime('%Y年%m月%d日%H点%M分')}.xlsx"
+        cfg = getattr(request.app.state, "config", None)
+        uploads_dir = cfg.uploads_dir if cfg else state.data_dir / "uploads"
+        payload = await asyncio.to_thread(build_stats_xlsx, bundle, uploads_dir)
+        fname = export_filename(dept_path, bundle["template"]["name"], state.now())
         return Response(
             content=payload,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={
-                "Content-Disposition": f"attachment; filename=\"stats.xlsx\"; filename*=UTF-8''{quote(fname)}",
+                "Content-Disposition": f"attachment; filename=\"stats.xlsx\"; filename*=UTF-8''{quote(fname, safe='')}",
                 "Cache-Control": "no-store",
             },
         )

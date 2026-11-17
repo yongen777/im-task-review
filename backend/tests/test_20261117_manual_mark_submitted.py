@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from PIL import Image
 
 from app.api.admin import create_admin_router, register_admin_guard
 from app.api.h5 import create_h5_router
@@ -161,18 +162,28 @@ def test_reviewed_task_waits_and_legacy_no_review_submission_filters_as_complete
 
 def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx):
     store, _, notifier, _, owner, _, tpl, inst = ctx
+    spec = {**tpl["spec_json"], "allow_multiple_images": True}
+    store.update_template(tpl["template_id"], {"spec": spec})
+    pictures = []
+    for color in ("blue", "orange"):
+        picture = BytesIO()
+        Image.new("RGB", (36, 24), color=color).save(picture, format="PNG")
+        pictures.append(picture.getvalue())
+    assert owner.get(f"/api/admin/instances/{inst['id']}").json()["instance"]["attachment_limits"] == {"image": 10, "file": 1}
     response = owner.post(endpoint(inst), data={"payload": '{"fields":{"qty":0},"note":"线下统一代交"}'}, files=[
-        ("attachments", ("现场.jpg", PNG, "image/jpeg")),
+        ("attachments", ("现场.jpg", pictures[0], "image/jpeg")),
+        ("attachments", ("结果.png", pictures[1], "image/png")),
         ("attachments", ("清单.pdf", b"%PDF-1.7\nexample", "application/pdf")),
     ])
     assert response.status_code == 200, response.text
     detail = owner.get(f"/api/admin/instances/{inst['id']}").json()
     assert detail["instance"]["status"] == "approved"
+    assert detail["submissions"][0]["source"] == "admin"
     saved = detail["submission"]
     assert saved["source"] == "admin"
     assert saved["form_values"] == {"qty": 0}
     assert saved["note"] == "线下统一代交"
-    assert [a["mime"] for a in saved["attachments"]] == ["image/png", "application/pdf"]
+    assert [a["mime"] for a in saved["attachments"]] == ["image/png", "image/png", "application/pdf"]
     for attachment in saved["attachments"]:
         assert store.get_upload_ref(attachment["ref"])["consumed"]
         assert owner.get(attachment["url"]).status_code == 200
@@ -185,7 +196,11 @@ def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx
     exported = owner.get("/api/admin/stats-panel/export", params=params)
     assert exported.status_code == 200, exported.text
     rows = list(load_workbook(BytesIO(exported.content), read_only=True).active.values)
-    assert any("已提交" in row and PHONE in row for row in rows)
+    assert any("已完成" in row and PHONE in row for row in rows)
+    assert rows[0][-4:] == ("图片数量", "上报图片", "上报图片 2", "文件是否上传")
+    assert rows[1][-4] == 2 and rows[1][-1] == "已上传"
+    images = load_workbook(BytesIO(exported.content)).active._images
+    assert len(images) == 2 and [image.anchor._from.row for image in images] == [1, 1]
     assert not notifier.sent_messages
 
 

@@ -87,6 +87,15 @@ function describeExecWeekdays(days: number[]): string {
   return s.map((d) => WEEKDAY_LABELS[d - 1]).join('、');
 }
 
+function describeTemplateSchedule(tpl: TemplateItem): string {
+  const days = tpl.exec_dom_days?.length ? tpl.exec_dom_days : tpl.period === 'month' ? [tpl.anchor_dom ?? 1] : [];
+  if (days.length) return `每月 ${days.join('、')} 号`;
+  if (tpl.period === 'week') return `每${WEEKDAY_LABELS[(tpl.anchor_weekday ?? 1) - 1]}`;
+  const weekdays = tpl.exec_weekdays?.length ? tpl.exec_weekdays : [1, 2, 3, 4, 5, 6, 7];
+  const label = describeExecWeekdays(weekdays);
+  return label.startsWith('周') ? `每周 ${label}` : label;
+}
+
 function createDefaultNoticeItems(): NoticeMessageItem[] {
   return [
     {
@@ -326,12 +335,12 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                               {f.required && <span className="text-rose-500 ml-0.5">*</span>}
                             </span>
                             <span className="text-[10px] text-slate-400">
-                              {f.type === 'number' ? '数值报数' : f.type === 'select' ? '下拉选择' : '文本'}
+                              {f.type === 'number' ? '数值报数' : f.type === 'boolean' ? '是／否' : f.type === 'select' ? '下拉选择' : '文本'}
                             </span>
                           </label>
-                          {f.type === 'select' ? (
+                          {f.type === 'select' || f.type === 'boolean' ? (
                             <select className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-700">
-                              {(f.options && f.options.length > 0 ? f.options : ['已完成', '进行中']).map(
+                              {(f.type === 'boolean' ? ['是', '否'] : f.options || []).map(
                                 (opt, idx) => (
                                   <option key={idx}>{opt}</option>
                                 ),
@@ -489,6 +498,8 @@ export const TemplatesView: React.FC = () => {
     '请按时点击下方 H5 链接，完成本时段业务数据报数及现场图片/文件上传。',
   );
   const [uploadModules, setUploadModules] = useState<UploadH5Module[]>(['fields', 'image', 'text']);
+  const [multipleImages, setMultipleImages] = useState(false);
+  const [multipleFiles, setMultipleFiles] = useState(false);
   const [fields, setFields] = useState<FormFieldSpec[]>([
     { key: 'visit_count', label: '今日累计上门户数', type: 'number', required: true },
     { key: 'intent_count', label: '商机意向单数量', type: 'number', required: true },
@@ -585,6 +596,8 @@ export const TemplatesView: React.FC = () => {
       '请按时点击下方 H5 链接，完成今日上门走访户数报数及图片上传。',
     );
     setUploadModules(['fields', 'image', 'text']);
+    setMultipleImages(false);
+    setMultipleFiles(false);
     setFields([
       { key: 'visit_count', label: '今日累计上门户数', type: 'number', required: true },
       { key: 'intent_count', label: '新增意向单数量', type: 'number', required: true },
@@ -626,7 +639,7 @@ export const TemplatesView: React.FC = () => {
       tpl.deadline_type === 'weekend' || tpl.deadline_type === 'month_end' ? tpl.deadline_type : 'same_day',
     );
     setDeadlineTime(tpl.deadline_time || tpl.deadline || '18:00');
-    setRequireReview(tpl.kind === 'notice' ? false : tpl.spec?.require_review !== false);
+    setRequireReview(tpl.kind !== 'notice' && (tpl.need_review ?? tpl.spec?.require_review ?? false));
     setEnabled(tpl.enabled);
 
     if (tpl.kind === 'notice') {
@@ -655,6 +668,8 @@ export const TemplatesView: React.FC = () => {
     } else {
       setUploadRemindText(tpl.text_tpl || '');
       setUploadModules(resolveUploadModules(tpl));
+      setMultipleImages(tpl.spec?.allow_multiple_images ?? tpl.name.trim().toLowerCase() === 'ta使用统计');
+      setMultipleFiles(tpl.spec?.allow_multiple_files === true);
       if (Array.isArray(tpl.spec?.fields) && tpl.spec.fields.length > 0) {
         setFields(tpl.spec.fields.map((f) => ({ ...f })));
       } else {
@@ -870,6 +885,8 @@ export const TemplatesView: React.FC = () => {
       spec = {
         require_review: requireReview,
         upload_modules: uploadModules,
+        allow_multiple_images: uploadModules.includes('image') && multipleImages,
+        allow_multiple_files: uploadModules.includes('file') && multipleFiles,
         fields: uploadModules.includes('fields')
           ? fields.map((f, idx) => ({
               ...f,
@@ -1217,10 +1234,13 @@ export const TemplatesView: React.FC = () => {
                             <span>—（菜单自选）</span>
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50/80 text-blue-700 border border-blue-200/70 font-mono text-xs font-bold">
-                            <Clock className="w-3.5 h-3.5 shrink-0" />
-                            <span>{tpl.remind_at || '—'}</span>
-                          </span>
+                          <div className="space-y-1.5">
+                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-blue-50/80 text-blue-700 border border-blue-200/70 font-mono text-xs font-bold">
+                              <Clock className="w-3.5 h-3.5 shrink-0" />
+                              <span>{(isNotice && tpl.notice_times?.join(' / ')) || tpl.remind_at || '—'}</span>
+                            </span>
+                            <div className="max-w-44 whitespace-normal text-xs font-medium text-slate-600">{describeTemplateSchedule(tpl)}</div>
+                          </div>
                         )}
                       </td>
 
@@ -2106,6 +2126,17 @@ export const TemplatesView: React.FC = () => {
                           })}
                         </div>
 
+                        <div className="flex flex-wrap gap-x-5 gap-y-2">
+                          {uploadModules.includes('image') && <label className="inline-flex items-center gap-2 text-xs text-slate-700">
+                            <input type="checkbox" checked={multipleImages} onChange={(event) => setMultipleImages(event.target.checked)} />
+                            允许上传多张图片（最多 10 张）
+                          </label>}
+                          {uploadModules.includes('file') && <label className="inline-flex items-center gap-2 text-xs text-slate-700">
+                            <input type="checkbox" checked={multipleFiles} onChange={(event) => setMultipleFiles(event.target.checked)} />
+                            允许上传多个文件（最多 10 个）
+                          </label>}
+                        </div>
+
                         {/* 若勾选了「字段（报数类型）」，展示报数字段配置 */}
                         {uploadModules.includes('fields') && (
                           <div className="p-3 rounded-xl bg-white border border-slate-200 space-y-2">
@@ -2135,13 +2166,15 @@ export const TemplatesView: React.FC = () => {
                                     value={f.type}
                                     onChange={(e) =>
                                       updateFieldRow(idx, {
-                                        type: e.target.value as 'number' | 'text' | 'select',
+                                        type: e.target.value as FormFieldSpec['type'],
                                       })
                                     }
                                     className="bg-slate-50 border border-slate-200 rounded-lg px-2 py-1.5 text-[11px]"
                                   >
                                     <option value="number">数字报数</option>
                                     <option value="text">单行文本</option>
+                                    <option value="boolean">布尔（是／否）</option>
+                                    {f.type === 'select' && <option value="select">下拉选择</option>}
                                   </select>
                                   {fields.length > 1 && (
                                     <button

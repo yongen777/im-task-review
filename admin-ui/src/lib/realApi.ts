@@ -169,19 +169,21 @@ function tplToMock(t: any): TemplateItem {
     /* 2026-10-28 修复：优先从 spec_json 恢复完整前端配置，fallback schema_json */
     if (t.spec_json && typeof t.spec_json === 'object') {
       Object.assign(spec, t.spec_json);
-    } else {
-      spec.schema_json = t.schema_json;
     }
+    if (!Array.isArray(spec.fields) && Array.isArray(t.schema_json)) spec.fields = t.schema_json;
   }
   return {
     id: t.template_id as unknown as number,
     name: t.name,
     kind: t.kind === 'form' ? 'upload' : t.kind || 'notice',
     period: t.period || 'day',
+    anchor_weekday: t.anchor_weekday,
+    anchor_dom: t.anchor_dom,
     role_id: (t.role_ids || [])[0] || '',
     role_ids: (t.role_ids || []).map(String),
     /* 2026-10-28 修复：form 类模板后端存的是 remind_at（非 notice_times），双向兼容 */
     remind_at: (t.notice_times && t.notice_times[0]) || t.remind_at || '',
+    notice_times: Array.isArray(t.notice_times) ? t.notice_times : null,
     deadline: t.deadline || '',
     /* 2026-11-12 任务E1 截止三件套（用户实锤修复：此前只回 deadline，
        deadline_type 永远 undefined → 列表徽章/编辑弹窗永远回落「今天」；
@@ -256,7 +258,7 @@ function tplFromMock(t: any, partial = false) {
       out.schema_json = specFields.map((f: any) => ({
         key: String(f.key || f.id || 'field').replace(/[^A-Za-z0-9_]/g, '_') || 'field',
         label: String(f.label || f.title || '填写项'),
-        type: ['text', 'number', 'select'].includes(f.type) ? f.type : 'text',
+        type: ['text', 'number', 'select', 'boolean'].includes(f.type) ? f.type : 'text',
         required: !!f.required,
         ...(f.unit ? { unit: f.unit } : {}),
         ...(f.options ? { options: f.options } : {}),
@@ -582,6 +584,7 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
       /* 2026-10-28：后端给的是归一化后的 submission（字段标签 + 附件清单），
          之前这里读 d.submission 但后端只返回 submissions 数组，详情页永远显示「尚未产生提交」。 */
       submission: d.submission || null,
+      submissions: Array.isArray(d.submissions) ? d.submissions : [],
       template: d.template || null,
       reminders: (d.reminders || d.items || []).map(remToMock),
     } as unknown as T;

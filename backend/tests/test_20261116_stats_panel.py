@@ -416,7 +416,7 @@ def test_export_xlsx_full_contract() -> None:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         # 文件名 = 任务名 + 导出时间（年月日几点几分，不带秒）
         cd = unquote(r.headers.get("content-disposition", ""))
-        m = re.search(r"统计日报h_统计导出_(\d{4})年(\d{2})月(\d{2})日(\d{2})点(\d{2})分\.xlsx", cd)
+        m = re.search(r"全部覆盖部门_统计日报h_2026／11／16 12：00\.xlsx", cd)
         assert m, cd
         wb = load_workbook(io.BytesIO(r.content))
         ws = wb.active
@@ -432,8 +432,8 @@ def test_export_xlsx_full_contract() -> None:
         assert set(rows) == {"王五", "赵六", "钱七", "李四", "张三"}, set(rows)
         g = lambda i, c: ws.cell(row=i, column=c).value  # noqa: E731
         # 完成状态统一收敛 4 种
-        assert g(rows["张三"], 6) == "已提交" and g(rows["李四"], 6) == "已提交"
-        assert g(rows["王五"], 6) == "待上传" and g(rows["赵六"], 6) == "已逾期" and g(rows["钱七"], 6) == "被驳回"
+        assert g(rows["张三"], 6) == "已提交（待审核）" and g(rows["李四"], 6) == "已完成（审核通过）"
+        assert g(rows["王五"], 6) == "待上传" and g(rows["赵六"], 6) == "已逾期未交" and g(rows["钱七"], 6) == "已驳回待重交"
         # 未提交：提交时间留空；已提交带时间（不带秒）
         assert (g(rows["王五"], 7) or "") == ""
         assert str(g(rows["张三"], 7)) == "2026-11-16 09:00", g(rows["张三"], 7)
@@ -443,10 +443,11 @@ def test_export_xlsx_full_contract() -> None:
         # 动态内容列 + 补充说明；公式注入转义（- / = 前置单引号）
         assert g(rows["张三"], 8) == 42 and g(rows["张三"], 10) == "第一条说明"
         assert g(rows["李四"], 9) == "'-3" and g(rows["李四"], 10) == "'=SUM(A1:A2)", (g(rows["李四"], 9), g(rows["李四"], 10))
-        # 附件列绝不出现（headers 已断言）；驳回/逾期行无内容值
         assert (g(rows["赵六"], 8) or "") == ""
+        assert g(rows["钱七"], 8) == 5
         # 部门范围导出：只含市公司本部子树 3 人
         r2 = _q(ctx["sa1"], f"stats-panel/export?template_id={ctx['tpl_id']}&period_key={PK_DAY}&dept_path={PATH_BEN}")
+        assert "市公司本部_统计日报h_2026／11／16 12：00.xlsx" in unquote(r2.headers["content-disposition"])
         wb2 = load_workbook(io.BytesIO(r2.content))
         ws2 = wb2.active
         names2 = {ws2.cell(row=i, column=2).value for i in range(2, ws2.max_row + 1)}

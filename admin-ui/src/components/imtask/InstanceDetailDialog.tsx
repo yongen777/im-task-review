@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Check, CheckCircle2, Clock, Download, Eye, Paperclip, Send, ShieldCheck, Users, X, XCircle } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, Check, CheckCircle2, Clock, Download, Eye, ImagePlus, Paperclip, Send, ShieldCheck, Users, X, XCircle } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
@@ -56,17 +56,17 @@ export function getInstanceStatusMeta(inst: Pick<TaskInstanceItem, 'kind' | 'sta
       // 免审任务的管理员代交和员工自交共用提交徽章。
       return completedStatus('已完成');
     case 'approved':
-      return completedStatus(inst.need_review ? '审核通过' : '已完成');
+      return completedStatus(inst.need_review ? '已完成（审核通过）' : '已完成');
     case 'rejected':
       return {
-        label: '已驳回',
+        label: '已驳回待重交',
         className: 'bg-rose-50 text-rose-700 border-rose-200',
         icon: <XCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />,
       };
     case 'overdue':
     case 'expired':
       return {
-        label: inst.status === 'overdue' ? '已逾期' : '已过期',
+        label: inst.status === 'overdue' ? '已逾期未交' : '已过期',
         className: 'bg-amber-50 text-amber-800 border-amber-200',
         icon: <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />,
       };
@@ -170,6 +170,46 @@ export const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: st
   );
 };
 
+function ManualAttachmentPicker({ image, limit, files, onChange }: {
+  image: boolean; limit: number; files: File[]; onChange: (files: File[]) => void;
+}) {
+  const [warning, setWarning] = useState('');
+  const label = image ? '图片' : '文件';
+  const Icon = image ? ImagePlus : Paperclip;
+  return (
+    <div className="space-y-1.5">
+      <div className="font-medium text-slate-700">{label}凭证 <span className="font-normal text-slate-500">{files.length} / {limit}</span></div>
+      <label className="flex min-h-12 cursor-pointer items-center gap-2 rounded-xl border border-dashed border-blue-300 bg-white px-3 font-semibold text-blue-700 hover:bg-blue-50 focus-within:ring-2 focus-within:ring-blue-500">
+        <Icon className="h-4 w-4" />{limit === 1 && files.length ? `更换${label}` : `选择${label}`}
+        <input aria-label={`选择${label}`} className="sr-only" type="file" multiple={limit > 1}
+          accept={image ? 'image/jpeg,image/png,image/webp,image/bmp,image/gif' : '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip'}
+          onChange={(event) => {
+            const incoming = Array.from(event.currentTarget.files || []);
+            event.currentTarget.value = '';
+            if (!incoming.length) return;
+            const next = limit === 1 ? incoming : [...files, ...incoming];
+            if (next.length > limit) {
+              setWarning(`最多选择 ${limit} ${image ? '张图片' : '个文件'}`);
+              return;
+            }
+            setWarning('');
+            onChange(next);
+          }} />
+      </label>
+      {warning && <p role="alert" className="text-rose-700">{warning}</p>}
+      {files.map((file, index) => (
+        <div key={`${file.name}/${index}`} className="flex items-center gap-2 rounded-lg bg-white px-2.5 py-1.5">
+          <span className="min-w-0 flex-1 truncate" title={file.name}>{file.name}</span>
+          <button type="button" aria-label={`移除 ${file.name}`} onClick={() => {
+            setWarning('');
+            onChange(files.filter((_, position) => position !== index));
+          }} className="rounded p-1 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ManualSubmissionForm({
   detail, busy, onCancel, onConfirm,
 }: {
@@ -179,6 +219,10 @@ function ManualSubmissionForm({
   onConfirm: (body: FormData) => void;
 }) {
   const modules = detail.instance.modules ?? [];
+  const [images, setImages] = useState<File[]>([]);
+  const [files, setFiles] = useState<File[]>([]);
+  const formRef = useRef<HTMLFormElement>(null);
+  useEffect(() => { formRef.current?.scrollIntoView({ block: 'nearest' }); }, []);
   const resultLabel = detail.instance.need_review ? '已提交' : '已完成';
   const fields = modules.includes('fields') ? detail.template?.schema_json ?? [] : [];
   const spec = detail.template?.spec_json;
@@ -194,14 +238,12 @@ function ManualSubmissionForm({
     }));
     const body = new FormData();
     body.set('payload', JSON.stringify({ fields: values, note: String(input.get('note') ?? '').trim() }));
-    for (const file of [...input.getAll('images'), ...input.getAll('files')]) {
-      if (file instanceof File && file.name) body.append('attachments', file);
-    }
+    for (const file of [...images, ...files]) body.append('attachments', file);
     onConfirm(body);
   };
 
   return (
-    <form onSubmit={handleSubmit} aria-labelledby="manual-submit-title" className="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-3">
+    <form ref={formRef} onSubmit={handleSubmit} aria-labelledby="manual-submit-title" className="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-3">
       <div>
         <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">标记{resultLabel}</h4>
         <p className="mt-1 text-slate-600">所有内容均可选，可直接确认。标记后，员工原提交链接将作废。</p>
@@ -210,10 +252,10 @@ function ManualSubmissionForm({
         {fields.map((field) => (
           <label key={field.key} className="grid gap-1 font-medium text-slate-700">
             <span>{field.label}{field.unit ? `（${field.unit}）` : ''}</span>
-            {field.type === 'select' ? (
+            {field.type === 'select' || field.type === 'boolean' ? (
               <select name={`field:${field.key}`} defaultValue="" className={inputClass}>
                 <option value="">请选择</option>
-                {field.options?.map((option) => <option key={option} value={option}>{option}</option>)}
+                {(field.type === 'boolean' ? ['是', '否'] : field.options)?.map((option) => <option key={option} value={option}>{option}</option>)}
               </select>
             ) : (
               <input
@@ -233,16 +275,10 @@ function ManualSubmissionForm({
           </label>
         )}
         {modules.includes('image') && (
-          <label className="grid gap-1 font-medium text-slate-700">
-            <span>图片凭证</span>
-            <input name="images" type="file" multiple accept=".jpg,.jpeg,.png,.webp,.bmp,.gif" className={inputClass} />
-          </label>
+          <ManualAttachmentPicker image limit={detail.instance.attachment_limits?.image ?? 1} files={images} onChange={setImages} />
         )}
         {modules.includes('file') && (
-          <label className="grid gap-1 font-medium text-slate-700">
-            <span>文件凭证</span>
-            <input name="files" type="file" multiple accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" className={inputClass} />
-          </label>
+          <ManualAttachmentPicker image={false} limit={detail.instance.attachment_limits?.file ?? 1} files={files} onChange={setFiles} />
         )}
       </fieldset>
       <div className="flex justify-end gap-2">
@@ -301,8 +337,9 @@ export function InstanceDetailDialog({
   const [manualSubmissionBusy, setManualSubmissionBusy] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
+  const [selectedSubmissionId, setSelectedSubmissionId] = useState(submissionId);
   const path = `/api/admin/instances/${instanceId}`;
-  const detailPath = submissionId === undefined ? path : `${path}?submission_id=${submissionId}`;
+  const detailPath = selectedSubmissionId === undefined ? path : `${path}?submission_id=${selectedSubmissionId}`;
 
   useEffect(() => {
     let active = true;
@@ -343,6 +380,10 @@ export function InstanceDetailDialog({
       onChanged();
       if (action === 'reject') {
         onClose();
+        return;
+      }
+      if (action === 'manual' && selectedSubmissionId !== undefined) {
+        setSelectedSubmissionId(undefined);
         return;
       }
       try {
@@ -533,14 +574,18 @@ export function InstanceDetailDialog({
 
             {/* 2. 提交内容与附件下载 (/api/admin/uploads/{ref}) */}
             <div className="space-y-2.5">
-              <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
-                <Paperclip className="w-3.5 h-3.5 text-blue-600" />
-                <span>
-                  {detailData.instance.kind === 'notice'
-                    ? '提醒任务下发内容与附件'
-                    : '员工上传内容与附件凭证'}
-                </span>
-              </h4>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                  <Paperclip className="w-3.5 h-3.5 text-blue-600" />
+                  <span>{detailData.instance.kind === 'notice' ? '提醒任务下发内容与附件' : '提交内容与凭证'}</span>
+                </h4>
+                {canMarkSubmitted && !manualSubmissionOpen && (
+                  <button type="button" onClick={() => setManualSubmissionOpen(true)}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-3 py-2 font-semibold text-blue-700 hover:bg-blue-100">
+                    <Check className="h-3.5 w-3.5" /> 标记{detailData.instance.need_review ? '已提交' : '已完成'}
+                  </button>
+                )}
+              </div>
 
               {!detailData.submission ? (
                 <div className="p-6 rounded-xl bg-slate-50 border border-slate-200/70 text-center text-slate-400">
@@ -704,6 +749,42 @@ export function InstanceDetailDialog({
               )}
             </div>
 
+            {canMarkSubmitted && manualSubmissionOpen && (
+              <ManualSubmissionForm detail={detailData} busy={manualSubmissionBusy}
+                onCancel={() => setManualSubmissionOpen(false)} onConfirm={(body) => void save('manual', body)} />
+            )}
+
+            {detailData.instance.kind !== 'notice' && !!detailData.submissions?.length && (
+              <section className="space-y-2.5">
+                <h4 className="font-bold text-slate-900">提交记录（{detailData.submissions.length}）</h4>
+                <div className="overflow-x-auto rounded-xl border border-slate-200">
+                  <table className="w-full whitespace-nowrap text-left text-xs">
+                    <thead className="bg-slate-50 text-slate-600">
+                      <tr><th className="px-3 py-2">提交时间</th><th className="px-3 py-2">提交方式</th><th className="px-3 py-2">执行状态</th><th className="px-3 py-2">内容</th></tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {[...detailData.submissions].reverse().map((record) => {
+                        const current = record.id === detailData.submission?.id;
+                        const status = getInstanceStatusMeta({ ...detailData.instance, status: record.status });
+                        return (
+                          <tr key={record.id}>
+                            <td className="px-3 py-2 tabular-nums text-slate-600">{record.created_at}</td>
+                            <td className="px-3 py-2">{record.source === 'admin'
+                              ? <span className="rounded-md bg-blue-50 px-2 py-1 font-semibold text-blue-700">管理员代交</span>
+                              : '员工自交'}</td>
+                            <td className="px-3 py-2">{status.label}</td>
+                            <td className="px-3 py-2">{current ? <span className="text-slate-500">正在查看</span>
+                              : <button type="button" disabled={manualSubmissionBusy || manualSubmissionOpen}
+                                onClick={() => setSelectedSubmissionId(record.id)} className="font-semibold text-blue-700 hover:underline disabled:opacity-50">查看</button>}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+
             {/* 3. 提醒发送记录 */}
             <div className="space-y-2.5">
               <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
@@ -758,15 +839,6 @@ export function InstanceDetailDialog({
               )}
             </div>
 
-            {canMarkSubmitted && manualSubmissionOpen && (
-              <ManualSubmissionForm
-                detail={detailData}
-                busy={manualSubmissionBusy}
-                onCancel={() => setManualSubmissionOpen(false)}
-                onConfirm={(body) => void save('manual', body)}
-              />
-            )}
-
             {/* 弹窗底部：仅分级管理员可审核通过/驳回；超管只读查看 */}
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -779,15 +851,6 @@ export function InstanceDetailDialog({
                   )
                 ) : (
                   <>
-                    {canMarkSubmitted && !manualSubmissionOpen && (
-                      <button
-                        type="button"
-                        onClick={() => setManualSubmissionOpen(true)}
-                        className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-4 py-2 font-semibold text-blue-700 hover:bg-blue-100"
-                      >
-                        <Check className="w-3.5 h-3.5" /> 标记{detailData.instance.need_review ? '已提交' : '已完成'}
-                      </button>
-                    )}
                     {detailData.instance.kind !== 'notice' &&
                       detailData.instance.need_review === true &&
                       detailData.instance.status === 'submitted' && (
