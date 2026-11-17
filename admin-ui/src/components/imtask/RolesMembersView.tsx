@@ -16,11 +16,11 @@ import {
   ShieldCheck,
   Search,
   Building2,
-  ChevronRight,
   RefreshCw,
   Loader2,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { DepartmentTree, type DeptTreeNode } from './DepartmentTree';
 import { AdminScopeHeader } from './AdminScopeHeader';
 import { OrgPickerModal } from './OrgPickerModal';
 import { useAppStore } from '../../lib/store';
@@ -82,13 +82,6 @@ function parseCsvRows(csvText: string): {
   return { rows, errors };
 }
 
-/* 2026-11-12 A3：部门分级树节点（GET /api/admin/dept-tree，超管视图） */
-interface DeptTreeNode {
-  name: string;
-  path: string;
-  count: number;
-  children: DeptTreeNode[];
-}
 import {
   GlobalActivatedMemberItem,
   RoleItem,
@@ -190,7 +183,6 @@ export const RolesMembersView: React.FC = () => {
   const [deptModalOpen, setDeptModalOpen] = useState(false);
   const [deptTree, setDeptTree] = useState<DeptTreeNode[]>([]);
   const [deptTreeLoading, setDeptTreeLoading] = useState(false);
-  const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
   const [syncingDirectory, setSyncingDirectory] = useState(false);
   const [memberStatusPending, setMemberStatusPending] = useState<string | null>(null);
 
@@ -893,39 +885,7 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  const renderDeptTreeNodes = (nodes: DeptTreeNode[]): React.ReactNode => nodes.map((node) => {
-    const hasChildren = node.children.length > 0;
-    const expanded = expandedDepts.has(node.path);
-    const label = (
-      <>
-        {hasChildren && <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 ${expanded ? 'rotate-90' : ''}`} />}
-        <Building2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-blue-500" />
-        <span className="min-w-0 flex-1 break-words" title={node.path}>{node.name}</span>
-        <span className="shrink-0 text-slate-500 tabular-nums">{node.count} 人</span>
-      </>
-    );
-    const rowClass = 'flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs';
-    return (
-      <li key={node.path}>
-        {hasChildren ? (
-          <button
-            type="button"
-            aria-expanded={expanded}
-            className={`${rowClass} hover:bg-slate-50 cursor-pointer`}
-            onClick={() => setExpandedDepts((prev) => {
-              const next = new Set(prev);
-              if (next.has(node.path)) next.delete(node.path);
-              else next.add(node.path);
-              return next;
-            })}
-          >
-            {label}
-          </button>
-        ) : <div className={rowClass}>{label}</div>}
-        {expanded && hasChildren && <ul className="ml-4 border-l border-slate-100 pl-2">{renderDeptTreeNodes(node.children)}</ul>}
-      </li>
-    );
-  });
+
 
   return (
     <div className="space-y-5">
@@ -958,7 +918,6 @@ export const RolesMembersView: React.FC = () => {
               <button
                 type="button"
                 onClick={() => {
-                  setExpandedDepts(new Set());
                   setDeptTree([]);
                   setDeptModalOpen(true);
                   void loadDeptTree();
@@ -1514,7 +1473,7 @@ export const RolesMembersView: React.FC = () => {
             </div>
             <div className="mt-3 max-h-[60vh] overflow-y-auto">
               {deptTreeLoading ? <p role="status" className="text-xs text-slate-500">正在加载部门架构…</p>
-                : deptTree.length ? <ul>{renderDeptTreeNodes(deptTree)}</ul>
+                : deptTree.length ? <DepartmentTree nodes={deptTree} />
                 : <p className="text-xs text-slate-500">当前名册暂无部门数据</p>}
             </div>
           </section>

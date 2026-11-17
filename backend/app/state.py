@@ -4881,6 +4881,21 @@ class StateStore:
     }
     STATS_PANEL_NO_DEPT = "未分配部门"
 
+    @staticmethod
+    def stats_panel_period(template: Dict[str, Any]) -> str:
+        if template.get("is_adhoc"):
+            return "day"
+        period = template.get("period")
+        if period in ("week", "month"):
+            return period
+        if template.get("exec_dom_days"):
+            return "month"
+        deadline_period = {"weekend": "week", "month_end": "month"}.get(template.get("deadline_type"))
+        if template.get("has_deadline") and deadline_period:
+            return deadline_period
+        weekdays = template.get("exec_weekdays") or []
+        return "week" if 0 < len(weekdays) < 7 else "day"
+
     def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
         """面板模板定位 + 归属校验（404 / 非上传任务 / 跨属主 403）。
 
@@ -4964,24 +4979,21 @@ class StateStore:
         return list(best.values())
 
 
-    def _stats_dept_exists_sql(self, role_ids: List[str], dept_path: str,
-                               phone_expr: str = "i.phone") -> tuple:
-        """部门过滤 EXISTS 片段（DB 层）：命中模板角色且 dept_path 在选中子树内。
-
-        返回 (sql, params)；dept_path 为空 = 全部覆盖部门 → 不加过滤 ("", [])。
-        """
-        roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
-        if not roles:
-            return "1=0", []
+    def _stats_dept_filter_sql(self, dept_map: Dict[str, str], dept_path: str) -> tuple:
+        """按看板的名册归属筛选，未分配部门包含没有名册路径的历史实例。"""
         clean = str(dept_path or "").strip().strip("/")
         if not clean:
             return "", []
-        ph = ",".join("?" for _ in roles)
-        like = self._stats_like_escape(clean) + "/%"
-        sql = (f"EXISTS (SELECT 1 FROM member sm WHERE sm.phone = {phone_expr} "
-               f"AND sm.role_id IN ({ph}) AND sm.dept_path IS NOT NULL "
-               f"AND sm.dept_path <> '' AND (sm.dept_path = ? OR sm.dept_path LIKE ?))")
-        return sql, [*roles, clean, like]
+        unassigned = clean == self.STATS_PANEL_NO_DEPT
+        phones = [phone for phone, path in dept_map.items() if (
+            (path and path != self.STATS_PANEL_NO_DEPT) if unassigned
+            else (path == clean or path.startswith(clean + "/"))
+        )]
+        if not phones:
+            return ("", []) if unassigned else ("1=0", [])
+        ph = ",".join("?" for _ in phones)
+        op = "NOT IN" if unassigned else "IN"
+        return f"i.phone {op} ({ph})", phones
 
     def _stats_member_dept_map(self, role_ids: List[str]) -> Dict[str, str]:
         """模板角色名册 → {手机号: 完整部门路径}。
@@ -4991,9 +5003,9 @@ class StateStore:
         实例/名册的真实部门，停用成员的历史实例同样要能归到部门）。
         """
         roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
-        out: Dict[str, str] = {}
+        out: Dict[str, tuple[int, str]] = {}
         if not roles:
-            return out
+            return {}
         order = {r: idx for idx, r in enumerate(roles)}
         ph = ",".join("?" for _ in roles)
         rows = self.conn.execute(
@@ -5003,12 +5015,12 @@ class StateStore:
             phone = str(r["phone"] or "").strip()
             if not phone:
                 continue
-            path = str(r["dept_path"] or "").strip()
+            path = "/".join(seg.strip() for seg in str(r["dept_path"] or "").split("/") if seg.strip())
             cur = out.get(phone)
             cand_prio = order.get(str(r["role_id"]), 999)
             if cur is None or cand_prio < cur[0]:
-                out[phone] = path
-        return out
+                out[phone] = (cand_prio, path)
+        return {phone: path for phone, (_, path) in out.items()}
 
     @classmethod
     def _stats_phone_path(cls, phone: str, dept_map: Dict[str, str]) -> str:
@@ -5075,7 +5087,7 @@ class StateStore:
             day_start = f"{date_str} 00:00:00"
             day_end = f"{date_str} 23:59:59"
             tree = self._stats_dept_tree({p: self._stats_phone_path(p, dept_map) for p in dept_map})
-            ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, sel, phone_expr="i.phone")
+            ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
             ex_and = f" AND {ex_sql}" if ex_sql else ""
             base = "FROM submission s JOIN task_instance i ON i.id = s.instance_id WHERE i.template_id = ?"
             base_params: List[Any] = [tpl["template_id"]]
@@ -5242,42 +5254,67 @@ class StateStore:
         if ids:
             ph = ",".join("?" for _ in ids)
             subs = self.conn.execute(
-                f"SELECT instance_id, fields_json, note FROM submission WHERE instance_id IN ({ph}) ORDER BY id ASC",
+                f"SELECT instance_id, fields_json, note, refs_json, file_ref FROM submission "
+                f"WHERE instance_id IN ({ph}) ORDER BY id ASC",
                 tuple(ids)).fetchall()
             for s in subs:
-                previews[int(s["instance_id"])] = {"fields_json": s["fields_json"], "note": s["note"]}
+                previews[int(s["instance_id"])] = dict(s)
+        content = self._stats_submission_contents(previews.values(), tpl.get("schema_json") or [])
         items: List[Dict[str, Any]] = []
         for r in page_rows:
             phone = str(r["phone"])
-            preview = self._stats_submission_preview(previews.get(int(r["id"])), tpl_meta_fields=tpl.get("schema_json") or [])
+            submitted = content.get(int(r["id"]))
             items.append({
                 "id": int(r["id"]), "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
                 "dept_path": r.get("dept_path") or "",
                 "status": str(r["status"]), "submitted_at": r["submitted_at"],
                 "late_submit": bool(r.get("late_submit")),
-                "preview": preview,
+                "preview": self._stats_submission_preview(submitted), "content": submitted,
             })
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 
-    @classmethod
-    def _stats_submission_preview(cls, sub: Optional[Dict[str, Any]],
-                                  tpl_meta_fields: List[Dict[str, Any]]) -> str:
-        """内容预览：按模板字段顺序取首个非空值，退回补充说明；整体截断 40 字。"""
-        if not sub:
-            return ""
+    @staticmethod
+    def submission_refs(sub: Dict[str, Any]) -> List[str]:
         try:
-            fields = json.loads(str(sub.get("fields_json") or "") or "{}") or {}
-        except Exception:  # noqa: BLE001
-            fields = {}
-        for f in tpl_meta_fields:
-            key = str((f or {}).get("key") or "")
-            if key and str(fields.get(key) or "").strip():
-                return str(fields[key]).strip()[:40]
-        for v in fields.values():
-            if str(v or "").strip():
-                return str(v).strip()[:40]
-        note = str(sub.get("note") or "").strip()
-        return note[:40]
+            refs = json.loads(sub.get("refs_json") or "[]")
+        except (TypeError, ValueError):
+            refs = []
+        if isinstance(refs, list) and refs:
+            return list(dict.fromkeys(str(ref) for ref in refs if ref))
+        return [str(sub["file_ref"])] if sub.get("file_ref") else []
+
+    def _stats_submission_contents(self, submissions, schema: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        labels = {str(f["key"]): str(f.get("label") or f["key"]) for f in schema if isinstance(f, dict) and f.get("key")}
+        by_id = {int(s.get("submission_id") or s["instance_id"]): s for s in submissions}
+        refs_by_id = {sid: self.submission_refs(s) for sid, s in by_id.items()}
+        refs = sorted({ref for group in refs_by_id.values() for ref in group})
+        attachments: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(refs), 900):
+            batch = refs[start:start + 900]
+            ph = ",".join("?" for _ in batch)
+            for row in self.conn.execute(f"SELECT ref, file_name, mime FROM upload_ref WHERE ref IN ({ph})", tuple(batch)).fetchall():
+                ref = row["ref"]
+                attachments[ref] = {
+                    "ref": ref, "file_name": row["file_name"] or ref,
+                    "is_image": str(row["mime"] or "").startswith("image/"), "url": f"/api/admin/uploads/{ref}",
+                }
+        content = {}
+        for sid, sub in by_id.items():
+            values = self._parse_fields_json(sub.get("fields_json"))
+            content[sid] = {
+                "fields": [{"key": k, "label": labels.get(k, k), "value": str(values[k])}
+                           for k in dict.fromkeys([*labels, *values]) if values.get(k) is not None and str(values[k]).strip()],
+                "note": str(sub.get("note") or "").strip(),
+                "attachments": [attachments[ref] for ref in refs_by_id[sid] if ref in attachments],
+            }
+        return content
+
+    @staticmethod
+    def _stats_submission_preview(content: Optional[Dict[str, Any]]) -> str:
+        if not content:
+            return ""
+        fields = content["fields"]
+        return (fields[0]["value"] if fields else content["note"])[:40]
 
     def stats_panel_submissions_day(self, template_id: str, date_str: str, owner_id: int, *,
                                     dept_path: str = "", q: str = "",
@@ -5291,13 +5328,14 @@ class StateStore:
         where = ["i.template_id = ?",
                  "s.created_at >= ?", "s.created_at <= ?"]
         params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
-        ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, dept_path, "i.phone")
+        dept_map = self._stats_member_dept_map(role_ids)
+        ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, dept_path)
         if ex_sql:
             where.append(ex_sql)
             params += ex_params
         kw = str(q or "").strip()
         if kw:
-            like = f"%{kw}%"
+            like = f"%{self._stats_like_escape(kw)}%"
             where.append("(i.name_snap LIKE ? OR i.phone LIKE ?)")
             params += [like, like]
         where_sql = "WHERE " + " AND ".join(where)
@@ -5308,12 +5346,12 @@ class StateStore:
                 f"SELECT COUNT(1) AS cnt FROM submission s JOIN task_instance i ON i.id = s.instance_id {where_sql}",
                 tuple(params)).fetchone()["cnt"] or 0)
             rows = self.conn.execute(
-                f"SELECT s.id AS submission_id, s.instance_id, s.fields_json, s.note, s.created_at, "
-                f"i.phone, i.name_snap, i.dept_snap, i.status AS instance_status "
+                f"SELECT s.id AS submission_id, s.instance_id, s.fields_json, s.note, s.refs_json, s.file_ref, s.created_at, "
+                f"i.phone, i.name_snap, i.dept_snap, i.status AS instance_status, s.status AS status "
                 f"FROM submission s JOIN task_instance i ON i.id = s.instance_id {where_sql} "
                 f"ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?",
                 tuple(params + [p_size, offset])).fetchall()
-        dept_map = self._stats_member_dept_map(role_ids)
+        content = self._stats_submission_contents((dict(r) for r in rows), tpl.get("schema_json") or [])
         items: List[Dict[str, Any]] = []
         for r in rows:
             phone = str(r["phone"])
@@ -5321,10 +5359,9 @@ class StateStore:
                 "submission_id": int(r["submission_id"]), "instance_id": int(r["instance_id"]),
                 "phone": phone, "name": r["name_snap"], "dept_snap": r["dept_snap"] or "",
                 "dept_path": self._stats_phone_path(phone, dept_map),
-                "submitted_at": r["created_at"], "instance_status": str(r["instance_status"]),
-                "preview": self._stats_submission_preview(
-                    {"fields_json": r["fields_json"], "note": r["note"]},
-                    tpl.get("schema_json") or []),
+                "submitted_at": r["created_at"], "instance_status": str(r["instance_status"]), "status": str(r["status"]),
+                "preview": self._stats_submission_preview(content[int(r["submission_id"])]),
+                "content": content[int(r["submission_id"])],
             })
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 
@@ -5353,7 +5390,7 @@ class StateStore:
             params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
             rows = self.conn.execute(
                 "SELECT i.id AS instance_id, s.fields_json, s.note, s.created_at AS submitted_at, "
-                "i.phone, i.name_snap, i.status AS status, i.dept_snap "
+                "i.phone, i.name_snap, s.status AS status, i.dept_snap "
                 "FROM submission s JOIN task_instance i ON i.id = s.instance_id "
                 "WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at DESC, s.id DESC",
                 tuple(params)).fetchall()
@@ -5372,7 +5409,7 @@ class StateStore:
         else:
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-            ex_sql, ex_params = self._stats_dept_exists_sql(role_ids, sel, "i.phone")
+            ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
             per_sql, per_params = self._stats_period_where(period_key.strip())
             where = ["i.template_id = ?", per_sql, "i.status != 'cancelled'"]
             params: List[Any] = [tpl["template_id"], *per_params]

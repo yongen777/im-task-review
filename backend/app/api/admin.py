@@ -10,7 +10,9 @@ import hmac
 import io
 import json
 import logging
+import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -36,6 +38,7 @@ from ..channel_config import (
     validate_payload,
 )
 from ..config import format_dt
+from ..scheduler import period_key
 from ..state import (
     SESSION_TTL_HOURS,
     BizError,
@@ -107,10 +110,21 @@ def _platform_allowed(admin: Dict[str, Any], platform: Optional[str]) -> bool:
 def _stats_export_escape(v: Any) -> Any:
     """Excel 公式注入防御（2026-11-16 统计面板导出）：
     = + - @ 开头的文本前置单引号（Excel 文本约定，打开不执行公式）。"""
-    s = "" if v is None else str(v)
+    s = "" if v is None else re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", str(v))
     if s and s[0] in ("=", "+", "-", "@"):
         return "'" + s
     return s
+
+
+def _stats_export_field(value: Any, field_type: str) -> Any:
+    if field_type == "number" and value is not None and not isinstance(value, bool):
+        try:
+            number = float(value)
+            if math.isfinite(number) and abs(number) < 10**15:
+                return number
+        except (ValueError, TypeError, OverflowError):
+            pass
+    return _stats_export_escape(value)
 
 
 def _check_path_ownership(state: StateStore, admin: Dict[str, Any], path: str) -> Optional[JSONResponse]:
@@ -2135,7 +2149,7 @@ def create_admin_router(
         }
 
     @router.get("/instances/{instance_id}")
-    async def get_instance_detail(instance_id: int, request: Request):
+    async def get_instance_detail(instance_id: int, request: Request, submission_id: Optional[int] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
@@ -2152,6 +2166,8 @@ def create_admin_router(
         _tpl = tpl or {}
         _role_ids = _tpl.get("role_ids") or []
         inst["kind"] = _tpl.get("kind") or "form"
+        inst["template_name"] = _tpl.get("name") or inst["template_id"]
+        inst["period"] = _tpl.get("period")
         inst["need_review"] = bool(_tpl.get("need_review"))
         inst["role_id"] = _role_ids[0] if _role_ids else ""
         inst["role_ids"] = list(_role_ids)
@@ -2172,20 +2188,17 @@ def create_admin_router(
         # 2026-10-28：详情页要能直接看到「字段 / 文字说明 / 图片 / 文件」，
         # 前端只需要一份归一化的 submission（含每个附件的文件名、类型、能否预览）。
         latest = submissions[-1] if submissions else None
+        if submission_id is not None:
+            latest = next((s for s in submissions if s["id"] == submission_id), None)
+            if latest is None:
+                return error_response(404, "NOT_FOUND", "上报记录不存在")
         submission_view = None
         if latest:
             try:
                 form_values = json.loads(latest.get("fields_json") or "{}") or {}
             except Exception:
                 form_values = {}
-            refs: List[str] = []
-            if latest.get("refs_json"):
-                try:
-                    refs = [str(r) for r in (json.loads(latest["refs_json"]) or [])]
-                except Exception:
-                    refs = []
-            if not refs and latest.get("file_ref"):
-                refs = [str(latest["file_ref"])]
+            refs = state.submission_refs(latest)
             attachments: List[Dict[str, Any]] = []
             fields_meta: List[Dict[str, Any]] = []
             for r in refs:
@@ -2699,9 +2712,12 @@ def create_admin_router(
             for t in res["items"]:
                 if str(t.get("kind") or "") == "notice":
                     continue
+                stats_period = state.stats_panel_period(t)
                 items.append({
                     "template_id": t["template_id"], "name": t["name"],
                     "kind": t.get("kind"), "period": t.get("period"),
+                    "statistics_period": stats_period,
+                    "current_period_key": period_key(stats_period, state.now()),
                     "is_adhoc": bool(t.get("is_adhoc")),
                     "remind_at": t.get("remind_at"),
                     "anchor_weekday": t.get("anchor_weekday"),
@@ -2832,7 +2848,7 @@ def create_admin_router(
         ws = wb.active
         ws.title = "统计数据"
         # 表头（无合并单元格；冻结首行；全列 AutoFilter）
-        ws.append(headers)
+        ws.append([_stats_export_escape(header) for header in headers])
         for c in range(1, len(headers) + 1):
             cell = ws.cell(row=1, column=c)
             cell.font = Font(bold=True)
@@ -2847,13 +2863,13 @@ def create_admin_router(
                 idx,
                 _stats_export_escape(r.get("name")),
                 _stats_export_escape(r.get("phone")),
-                _stats_export_escape(r.get("dept_snap") or (str(r.get("dept_path") or "").split("/")[-1])),
+                _stats_export_escape(str(r.get("dept_path") or "").rsplit("/", 1)[-1]),
                 _stats_export_escape(r.get("dept_path")),
                 status_cn.get(str(r.get("status") or ""), str(r.get("status") or "")),
                 (str(r.get("submitted_at") or "")[:16] if r.get("submitted_at") else ""),
             ]
             for f in content_fields:
-                values.append(_stats_export_escape(r.get("fields", {}).get(str(f.get("key")))))
+                values.append(_stats_export_field(r.get("fields", {}).get(str(f.get("key"))), f.get("type")))
             if has_note:
                 values.append(_stats_export_escape(r.get("note")))
             ws.append(values)

@@ -382,6 +382,22 @@ def test_adhoc_overview_trend_and_day_list() -> None:
         assert ovf["kpis"]["day_unique"] == 1 and ovf["kpis"]["total_unique"] == 1, ovf["kpis"]
         lstf = _q(sa1, f"stats-panel/submissions-day?template_id={tpl}&date={PK_DAY}&dept_path={PATH_BEN}").json()
         assert lstf["total"] == 2
+        export = _q(sa1, f"stats-panel/export?template_id={tpl}&period_key={PK_DAY}&dept_path={PATH_BEN}")
+        assert export.status_code == 200
+        ws = load_workbook(io.BytesIO(export.content)).active
+        assert [r[6] for r in ws.iter_rows(min_row=2, values_only=True)] == ["2026-11-16 10:30", "2026-11-16 09:00"]
+        older = lst["items"][-1]
+        with store.conn:
+            store.conn.execute(
+                "INSERT INTO submission(instance_id, note, source, status, created_at) "
+                "VALUES (?, '新一次上报', 'user', 'submitted', '2026-11-17 09:00:00')",
+                (older["instance_id"],),
+            )
+        detail = _q(sa1, f"instances/{older['instance_id']}?submission_id={older['submission_id']}")
+        assert detail.status_code == 200
+        assert detail.json()["submission"]["note"] == "x"
+        assert detail.json()["instance"]["template_name"] == "随手报"
+        assert _q(sa1, f"instances/{older['instance_id']}?submission_id={lst['items'][0]['submission_id']}").status_code == 404
         # 智能周期元数据：is_adhoc 任务在清单里可被判别
         items = sa1.get("/api/admin/stats-panel/tasks").json()["items"]
         assert any(it["template_id"] == tpl and it["is_adhoc"] for it in items)
@@ -425,7 +441,7 @@ def test_export_xlsx_full_contract() -> None:
         assert g(rows["张三"], 5) == PATH_CS
         assert g(rows["赵六"], 5) == "未分配部门" and (g(rows["赵六"], 4) or "未分配部门") == "未分配部门"
         # 动态内容列 + 补充说明；公式注入转义（- / = 前置单引号）
-        assert str(g(rows["张三"], 8)) == "42" and g(rows["张三"], 10) == "第一条说明"
+        assert g(rows["张三"], 8) == 42 and g(rows["张三"], 10) == "第一条说明"
         assert g(rows["李四"], 9) == "'-3" and g(rows["李四"], 10) == "'=SUM(A1:A2)", (g(rows["李四"], 9), g(rows["李四"], 10))
         # 附件列绝不出现（headers 已断言）；驳回/逾期行无内容值
         assert (g(rows["赵六"], 8) or "") == ""
@@ -442,6 +458,55 @@ def test_export_xlsx_full_contract() -> None:
 
 
 # ── ⑥ 前端静态契约（无浏览器环境下守住关键交互红线）───────────────
+
+def test_task_picker_uses_execution_cycle_before_deadline() -> None:
+    ctx = _seed_main("cycle")
+    try:
+        sa, rid = ctx["sa1"], ctx["rid"]
+        monthly = _mk_form_tpl(sa, rid, "每月上报", exec_dom_days=[16], has_deadline=False)
+        weekly = _mk_form_tpl(sa, rid, "每周上报", exec_weekdays=[1])
+        legacy = _mk_form_tpl(sa, rid, "原生月任务", period="month")
+        deadline = _mk_form_tpl(sa, rid, "按月收集", deadline_type="month_end")
+        adhoc = _mk_form_tpl(sa, rid, "随时上报", is_adhoc=True)
+        items = {r["template_id"]: r for r in _q(sa, "stats-panel/tasks").json()["items"]}
+        for tid, mode, key in (
+            (monthly, "month", "2026-11"), (weekly, "week", "2026-W47"),
+            (legacy, "month", "2026-11"), (deadline, "month", "2026-11"),
+            (adhoc, "day", PK_DAY), (ctx["tpl_id"], "day", PK_DAY),
+        ):
+            assert (items[tid]["statistics_period"], items[tid]["current_period_key"]) == (mode, key)
+    finally:
+        ctx["store"].close()
+
+
+def test_submission_content_and_unassigned_department_export_match() -> None:
+    ctx = _seed_main("content")
+    try:
+        store, sa, tid = ctx["store"], ctx["sa1"], ctx["tpl_id"]
+        inst = store.get_instance_by_key(tid, P_ZS, PK_DAY)
+        for ref, name, mime in (("image-ref", "凭证.png", "image/png"), ("file-ref", "清单.pdf", "application/pdf")):
+            store.create_upload_ref(ref=ref, phone=P_ZS, template_id=tid, file_name=name, mime=mime, size=10, rel_path=name)
+        with store.conn:
+            store.conn.execute(
+                "UPDATE submission SET fields_json = ?, refs_json = ? WHERE instance_id = ?",
+                ('{"qty": 0}', '["image-ref", "file-ref"]', inst["id"]),
+            )
+        base = f"template_id={tid}&period_key={PK_DAY}"
+        row = _q(sa, f"stats-panel/instances?{base}&q={P_ZS}").json()["items"][0]
+        assert row["content"]["fields"] == [{"key": "qty", "label": "数量", "value": "0"}]
+        assert row["content"]["note"] == "第一条说明"
+        assert [(a["file_name"], a["is_image"]) for a in row["content"]["attachments"]] == [
+            ("凭证.png", True), ("清单.pdf", False),
+        ]
+        scoped = f"{base}&dept_path=未分配部门"
+        rows = _q(sa, f"stats-panel/instances?{scoped}").json()["items"]
+        result = _q(sa, f"stats-panel/export?{scoped}")
+        assert result.status_code == 200
+        ws = load_workbook(io.BytesIO(result.content)).active
+        assert [r[1] for r in ws.iter_rows(min_row=2, values_only=True)] == [r["name"] for r in rows] == ["赵六"]
+    finally:
+        ctx["store"].close()
+
 
 def test_frontend_static_contract() -> None:
     root = Path(__file__).resolve().parents[1].parent / "im-task-admin"

@@ -318,8 +318,10 @@ def test_frontend_directory_tree_and_read_only_profile_contract():
     if not ui.exists():
         pytest.skip("此环境没有前端工作区")
     source = ui.read_text(encoding="utf-8")
-    assert "部门架构" in source and "setExpandedDepts(new Set())" in source
-    assert "aria-expanded={expanded}" in source and "expanded && hasChildren" in source
+    tree = ui.with_name("DepartmentTree.tsx").read_text(encoding="utf-8")
+    assert "部门架构" in source and "deptModalOpen &&" in source and "<DepartmentTree nodes={deptTree}" in source
+    assert "useState(() => new Set(" in tree
+    assert "aria-expanded={isExpanded}" in tree and "isExpanded && hasChildren" in tree
     assert "同步最新部门" in source and "已移出通讯录（疑似离职）" in source
     assert "停用派单" in source and "恢复派单" in source and "加入其他角色" in source and "批量移除" in source
     assert "加入部门选项" not in source and "新建下级" not in source
