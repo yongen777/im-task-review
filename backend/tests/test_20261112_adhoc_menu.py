@@ -357,38 +357,22 @@ def test_adhoc_number_cooldown_blocks_repeat_issuance() -> None:
 # ════════════════════ 四：角色删除引用校验加固 ════════════════════
 
 def test_role_delete_reference_hardening() -> None:
-    """role_ids 脏数据（逗号/混杂格式）一律被识别为引用 → 409 拦截，杜绝漏判误删。"""
+    """删除角色时规范化历史引用，并保留模板和其他完整角色 ID。"""
     store = _store()
     try:
         rid = _seed_zdxlx(store)
-        # 正常 JSON 数组引用 → 409
         _adhoc_tpl(store, rid, "正常引用")
-        try:
-            store.delete_role(rid, actor="t")
-            raise AssertionError("被 JSON 数组引用的角色必须 409")
-        except BizError as exc:
-            assert (exc.status_code, exc.code) == (409, "ROLE_IN_USE"), exc
-            assert "请先删除相关任务模板" in exc.message, exc.message
-        store.delete_template([t for t in store.list_templates()["items"] if t["is_adhoc"]][0]["template_id"], actor="t")
-
-        # 脏数据：逗号分隔（非 JSON）→ 旧实现 json.loads 失败置空导致漏删，新实现必须 409
         with store.lock, store.conn:
             store.conn.execute(
                 "INSERT INTO task_template(template_id, name, kind, role_ids, text_tpl, period, created_by, created_at, updated_at, owner_id) "
                 "VALUES ('t_dirty', '脏数据模板', 'form', ?, 'x', 'day', 't', '2026-11-12 19:00:00', '2026-11-12 19:00:00', 1)",
-                (f"{rid},r_other,",),
+                (f"{rid},r_abc123,{rid}ff,",),
             )
-        try:
-            store.delete_role(rid, actor="t")
-            raise AssertionError("逗号分隔脏引用必须 409 拦截")
-        except BizError as exc:
-            assert (exc.status_code, exc.code) == (409, "ROLE_IN_USE"), exc
-        with store.lock, store.conn:
-            store.conn.execute("DELETE FROM task_template WHERE template_id = 't_dirty'")
-
-        # 无引用 → 删除成功（放行路径不回归）
         res = store.delete_role(rid, actor="t")
         assert res["ok"] is True and res["deleted_members"] == 1, res
+        templates = {t["name"]: t["role_ids"] for t in store.list_templates()["items"]}
+        assert templates["脏数据模板"] == ["r_abc123", f"{rid}ff"]
+        assert templates["正常引用"] == []
     finally:
         store.close()
 

@@ -784,10 +784,6 @@ export const TemplatesView: React.FC = () => {
       toast.warning('请填写任务模板名称');
       return;
     }
-    if (roleIds.length === 0) {
-      toast.warning('请至少选择 1 个所属业务角色');
-      return;
-    }
     if (!isAdhoc && !remindAt.trim()) {
       toast.warning('请填写执行时间');
       return;
@@ -1563,7 +1559,7 @@ export const TemplatesView: React.FC = () => {
                           <span>所属业务角色（支持多选）</span>
                           <span className="text-rose-500">*</span>
                           <span className="px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-bold">
-                            已选 {roleIds.length} / {roles.length} 个角色
+                            {roleIds.length ? `已选 ${roleIds.length} / ${roles.length} 个角色` : '未绑定角色，保存后暂不派发'}
                           </span>
                         </label>
                         <div className="flex items-center gap-1.5">

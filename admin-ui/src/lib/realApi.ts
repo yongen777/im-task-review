@@ -97,9 +97,9 @@ function roleToMock(r: any): RoleItem {
     role_id: r.role_id,
     role_name: r.name,
     description: r.note || '',
-    member_count: 0,
-    active_count: 0,
-    activated_count: 0,
+    member_count: Number(r.member_count || 0),
+    active_count: Number(r.active_count || 0),
+    activated_count: Number(r.activated_count || 0),
     created_at: r.created_at || '',
     /* 2026-11-05：创建人字段链路补齐 —— 后端早已返回，此前白名单映射把它丢了，
        导致超管视角「创建人」标签永不显示（组件侧条件恒 false）。 */
@@ -107,27 +107,6 @@ function roleToMock(r: any): RoleItem {
     owner_username: r.owner_username || '',
     owner_display_name: r.owner_display_name || '',
   };
-}
-
-async function fillRoleCounts(items: RoleItem[], platform: string): Promise<RoleItem[]> {
-  const filled = await Promise.all(
-    items.map(async (role) => {
-      try {
-        const res = await rawFetch<{ items?: any[] }>(
-          'GET',
-          `/api/admin/roles/${encodeURIComponent(role.role_id)}/members?size=200${platform ? `&platform=${encodeURIComponent(platform)}` : ''}`,
-        );
-        const members = res.items || [];
-        role.member_count = members.length;
-        role.active_count = members.filter((m) => m.enabled !== false).length;
-        role.activated_count = members.filter((m) => m.activated).length;
-      } catch {
-        /* 计数失败不阻塞列表展示 */
-      }
-      return role;
-    }),
-  );
-  return filled;
 }
 
 function memberToMock(m: any): RoleMemberItem {
@@ -138,6 +117,7 @@ function memberToMock(m: any): RoleMemberItem {
     status: m.enabled !== false ? 'active' : 'disabled',
     activation: m.activated ? 'activated' : 'pending',
     activations: m.activations,
+    is_left_org: Boolean(m.is_left_org),
     usable: m.usable,
     external_id: m.external_id,
     activated_at: m.activated_at,
@@ -261,7 +241,7 @@ function tplFromMock(t: any, partial = false) {
        （原来会把「当日数据看板（到点自动生成并推送）」这类描述写进消息）。 */
     attach = t.spec.notice_items.some((x: any) => x.format === 'file' && !!x.image_path);
   }
-  const roleIds = Array.isArray(t.role_ids) && t.role_ids.length ? t.role_ids : t.role_id ? [t.role_id] : [];
+  const roleIds = Array.isArray(t.role_ids) ? t.role_ids : t.role_id ? [t.role_id] : [];
   const out: Record<string, unknown> = {};
 
   /* spec → spec_json / schema_json（仅上传类使用；通知类的 spec 只是 notice_items 的回显载体） */
@@ -285,7 +265,7 @@ function tplFromMock(t: any, partial = false) {
 
   if (partial) {
     if (t.name !== undefined) out.name = t.name;
-    if (roleIds.length) out.role_ids = roleIds;
+    if (Array.isArray(t.role_ids) || t.role_id !== undefined) out.role_ids = roleIds;
     if (t.kind !== undefined && t.kind !== '') out.kind = t.kind === 'upload' || t.kind === 'form' ? 'form' : t.kind;
     if (t.period !== undefined && t.period !== '') out.period = t.period;
     if (t.remind_at !== undefined) out.remind_at = String(t.remind_at || '').trim();
@@ -355,6 +335,7 @@ function remToMock(m: any): ReminderLogItem {
   return {
     id: m.id,
     instance_id: m.instance_id || 0,
+    kind: m.kind || '',
     slot: m.kind === 'notice_img' ? '看板' : m.kind || '',
     retry_no: m.retry || 0,
     planned_at: m.planned_at || '',
@@ -565,8 +546,7 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   }
   if (rawPath === '/api/admin/health') return healthToMock(d) as unknown as T;
   if (rawPath === '/api/admin/roles' && method === 'GET') {
-    const m = new URLSearchParams(queryText);
-    const items = await fillRoleCounts((d.items || []).map(roleToMock), m.get('platform') || '');
+    const items = (d.items || []).map(roleToMock);
     /* 2026-11-05：按人去重的在册人数由后端统一口径计算（一人多角色只算一次），
        替代前端把各角色人数加总的重复统计。 */
     return { ok: true, items, member_distinct_total: Number(d.member_distinct_total || 0) } as unknown as T;

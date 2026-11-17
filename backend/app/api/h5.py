@@ -477,7 +477,12 @@ def process_h5_task_upload(
     disk_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        disk_path.write_bytes(content_bytes)
+        try:
+            disk_path.write_bytes(content_bytes)
+        except FileNotFoundError:
+            # 孤儿清理可能在 mkdir 与写入之间刚好移除了空目录。
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_bytes(content_bytes)
         rec = state.create_upload_ref(
             ref=ref, phone=inst["phone"], template_id=tpl["template_id"],
             file_name=orig_name, mime=detected_mime, size=len(content_bytes), rel_path=rel_path,

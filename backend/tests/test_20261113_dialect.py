@@ -61,8 +61,10 @@ def test_rowid_and_last_insert_rowid() -> None:
 
 def test_percent_in_string_literal_escaped() -> None:
     # 方案B 补丁：pymysql 对带参 SQL 做 % 格式化，字面量里的 % 必须转义为 %%
-    out = _translate_sql("SELECT * FROM member WHERE name LIKE '%张%' AND phone = ?")
-    assert "'%%张%%'" in out and out.count("%s") == 1
+    sql = "SELECT '100%', '%%' FROM member WHERE name LIKE '%张%'"
+    assert _translate_sql(sql, has_params=False) == sql
+    out = _translate_sql(sql + " AND phone = ?", has_params=True)
+    assert out == "SELECT '100%%', '%%%%' FROM member WHERE name LIKE '%%张%%' AND phone = %s"
 
 
 def test_backtick_and_double_quote_literals() -> None:

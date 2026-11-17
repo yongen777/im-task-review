@@ -80,18 +80,13 @@ def sync_backend() -> None:
             if not (src_root / rel).is_file():
                 f.unlink()
 def git_changed() -> list[str]:
-    """评审库当前待提交清单（git status 权威；容忍 ?/! 在任一列、剔除警告行）。"""
-    out = subprocess.run(
-        ["git", "-C", str(REPO), "status", "--porcelain"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    """读取逐文件状态，保留空格、中文与改名涉及的两个路径。"""
+    result = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(REPO), "status", "--porcelain", "-z",
+         "--untracked-files=all", "--no-renames"],
+        capture_output=True, check=True,
     )
-    status = out.stdout or ""
-    changed: list[str] = []
-    for ln in status.splitlines():
-        ln = ln.rstrip("\r")
-        if len(ln) >= 4 and (ln[0] in "MARCUD?!" or ln[1] in "MARCUD?!") and ln[2] == " ":
-            changed.append(ln[3:].strip())
-    return changed
+    return [entry[3:] for entry in result.stdout.decode("utf-8").split("\0") if entry]
 
 
 def sync_frontend_ui() -> None:
@@ -178,10 +173,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--commit", help="同步后附带 git commit 的消息（push 仍手动）")
     ap.add_argument("--skip-build", action="store_true", help="跳过前端构建（产物未变时省时间）")
+    ap.add_argument("--commit-paths", nargs="+", metavar="PATH",
+                    help="限制本次提交范围；目录须以 / 结尾")
     args = ap.parse_args()
 
     if not REPO.is_dir():
         print(f"✗ 评审库不存在：{REPO}")
+        return 1
+
+    if args.commit and git_changed():
+        print("✗ 评审库已有未提交改动，请核对后再同步提交")
         return 1
 
     print("① 后端全目录同步（脱敏）…")
@@ -189,8 +190,6 @@ def main() -> int:
 
     print("② 前端源码同步…")
     sync_frontend_ui()
-
-    changed = git_changed()
 
     if not args.skip_build:
         print("③ 前端构建…")
@@ -201,6 +200,7 @@ def main() -> int:
     if not verify_static():
         return 1
 
+    changed = git_changed()
     if changed:
         print("\n将提交的文件：")
         for c in changed[:20]:
@@ -210,8 +210,17 @@ def main() -> int:
     else:
         print("\n评审库无内容变更（脱敏后与 HEAD 一致）")
 
-    if args.commit:
-        subprocess.run(["git", "-C", str(REPO), "add", "-A"], check=False)
+    if args.commit and changed:
+        outside = [
+            path for path in changed if args.commit_paths and not any(
+                path == allowed or (allowed.endswith("/") and path.startswith(allowed))
+                for allowed in args.commit_paths
+            )
+        ]
+        if outside:
+            print(f"✗ 发现本次提交范围外的改动：{outside}")
+            return 1
+        subprocess.run(["git", "--literal-pathspecs", "-C", str(REPO), "add", "--", *changed], check=True)
         r = subprocess.run(
             ["git", "-C", str(REPO), "commit", "-m", args.commit],
             capture_output=True, text=True, encoding="utf-8", errors="replace",

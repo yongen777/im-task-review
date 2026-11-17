@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,7 +100,16 @@ class ZdxlzContacts:
         # 2026-11-11 部门口径（用户拍板）：末级部门=展示用；dept_path=官方全路径（统计归集用，
         # 「云中台」要把直属与下级部门成员都卷进来，靠路径段匹配实现）
         depts = row.get("user_departments") if isinstance(row.get("user_departments"), list) else []
-        primary = depts[0] if depts and isinstance(depts[0], dict) else {}
+        keyword = os.getenv("IMT_ORG_PREFER_DEPT_KEYWORD", "中国电信德阳分公司").strip()
+        departments = [dept for dept in depts if isinstance(dept, dict)]
+        primary = max(
+            departments,
+            key=lambda dept: (
+                bool(keyword and keyword in str(dept.get("full_name") or "")),
+                dept.get("is_primary") is True,
+            ),
+            default={},
+        )
         full_path = str(primary.get("full_name") or "").strip()
         last_name = str(primary.get("name") or "").strip()
         if not union_id and not phone:
@@ -135,12 +145,20 @@ class ZdxlzContacts:
         cached = self._phone_cache.get(clean)
         if cached is not None:
             return cached
+        return self.refresh_by_phone_strict(clean)
+
+    def refresh_by_phone_strict(self, phone: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """绕过缓存查询官方通讯录，并更新成功结果。"""
+        clean = str(phone or "").strip()
         obj = self._call("/open/v2/user/search", {"phone": clean})
         if obj is None:
             # 失败与「查无」必须可区分：导入/加人的拦截文案依赖这个区分
             return ("error", None)
+        rows = obj.get("users")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            return ("error", None)
         user: Optional[Dict[str, Any]] = None
-        for row in obj.get("users") or []:
+        for row in rows:
             if str(row.get("phone") or "").strip() == clean:
                 user = self._pick_user(row)
                 break

@@ -224,7 +224,10 @@ def test_member_pool_platform_scoped_and_ops() -> None:
 
         # 同平台内多行不同姓名 → 姓名不一致提醒保留
         rz2 = store.create_role("密信组2", actor="sa", platform="zdxlz", owner_id=s1)["role_id"]
-        store.add_role_member(rz2, PHONE_X, "张三丰", "云中台", actor="sa", owner_id=s1)
+        store.add_role_member(rz2, PHONE_X, "张三", "云中台", actor="sa", owner_id=s1)
+        # 模拟启用通讯录档案锁定前遗留的姓名差异。
+        store.conn.execute("UPDATE member SET name = ? WHERE role_id = ? AND phone = ?",
+                           ("张三丰", rz2, PHONE_X))
         bind_activated_at(store, PHONE_X, "uid_phone_x")
         pz2 = store.list_member_pool(platform="zdxlz")
         assert pz2[0]["row_count"] == 2 and pz2[0]["role_count"] == 2

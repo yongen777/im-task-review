@@ -124,6 +124,27 @@ function getInstanceStatusMeta(inst: TaskInstanceItem): {
   }
 }
 
+const reminderKindLabels: Record<string, string> = {
+  remind: '定时下发',
+  manual_push: '手动推送',
+  submit_ack: '提交回执',
+  reject: '驳回通知',
+  overdue: '逾期提醒',
+  notice: '通知',
+  notice_img: '通知图片',
+  notice_img_link: '通知链接',
+  看板: '通知图片',
+};
+
+const reminderResultBadges: Record<string, { label: string; color: string }> = {
+  sent: { label: '已送达', color: 'bg-emerald-50 text-emerald-700' },
+  skipped: { label: '已跳过', color: 'bg-slate-100 text-slate-700' },
+  no_target: { label: '未激活', color: 'bg-amber-50 text-amber-700' },
+  need_activate: { label: '需重激活', color: 'bg-amber-50 text-amber-700' },
+  missed: { label: '已过期跳过', color: 'bg-slate-100 text-slate-700' },
+  failed: { label: '发送失败', color: 'bg-rose-50 text-rose-700' },
+};
+
 /* 2026-10-29：执行时间统一在这里算——列表和详情共用一份，避免两处再走偏。
    规则：取模板计划时刻（通知类可能是多个）；已到达的加粗，未到达的置灰。 */
 function parseNoticeTimes(v: unknown): string[] {
@@ -1235,47 +1256,38 @@ export const InstancesView: React.FC = () => {
                   <table className="w-full text-left border-collapse text-[11px]">
                     <thead>
                       <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold">
-                        <th className="py-2 px-3">时间点 / 重试</th>
-                        <th className="py-2 px-3">计划时刻 / 实际时刻</th>
+                        <th className="py-2 px-3">触发类型 / 重试</th>
+                        <th className="py-2 px-3">发送时刻</th>
                         <th className="py-2 px-3">发送结果</th>
                         <th className="py-2 px-3">状态说明</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {detailData.reminders.map((r) => (
-                        <tr key={r.id}>
-                          <td className="py-2.5 px-3 font-mono">
-                            <span className="font-semibold text-slate-800">{r.slot}</span>
-                            {r.retry_no > 0 && (
-                              <span className="ml-1.5 px-1.5 py-0.2 rounded bg-amber-50 text-amber-700 border border-amber-200">
-                                重试 #{r.retry_no}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2.5 px-3 font-mono text-slate-600">
-                            <div>计划: {r.planned_at}</div>
-                            <div className="text-slate-400">
-                              实际: {r.attempted_at || r.sent_at || '—'}
-                            </div>
-                          </td>
-                          <td className="py-2.5 px-3">
-                            <span
-                              className={`px-2 py-0.5 rounded font-semibold ${
-                                r.result === 'sent'
-                                  ? 'bg-emerald-50 text-emerald-700'
-                                  : r.result === 'need_activate' || r.result === 'no_target'
-                                    ? 'bg-amber-50 text-amber-700'
-                                    : 'bg-rose-50 text-rose-700'
-                              }`}
-                            >
-                              {r.result === 'sent' ? '已送达' : r.result}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-3 text-slate-600">
-                            {humanizeReminderLogError(r.result, r.error)}
-                          </td>
-                        </tr>
-                      ))}
+                      {detailData.reminders.map((r) => {
+                        const kind = r.kind || r.slot;
+                        const badge = reminderResultBadges[r.result] || reminderResultBadges.skipped;
+                        return (
+                          <tr key={r.id}>
+                            <td className="py-2.5 px-3">
+                              <span className="font-semibold text-slate-800">{reminderKindLabels[kind] || kind || '—'}</span>
+                              {r.retry_no > 0 && (
+                                <span className="ml-1.5 px-1.5 py-0.2 rounded bg-amber-50 text-amber-700 border border-amber-200">
+                                  重试 #{r.retry_no}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-2.5 px-3 font-mono text-slate-600" title={`计划时刻：${r.planned_at || '—'}`}>
+                              {r.attempted_at || r.sent_at || '—'}
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span className={`px-2 py-0.5 rounded font-semibold ${badge.color}`}>{badge.label}</span>
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-600">
+                              {humanizeReminderLogError(r.result, r.error, kind)}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

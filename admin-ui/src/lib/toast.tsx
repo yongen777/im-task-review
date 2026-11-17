@@ -135,23 +135,29 @@ export function humanizeMessage(raw: unknown, fallback = '操作未成功，请�
   return text;
 }
 
-/**
- * 将提醒日志里的英文错误码或状态翻译为易懂的中文说明
- */
-export function humanizeReminderLogError(result: string, error: string | null): string {
-  if (result === 'sent') {
-    return '已成功通过当前办公软件下发提醒消息';
-  }
-  if (result === 'no_target') {
-    return '未发送：该成员手机号尚未在当前办公软件中激活绑定（无 external_id）';
-  }
+const reminderDescriptions: Record<string, Record<'sent' | 'failed' | 'skipped', string>> = {
+  remind: { sent: '已通过当前办公软件定时下发任务提醒', failed: '定时任务提醒发送失败', skipped: '已跳过定时任务提醒' },
+  manual_push: { sent: '已手动推送任务提醒', failed: '手动推送任务提醒失败', skipped: '已跳过手动推送任务提醒' },
+  submit_ack: { sent: '已向提交人回执「提交成功」', failed: '提交成功回执发送失败', skipped: '已跳过提交成功回执' },
+  reject: { sent: '已向提交人发送驳回通知', failed: '驳回通知发送失败', skipped: '已跳过驳回通知' },
+  overdue: { sent: '已向成员发送逾期提醒', failed: '逾期提醒发送失败', skipped: '已跳过逾期提醒' },
+  notice: { sent: '已向成员发送通知', failed: '通知发送失败', skipped: '已跳过通知' },
+  notice_img: { sent: '已向成员发送通知图片', failed: '通知图片发送失败', skipped: '已跳过通知图片' },
+  notice_img_link: { sent: '已向成员发送通知链接', failed: '通知链接发送失败', skipped: '已跳过通知链接' },
+};
+
+export function humanizeReminderLogError(result: string, error: string | null, kind?: string): string {
   if (result === 'need_activate') {
-    return '需重新激活：办公软件接口返回 500，员工需在办公软件向机器人发任意消息恢复会话';
+    return '需重新激活，请员工在当前办公软件向机器人发送任意消息恢复会话';
   }
-  if (!error) {
-    return result === 'failed' ? '发送失败：通道返回异常，系统将自动退避重试' : '—';
+  if (error === 'CIRCUIT_OPEN') return '通道临时熔断保护中，暂未继续发送';
+  if (result === 'missed') return '已错过补偿窗口，系统已跳过本次发送';
+  if (result === 'no_target') return '该成员尚未在当前办公软件激活绑定';
+  if (result === 'sent' || result === 'failed' || result === 'skipped') {
+    const description = (reminderDescriptions[kind || ''] ?? reminderDescriptions.remind)[result];
+    return error && result !== 'sent' ? `${description}。 ${humanizeMessage(error, '请检查发送记录')}` : description;
   }
-  return humanizeMessage(error, error);
+  return error ? humanizeMessage(error, '请检查发送记录') : '—';
 }
 
 // 允许在 React 组件树外（如 api.ts 全局拦截）触发 Toast

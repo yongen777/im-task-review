@@ -339,6 +339,18 @@ class WecomClient:
         userid = str(data.get("userid") or "").strip()
         return ("ok", userid or None)
 
+    def directory_user(self, userid: str) -> Dict[str, Any]:
+        """读取成员姓名和主部门。调用方负责处理授权及网络异常。"""
+        params = {"access_token": self.get_token(), "userid": userid}
+        data = self._request("GET", "/cgi-bin/user/get", params=params)
+        if int(data.get("errcode") or 0) in _TOKEN_INVALID_CODES:
+            params["access_token"] = self.get_token(force=True)
+            data = self._request("GET", "/cgi-bin/user/get", params=params)
+        errcode = int(data.get("errcode") or 0)
+        if errcode:
+            raise WecomError(errcode, str(data.get("errmsg") or ""))
+        return data
+
     def get_userid_by_code(self, code: str) -> Optional[str]:
         """用 OAuth2 的 code 换成员 userid（静默授权，不弹窗）。
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
 from .contacts_cache import TtlCache
@@ -50,6 +51,8 @@ class WecomContacts:
         self.mcp = mcp or (WecomMcpContacts(apikey) if apikey else None)
         # 2026-11-13 用户需求一 ·1：同 zdxlz，手机号严格反查结果短期 TTL 缓存
         self._phone_cache = TtlCache()
+        self._department_cache = TtlCache()
+        self._department_lock = Lock()
 
     def is_configured(self) -> bool:
         """反查是否具备最小凭证（自建应用 corpid+secret，或 MCP apikey）。"""
@@ -58,6 +61,11 @@ class WecomContacts:
     def cache_clear(self) -> None:
         """清空手机号查询缓存（运维/测试用）。"""
         self._phone_cache.clear()
+        self.clear_department_cache()
+
+    def clear_department_cache(self) -> None:
+        with self._department_lock:
+            self._department_cache.clear()
 
     def supports_strict_phone_verify(self) -> bool:
         """是否具备「手机号精确反查」能力（getuserid 需要自建应用 corpid+secret）。
@@ -77,7 +85,7 @@ class WecomContacts:
           · ("error", None) → 查询失败（60011 无权限/网络异常，**不进缓存**）。
         调用方应先用 supports_strict_phone_verify() 判定；未具备凭证时本方法也按
         ("error", None) 返回，绝不误报「不存在」。
-        命中/查无结果走 TTL 内存缓存（getuserid 不带部门信息 → department/dept_path 留空）。
+        命中/查无结果走 TTL 内存缓存，成员姓名和部门通过成员详情及部门列表查询。
         """
         del name, dept  # getuserid 口径：只按手机号精确反查，姓名/部门不参与
         clean = str(phone or "").strip()
@@ -88,15 +96,43 @@ class WecomContacts:
         cached = self._phone_cache.get(clean)
         if cached is not None:
             return cached
+        return self.refresh_by_phone_strict(clean)
+
+    def refresh_by_phone_strict(self, phone: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        clean = str(phone or "").strip()
+        if not clean or not self.supports_strict_phone_verify():
+            return ("error", None)
         try:
             status, uid = self.client.get_userid_by_mobile_strict(clean)
-        except Exception as exc:  # noqa: BLE001 - fail-open：异常按查询失败处理
-            logger.warning("企微严格反查异常 phone=%s: %s", _mask(clean), _mask(str(exc))[:160])
+            if status != "ok":
+                return ("error", None)
+            profile = None
+            if uid:
+                official = self.client.directory_user(uid)
+                name = str(official.get("name") or "").strip()
+                if not name:
+                    return ("error", None)
+                dept_ids = official.get("department") or []
+                dept_id = str(official.get("main_department") or (dept_ids[0] if dept_ids else ""))
+                path = ""
+                if dept_id:
+                    with self._department_lock:
+                        departments = self._department_cache.get("directory")
+                        if departments is None:
+                            departments = self.client.department_list()
+                            if departments:
+                                self._department_cache.set("directory", departments)
+                    path = self._department_path(dept_id, departments or [])
+                if dept_id and not path:
+                    return ("error", None)
+                profile = {
+                    "external_id": uid, "name": name,
+                    "department": path.rsplit("/", 1)[-1], "dept_path": path,
+                }
+        except Exception as exc:  # noqa: BLE001 - 暂时错误不标记离职
+            logger.warning("企微通讯录查询失败 phone=%s: %s", _mask(clean), _mask(str(exc))[:160])
             return ("error", None)
-        if status != "ok":
-            return ("error", None)
-        result: Tuple[str, Optional[Dict[str, Any]]] = (
-            "ok", {"external_id": uid, "department": "", "dept_path": ""} if uid else None)
+        result = ("ok", profile)
         self._phone_cache.set(clean, result)
         return result
 
@@ -173,7 +209,11 @@ class WecomContacts:
         """部门完整路径（企微 department/list 全量 + parentid 上溯；段分隔 "/"）。"""
         if not self.org_available():
             return ""
-        all_depts = {d["dept_id"]: d for d in self.client.department_list()}
+        return self._department_path(dept_id, self.client.department_list())
+
+    @staticmethod
+    def _department_path(dept_id: str, departments: list) -> str:
+        all_depts = {d["dept_id"]: d for d in departments}
         cur = all_depts.get(str(dept_id or "").strip())
         if not cur:
             return ""

@@ -2,6 +2,7 @@
 """周期与时间纯函数工具 + 实例惰性生成与调度循环（严格对齐规格书 §1、§5、§6、§8.1、§11、R10~R27、R47~R49）。"""
 from __future__ import annotations
 
+import asyncio
 import calendar
 import functools
 import hashlib
@@ -43,6 +44,27 @@ logger = logging.getLogger(__name__)
 
 DateLike = Union[datetime, date, str]
 PERIOD_DISPLAY_MAP = {"day": "今日", "week": "本周", "month": "本月"}
+
+
+async def run_upload_cleanup_loop(state: StateStore, stop_event: asyncio.Event) -> None:
+    """每天上海时间 03:00 执行，独立于派发扫描。"""
+    while not stop_event.is_set():
+        now = datetime.now(SHANGHAI_TZ)
+        next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if next_run < now:
+            next_run += timedelta(days=1)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=(next_run - now).total_seconds())
+            return
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+        try:
+            removed = await asyncio.to_thread(state.cleanup_orphan_uploads)
+            logger.info("孤儿上传清理完成，移除 %d 条", removed)
+        except Exception:
+            logger.exception("孤儿上传清理失败")
 
 
 def _to_date(value: DateLike) -> date:
@@ -941,8 +963,9 @@ class Scheduler:
         p_key = period_key(tpl["period"], cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
-        self.state.ensure_template_instances(tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s)
-        instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
+        instances = self.state.ensure_template_instances(
+            tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
+        )
         return {
             "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
             "deadline_at": deadline_at, "instance_count": len(instances),
@@ -1043,7 +1066,7 @@ class Scheduler:
         stats = {"generated_instances": 0, "sent": 0, "skipped": 0, "missed": 0, "failed": 0, "to_overdue": 0, "to_expired": 0}
 
         for tpl in self.state.list_active_templates(include_notice=True):
-            if not is_template_anchor_day(tpl, cur_dt):
+            if not tpl["role_ids"] or not is_template_anchor_day(tpl, cur_dt):
                 continue
 
             if tpl["kind"] == "notice":

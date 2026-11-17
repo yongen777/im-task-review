@@ -38,11 +38,27 @@ interface PanelTask {
   name: string;
   kind: string;
   period: string;
+  anchor_weekday?: number | null;
+  anchor_dom?: number | null;
+  remind_at?: string | null;
+  exec_weekdays?: number[] | null;
+  exec_dom_days?: number[] | null;
   is_adhoc: boolean;
   has_deadline: boolean;
   deadline_type: 'same_day' | 'weekend' | 'month_end' | null;
   deadline_time: string | null;
   need_review: boolean;
+}
+
+function execCycleText(task: PanelTask): string {
+  if (task.is_adhoc) return '不定期';
+  const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
+  if (task.exec_dom_days?.length) return `每月${task.exec_dom_days.join('、')}号`;
+  if (task.exec_weekdays?.length === 7) return '每天';
+  if (task.exec_weekdays?.length) return `每周${task.exec_weekdays.map((day) => weekdays[day - 1]).join('、')}`;
+  if (task.period === 'week') return `每周${weekdays[(task.anchor_weekday || 1) - 1]}`;
+  if (task.period === 'month') return `每月${task.anchor_dom || 1}号`;
+  return '每天';
 }
 
 interface TreeNode {
@@ -637,6 +653,12 @@ export function StatisticsView() {
           </select>
         </div>
 
+        {selectedTask && (
+          <dl className="flex gap-4 text-xs text-slate-700">
+            <div><dt className="mb-1 text-slate-500">执行时间</dt><dd>{selectedTask.remind_at || '—'}</dd></div>
+            <div><dt className="mb-1 text-slate-500">执行周期</dt><dd>{execCycleText(selectedTask)}</dd></div>
+          </dl>
+        )}
         <div>
           <label className="block text-[11px] font-semibold text-slate-500 mb-1">
             {periodMode === 'day' ? '日期' : periodMode === 'week' ? '周' : '月份'}

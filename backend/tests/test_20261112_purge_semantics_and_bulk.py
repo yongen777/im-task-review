@@ -297,23 +297,20 @@ def test_p3_delete_role_purges_all_members() -> None:
         store.close()
 
 
-def test_p3_delete_role_blocked_when_template_references() -> None:
-    """仍有任务模板引用本组 → 409 拦下（引导先删模板），组与成员原样保留。"""
+def test_p3_delete_role_prunes_template_references() -> None:
+    """删除被引用的角色时，保留模板及其他角色。"""
     store = _store()
     try:
         r_a = _seed(store, "A组", "13900002002")
         r_b = _seed(store, "B组", "17313771297")
-        _tpl(store, [r_a, r_b], "引用A组")
-        try:
-            store.delete_role(r_a, actor="t")
-            raise AssertionError("被模板引用时必须 409")
-        except BizError as exc:
-            assert exc.status_code == 409 and exc.code == "ROLE_IN_USE", (exc.status_code, exc.code)
+        tpl = _tpl(store, [r_a, r_b], "引用A组")
+        assert store.delete_role(r_a, actor="t")["updated_templates"] == [tpl["template_id"]]
+        assert store.get_template(tpl["template_id"])["role_ids"] == [r_b]
         with store.lock:
             role_cnt = store.conn.execute("SELECT COUNT(1) FROM role WHERE role_id = ?", (r_a,)).fetchone()[0]
             mem_cnt = store.conn.execute(
                 "SELECT COUNT(1) FROM member m JOIN role r ON r.role_id = m.role_id WHERE r.role_id = ?", (r_a,)).fetchone()[0]
-        assert int(role_cnt) == 1 and int(mem_cnt) == 1, "拦截时组与成员必须原样保留"
+        assert int(role_cnt) == 0 and int(mem_cnt) == 0
     finally:
         store.close()
 

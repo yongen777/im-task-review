@@ -66,9 +66,6 @@ SUPER_ADMIN_LEVEL = "super_admin"
 SUPER_ADMIN_WRITE_ALLOW_PREFIXES = (
     "/api/admin/accounts",
     "/api/admin/channel-config",
-    # 2026-11-05 拍板：部门是全局共享库，增/改/删仅超管（分级只能通过导入自动建档）；
-    # 成员池是超管的全局名册操作入口（分级自己的增删改仍走角色内接口，仅作用于自己名下）。
-    "/api/admin/departments",
     "/api/admin/member-pool",
 )
 SUPER_ADMIN_WRITE_ALLOW_EXACT = {"/api/admin/change-password", "/api/admin/logout"}
@@ -668,7 +665,10 @@ def _probe_channel(channel: str, payload: Dict[str, str], *, notifier: Any = Non
     return False, f"不支持的通道：{channel}"
 
 
-def create_admin_router(state: StateStore, notifier: Any = None, public_base_url: str = "", notifiers: Optional[Dict[str, Any]] = None) -> APIRouter:
+def create_admin_router(
+    state: StateStore, notifier: Any = None, public_base_url: str = "",
+    notifiers: Optional[Dict[str, Any]] = None, *, require_directory: bool = False,
+) -> APIRouter:
     router = APIRouter(prefix="/api/admin")
     # 2026-10-29 逾期补交审核：审核通过后要主动把新链接推给用户。
     # notifier 由 main.py 按现有装配方式注入（⛔ 不造全局单例）；缺省时只记日志不发送。
@@ -1324,63 +1324,46 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return {"ok": True, "items": state.list_departments()}
 
     @router.post("/departments")
-    async def create_department(request: Request):
-        sess, err = require_session(request, state, check_csrf=True)
-        if err is not None:
-            return err
-        assert sess is not None
-        forbidden = _require_super(state, sess)
-        if forbidden is not None:
-            return forbidden
-        body = await _read_json_body(request)
-        try:
-            dept = state.create_department(str(body.get("name") or ""), actor=sess["username"])
-        except BizError as exc:
-            return biz_error_response(exc)
-        return {"ok": True, "department": dept}
-
     @router.put("/departments/{dept_id}")
-    async def update_department(dept_id: int, request: Request):
-        sess, err = require_session(request, state, check_csrf=True)
-        if err is not None:
-            return err
-        assert sess is not None
-        forbidden = _require_super(state, sess)
-        if forbidden is not None:
-            return forbidden
-        body = await _read_json_body(request)
-        try:
-            dept = state.update_department(int(dept_id), str(body.get("name") or ""), actor=sess["username"])
-        except BizError as exc:
-            return biz_error_response(exc)
-        return {"ok": True, "department": dept}
-
     @router.delete("/departments/{dept_id}")
-    async def delete_department(dept_id: int, request: Request):
-        sess, err = require_session(request, state, check_csrf=True)
+    async def disabled_department_write(request: Request):
+        _, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
-        assert sess is not None
-        forbidden = _require_super(state, sess)
-        if forbidden is not None:
-            return forbidden
-        try:
-            state.delete_department(int(dept_id), actor=sess["username"])
-        except BizError as exc:
-            return biz_error_response(exc)
-        return {"ok": True}
+        return error_response(403, "DIRECTORY_READONLY", "部门由官方通讯录维护")
 
-    # ── 2026-11-12 A3：部门分级树（基于已导入成员的 dept_path 聚合；仅超管）──
     @router.get("/dept-tree")
-    async def dept_tree(request: Request):
+    async def dept_tree(request: Request, platform: Optional[str] = None, owner_id: Optional[str] = None):
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
-        assert sess is not None
-        forbidden = _require_super(state, sess)
-        if forbidden is not None:
-            return forbidden
-        return {"ok": True, "items": state.build_dept_tree()}
+        admin = _admin_profile(state, sess)
+        plat = (platform or "").strip().lower()
+        if plat and not _platform_allowed(admin, plat):
+            return error_response(403, "FORBIDDEN", "当前账号未授权该平台")
+        if not plat and not _is_super_admin(admin):
+            plat = state.platform
+            if not _platform_allowed(admin, plat):
+                return {"ok": True, "items": []}
+        items = state.build_dept_tree(platform=plat or None, owner_id=_owner_filter(admin, owner_id))
+        return {"ok": True, "items": items}
+
+    @router.post("/directory/sync")
+    async def sync_directory(request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        if _is_super_admin(admin):
+            return error_response(403, "SUPER_ADMIN_READONLY", "请由分级管理员同步自己的名册")
+        body = await _read_json_body(request)
+        plat = str(body.get("platform") or state.platform).strip().lower()
+        if plat not in StateStore.ALL_PLATFORMS or not _platform_allowed(admin, plat):
+            return error_response(403, "FORBIDDEN", "当前账号未授权该平台")
+        try:
+            return await asyncio.to_thread(state.sync_directory_profiles, plat, int(admin["id"]), sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
 
     # ── 全平台成员池（2026-11-05）：超管按「人」管理的全局名册，操作全局同步到所有管理员名下 ──
     @router.get("/member-pool")
@@ -1411,22 +1394,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         return res
 
     @router.put("/member-pool/{phone}")
-    async def member_pool_update_profile(phone: str, request: Request, platform: Optional[str] = None):
-        """改姓名/部门（platform 传入时仅同步该平台名册行）。⛔ 接口不收手机号 —— 手机号永不可改（用户红线）。"""
-        sess, err = require_session(request, state, check_csrf=True)
+    async def member_pool_update_profile(phone: str, request: Request):
+        _, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
-        assert sess is not None
-        forbidden = _require_super(state, sess)
-        if forbidden is not None:
-            return forbidden
-        body = await _read_json_body(request)
-        try:
-            res = state.member_pool_update_profile(
-                phone, name=body.get("name"), dept=body.get("dept"), actor=sess["username"], platform=platform)
-        except BizError as exc:
-            return biz_error_response(exc)
-        return res
+        return error_response(403, "MEMBER_PROFILE_FORBIDDEN", "姓名、手机号和部门由官方通讯录维护")
 
     @router.delete("/member-pool/{phone}")
     async def member_pool_delete(phone: str, request: Request, platform: Optional[str] = None):
@@ -1599,19 +1571,20 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         _admin = _admin_profile(state, sess)
         _phone = str(body.get("phone") or "").strip()
         try:
-            member = state.add_role_member(
+            member = await asyncio.to_thread(
+                state.add_role_member,
                 role_id=role_id,
                 phone=_phone,
                 name=str(body.get("name") or ""),
-                dept=body.get("dept"),
                 source="manual",
                 actor=sess["username"],
                 owner_id=int(_admin.get("id") or 0),
+                require_directory=require_directory,
             )
         except BizError as exc:
             return biz_error_response(exc)
         # 2026-11-04：成员激活关系全局共享 —— 别的管理员已激活过就无需二次激活
-        _global_reused = state.is_phone_activated(_phone, platform=None)
+        _global_reused = member.pop("reused_binding")
         return {
             "ok": True,
             "member": member,
@@ -1651,16 +1624,21 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         name = str(body.get("name") or "").strip()
         if not name:
             return error_response(400, "VALIDATION_FAILED", "成员姓名不能为空")
-        dept = body.get("dept")
+        admin = _admin_profile(state, sess)
 
         added: List[str] = []
         skipped: List[str] = []
         failed: List[Dict[str, Any]] = []
         for rid in [str(x).strip() for x in raw_role_ids if str(x).strip()]:
+            role = state.get_role(rid)
+            if not role or int(role["owner_id"]) != int(admin["id"]) or not _platform_allowed(admin, role["platform"]):
+                failed.append({"role_id": rid, "message": "当前账号无权向该角色添加成员"})
+                continue
             try:
-                state.add_role_member(
-                    role_id=rid, phone=phone, name=name, dept=dept,
-                    source="manual", actor=sess["username"],
+                await asyncio.to_thread(
+                    state.add_role_member, role_id=rid, phone=phone, name=name,
+                    source="manual", actor=sess["username"], owner_id=int(admin["id"]),
+                    require_directory=require_directory,
                 )
                 added.append(rid)
             except BizError as exc:
@@ -1678,52 +1656,19 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
         assert sess is not None
 
         body = await _read_json_body(request)
-        # 2026-11-10 用户口径（取代 11-09 的「分级一律禁改」）：
-        #   · 姓名/部门：超管 或 **创建该成员行的管理员**可改，改后同步到当前办公软件
-        #     全量池（该手机号在该平台下所有管理员名下的行一起改）；非创建者 → 403。
-        #   · 派单状态（enabled）：所有有该成员行的管理员都可改（仅作用于自己名下行）。
-        # → 前端按此矩阵灰显，后端护栏防直接调 API 绕过。
-        _admin = _admin_profile(state, sess)
-        _is_super = str(_admin.get("role_level") or "") == "super_admin"
-        _new_name = body.get("name")
-        _new_dept = body.get("dept")
-        _cur = state.conn.execute(
-            "SELECT name, dept, owner_id FROM member WHERE role_id = ? AND phone = ?",
-            ((role_id or "").strip(), (phone or "").strip()),
-        ).fetchone()
-        _cur_owner = int(_cur["owner_id"] or 1) if _cur is not None else None
-        _name_chg = _cur is not None and _new_name is not None and str(_new_name).strip() != str(_cur["name"] or "").strip()
-        _dept_chg = _cur is not None and _new_dept is not None and str(_new_dept).strip() != str(_cur["dept"] or "").strip()
-        if not _is_super and _cur is not None and _cur_owner != int(_admin.get("id") or 0):
-            if _name_chg or _dept_chg:
-                return error_response(
-                    403, "MEMBER_PROFILE_FORBIDDEN",
-                    "仅超级管理员或该成员的创建者可修改姓名/部门；派单状态可正常调整。",
-                )
+        profile_fields = {"name", "phone", "dept", "dept_path"} & body.keys()
+        if profile_fields:
+            profile = state.conn.execute(
+                "SELECT name, phone, dept, dept_path FROM member WHERE role_id = ? AND phone = ?",
+                (role_id, phone),
+            ).fetchone()
+            if profile is None or any(str(body[key] or "").strip() != str(profile[key] or "").strip()
+                                      for key in profile_fields):
+                return error_response(403, "MEMBER_PROFILE_FORBIDDEN", "姓名、手机号和部门由官方通讯录维护")
         try:
             member = state.update_role_member(
-                role_id=role_id,
-                phone=phone,
-                name=body.get("name"),
-                dept=body.get("dept"),
-                enabled=body.get("enabled"),
-                actor=sess["username"],
+                role_id=role_id, phone=phone, enabled=body.get("enabled"), actor=sess["username"],
             )
-            # 创建者/超管改了姓名或部门 → 按用户口径同步当前办公软件全量池
-            # （该手机号在该平台下所有管理员名下的 member 行统一改，与超管成员池同口径）。
-            if _name_chg or _dept_chg:
-                _role_row = state.conn.execute(
-                    "SELECT platform FROM role WHERE role_id = ?", ((role_id or "").strip(),)
-                ).fetchone()
-                _plat = str(_role_row["platform"] or "") if _role_row is not None else ""
-                if _plat:
-                    state.member_pool_update_profile(
-                        phone,
-                        name=_new_name if _name_chg else None,
-                        dept=_new_dept if _dept_chg else None,
-                        actor=sess["username"],
-                        platform=_plat,
-                    )
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "member": member}
@@ -1772,6 +1717,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
 
         body = await _read_json_body(request)
         csv_rows = body.get("csv_rows")
+        if isinstance(csv_rows, list):
+            csv_rows = [
+                {key: row.get(key) for key in ("row", "phone", "name")} if isinstance(row, dict) else row
+                for row in csv_rows
+            ]
         dry_run = bool(body.get("dry_run", True))
         _admin = _admin_profile(state, sess)
         try:
@@ -1784,19 +1734,10 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                 dry_run=dry_run,
                 actor=sess["username"],
                 owner_id=int(_admin.get("id") or 0),
+                require_directory=require_directory,
             )
         except BizError as exc:
             return biz_error_response(exc)
-        # 2026-11-04：本次导入里有多少人已被（任意管理员）激活 → 免二次激活
-        _reused_phones: List[str] = []
-        for _row in (csv_rows or []):
-            if isinstance(_row, dict):
-                _p = str(_row.get("phone") or "").strip()
-                if _p and _p not in _reused_phones and state.is_phone_activated(_p, platform=None):
-                    _reused_phones.append(_p)
-        res["global_reused"] = bool(_reused_phones)
-        res["global_reused_count"] = len(_reused_phones)
-        res["global_reused_phones"] = _reused_phones
         return res
 
     # ==================================================================
@@ -1967,7 +1908,7 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             for u in raw:
                 users.append({"name": u.get("name"), "phone": u.get("phone"),
                               "external_id": u.get("external_id") if "external_id" in (u or {}) else u.get("union_id"),
-                              "department": dept_name or plat,
+                              "department": (dept_path.rsplit("/", 1)[-1] if require_directory else dept_name or plat),
                               "dept_path": dept_path})
         else:
             selected = body.get("selected_users")
@@ -1978,6 +1919,21 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
             users = selected  # type: ignore[assignment]
             if not isinstance(users, list) or not all(isinstance(u, dict) for u in users):
                 return error_response(400, "VALIDATION_FAILED", "selected_users 必须是对象数组")
+            if require_directory:
+                existing = state.role_member_phones(role_id)
+                pending = [{"phone": u.get("phone"), "name": u.get("name")} for u in users
+                           if str(u.get("phone") or "").strip() not in existing]
+                try:
+                    imported = await asyncio.to_thread(
+                        state.import_role_members, role_id, pending, dry_run=False,
+                        actor=sess["username"], owner_id=int(_admin["id"]), require_directory=True,
+                    )
+                except BizError as exc:
+                    return biz_error_response(exc)
+                return {
+                    "ok": True, "added": imported["will_add"], "skipped": len(users) - len(pending),
+                    "activated": imported["auto_activation"]["activated"], "invalid": imported["invalid"],
+                }
 
         try:
             res = state.import_members_from_org(
@@ -2681,6 +2637,11 @@ def create_admin_router(state: StateStore, notifier: Any = None, public_base_url
                     "template_id": t["template_id"], "name": t["name"],
                     "kind": t.get("kind"), "period": t.get("period"),
                     "is_adhoc": bool(t.get("is_adhoc")),
+                    "remind_at": t.get("remind_at"),
+                    "anchor_weekday": t.get("anchor_weekday"),
+                    "anchor_dom": t.get("anchor_dom"),
+                    "exec_weekdays": t.get("exec_weekdays"),
+                    "exec_dom_days": t.get("exec_dom_days"),
                     "has_deadline": bool(t.get("has_deadline")),
                     "deadline_type": t.get("deadline_type"),
                     "deadline_time": t.get("deadline_time"),

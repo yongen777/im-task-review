@@ -87,6 +87,8 @@ CREATE TABLE IF NOT EXISTS member (
   name       VARCHAR(128) NOT NULL,
   dept       VARCHAR(200) DEFAULT NULL,
   dept_path  VARCHAR(1024) DEFAULT NULL,
+  is_left_org TINYINT NOT NULL DEFAULT 0,
+  directory_checked_at VARCHAR(32) DEFAULT NULL,
   enabled    TINYINT      NOT NULL DEFAULT 1,
   source     VARCHAR(32)  NOT NULL DEFAULT 'manual',
   owner_id   INT          NOT NULL DEFAULT 1,
@@ -334,7 +336,7 @@ def mysql_config_from_env() -> dict:
     }
 
 
-def _translate_sql(sql: str) -> str:
+def _translate_sql(sql: str, *, has_params: bool = False) -> str:
     """SQL 适配层（业务层 SQL → MySQL 方言，语句边界内在线翻译）。
 
     六族规则（覆盖 state.py 的既有用法，grep 实证过）：
@@ -355,7 +357,7 @@ def _translate_sql(sql: str) -> str:
             # 方案B 补丁（2026-11-16）：pymysql 对带参 SQL 做 % 格式化，
             # 字符串字面量里的 %（LIKE 模式等）必须转义为 %%，否则
             # "not enough arguments for format string"。占位符都在引号外，不受影响。
-            out.append("%%" if ch == "%" else ch)
+            out.append("%%" if has_params and ch == "%" else ch)
             if ch == in_str:
                 in_str = None
             elif ch == "\\" and in_str == "'" and i + 1 < n:
@@ -544,14 +546,14 @@ class MySQLConnProxy:
 
     # ---- 执行 ----
     def execute(self, sql: str, params=()):
-        msql = _translate_sql(sql)
+        msql = _translate_sql(sql, has_params=bool(params))
         st = getattr(self._tls, "stack", None)
         if st:
             cur = st[-1].cursor()
             if params:
                 cur.execute(msql, params)
             else:
-                cur.execute(msql)  # 空参不触发 % 格式化（字面 % 已转义，双保险）
+                cur.execute(msql)  # 空参保留字面百分号
             return _CursorWrap(cur)
         conn = self._borrow()
         try:
@@ -573,9 +575,9 @@ class MySQLConnProxy:
             conn.close()
 
     def executemany(self, sql: str, seq_of_params):
-        msql = _translate_sql(sql)
-        st = getattr(self._tls, "stack", None)
         seq = list(seq_of_params or [])
+        msql = _translate_sql(sql, has_params=bool(seq and seq[0]))
+        st = getattr(self._tls, "stack", None)
         if st:
             cur = st[-1].cursor()
             if seq:
@@ -662,6 +664,18 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         if cur_len < want:
             proxy.execute(
                 f"ALTER TABLE `{table}` MODIFY COLUMN `{col}` VARCHAR({want}) {null_spec}")
+
+
+    member_columns = {
+        row[0] for row in proxy.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'member'"
+        ).fetchall()
+    }
+    if "is_left_org" not in member_columns:
+        proxy.execute("ALTER TABLE member ADD COLUMN is_left_org TINYINT NOT NULL DEFAULT 0")
+    if "directory_checked_at" not in member_columns:
+        proxy.execute("ALTER TABLE member ADD COLUMN directory_checked_at VARCHAR(32) DEFAULT NULL")
 
 
 def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn) -> None:

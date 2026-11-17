@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Users,
   UserPlus,
@@ -16,8 +16,9 @@ import {
   ShieldCheck,
   Search,
   Building2,
+  ChevronRight,
   RefreshCw,
-  Network,
+  Loader2,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { AdminScopeHeader } from './AdminScopeHeader';
@@ -109,6 +110,7 @@ interface MemberPoolItem {
   first_owner_username: string;
   activated_platforms: string[];
   name_inconsistent: boolean;
+  is_left_org?: boolean;
   dept_inconsistent: boolean;
 }
 
@@ -127,18 +129,18 @@ export const RolesMembersView: React.FC = () => {
     setOwnerFilter,
     adminAccounts,
     memberDistinctTotal,
-    me,
   } = useAppStore();
   const toast = useToast();
 
   const [selectedRoleId, setSelectedRoleId] = useState<string>('');
+  const rosterScope = useRef({ roleId: '', platform });
+  const rosterRequestId = useRef(0);
+  useEffect(() => {
+    rosterScope.current = { roleId: selectedRoleId, platform };
+  }, [selectedRoleId, platform]);
   const [members, setMembers] = useState<RoleMemberItem[]>([]);
   const [loadingMembers, setLoadingMembers] = useState(false);
   const [memberKeyword, setMemberKeyword] = useState('');
-  // 2026-11-13：成员列表内存分页（后端单次拉全量 ≤5000，前端按 20/页翻页——2600 人名册可完整翻看）
-  const [memberPage, setMemberPage] = useState(1);
-  const MEMBER_PAGE_SIZE = 20;
-
   // 从当前角色移除成员交互确认弹窗状态
   const [confirmRemoveRoleMember, setConfirmRemoveRoleMember] = useState<RoleMemberItem | null>(null);
   const [removingRoleMember, setRemovingRoleMember] = useState(false);
@@ -146,25 +148,14 @@ export const RolesMembersView: React.FC = () => {
   // 单条添加成员表单（姓名 + 手机号 + 部门，部门由后台统一配置）
   const [newName, setNewName] = useState('');
   const [newPhone, setNewPhone] = useState('');
-  const [newDept, setNewDept] = useState('');
   const [addingMember, setAddingMember] = useState(false);
 
-  // 2026-11-03 部门选项（后台配置；成员表单、编辑弹窗、H5 登记页共用同一份）
-  const [departments, setDepartments] = useState<{ id: number; name: string }[]>([]);
   const [deptModalOpen, setDeptModalOpen] = useState(false);
-  const [newDeptName, setNewDeptName] = useState('');
-  const [editingDeptId, setEditingDeptId] = useState<number | null>(null);
-  const [editingDeptName, setEditingDeptName] = useState('');
-  const [deptBusy, setDeptBusy] = useState(false);
-
-  // 2026-11-12 A3：部门分级树（数据源 = 已导入成员的 dept_path 聚合）
-  // 2026-11-12 下午（用户拍板）：与「部门管理」合并为一个入口 —— 树内嵌在部门管理弹窗里，
-  // 超管可在树上创建分支部门（节点「加入部门选项」/「新建下级部门」）。
   const [deptTree, setDeptTree] = useState<DeptTreeNode[]>([]);
   const [deptTreeLoading, setDeptTreeLoading] = useState(false);
-  const [deptTreeBusy, setDeptTreeBusy] = useState('');
-  const [creatingChildPath, setCreatingChildPath] = useState<string | null>(null);
-  const [childDeptName, setChildDeptName] = useState('');
+  const [expandedDepts, setExpandedDepts] = useState<Set<string>>(new Set());
+  const [syncingDirectory, setSyncingDirectory] = useState(false);
+  const [memberStatusPending, setMemberStatusPending] = useState<string | null>(null);
 
   // 2026-11-12 下午：成员列表批量删除（勾选 + 一次移除，用户要求「不要一个一个删」）
   const [selectedMemberPhones, setSelectedMemberPhones] = useState<Set<string>>(new Set());
@@ -176,9 +167,6 @@ export const RolesMembersView: React.FC = () => {
   const [poolLoading, setPoolLoading] = useState(false);
   const [poolKeyword, setPoolKeyword] = useState('');
   const [poolBusyPhone, setPoolBusyPhone] = useState('');
-  const [poolEditing, setPoolEditing] = useState<MemberPoolItem | null>(null);
-  const [poolEditName, setPoolEditName] = useState('');
-  const [poolEditDept, setPoolEditDept] = useState('');
   const [poolDeleting, setPoolDeleting] = useState<MemberPoolItem | null>(null);
 
   const loadPool = useCallback(async () => {
@@ -243,30 +231,6 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  const handlePoolSaveProfile = async () => {
-    if (!poolEditing) return;
-    if (!poolEditName.trim()) {
-      toast.warning('姓名不能为空');
-      return;
-    }
-    setPoolBusyPhone(poolEditing.phone);
-    try {
-      // 2026-11-09 用户口径：超管修改姓名/部门 → **全部分级管理员管理下的该用户同步**
-      // （不传 platform = 全局同步；后端 member_pool_update_profile 无 platform 时按 phone 全表更新）
-      await api.put(`/api/admin/member-pool/${encodeURIComponent(poolEditing.phone)}`, {
-        name: poolEditName.trim(),
-        dept: poolEditDept.trim(),
-      });
-      toast.success(`已在当前办公软件下同步「${poolEditName.trim()}」的名下全部 ${poolEditing.row_count} 条名册记录。`);
-      setPoolEditing(null);
-      await Promise.all([loadPool(), refreshRoles()]);
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '保存失败');
-    } finally {
-      setPoolBusyPhone('');
-    }
-  };
-
   const handlePoolDelete = async () => {
     if (!poolDeleting) return;
     setPoolBusyPhone(poolDeleting.phone);
@@ -290,17 +254,11 @@ export const RolesMembersView: React.FC = () => {
   const [roleNameInput, setRoleNameInput] = useState('');
   const [savingRole, setSavingRole] = useState(false);
 
-  // P2-1: 成员「改名/停用」弹窗（手机号只读不可改）
-  const [editingMember, setEditingMember] = useState<RoleMemberItem | null>(null);
-  const [editMemberName, setEditMemberName] = useState('');
-  const [editMemberDept, setEditMemberDept] = useState('');
-  const [editMemberStatus, setEditMemberStatus] = useState<'active' | 'disabled'>('active');
   /* 2026-10-29：一人多角色 —— 把已在某角色的成员同时加入其他角色 */
   const [assignMember, setAssignMember] = useState<RoleMemberItem | null>(null);
   const [assignRoleIds, setAssignRoleIds] = useState<string[]>([]);
   const [assigningRoles, setAssigningRoles] = useState(false);
   const [memberRoleIds, setMemberRoleIds] = useState<string[]>([]);
-  const [savingMember, setSavingMember] = useState(false);
 
   // CSV 批量导入弹窗（手机号,姓名,部门）
   const [importModalOpen, setImportModalOpen] = useState(false);
@@ -334,138 +292,53 @@ export const RolesMembersView: React.FC = () => {
 
   const loadMembers = useCallback(
     async (roleId: string) => {
-      if (!roleId) {
-        setMembers([]);
-        return;
-      }
+      if (!roleId || roleId !== rosterScope.current.roleId || platform !== rosterScope.current.platform) return;
+      const requestId = ++rosterRequestId.current;
+      const isCurrent = () => requestId === rosterRequestId.current
+        && roleId === rosterScope.current.roleId && platform === rosterScope.current.platform;
       setLoadingMembers(true);
       try {
         const res = await api.get<{ ok: boolean; total?: number; items: RoleMemberItem[] }>(
-          // 2026-11-13：size=5000 一次取全量（与后端 IMPORT_ROW_LIMIT 同上限），前端内存分页
-          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}&size=5000`,
+          `/api/admin/roles/${encodeURIComponent(roleId)}/members?platform=${encodeURIComponent(platform)}&size=0`,
         );
-        setMembers(res.items || []);
+        if (isCurrent()) setMembers(res.items || []);
       } catch (err) {
-        toast.error(err instanceof Error ? plainError(err.message) : '加载角色成员失败');
+        if (isCurrent()) toast.error(err instanceof Error ? plainError(err.message) : '加载角色成员失败');
       } finally {
-        setLoadingMembers(false);
+        if (isCurrent()) setLoadingMembers(false);
       }
     },
     [toast, platform],
   );
 
-  // 2026-11-03 部门选项：后台配置，与 H5 登记页共用
-  const loadDepartments = useCallback(async () => {
-    try {
-      const res = await api.get<{ ok: boolean; items: { id: number; name: string }[] }>('/api/admin/departments');
-      setDepartments(res.items || []);
-    } catch {
-      /* 部门选项加载失败不阻塞页面 */
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadDepartments();
-  }, [loadDepartments]);
-
-  // 2026-11-12 A3：部门分级树（超管视图，按已导入成员的 dept_path 聚合；打开弹窗时拉取）
-  const loadDeptTree = useCallback(async () => {
+  const loadDeptTree = async () => {
     setDeptTreeLoading(true);
     try {
-      const res = await api.get<{ ok: boolean; items: DeptTreeNode[] }>('/api/admin/dept-tree');
+      const query = new URLSearchParams({ platform, owner_id: String(ownerFilter) });
+      const res = await api.get<{ ok: boolean; items: DeptTreeNode[] }>(`/api/admin/dept-tree?${query}`);
       setDeptTree(res.items || []);
     } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '加载部门分级树失败');
+      toast.error(err instanceof Error ? plainError(err.message) : '加载部门架构失败');
     } finally {
       setDeptTreeLoading(false);
     }
-  }, [toast]);
-
-  // 2026-11-12 下午：把树节点建进部门下拉选项（POST /departments，仅超管可写）
-  // 改用**完整路径**（如「市场部/华东组」）—— 分级管理员改成员时选到的就是分级树里的分支，
-  // 部门名超 30 字也可正常创建（后端上限已放宽到 200）。
-  const handleAddDeptFromTree = async (node: DeptTreeNode, rawName?: string) => {
-    const name = (rawName ?? node.path ?? node.name ?? '').trim();
-    if (!name) return;
-    if (departments.some((d) => d.name === name)) {
-      toast.warning(`部门选项「${name}」已存在，无需重复创建。`, '已在下拉选项里');
-      return;
-    }
-    setDeptTreeBusy(node.path);
-    try {
-      await api.post('/api/admin/departments', { name });
-      await loadDepartments();
-      toast.success(`部门「${name}」已加入成员表单 / H5 登记页的下拉选项。`, '已创建部门选项');
-    } catch (err) {
-      // 409 DEPT_NAME_TAKEN（该段名已存在）→ 按「未创建」提示而不是错误
-      const msg = err instanceof Error ? plainError(err.message) : '创建部门选项失败';
-      toast.warning(msg, '部门选项未创建');
-    } finally {
-      setDeptTreeBusy('');
-    }
   };
 
-  // 2026-11-12 下午：在树节点下**新建下级部门**（写入下拉选项的名字 = 父路径/新名称）
-  const handleCreateChildDept = async (node: DeptTreeNode) => {
-    const seg = childDeptName.trim();
-    if (!seg) {
-      toast.warning('请填写新分支部门名称');
-      return;
-    }
-    await handleAddDeptFromTree(node, `${node.path}/${seg}`);
-    setChildDeptName('');
-    setCreatingChildPath(null);
-  };
-
-  const handleAddDepartment = async () => {
-    const name = newDeptName.trim();
-    if (!name) {
-      toast.warning('请填写部门名称');
-      return;
-    }
-    setDeptBusy(true);
+  const handleSyncDirectory = async () => {
+    setSyncingDirectory(true);
     try {
-      await api.post('/api/admin/departments', { name });
-      setNewDeptName('');
-      await loadDepartments();
-      toast.success(`部门「${name}」已添加。`, '部门已添加');
+      const result = await api.post<{ total: number; updated: number; left: number; failed: number }>(
+        '/api/admin/directory/sync', { platform },
+      );
+      const scope = rosterScope.current;
+      await Promise.all([scope.platform === platform && loadMembers(scope.roleId), refreshRoles()]);
+      const summary = `共核查 ${result.total} 人，刷新 ${result.updated} 人，疑似离职 ${result.left} 人，查询失败 ${result.failed} 人。`;
+      if (result.left || result.failed) toast.warning(summary, '通讯录同步完成');
+      else toast.success(summary, '通讯录同步完成');
     } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '添加部门未成功');
+      toast.error(err instanceof Error ? plainError(err.message) : '通讯录同步失败');
     } finally {
-      setDeptBusy(false);
-    }
-  };
-
-  const handleRenameDepartment = async (id: number) => {
-    const name = editingDeptName.trim();
-    if (!name) {
-      toast.warning('请填写新的部门名称');
-      return;
-    }
-    setDeptBusy(true);
-    try {
-      await api.put(`/api/admin/departments/${id}`, { name });
-      setEditingDeptId(null);
-      setEditingDeptName('');
-      await loadDepartments();
-      toast.success('部门名称已更新。', '修改已保存');
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '修改部门未成功');
-    } finally {
-      setDeptBusy(false);
-    }
-  };
-
-  const handleDeleteDepartment = async (id: number, name: string) => {
-    setDeptBusy(true);
-    try {
-      await api.delete(`/api/admin/departments/${id}`);
-      await loadDepartments();
-      toast.success(`部门「${name}」已删除（已登记人员的信息不受影响）。`, '部门已删除');
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '删除部门未成功');
-    } finally {
-      setDeptBusy(false);
+      setSyncingDirectory(false);
     }
   };
 
@@ -513,21 +386,6 @@ export const RolesMembersView: React.FC = () => {
       (m) => m.phone.includes(kw) || m.name.toLowerCase().includes(kw),
     );
   }, [members, memberKeyword]);
-
-  /* 2026-11-13：内存分页。当前页成员 = filteredMembers 切片；搜索/换角色/增删自动回第 1 页。
-     勾选批量删除维持基于全量 filteredMembers 的语义（翻页不清空勾选）。 */
-  const scrollToMembersTop = () => {
-    window.document.getElementById('role-members-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-  const memberTotalPages = Math.max(1, Math.ceil(filteredMembers.length / MEMBER_PAGE_SIZE));
-  const safeMemberPage = Math.min(memberPage, memberTotalPages);
-  const pagedMembers = useMemo(
-    () => filteredMembers.slice((safeMemberPage - 1) * MEMBER_PAGE_SIZE, safeMemberPage * MEMBER_PAGE_SIZE),
-    [filteredMembers, safeMemberPage],
-  );
-  useEffect(() => {
-    setMemberPage(1);
-  }, [memberKeyword, selectedRoleId, members.length]);
 
   const handleOpenCreateRole = () => {
     setEditingRoleId('');
@@ -609,11 +467,9 @@ export const RolesMembersView: React.FC = () => {
       const addedPhone = newPhone.trim();
       setNewName('');
       setNewPhone('');
-      setNewDept('');
       await Promise.all([
         loadMembers(selectedRoleId),
         refreshRoles(),
-        loadDepartments(),
       ]);
       if (res?.global_reused) {
         toast.success(
@@ -783,64 +639,15 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  // P2-1: 打开成员「修改」弹窗
-  const openEditMemberModal = (m: RoleMemberItem) => {
-    setEditingMember(m);
-    setEditMemberName(m.name);
-    setEditMemberDept(m.dept || '');
-    setEditMemberStatus(m.status);
-  };
-
-  /* 2026-11-10 权限矩阵（用户口径）：姓名/部门 = 超管 或 该成员行的创建者（owner_id）可改；
-     派单状态 = 所有管理员可改。与后端护栏同口径（后端防直接调 API 绕过）。 */
-  const canEditProfile =
-    isSuperAdmin ||
-    (editingMember?.owner_id != null && editingMember.owner_id === me?.id) ||
-    (editingMember?.owner_id == null && !isSuperAdmin); // 老数据无 owner：按创建者可改处理
-
-  // P2-1: 提交 PUT /api/admin/roles/{role_id}/members/{phone}
-  const handleSaveMemberEdit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedRoleId || !editingMember) return;
-    if (!editMemberName.trim()) {
-      toast.warning('用户名不能为空');
-      return;
-    }
-    setSavingMember(true);
-    try {
-      await api.put(
-        `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/${encodeURIComponent(editingMember.phone)}`,
-        {
-          name: editMemberName.trim(),
-          dept: editMemberDept,
-          status: editMemberStatus,
-        },
-      );
-      setEditingMember(null);
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
-      toast.success(
-        `成员「${editMemberName.trim()}」(${editingMember.phone}) 信息已更新（状态：${editMemberStatus === 'active' ? '正常参与派单' : '已停用'}）。`,
-        '成员已更新',
-      );
-    } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '更新成员失败');
-    } finally {
-      setSavingMember(false);
-    }
-  };
-
   // P2-1: 快捷切换成员启用/停用
   const handleQuickToggleMemberStatus = async (m: RoleMemberItem) => {
     if (!selectedRoleId) return;
     const nextStatus = m.status === 'active' ? 'disabled' : 'active';
+    setMemberStatusPending(m.phone);
     try {
       await api.put(
         `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/${encodeURIComponent(m.phone)}`,
-        {
-          name: m.name,
-          dept: '',
-          status: nextStatus,
-        },
+        { enabled: nextStatus === 'active' },
       );
       await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
       toast.success(
@@ -851,6 +658,8 @@ export const RolesMembersView: React.FC = () => {
       );
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '操作失败');
+    } finally {
+      setMemberStatusPending(null);
     }
   };
 
@@ -896,8 +705,7 @@ export const RolesMembersView: React.FC = () => {
   };
 
   /* 2026-11-12 下午：批量移除成员（用户要求「不要一个一个删」）——
-     勾选复数成员 → 一次 POST batch-delete；语义与单删完全一致，
-     单个失败不影响其余，逐条回报。 */
+     按接口的单批上限提交；逐条记录移除结果。 */
   const toggleMemberSelected = (phone: string) => {
     setSelectedMemberPhones((prev) => {
       const next = new Set(prev);
@@ -911,33 +719,34 @@ export const RolesMembersView: React.FC = () => {
     if (!selectedRoleId || selectedMemberPhones.size === 0) return;
     const roleName = currentRole?.role_name || '当前角色';
     setBulkRemoving(true);
+    const phones = [...selectedMemberPhones];
+    const deleted = new Set<string>();
+    const failed: Array<{ phone: string; message: string }> = [];
     try {
-      const res = await api.post<{
-        ok: boolean;
-        deleted: string[];
-        failed: Array<{ phone: string; code: string; message: string }>;
-      }>(`/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/batch-delete`, {
-        phones: [...selectedMemberPhones],
-      });
-      const okCnt = (res.deleted || []).length;
-      const failed = res.failed || [];
-      setSelectedMemberPhones(new Set());
+      for (let i = 0; i < phones.length; i += 500) {
+        const response = await api.post<{ deleted: string[]; failed: Array<{ phone: string; message: string }> }>(
+          `/api/admin/roles/${encodeURIComponent(selectedRoleId)}/members/batch-delete`,
+          { phones: phones.slice(i, i + 500) },
+        );
+        for (const phone of response.deleted || []) deleted.add(phone);
+        failed.push(...(response.failed || []));
+      }
       setConfirmBulkRemove(false);
-      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
-      if (failed.length === 0) {
-        toast.success(`已从角色「${roleName}」批量移除 ${okCnt} 名成员。`, '批量移除完成');
+      if (!failed.length) {
+        toast.success(`已从角色「${roleName}」批量移除 ${deleted.size} 名成员。`, '批量移除完成');
       } else {
         toast.warning(
-          `成功移除 ${okCnt} 人，${failed.length} 人未移除（${failed
-            .map((f) => `${f.phone}:${f.message}`)
-            .join('；')}）。`,
+          `已移除 ${deleted.size} 人，${failed.length} 人未移除。${failed.map((item) => `${item.phone} ${item.message}`).join('；')}`,
           '批量移除部分完成',
         );
       }
     } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '批量移除成员失败');
+      const error = err instanceof Error ? plainError(err.message) : '批量移除成员失败';
+      toast.error(deleted.size ? `已移除 ${deleted.size} 人，后续批次停止。 ${error}` : error);
     } finally {
+      setSelectedMemberPhones((current) => new Set([...current].filter((phone) => !deleted.has(phone))));
       setBulkRemoving(false);
+      await Promise.all([loadMembers(selectedRoleId), refreshRoles()]);
     }
   };
 
@@ -992,7 +801,7 @@ export const RolesMembersView: React.FC = () => {
       const reusedN = res.global_reused_count || 0;
       const reusedNote =
         reusedN > 0
-          ? `（其中 ${reusedN} 人已在全平台激活，自动复用免二次激活）`
+          ? `（其中 ${reusedN} 人已复用当前办公软件的通讯录档案与激活绑定）`
           : '';
       // 2026-11-09 用户口径：「待修复后才全量导入成功」——
       // 有任何错误行就整批不写入，把**全部**错误行列出来，且**不关窗**（用户改完再导）。
@@ -1007,7 +816,6 @@ export const RolesMembersView: React.FC = () => {
       await Promise.all([
         loadMembers(selectedRoleId),
         refreshRoles(),
-        loadDepartments(),
       ]);
       setImportErrors([]);
       setImportModalOpen(false);
@@ -1027,94 +835,39 @@ export const RolesMembersView: React.FC = () => {
     }
   };
 
-  // 2026-11-12 A3：递归渲染部门分级树（默认全展开；节点人数 = 含全部下级的总人数）
-  // 2026-11-12 下午：节点动作合并进「部门管理」弹窗 —— ①一键把该分支（全路径）建为部门选项；
-  // ②在该节点下新建下级分支（也进下拉选项，名字 = 完整路径，支持超长部门名）。
-  const renderDeptTreeNodes = (nodes: DeptTreeNode[], depth: number): React.ReactNode =>
-    nodes.map((node) => {
-      const added = departments.some((d) => d.name === node.path);
-      const creatingChild = creatingChildPath === node.path;
-      return (
-        <div key={node.path}>
-          <div
-            className="flex items-center gap-2 px-2.5 py-1.5 rounded-lg hover:bg-slate-50 border border-transparent hover:border-slate-200 transition-colors"
-            style={{ marginLeft: depth * 18 }}
+  const renderDeptTreeNodes = (nodes: DeptTreeNode[]): React.ReactNode => nodes.map((node) => {
+    const hasChildren = node.children.length > 0;
+    const expanded = expandedDepts.has(node.path);
+    const label = (
+      <>
+        {hasChildren && <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 ${expanded ? 'rotate-90' : ''}`} />}
+        <Building2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+        <span className="min-w-0 flex-1 break-words" title={node.path}>{node.name}</span>
+        <span className="shrink-0 text-slate-500 tabular-nums">{node.count} 人</span>
+      </>
+    );
+    const rowClass = 'flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs';
+    return (
+      <li key={node.path}>
+        {hasChildren ? (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            className={`${rowClass} hover:bg-slate-50 cursor-pointer`}
+            onClick={() => setExpandedDepts((prev) => {
+              const next = new Set(prev);
+              if (next.has(node.path)) next.delete(node.path);
+              else next.add(node.path);
+              return next;
+            })}
           >
-            <Building2
-              className={`w-3 h-3 shrink-0 ${node.children.length > 0 ? 'text-blue-500' : 'text-slate-400'}`}
-            />
-            <span
-              className={`text-xs ${node.children.length > 0 ? 'font-semibold text-slate-800' : 'text-slate-700'}`}
-              title={node.path}
-            >
-              {node.name}
-            </span>
-            <span className="text-[11px] text-slate-400 tabular-nums shrink-0">· {node.count} 人</span>
-            <span className="flex-1" />
-            <button
-              type="button"
-              disabled={deptTreeBusy === node.path || added}
-              onClick={() => void handleAddDeptFromTree(node)}
-              className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-700 text-[10px] font-semibold cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
-              title={added ? '该分支已在部门下拉选项里' : '把该分支（完整路径）加入成员表单 / H5 登记页的部门下拉选项'}
-            >
-              {deptTreeBusy === node.path ? '创建中…' : added ? '已加入' : '加入部门选项'}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setCreatingChildPath(creatingChild ? null : node.path);
-                setChildDeptName('');
-              }}
-              className="px-2 py-0.5 rounded-md bg-slate-100 hover:bg-emerald-50 text-slate-500 hover:text-emerald-700 text-[10px] font-semibold cursor-pointer shrink-0 transition-colors"
-              title="在该部门下新建一个分支部门（写入下拉选项，名字为完整路径）"
-            >
-              新建下级
-            </button>
-          </div>
-          {creatingChild && (
-            <div className="flex items-center gap-2 pl-2.5 py-1" style={{ marginLeft: (depth + 1) * 18 }}>
-              <span className="text-[11px] text-slate-400 truncate max-w-[40%]" title={node.path}>
-                {node.path} /
-              </span>
-              <input
-                autoFocus
-                type="text"
-                value={childDeptName}
-                onChange={(e) => setChildDeptName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    void handleCreateChildDept(node);
-                  }
-                }}
-                placeholder="新分支部门名称（可超 30 字）"
-                className="flex-1 min-w-[140px] bg-white border border-slate-200 rounded-lg px-2.5 py-1 text-xs outline-none focus:border-blue-500"
-              />
-              <button
-                type="button"
-                disabled={deptTreeBusy === node.path}
-                onClick={() => void handleCreateChildDept(node)}
-                className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60 shrink-0"
-              >
-                创建
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setCreatingChildPath(null);
-                  setChildDeptName('');
-                }}
-                className="px-2 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-500 text-[11px] font-semibold cursor-pointer shrink-0"
-              >
-                取消
-              </button>
-            </div>
-          )}
-          {node.children.length > 0 && renderDeptTreeNodes(node.children, depth + 1)}
-        </div>
-      );
-    });
+            {label}
+          </button>
+        ) : <div className={rowClass}>{label}</div>}
+        {expanded && hasChildren && <ul className="ml-4 border-l border-slate-100 pl-2">{renderDeptTreeNodes(node.children)}</ul>}
+      </li>
+    );
+  });
 
   return (
     <div className="space-y-5">
@@ -1143,6 +896,31 @@ export const RolesMembersView: React.FC = () => {
             <span className="text-xs font-semibold text-slate-500">
               选择业务角色分组（点击卡片切换下方名册）
             </span>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setExpandedDepts(new Set());
+                  setDeptTree([]);
+                  setDeptModalOpen(true);
+                  void loadDeptTree();
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+              >
+                <Building2 className="h-3.5 w-3.5" /> 部门架构
+              </button>
+              {!isSuperAdmin && (
+                <button
+                  type="button"
+                  disabled={syncingDirectory}
+                  onClick={() => void handleSyncDirectory()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 cursor-pointer disabled:opacity-60"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${syncingDirectory ? 'animate-spin' : ''}`} />
+                  {syncingDirectory ? '正在同步…' : '同步最新部门'}
+                </button>
+              )}
+            </div>
           </div>
           {(roleOwnerGroups ?? [{ key: 'all', label: '', items: roles }]).map((group) => (
           <div key={group.key} className="space-y-2.5">
@@ -1351,23 +1129,6 @@ export const RolesMembersView: React.FC = () => {
                     */}
                   </>
                 )}
-                {isSuperAdmin && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        /* 2026-11-12 下午：部门管理 = 唯一入口（平铺列表 + 官方分级树合并进同一弹窗） */
-                        setDeptModalOpen(true);
-                        void loadDeptTree();
-                      }}
-                      className="px-3 py-1.5 bg-white border border-slate-200 hover:border-blue-300 text-slate-600 font-semibold rounded-xl flex items-center justify-center gap-1.5 cursor-pointer shrink-0 text-xs transition-colors"
-                      title="配置部门选项（平铺列表 + 按官方组织路径聚合的分级树；成员表单与员工 H5 登记页共用）"
-                    >
-                      <Building2 className="w-3.5 h-3.5 text-slate-500" />
-                      <span>部门管理</span>
-                    </button>
-                  </>
-                )}
               </div>
             </div>
 
@@ -1410,8 +1171,6 @@ export const RolesMembersView: React.FC = () => {
                   <Plus className="w-3.5 h-3.5" />
                   <span>添加成员</span>
                 </button>
-                {/* 2026-11-12 A2：部门管理入口收敛为超管专属（后端 /departments 写接口已有
-                    _require_super 守卫，分级管理员此前的入口点了必然 403）——按钮只保留在超管视角。 */}
               </form>
             )}
 
@@ -1490,7 +1249,7 @@ export const RolesMembersView: React.FC = () => {
                       </td>
                     </tr>
                   ) : (
-                    pagedMembers.map((m) => (
+                    filteredMembers.map((m) => (
                       <tr
                         key={m.phone}
                         className="hover:bg-slate-50/70 transition-colors group"
@@ -1513,6 +1272,7 @@ export const RolesMembersView: React.FC = () => {
                               {m.name.slice(0, 1)}
                             </div>
                             <span className="font-bold text-slate-900">{m.name}</span>
+                            {m.is_left_org && <span className="text-xs font-semibold text-rose-700">已移出通讯录（疑似离职）</span>}
                           </div>
                         </td>
                         <td className="py-3.5 px-3 font-mono font-semibold text-slate-700 tabular-nums">
@@ -1560,8 +1320,7 @@ export const RolesMembersView: React.FC = () => {
                                   ? 'bg-blue-50/70 text-blue-700 border-blue-200/80'
                                   : 'bg-slate-100 text-slate-500 border-slate-200'
                               }`}
-                              title="派单状态在右侧「修改」里调整"
-                            >
+                              >
                               {m.status === 'active' ? (
                                 <>
                                   <CheckCircle2 className="w-3.5 h-3.5 text-blue-600" />
@@ -1614,16 +1373,14 @@ export const RolesMembersView: React.FC = () => {
                                 <Users className="w-3 h-3" />
                                 <span>加入其他角色</span>
                               </button>
-                              {/* 2026-11-10 用户口径： 操作统一为「修改」弹窗——
-                                  姓名/部门（超管或创建者可改，改后同步该办公软件全量池）+
-                                  派单状态（所有管理员可改） */}
                               <button
-                                onClick={() => openEditMemberModal(m)}
-                                title="修改姓名 / 部门（需创建者或超管）/ 派单状态（所有人可调）"
-                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap"
+                                type="button"
+                                disabled={memberStatusPending !== null}
+                                onClick={() => void handleQuickToggleMemberStatus(m)}
+                                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap disabled:opacity-60"
                               >
-                                <Edit3 className="w-3 h-3" />
-                                <span>修改</span>
+                                {memberStatusPending === m.phone
+                                  ? '处理中…' : m.status === 'active' ? '停用派单' : '恢复派单'}
                               </button>
                               <button
                                 onClick={() => setConfirmRemoveRoleMember(m)}
@@ -1643,53 +1400,6 @@ export const RolesMembersView: React.FC = () => {
               </table>
             </div>
 
-            {/* 2026-11-13：分页器 —— 2600 人名册可完整翻看（每页 20，内存分页零后端改动） */}
-            {memberTotalPages > 1 && (
-              <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3 border-t border-slate-100 bg-slate-50/60">
-                <div className="text-xs text-slate-500 tabular-nums">
-                  共 <span className="font-bold text-slate-700">{filteredMembers.length}</span> 名成员
-                  · 第 <span className="font-bold text-slate-700">{safeMemberPage}</span> / {memberTotalPages} 页
-                  {memberKeyword.trim() ? '（按关键词过滤）' : ''}
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    disabled={safeMemberPage <= 1}
-                    onClick={() => { setMemberPage(1); scrollToMembersTop(); }}
-                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
-                  >
-                    首页
-                  </button>
-                  <button
-                    type="button"
-                    disabled={safeMemberPage <= 1}
-                    onClick={() => { setMemberPage((p) => Math.max(1, p - 1)); scrollToMembersTop(); }}
-                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
-                  >
-                    ‹ 上一页
-                  </button>
-                  <span className="px-2 py-1 text-xs font-bold text-blue-700 bg-blue-50 border border-blue-200 rounded-lg tabular-nums">
-                    {safeMemberPage} / {memberTotalPages}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={safeMemberPage >= memberTotalPages}
-                    onClick={() => { setMemberPage((p) => Math.min(memberTotalPages, p + 1)); scrollToMembersTop(); }}
-                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
-                  >
-                    下一页 ›
-                  </button>
-                  <button
-                    type="button"
-                    disabled={safeMemberPage >= memberTotalPages}
-                    onClick={() => { setMemberPage(memberTotalPages); scrollToMembersTop(); }}
-                    className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-600 hover:border-blue-400 hover:text-blue-600 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:border-slate-200 disabled:hover:text-slate-600 cursor-pointer transition-colors"
-                  >
-                    末页
-                  </button>
-                </div>
-              </div>
-            )}
           </>
         ) : (
           <div className="p-14 text-center text-slate-400 text-xs">
@@ -1702,140 +1412,21 @@ export const RolesMembersView: React.FC = () => {
            依赖后端 PUT /api/admin/global-activated-members/{phone}/status 端点（当前未实现），
            后端补齐后可恢复此区块（源码见 Google 交付包 RolesMembersView）。 */}
 
-      {/* 2026-11-03 部门管理弹窗：配置部门选项（成员表单与员工 H5 登记页共用） */}
       {deptModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+          <section role="dialog" aria-modal="true" aria-labelledby="department-tree-title" className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-bold text-slate-900 text-base flex items-center gap-1.5">
-                  <Building2 className="w-4 h-4 text-blue-600" />
-                  <span>部门管理</span>
-                </h3>
-                <p className="text-[11px] text-slate-400">
-                  员工 H5 登记页与成员表单的下拉选项都来自这里；含官方部门分级树（超管可在树上创建分支部门）
-                </p>
-              </div>
-              <button onClick={() => setDeptModalOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-400">
+              <h3 id="department-tree-title" className="font-bold text-slate-900">部门架构</h3>
+              <button type="button" aria-label="关闭部门架构" onClick={() => setDeptModalOpen(false)} className="p-1 rounded-lg hover:bg-slate-100 text-slate-500">
                 <X className="w-5 h-5" />
               </button>
             </div>
-
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={newDeptName}
-                onChange={(e) => setNewDeptName(e.target.value)}
-                placeholder="新增部门名称，如：市场部"
-                className="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500"
-              />
-              <button
-                type="button"
-                disabled={deptBusy}
-                onClick={() => void handleAddDepartment()}
-                className="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-xs inline-flex items-center gap-1 cursor-pointer disabled:opacity-60 shrink-0"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>添加</span>
-              </button>
+            <div className="mt-3 max-h-[60vh] overflow-y-auto">
+              {deptTreeLoading ? <p role="status" className="text-xs text-slate-500">正在加载部门架构…</p>
+                : deptTree.length ? <ul>{renderDeptTreeNodes(deptTree)}</ul>
+                : <p className="text-xs text-slate-500">当前名册暂无部门数据</p>}
             </div>
-
-            <div className="max-h-72 overflow-y-auto space-y-1.5">
-              {departments.length === 0 ? (
-                <div className="py-8 text-center text-xs text-slate-400">还没有配置部门，先添加一个</div>
-              ) : (
-                departments.map((d) => (
-                  <div key={d.id} className="flex items-center gap-2 px-3 py-2 rounded-xl border border-slate-200 bg-slate-50/60">
-                    {editingDeptId === d.id ? (
-                      <input
-                        autoFocus
-                        type="text"
-                        value={editingDeptName}
-                        onChange={(e) => setEditingDeptName(e.target.value)}
-                        className="flex-1 bg-white border border-blue-300 rounded-lg px-2.5 py-1.5 text-xs outline-none"
-                      />
-                    ) : (
-                      <span className="flex-1 text-xs font-semibold text-slate-800">{d.name}</span>
-                    )}
-                    {editingDeptId === d.id ? (
-                      <>
-                        <button
-                          type="button"
-                          disabled={deptBusy}
-                          onClick={() => void handleRenameDepartment(d.id)}
-                          className="px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-60"
-                        >
-                          保存
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setEditingDeptId(null); setEditingDeptName(''); }}
-                          className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 text-[11px] font-semibold cursor-pointer"
-                        >
-                          取消
-                        </button>
-                      </>
-                    ) : isSuperAdmin ? (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => { setEditingDeptId(d.id); setEditingDeptName(d.name); }}
-                          className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-600 hover:text-blue-700 text-[11px] font-semibold cursor-pointer inline-flex items-center gap-1"
-                        >
-                          <Edit3 className="w-3 h-3" />
-                          <span>改名</span>
-                        </button>
-                        <button
-                          type="button"
-                          disabled={deptBusy}
-                          onClick={() => void handleDeleteDepartment(d.id, d.name)}
-                          className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 text-[11px] font-semibold cursor-pointer inline-flex items-center gap-1 disabled:opacity-60"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                          <span>删除</span>
-                        </button>
-                      </>
-                    ) : null}
-                  </div>
-                ))
-              )}
-            </div>
-
-            {/* 2026-11-12 下午（用户拍板）：部门分级树并入「部门管理」弹窗 —— 单一入口。
-                按已导入成员的官方组织路径（dept_path）聚合；节点可一键把分支（完整路径）
-                建为部门选项，也可在该节点下新建下级分支；改名/删除仍在上方平铺列表里。 */}
-            <div className="border-t border-slate-100 pt-3 space-y-2">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <Network className="w-3.5 h-3.5 text-blue-500" />
-                  <span className="text-xs font-bold text-slate-700">部门分级树（官方组织路径）</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void loadDeptTree()}
-                  disabled={deptTreeLoading}
-                  className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-400 cursor-pointer disabled:opacity-50"
-                  title="刷新部门分级树"
-                >
-                  <RefreshCw className={`w-4 h-4 ${deptTreeLoading ? 'animate-spin' : ''}`} />
-                </button>
-              </div>
-              <p className="text-[11px] text-slate-400">
-                人数含全部下级，仅统计启用成员；「加入部门选项」写入的是完整路径（如「市场部/华东组」），部门名可超 30 字
-              </p>
-              <div className="max-h-56 overflow-y-auto space-y-0.5 pr-1 border border-slate-100 rounded-xl p-2 bg-slate-50/40">
-                {deptTreeLoading ? (
-                  <div className="py-8 text-center text-xs text-slate-400">正在聚合部门树…</div>
-                ) : deptTree.length === 0 ? (
-                  <div className="py-8 text-center text-xs text-slate-400">
-                    暂无带官方组织路径的已导入成员；导入 / 添加成员并完成通讯录反查后，这里会按部门层级展示
-                  </div>
-                ) : (
-                  renderDeptTreeNodes(deptTree, 0)
-                )}
-              </div>
-            </div>
-          </div>
+          </section>
         </div>
       )}
 
@@ -1957,112 +1548,6 @@ export const RolesMembersView: React.FC = () => {
                 {bulkRemoving ? '正在批量移除…' : `确认批量移除（${selectedMemberPhones.size} 人）`}
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* P2-1: 成员「改名/停用」弹窗（严禁改号，phone 只读） */}
-      {editingMember && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
-                <h3 className="font-bold text-slate-900 text-base">修改成员信息</h3>
-                <p className="text-[11px] text-slate-400">
-                  {canEditProfile
-                    ? '可修改姓名/部门（同步该办公软件下全部管理员的名册）与派单状态'
-                    : '仅创建者或超管可改姓名/部门；派单状态可正常调整'}
-                </p>
-              </div>
-              <button
-                onClick={() => setEditingMember(null)}
-                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSaveMemberEdit} className="space-y-3.5 text-xs">
-              <div>
-                <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
-                  <span>手机号码（唯一标识）</span>
-                  <span className="inline-flex items-center gap-0.5 text-[10px] text-amber-700">
-                    <Lock className="w-2.5 h-2.5" /> 不可修改
-                  </span>
-                </label>
-                <input
-                  type="text"
-                  readOnly
-                  disabled
-                  value={editingMember.phone}
-                  className="w-full bg-slate-100 border border-slate-200 rounded-xl p-2.5 font-mono text-slate-500 cursor-not-allowed tabular-nums"
-                />
-                <div className="text-[11px] text-slate-400 mt-1">
-                  如需更换手机号，请先移除该成员后重新添加。
-                </div>
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">
-                  用户名 / 姓名 {canEditProfile && <span className="text-rose-500">*</span>}
-                </label>
-                <input
-                  type="text"
-                  value={editMemberName}
-                  onChange={(e) => setEditMemberName(e.target.value)}
-                  /* 2026-11-10 权限矩阵：超管或创建者可改；非创建者只读灰显（后端同口径护栏） */
-                  readOnly={!canEditProfile}
-                  disabled={!canEditProfile}
-                  placeholder={canEditProfile ? '请输入成员真实姓名' : '仅创建者或超管可修改姓名'}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                />
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">部门</label>
-                <select
-                  value={editMemberDept}
-                  onChange={(e) => setEditMemberDept(e.target.value)}
-                  /* 2026-11-10 部门全量池下拉（用户口径）：与超管成员池同款数据源；非创建者只读 */
-                  disabled={!canEditProfile}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 cursor-pointer disabled:bg-slate-100 disabled:text-slate-500 disabled:cursor-not-allowed"
-                >
-                  <option value="">不填部门</option>
-                  {departments.map((d) => (
-                    <option key={d.id} value={d.name}>{d.name}</option>
-                  ))}
-                </select>
-              </div>
-
-              <div>
-                <label className="font-semibold text-slate-700 block mb-1">派单状态</label>
-                <select
-                  value={editMemberStatus}
-                  onChange={(e) => setEditMemberStatus(e.target.value as 'active' | 'disabled')}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
-                >
-                  <option value="active">正常派单 — 参与周期任务派发与提醒</option>
-                  <option value="disabled">暂停派单 — 保留历史记录但不再派发新任务</option>
-                </select>
-              </div>
-
-              <div className="pt-2 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setEditingMember(null)}
-                  className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium cursor-pointer"
-                >
-                  取消
-                </button>
-                <button
-                  type="submit"
-                  disabled={savingMember}
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60"
-                >
-                  {savingMember ? '正在保存…' : '保存修改'}
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}
@@ -2270,7 +1755,11 @@ export const RolesMembersView: React.FC = () => {
                   disabled={importing}
                   className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold cursor-pointer disabled:opacity-60"
                 >
-                  {importing ? '正在导入…' : '开始导入'}
+                  {importing ? (
+                    <span role="status" className="inline-flex items-center gap-1.5">
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> 正在导入…
+                    </span>
+                  ) : '开始导入'}
                 </button>
               </div>
             </form>
@@ -2431,7 +1920,7 @@ export const RolesMembersView: React.FC = () => {
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  展示当前所选办公软件下全部分级管理员的在册成员（按手机号去重）；停用 / 修改姓名部门 / 删除
+                  展示当前所选办公软件下全部分级管理员的在册成员（按手机号去重）；停用 / 恢复 / 删除
                   <strong className="text-slate-700">仅作用于该平台下全部管理员名下的名册记录</strong>，其它平台不受影响；手机号不可修改。
                 </p>
               </div>
@@ -2487,6 +1976,7 @@ export const RolesMembersView: React.FC = () => {
                       <td className="px-5 py-3.5">
                         <div className="flex items-center gap-1.5">
                           <span className="font-semibold text-slate-900 whitespace-nowrap">{p.display_name || '—'}</span>
+                          {p.is_left_org && <span className="text-xs font-semibold text-rose-700">已移出通讯录（疑似离职）</span>}
                           {p.name_inconsistent && (
                             <span
                               title={`该手机号在 ${p.row_count} 个角色行中，姓名不一致（点「修改」可统一）`}
@@ -2576,19 +2066,6 @@ export const RolesMembersView: React.FC = () => {
                           <button
                             type="button"
                             disabled={busy}
-                            onClick={() => {
-                              setPoolEditing(p);
-                              setPoolEditName(p.display_name);
-                              setPoolEditDept(p.display_dept);
-                            }}
-                            className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
-                          >
-                            <Edit3 className="w-3 h-3" />
-                            <span>修改</span>
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busy}
                             onClick={() => setPoolDeleting(p)}
                             className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors"
                           >
@@ -2633,71 +2110,6 @@ export const RolesMembersView: React.FC = () => {
               </div>
             </div>
           )}
-        </div>
-      )}
-
-      {/* 成员池：修改姓名/部门弹窗（手机号只读，保存即全局同步） */}
-      {poolEditing && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6 space-y-4">
-            <div>
-              <h3 className="font-bold text-slate-900 text-base">修改成员信息（当前办公软件内同步）</h3>
-              <p className="text-xs text-slate-500 mt-1">
-                将同步修改该手机号在当前办公软件（{platform === 'wecom' ? '企业微信' : '量子密信'}）下
-                <strong className="text-slate-700">全部管理员名下 {poolEditing.row_count} 条</strong>名册记录；其它平台不受影响。
-              </p>
-            </div>
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">手机号（不可修改）</label>
-                <input
-                  type="text"
-                  value={poolEditing.phone}
-                  disabled
-                  className="w-full px-3 py-2 rounded-xl bg-slate-100 border border-slate-200 text-sm text-slate-500 font-mono tabular-nums"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">姓名</label>
-                <input
-                  type="text"
-                  value={poolEditName}
-                  onChange={(e) => setPoolEditName(e.target.value)}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-800 outline-none focus:bg-white focus:border-blue-500"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">部门</label>
-                <input
-                  type="text"
-                  value={poolEditDept}
-                  onChange={(e) => setPoolEditDept(e.target.value)}
-                  placeholder="留空表示清除部门"
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-sm text-slate-800 outline-none focus:bg-white focus:border-blue-500"
-                />
-                <div className="text-[11px] text-slate-400 mt-1">
-                  可选：{departments.slice(0, 8).map((d) => d.name).join(' / ')}
-                </div>
-              </div>
-            </div>
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setPoolEditing(null)}
-                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-sm cursor-pointer"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                disabled={poolBusyPhone === poolEditing.phone}
-                onClick={() => void handlePoolSaveProfile()}
-                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-xl text-sm cursor-pointer disabled:opacity-60"
-              >
-                {poolBusyPhone === poolEditing.phone ? '保存中…' : '保存（全局同步）'}
-              </button>
-            </div>
-          </div>
         </div>
       )}
 

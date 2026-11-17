@@ -147,7 +147,7 @@ def test_h5_badge_no_deadline_via_api() -> None:
     store, app, sa, sub, sched, ntf, tpl_id = _setup()
     try:
         rid = store.create_role("无截止组", actor="sa", platform="zdxlz", owner_id=2)["role_id"]
-        store.add_role_member(rid, PHONE_A, "甲一", "一部", owner_id=2, actor="sub")
+        store.add_role_member(rid, PHONE_A, "成员0", "一部", owner_id=2, actor="sub")
         store.upsert_delivery_target(PHONE_A, "uid_4001", platform="zdxlz", external_type="union_id")
         r = sub.post("/api/admin/templates", json={
             "name": "随到随报", "kind": "upload", "role_ids": [rid], "period": "day",

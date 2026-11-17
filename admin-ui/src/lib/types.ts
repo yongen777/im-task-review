@@ -158,6 +158,7 @@ export interface RoleMemberItem {
   dept: string;
   status: 'active' | 'disabled';
   activation: 'activated' | 'pending';
+  is_left_org?: boolean;
   activations?: { zdxlz: boolean; wecom: boolean };
   usable?: boolean;
   external_id?: string | null;
@@ -277,11 +278,12 @@ export interface ReminderLogItem {
   id: number;
   instance_id: number;
   slot: string;
+  kind?: string;
   retry_no: number;
   planned_at: string;
   attempted_at: string | null;
   sent_at: string | null;
-  result: 'sent' | 'need_activate' | 'failed' | 'no_target' | 'skipped';
+  result: 'sent' | 'need_activate' | 'failed' | 'no_target' | 'skipped' | 'missed';
   error: string | null;
   template_name?: string;
   phone?: string;

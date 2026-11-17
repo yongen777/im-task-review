@@ -116,11 +116,11 @@ def test_sub_admin_same_name_is_allowed():
         store.close()
 
 
-def test_creator_change_syncs_platform_pool():
-    """2026-11-10 口径①②：创建者（sub1）改名部门 → 200，且同步该平台全量池。"""
+def test_creator_cannot_change_directory_profile():
+    """当前角色和同平台其他名册均受档案写保护。"""
     store, app, admin, sub, role = _setup()
     try:
-        # 再造一个同平台超管外管理员的名册行，验证同步
+        # 再造一个同平台管理员的名册行，验证两边均保留原档案
         r = admin.post("/api/admin/accounts", json={"username": "sub2", "display_name": "分级乙"})
         assert r.status_code == 200, r.text
         sub2 = _login(app, "sub2", PWD)
@@ -130,20 +130,19 @@ def test_creator_change_syncs_platform_pool():
         sub2.post(f"/api/admin/roles/{role2}/members", json={"phone": PHONE, "name": "张三", "dept": "市场部"})
 
         r1 = sub.put(f"/api/admin/roles/{role}/members/{PHONE}", json={"name": "张三丰", "dept": "渠道部"})
-        assert r1.status_code == 200, r1.text
+        assert r1.status_code == 403, r1.text
         rows = {(str(x[0]), str(x[1])) for x in store.conn.execute(
             "SELECT role_id, name FROM member WHERE phone = ?", (PHONE,))}
-        assert rows == {(role, "张三丰"), (role2, "张三丰")}, rows  # 两行都已同步
+        assert rows == {(role, "张三"), (role2, "张三")}, rows
     finally:
         store.close()
 
 
-def test_super_admin_can_change_member_profile():
+def test_super_admin_cannot_change_member_profile():
     store, app, admin, sub, role = _setup()
     try:
         r = admin.put(f"/api/admin/roles/{role}/members/{PHONE}", json={"name": "李四", "dept": "渠道部"})
-        assert r.status_code == 200, r.text
-        m = r.json()["member"]
-        assert m["name"] == "李四" and m["dept"] == "渠道部", m
+        assert r.status_code == 403, r.text
+        assert store.list_role_members(role)["items"][0]["name"] == "张三"
     finally:
         store.close()

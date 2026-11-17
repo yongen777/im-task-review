@@ -5,7 +5,7 @@
    PUT 带 exec_weekdays=[1..5] → 读回即工作日（此前前端丢字段导致后端保留旧值）。
 ② 月度执行日：exec_dom_days 优先于 exec_weekdays；31 号 = 大月 31 / 小月 30 / 2 月 28-29。
 ③ 成员修改权限矩阵（用户 11-10 口径，取代 11-09 的分级一律 403）：
-   创建者可改姓名部门并同步该平台全量池；非创建者改名部门 403、改派单状态 200。
+   姓名和部门由官方通讯录维护；角色管理员可调整派单状态。
 """
 from __future__ import annotations
 
@@ -131,7 +131,7 @@ def test_monthly_exec_dom_days_anchor() -> None:
 
 
 def test_member_profile_permission_matrix() -> None:
-    """③ 权限矩阵：创建者改姓名部门 200 且同步平台全量池；非创建者 403；派单全员可改。"""
+    """成员档案由官方通讯录维护，角色管理员仍可调整派单状态。"""
     store = _store()
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
@@ -146,12 +146,12 @@ def test_member_profile_permission_matrix() -> None:
         sb.post(f"/api/admin/roles/{rb}/members", json={"phone": PHONE_A, "name": "张三", "dept": "市场部"})
         # 两条行的 owner 分别是 sa / sb
 
-        # ① 创建者 sa 改自己建的行（ra 行 owner=sa）→ 200，且同步该平台全量池（sb 的行也改）
+        # 创建者也不能手工写入档案，两个名册均保留原姓名。
         r = sa.put(f"/api/admin/roles/{ra}/members/{PHONE_A}", json={"name": "张三丰", "dept": "渠道部"})
-        assert r.status_code == 200, r.text
-        rows = {(str(x["role_id"]), str(x["name"]), str(x["dept"]))
-                for x in store.conn.execute("SELECT role_id, name, dept FROM member WHERE phone = ?", (PHONE_A,))}
-        assert rows == {(ra, "张三丰", "渠道部"), (rb, "张三丰", "渠道部")}, rows
+        assert (r.status_code, r.json()["code"]) == (403, "MEMBER_PROFILE_FORBIDDEN")
+        rows = {(str(x["role_id"]), str(x["name"]))
+                for x in store.conn.execute("SELECT role_id, name FROM member WHERE phone = ?", (PHONE_A,))}
+        assert rows == {(ra, "张三"), (rb, "张三")}, rows
 
         # ② 非创建者 sb 改「sa 的角色里那条行」→ 403。
         #    两道防线（顺序）：角色归属护栏 FORBIDDEN_OWNER（sb 别人的角色一律拦）

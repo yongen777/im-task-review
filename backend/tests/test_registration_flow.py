@@ -72,28 +72,17 @@ def _form_template(store: StateStore, role_id: str) -> str:
 
 
 # ── 1. 部门选项（后台配置）──────────────────────────────────────────
-def test_department_crud_api() -> None:
+def test_department_api_read_only() -> None:
     store = _store()
     try:
         c = _admin_client(store)
 
-        created = c.post("/api/admin/departments", json={"name": DEPT})
-        assert created.status_code == 200, created.text
-        dept_id = created.json()["department"]["id"]
-
-        dup = c.post("/api/admin/departments", json={"name": DEPT})
-        assert (dup.status_code, dup.json()["code"]) == (409, "DEPT_NAME_TAKEN")
-
+        dept_id = store.create_department(DEPT, actor="fixture")["id"]
+        assert c.post("/api/admin/departments", json={"name": "新增部"}).status_code == 403
+        assert c.put(f"/api/admin/departments/{dept_id}", json={"name": "市场部"}).status_code == 403
+        assert c.delete(f"/api/admin/departments/{dept_id}").status_code == 403
         items = c.get("/api/admin/departments").json()["items"]
         assert [d["name"] for d in items] == [DEPT]
-
-        upd = c.put(f"/api/admin/departments/{dept_id}", json={"name": "市场部"})
-        assert upd.status_code == 200
-        assert c.get("/api/admin/departments").json()["items"][0]["name"] == "市场部"
-
-        assert c.delete(f"/api/admin/departments/{dept_id}").status_code == 200
-        assert c.get("/api/admin/departments").json()["items"] == []
-        assert c.delete(f"/api/admin/departments/{dept_id}").status_code == 404
     finally:
         store.close()
 

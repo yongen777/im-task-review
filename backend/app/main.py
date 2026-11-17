@@ -22,7 +22,7 @@ from .api.h5 import create_h5_router
 from .channels.zdxlz import ZdxlzChannel
 from .channel_config import ChannelConfigStore, apply_db_channel_config
 from .config import Config, NowFn, default_now
-from .scheduler import NotifierProtocol, Scheduler, ZdxlzImageSender
+from .scheduler import NotifierProtocol, Scheduler, ZdxlzImageSender, run_upload_cleanup_loop
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -291,7 +291,10 @@ def create_apps(
     # 管理后台端口挂载：权限守卫 + /api/admin/* + 静态托管外壳 (/login 与 4 个管理页面)
     register_admin_guard(admin_app, store)
     admin_app.include_router(
-        create_admin_router(store, notifier=active_notifier, public_base_url=cfg.public_base_url, notifiers=notifiers)
+        create_admin_router(
+            store, notifier=active_notifier, public_base_url=cfg.public_base_url, notifiers=notifiers,
+            require_directory=True,
+        )
     )
     _register_admin_spa_pages(admin_app)
 
@@ -336,6 +339,7 @@ async def serve_dual_ports(config: Optional[Config] = None) -> None:
     adm_server = uvicorn.Server(adm_cfg)
     stop_event = asyncio.Event()
     sched_task = asyncio.create_task(_scheduler_loop(scheduler, stop_event))
+    cleanup_task = asyncio.create_task(run_upload_cleanup_loop(store, stop_event))
 
     try:
         await asyncio.gather(pub_server.serve(), adm_server.serve())
@@ -344,6 +348,7 @@ async def serve_dual_ports(config: Optional[Config] = None) -> None:
         sched_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sched_task
+        await cleanup_task
         chan.close()
         store.close()
 

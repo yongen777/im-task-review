@@ -331,11 +331,11 @@ def test_member_pool_api_super_only() -> None:
         # 超管全局启停（middleware 白名单放行 + 接口 _require_super）
         r = admin.put(f"/api/admin/member-pool/{PHONE_X}/status", json={"enabled": False})
         assert r.status_code == 200 and r.json()["rows"] == 1
-        # 超管全局改名（不收手机号字段）
+        # 超管仍可管理派单状态，通讯录档案只读。
         r = admin.put(f"/api/admin/member-pool/{PHONE_X}", json={"name": "张三丰", "dept": "渠道部"})
-        assert r.status_code == 200
+        assert (r.status_code, r.json()["code"]) == (403, "MEMBER_PROFILE_FORBIDDEN")
         row = store.conn.execute("SELECT name, dept FROM member WHERE phone = ?", (PHONE_X,)).fetchone()
-        assert row["name"] == "张三丰" and row["dept"] == "渠道部"
+        assert row["name"] == "张三" and row["dept"] is None
         # 分级管理员调用成员池 → 403（接口内校验，middleware 对 sub 不拦这个路径）
         assert sa.get("/api/admin/member-pool").status_code == 403
         assert sa.put(f"/api/admin/member-pool/{PHONE_X}/status", json={"enabled": True}).status_code == 403
@@ -376,7 +376,7 @@ def test_member_distinct_total_and_roles_response() -> None:
 
 
 # ── 7. 部门增/改/删仅超管 ──
-def test_departments_write_super_only() -> None:
+def test_departments_read_only_for_all_admins() -> None:
     store = _store()
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
@@ -386,17 +386,11 @@ def test_departments_write_super_only() -> None:
         sub = _login(app, "sa", StateStore.DEFAULT_SUB_ADMIN_PASSWORD)
         sub.post("/api/admin/change-password", json={"old_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD, "new_password": "NewPass@2026"})
 
-        # 超管：建/改/删全通
-        r = admin.post("/api/admin/departments", json={"name": "市场部"})
-        assert r.status_code == 200, r.text
-        dept_id = r.json()["department"]["id"]
-        assert admin.put(f"/api/admin/departments/{dept_id}", json={"name": "市场二部"}).status_code == 200
-        assert admin.delete(f"/api/admin/departments/{dept_id}").status_code == 200
-        # 分级管理员：全部 403（读列表仍可）
-        assert sub.post("/api/admin/departments", json={"name": "私设部门"}).status_code == 403
-        assert sub.put("/api/admin/departments/1", json={"name": "偷改"}).status_code == 403
-        assert sub.delete("/api/admin/departments/1").status_code == 403
-        assert sub.get("/api/admin/departments").status_code == 200
+        for client in (admin, sub):
+            assert client.post("/api/admin/departments", json={"name": "市场部"}).status_code == 403
+            assert client.put("/api/admin/departments/1", json={"name": "改名"}).status_code == 403
+            assert client.delete("/api/admin/departments/1").status_code == 403
+            assert client.get("/api/admin/departments").status_code == 200
     finally:
         store.close()
 

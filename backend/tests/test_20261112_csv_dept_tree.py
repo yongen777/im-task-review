@@ -10,7 +10,7 @@ A3：build_dept_tree()
 3. 按 dept_path 的 "/" 分段聚合成树；count = 人数（含全部下级）。
 4. 同一手机号多角色/多管理员行不重复计数；同一人跨 dept_path 时公共祖先只计 1 人。
 5. enabled=0（停用）不计入；dept_path 为空不计入。
-6. GET /api/admin/dept-tree：超管 200、分级管理员 403、匿名 401。
+6. GET /api/admin/dept-tree：超管和分级管理员 200，匿名 401。
 
 全部相对时刻（AGENTS.md 第六节：时间炸弹教训），不依赖真实网络。
 """
@@ -223,7 +223,7 @@ def test_build_dept_tree_aggregation() -> None:
 
 # ── A3：接口权限 ─────────────────────────────────────────────────────
 def test_dept_tree_endpoint_permissions() -> None:
-    """A3：GET /api/admin/dept-tree 仅超管可读（分级 403 / 匿名 401）。"""
+    """登录管理员可读取部门架构，匿名请求被拒绝。"""
     store = _store()
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
@@ -237,10 +237,9 @@ def test_dept_tree_endpoint_permissions() -> None:
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["ok"] is True and isinstance(body["items"], list), body
-        # 分级管理员：403 FORBIDDEN（A2 同口径：部门全局库仅超管）
         sub_c = _sub(app, "a1")
         r2 = sub_c.get("/api/admin/dept-tree")
-        assert r2.status_code == 403, r2.text
-        assert r2.json().get("code") == "FORBIDDEN", r2.text
+        assert r2.status_code == 200, r2.text
+        assert r2.json() == {"ok": True, "items": []}
     finally:
         store.close()

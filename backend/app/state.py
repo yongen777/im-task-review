@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -15,6 +16,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import NowFn, default_now, format_dt, parse_dt
 from .db import Database, IntegrityError
+
+logger = logging.getLogger(__name__)
 
 PBKDF2_ITERATIONS = 260_000
 SESSION_TTL_HOURS = 24 * 7
@@ -42,9 +45,7 @@ ROLE_ID_RE = re.compile(r"r_[0-9a-fA-F]+")
 def parse_role_ids(raw: Any) -> List[str]:
     """2026-11-12 晚（需求四 · 角色删除引用加固）：role_ids 字段的**规范解析**。
 
-    统一支持 JSON 数组字符串与逗号/分号分隔格式；解析失败时按 role_id 词法兜底提取，
-    保证「只要该角色被任意未删除模板引用，删除就 100% 拦截」——
-    旧实现 `json.loads` 失败直接置空列表会导致**漏判误删**（用户点名的隐患）。
+    支持 JSON 数组和历史分隔格式，角色删除时据此移除匹配的完整 ID。
     """
     s = raw if isinstance(raw, str) else ("" if raw is None else json.dumps(raw, ensure_ascii=False))
     s = (s or "").strip()
@@ -883,7 +884,7 @@ class StateStore:
             "COUNT(DISTINCT m.name) AS distinct_names, COUNT(DISTINCT COALESCE(m.dept, '')) AS distinct_depts, "
             # 方案B（2026-11-16）：p.name/p.dept 由每组唯一的 p.id 决定（函数依赖），
             # 但 MySQL only_full_group_by 识别不了这种表达式依赖 → ANY_VALUE 明示组内唯一取值
-            "ANY_VALUE(p.name) AS display_name, ANY_VALUE(p.dept) AS display_dept, "
+            "ANY_VALUE(p.name) AS display_name, ANY_VALUE(p.dept) AS display_dept, MAX(m.is_left_org) AS is_left_org, "
             "(SELECT GROUP_CONCAT(DISTINCT u.display_name) FROM member m2 "
             " JOIN role r2 ON r2.role_id = m2.role_id JOIN admin_user u ON u.id = m2.owner_id "
             f" WHERE m2.phone = m.phone {pf('r2')}) AS owner_names, "
@@ -940,6 +941,7 @@ class StateStore:
                     "first_owner_name": str(r["first_owner_name"] or ""),
                     "first_owner_username": str(r["first_owner_username"] or ""),
                     "activated_platforms": [p for p in str(r["activated_platforms"] or "").split(",") if p],
+                    "is_left_org": bool(r["is_left_org"]),
                     "name_inconsistent": int(r["distinct_names"] or 0) > 1,
                     "dept_inconsistent": int(r["distinct_depts"] or 0) > 1,
                 })
@@ -1580,13 +1582,17 @@ class StateStore:
         with self.lock:
             rows = self.conn.execute(
                 "SELECT r.role_id, r.name, r.note, r.platform, r.created_at, r.owner_id, COUNT(m.id) AS member_count, "
-                "u.username AS owner_username, u.display_name AS owner_display_name "
-                f"FROM role r LEFT JOIN member m ON m.role_id = r.role_id "
+                "COUNT(CASE WHEN m.enabled = 1 THEN 1 END) AS active_count, "
+                "COUNT(dt.phone) AS activated_count, u.username AS owner_username, u.display_name AS owner_display_name "
+                "FROM role r LEFT JOIN member m ON m.role_id = r.role_id "
+                "LEFT JOIN delivery_target dt ON dt.phone = m.phone AND dt.platform = r.platform AND dt.usable = 1 "
                 f"LEFT JOIN admin_user u ON u.id = r.owner_id {where_sql} "
                 "GROUP BY r.role_id ORDER BY r.created_at ASC, r.role_id ASC",
                 tuple(params),
             ).fetchall()
-            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "owner_id": int(r["owner_id"] or 1), "owner_username": r["owner_username"], "owner_display_name": r["owner_display_name"], "member_count": int(r["member_count"] or 0)} for r in rows]
+            return [{"role_id": r["role_id"], "name": r["name"], "note": r["note"], "platform": r["platform"], "created_at": r["created_at"], "owner_id": int(r["owner_id"] or 1), "owner_username": r["owner_username"], "owner_display_name": r["owner_display_name"],
+                     "member_count": int(r["member_count"] or 0), "active_count": int(r["active_count"] or 0),
+                     "activated_count": int(r["activated_count"] or 0)} for r in rows]
 
     def role_platforms(self, role_ids: List[str]) -> set:
         """这组角色覆盖到的办公软件集合（用于判断任务归属平台）。"""
@@ -1621,7 +1627,8 @@ class StateStore:
     def get_role(self, role_id: str) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT r.*, (SELECT COUNT(1) FROM member m WHERE m.role_id = r.role_id) AS member_count FROM role r WHERE r.role_id = ?", ((role_id or "").strip(),)).fetchone()
-            return {"role_id": row["role_id"], "name": row["name"], "note": row["note"], "platform": row["platform"], "created_at": row["created_at"], "member_count": int(row["member_count"] or 0)} if row else None
+            return {"role_id": row["role_id"], "name": row["name"], "note": row["note"], "platform": row["platform"], "created_at": row["created_at"], "member_count": int(row["member_count"] or 0),
+                    "owner_id": int(row["owner_id"] or 1)} if row else None
 
     def create_role(self, name: str, note: Optional[str] = None, actor: str = "system", platform: str = "zdxlz", owner_id: int = 1) -> Dict[str, Any]:
         clean_name = (name or "").strip()
@@ -1654,29 +1661,20 @@ class StateStore:
             return {"role_id": clean_id, "name": clean_name, "note": clean_note, "platform": existing["platform"], "created_at": existing["created_at"], "member_count": cnt}
 
     def delete_role(self, role_id: str, actor: str = "system") -> Dict[str, Any]:
-        """2026-11-12 下午（用户拍板）：删除角色分组 = **组内全部成员一并清除**。
-
-        旧实现在「组里还有成员」时 409 拦截，用户必须逐个删成员才能删组——不符合
-        「删分组即清全组」的预期（且清库迁移前这轮就是要整组清掉）。
-        新口径：
-        · 组内每个成员按 `delete_role_member` 同款语义处理：名册行物理删除、
-          绑定条件删（该平台已无其它角色归属才删）、该模板实例按 C 口径处置、逐条审计；
-        · ⛔ 若该角色仍被**任务模板引用** → 仍然 409 拦下（提示先删模板），
-          避免删组连带毁掉别的角色的模板/实例（模板删除走独立的物理清除口径）。
-        · 返回删除明细（成员数、绑定数、实例数），前端可提示「需重新导入」。
-        """
+        """移除角色和名册，并同步更新直接引用它的模板。"""
         clean_id, now_s = (role_id or "").strip(), self.now_str()
         with self.lock, self.conn:
-            existing = self.conn.execute("SELECT * FROM role WHERE role_id = ?", (clean_id,)).fetchone()
+            existing = self.conn.execute("SELECT * FROM role WHERE role_id = ? FOR UPDATE", (clean_id,)).fetchone()
             if not existing:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
-            # 2026-11-12 晚 · 需求四加固：规范解析（JSON 数组 / 逗号分隔统一提取），
-            # 解析不出 token 时按「原始字符串包含该 role_id」保守拦截 —— 杜绝漏判误删。
-            for trow in self.conn.execute("SELECT role_ids FROM task_template WHERE deleted = 0").fetchall():
-                _raw_ids = str(trow["role_ids"] or "")
-                rids = parse_role_ids(_raw_ids)
-                if clean_id in rids or (not rids and _raw_ids and clean_id in _raw_ids):
-                    raise BizError(409, "ROLE_IN_USE", "该角色已被任务模板引用，请先删除相关任务模板")
+            referenced = {
+                str(row["template_id"]): [rid for rid in parse_role_ids(row["role_ids"]) if rid != clean_id]
+                for row in self.conn.execute(
+                    "SELECT template_id, role_ids FROM task_template WHERE deleted = 0 "
+                    "AND INSTR(role_ids, ?) > 0 FOR UPDATE", (clean_id,),
+                ).fetchall()
+                if clean_id in parse_role_ids(row["role_ids"])
+            }
             phones = [str(r[0]) for r in self.conn.execute(
                 "SELECT phone FROM member WHERE role_id = ? ORDER BY id ASC", (clean_id,)).fetchall()]
             deleted_members = 0
@@ -1689,26 +1687,32 @@ class StateStore:
                 removed_bindings.extend(res.get("removed_bindings") or [])
                 cancelled_instances += int(res.get("cancelled_instances") or 0)
                 removed_instances += int(res.get("removed_instances") or 0)
+            for template_id, remaining in referenced.items():
+                self.conn.execute(
+                    "UPDATE task_template SET role_ids = ?, updated_at = ? WHERE template_id = ?",
+                    (json.dumps(remaining, ensure_ascii=False), now_s, template_id),
+                )
             self.conn.execute("DELETE FROM role WHERE role_id = ?", (clean_id,))
             self._insert_audit_unlocked(
                 actor, "role.purge", "role", clean_id,
                 {"name": existing["name"], "deleted_members": deleted_members,
                  "bindings_removed": removed_bindings,
                  "cancelled_instances": cancelled_instances,
-                 "removed_instances": removed_instances}, now_s,
+                 "removed_instances": removed_instances, "updated_templates": list(referenced)}, now_s,
             )
         return {
             "ok": True, "name": existing["name"], "deleted_members": deleted_members,
             "bindings_removed": removed_bindings,
             "cancelled_instances": cancelled_instances,
             "removed_instances": removed_instances,
+            "updated_templates": list(referenced),
         }
 
     def list_role_members(self, role_id: str, q: Optional[str] = None, page: int = 1, size: int = 20, platform: Optional[str] = None) -> Dict[str, Any]:
         clean_role_id = (role_id or "").strip()
         plat = self._plat(platform)
-        p, s = _clamp_page_size(page, size)
-        offset, kw = (p - 1) * s, (q or "").strip()
+        p, _ = _clamp_page_size(page, size)
+        kw = (q or "").strip()
         with self.lock:
             if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
                 raise BizError(404, "NOT_FOUND", "角色不存在")
@@ -1717,12 +1721,17 @@ class StateStore:
                 where_sql += " AND (m.name LIKE ? OR m.phone LIKE ? OR COALESCE(m.dept, '') LIKE ?)"
                 params.extend([f"%{kw}%", f"%{kw}%", f"%{kw}%"])
             total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM member m {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
+            pagination = ""
+            if size != 0:
+                s = max(1, min(int(size), total or 1))
+                pagination = " LIMIT ? OFFSET ?"
+                params.extend([s, min((p - 1) * s, total)])
             rows = self.conn.execute(
                 f"SELECT m.*, dtz.external_id AS ext_zdxlz, dtw.external_id AS ext_wecom FROM member m "
                 f"LEFT JOIN delivery_target dtz ON dtz.platform = 'zdxlz' AND dtz.phone = m.phone AND dtz.usable = 1 "
                 f"LEFT JOIN delivery_target dtw ON dtw.platform = 'wecom' AND dtw.phone = m.phone AND dtw.usable = 1 "
-                f"{where_sql} ORDER BY m.id ASC LIMIT ? OFFSET ?",
-                tuple(params + [s, offset]),
+                f"{where_sql} ORDER BY m.id ASC{pagination}",
+                tuple(params),
             ).fetchall()
             items = []
             for r in rows:
@@ -1736,7 +1745,7 @@ class StateStore:
                 items.append({**_fmt_member(
                     r["id"], r["role_id"], r["phone"], r["name"], r["dept"], r["enabled"],
                     r["source"], r["created_at"], activated, activations=act,
-                ), "owner_id": int(r["owner_id"] or 1)})
+                ), "owner_id": int(r["owner_id"] or 1), "is_left_org": bool(r["is_left_org"])})
             # 2026-11-10：附带角色归属 owner，前端据此判定「我是否为该成员的创建者」
             # （姓名/部门修改权限矩阵：超管 或 创建者可改）。
             _role_row = self.conn.execute("SELECT owner_id FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
@@ -1759,7 +1768,7 @@ class StateStore:
         ]
 
     # ── 2026-11-13 用户需求一：严格实名校验（单人添加 / CSV 批量导入共用） ──────
-    def _strict_contacts_lookup(self, platform: str) -> Optional[Callable[[str, str, str], Tuple[str, Optional[Dict[str, Any]]]]]:
+    def _strict_contacts_lookup(self, platform: str, *, fresh: bool = False) -> Optional[Callable[[str, str, str], Tuple[str, Optional[Dict[str, Any]]]]]:
         """当前平台「严格手机号核验」函数；None = 该平台不具备严格核验能力（降级）。
 
         入参 (phone, name, dept)，返回：
@@ -1776,6 +1785,8 @@ class StateStore:
             strict = getattr(resolver, "search_by_phone_strict", None) if resolver is not None else None
             if strict is None:
                 return None
+            if fresh:
+                strict = getattr(resolver, "refresh_by_phone_strict", strict)
             return lambda phone, name, dept: strict(phone)
         if plat == "wecom":
             resolver = getattr(self, "wecom_contacts", None)
@@ -1785,17 +1796,21 @@ class StateStore:
             supports = getattr(resolver, "supports_strict_phone_verify", None)
             if supports is not None and not supports():
                 return None
+            if fresh:
+                refresh = getattr(resolver, "refresh_by_phone_strict", None)
+                if refresh is not None:
+                    return lambda phone, name, dept: refresh(phone)
             return lambda phone, name, dept: strict(phone, name, dept)
         return None
 
-    def _contacts_verify_batch(self, phones: List[str], platform: str) -> Optional[Dict[str, Tuple[str, Optional[Dict[str, Any]]]]]:
+    def _contacts_verify_batch(self, phones: List[str], platform: str, *, fresh: bool = False) -> Optional[Dict[str, Tuple[str, Optional[Dict[str, Any]]]]]:
         """批量实名校验（16 线程并发 + 客户端 TTL 缓存）；None = 平台不支持严格核验。
 
         返回 {phone: ("ok", user|None) | ("error", None)}（按手机号去重）。
         ⚠️ 本方法只做**只读**网络查询，不写库、不持 self.lock —— 2600 人核验期间
         调度器（30s tick）与后台其它请求不受影响（导入写库在后续独立事务内完成）。
         """
-        lookup = self._strict_contacts_lookup(platform)
+        lookup = self._strict_contacts_lookup(platform, fresh=fresh)
         if lookup is None:
             return None
         unique: List[str] = []
@@ -1824,7 +1839,88 @@ class StateStore:
                 outcomes = list(pool.map(_one, unique))
         return {phone: (status, user) for phone, status, user in outcomes}
 
-    def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
+    def _local_directory_profiles(self, phones: List[str], platform: str, *, lock: bool = False) -> Dict[str, Dict[str, Any]]:
+        """同平台、可用绑定与名册联查，优先采用最近一次官方同步结果。"""
+        if not phones:
+            return {}
+        placeholders = ",".join("?" for _ in phones)
+        rows = self.conn.execute(
+            "SELECT m.phone, m.name, m.dept AS department, m.dept_path, m.is_left_org, "
+            "m.directory_checked_at, dt.external_id, dt.external_type "
+            "FROM member m JOIN role r ON r.role_id = m.role_id "
+            "JOIN delivery_target dt ON dt.platform = r.platform AND dt.phone = m.phone "
+            f"WHERE r.platform = ? AND dt.usable = 1 AND m.phone IN ({placeholders}) "
+            "ORDER BY m.directory_checked_at DESC, m.is_left_org DESC, m.id ASC"
+            + (" LOCK IN SHARE MODE" if lock else ""),
+            (platform, *phones),
+        ).fetchall()
+        latest = {}
+        for row in rows:
+            latest.setdefault(row["phone"], dict(row))
+        return {phone: row for phone, row in latest.items() if not row["is_left_org"]}
+
+    def sync_directory_profiles(self, platform: str, owner_id: int, actor: str) -> Dict[str, Any]:
+        """查询本管理员当前平台的去重名册，并逐人提交官方档案。"""
+        if self._strict_contacts_lookup(platform, fresh=True) is None:
+            raise BizError(503, "CONTACTS_QUERY_FAILED", "当前平台未配置可按手机号查询的官方通讯录")
+        checked_at = self.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+        where = (
+            "r.platform = ? AND r.owner_id = ? AND m.phone = ? "
+            "AND (m.directory_checked_at IS NULL OR m.directory_checked_at <= ?)"
+        )
+        phones = [row[0] for row in self.conn.execute(
+            "SELECT DISTINCT m.phone FROM member m JOIN role r ON r.role_id = m.role_id "
+            "WHERE r.platform = ? AND r.owner_id = ? ORDER BY m.phone",
+            (platform, owner_id),
+        ).fetchall()]
+        if platform == "wecom":
+            clear_depts = getattr(getattr(self, "wecom_contacts", None), "clear_department_cache", None)
+            if clear_depts is not None:
+                clear_depts()
+        outcomes = self._contacts_verify_batch(phones, platform, fresh=True) or {}
+        result = {"ok": True, "total": len(phones), "updated": 0, "left": 0, "failed": 0}
+        for phone in phones:
+            status, user = outcomes.get(phone, ("error", None))
+            if status != "ok":
+                result["failed"] += 1
+                continue
+            profile_key = (platform, owner_id, phone, checked_at)
+            if user is None:
+                changed = self.conn.execute(
+                    "UPDATE member m JOIN role r ON r.role_id = m.role_id "
+                    f"SET m.is_left_org = 1, m.directory_checked_at = ? WHERE {where}",
+                    (checked_at, *profile_key),
+                )
+                result["left"] += int(bool(changed.rowcount))
+                continue
+            external_id = str(user.get("union_id") or user.get("external_id") or "").strip()
+            name = str(user.get("name") or "").strip()
+            dept = str(user.get("department") or "").strip()
+            path = str(user.get("dept_path") or "").strip()
+            if not name or not external_id or len(name) > 128 or len(dept) > MAX_DEPT_NAME_LEN or len(path) > 1024 or len(external_id) > 128:
+                result["failed"] += 1
+                continue
+            try:
+                with self.conn:
+                    changed = self.conn.execute(
+                        "UPDATE member m JOIN role r ON r.role_id = m.role_id "
+                        "SET m.name = ?, m.dept = ?, m.dept_path = ?, m.is_left_org = 0, "
+                        f"m.directory_checked_at = ? WHERE {where}",
+                        (name, dept or None, path or None, checked_at, *profile_key),
+                    )
+                    if changed.rowcount:
+                        self.upsert_delivery_target(
+                            phone, external_id, platform=platform,
+                            external_type="union_id" if platform == "zdxlz" else "user",
+                        )
+                result["updated"] += int(bool(changed.rowcount))
+            except (BizError, IntegrityError):
+                result["failed"] += 1
+        self.write_audit(actor, "member.directory_sync", "role", str(owner_id), {**result, "platform": platform})
+        return result
+
+    def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1,
+                        *, require_directory: bool = False) -> Dict[str, Any]:
         """添加单个角色成员（管理员「快速添加」= 姓名 + 手机号）。
 
         2026-11-13 用户需求一 ·2（写库前严格实名核验，非匹配即拦截、零写入）：
@@ -1853,20 +1949,27 @@ class StateStore:
         _plat_key_pre = str(_role_plat_pre["platform"] or self.platform).strip().lower()
         # ── 严格核验（锁外网络查询；失败/查无/不符都不写库） ──
         resolved_user: Optional[Dict[str, Any]] = None
+        local = self._local_directory_profiles([clean_phone], _plat_key_pre).get(clean_phone)
         strict_lookup = self._strict_contacts_lookup(_plat_key_pre)
-        if strict_lookup is not None:
+        if require_directory and local is None and strict_lookup is None:
+            raise BizError(503, "CONTACTS_QUERY_FAILED", "当前平台未配置可按手机号查询的官方通讯录")
+        if local is not None or strict_lookup is not None:
             try:
-                _status, _user = strict_lookup(clean_phone, clean_name, clean_dept or "")
+                _status, _user = ("ok", local) if local is not None else strict_lookup(
+                    clean_phone, clean_name, clean_dept or "",
+                )
             except Exception:  # noqa: BLE001 - 反查异常按查询失败拦截，绝不误报手机号不存在
                 _status, _user = "error", None
             if _status != "ok":
                 raise BizError(503, "CONTACTS_QUERY_FAILED", "官方通讯录查询失败，请稍后重试")
             if _user is None:
                 raise BizError(400, "PHONE_NOT_IN_CONTACTS", f"手机号 {clean_phone} 不存在，请确定手机号是否正确")
+            if require_directory and not (_user.get("name") and (_user.get("union_id") or _user.get("external_id"))):
+                raise BizError(503, "CONTACTS_QUERY_FAILED", "官方通讯录返回的成员档案不完整，请稍后重试")
             if _user.get("name") is not None and clean_name_for_match(_user.get("name")) != clean_name_for_match(clean_name):
                 raise BizError(400, "NAME_MISMATCH", f"{clean_name} 姓名不正确，请核对后重试")
             resolved_user = _user
-            if clean_dept is None:
+            if local is not None or clean_dept is None:
                 clean_dept = str(resolved_user.get("department") or "").strip() or None
                 clean_path = str(resolved_user.get("dept_path") or "").strip() or None
         elif clean_dept is None and _plat_key_pre == "zdxlz":
@@ -1884,24 +1987,41 @@ class StateStore:
                     clean_path = str(_u.get("dept_path") or "").strip() or None
         now_s = self.now_str()
         with self.lock, self.conn:
-            if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ?", (clean_role_id,)).fetchone():
+            if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ? LOCK IN SHARE MODE", (clean_role_id,)).fetchone():
                 raise BizError(404, "NOT_FOUND", "角色不存在")
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
-            cur = self.conn.execute("INSERT INTO member(role_id, phone, name, dept, dept_path, enabled, source, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)", (clean_role_id, clean_phone, clean_name, clean_dept, clean_path, source, now_s, int(owner_id)))
+            if local and self._local_directory_profiles([clean_phone], _plat_key_pre, lock=True).get(clean_phone) != local:
+                raise BizError(409, "DIRECTORY_CHANGED", "通讯录档案已刷新，请重新核对后添加")
+            directory_checked_at = local["directory_checked_at"] if local else (
+                self.now().strftime("%Y-%m-%d %H:%M:%S.%f") if strict_lookup and resolved_user else None
+            )
+            cur = self.conn.execute(
+                "INSERT INTO member(role_id, phone, name, dept, dept_path, enabled, source, created_at, owner_id, directory_checked_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                (clean_role_id, clean_phone, clean_name, clean_dept, clean_path, source, now_s, int(owner_id), directory_checked_at),
+            )
             # 2026-11-04：这里原来跟随「当前通道」(self.platform)，导致在企微面板给密信角色
             # 加成员时取错通道 → 「激活状态」显示不对。改按**角色所属平台**判定（业务语义）。
             _role_plat = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
             _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
-            _ext = self.external_id_for(clean_phone, _plat_key)
+            binding = self.get_delivery_target(clean_phone, _plat_key)
+            _ext = str(binding["external_id"]) if binding else ""
+            reused_binding = bool(local or (binding and strict_lookup is None))
+            if resolved_user and local is None:
+                uid = str(resolved_user.get("union_id") or resolved_user.get("external_id") or "").strip()
+                ext_type = "union_id" if _plat_key == "zdxlz" else "user"
+                if uid and (not binding or (strict_lookup and (uid != _ext or binding["external_type"] != ext_type))):
+                    self.upsert_delivery_target(clean_phone, uid, platform=_plat_key, external_type=ext_type)
+                    _ext = uid
             self._insert_audit_unlocked(actor, "member.create", "member", f"{clean_role_id}:{clean_phone}", {"name": clean_name, "dept": clean_dept, "dept_path": clean_path, "source": source}, now_s)
             member = _fmt_member(int(cur.lastrowid), clean_role_id, clean_phone, clean_name, clean_dept, True, source, now_s, _ext)
 
         # 2026-11-10 方案A：单个加人也自动激活（zdxlz/企微均适用；查不到/未装配时静默跳过）。
         # 2026-11-13：复用上面核验查询到的官方用户（pre_resolved），不再二次反查同一手机号。
-        self._auto_activate_imported(
-            [(clean_phone, clean_name, clean_dept, clean_path)], platform=_plat_key, actor=actor,
-            pre_resolved={clean_phone: resolved_user} if resolved_user is not None else None)
+        if resolved_user is None:
+            self._auto_activate_imported([(clean_phone, clean_name, clean_dept, clean_path)], platform=_plat_key, actor=actor)
+        member["reused_binding"] = reused_binding
         return member
 
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
@@ -1995,7 +2115,7 @@ class StateStore:
             # 2026-11-12 晚 · 需求四加固：同款规范解析（脏数据兜底切分）
             _raw_tpl_roles = str((trow["role_ids"] if trow else "") or "")
             tpl_roles = parse_role_ids(_raw_tpl_roles)
-            if not tpl_roles:
+            if clean_role_id not in tpl_roles:
                 continue
             placeholders = ",".join("?" for _ in tpl_roles)
             still_member = self.conn.execute(
@@ -2068,7 +2188,7 @@ class StateStore:
         return {"ok": True, "deleted": deleted, "failed": failed}
 
     def import_role_members(self, role_id: str, csv_rows: List[Dict[str, Any]], dry_run: bool = True, actor: str = "system", owner_id: int = 1,
-                            sync_global_profile: bool = True) -> Dict[str, Any]:
+                            sync_global_profile: bool = True, *, require_directory: bool = False) -> Dict[str, Any]:
         """R43 + §9.3：批量导入成员（行解析加 try 保护，非法行进 invalid 列表而不抛 500）。
 
         2026-11-09 用户口径（三条）：
@@ -2105,10 +2225,16 @@ class StateStore:
             role_platform = str(role_row["platform"] or "zdxlz").strip().lower() or "zdxlz"
             existing_phones = {r["phone"] for r in self.conn.execute("SELECT phone FROM member WHERE role_id = ?", (clean_role_id,)).fetchall()}
             # 2026-11-09：全局已有的手机号 → 记下它现有的姓名/部门（用于同步与报告）
+            phones_in_csv = list(dict.fromkeys(
+                str(row.get("phone") or "").strip() for row in csv_rows
+                if isinstance(row, dict) and is_valid_phone(str(row.get("phone") or "").strip())
+            ))
+            placeholders = ",".join("?" for _ in phones_in_csv)
             global_rows = self.conn.execute(
-                "SELECT phone, name, dept FROM member WHERE phone IN "
-                f"(SELECT DISTINCT phone FROM member) ORDER BY id ASC"
-            ).fetchall()
+                "SELECT m.phone, m.name, m.dept FROM member m JOIN role r ON r.role_id = m.role_id "
+                f"WHERE r.platform = ? AND m.phone IN ({placeholders}) ORDER BY m.id ASC",
+                (role_platform, *phones_in_csv),
+            ).fetchall() if phones_in_csv else []
             global_profile: Dict[str, Dict[str, Any]] = {}
             for gr in global_rows:
                 gp = global_profile.setdefault(gr["phone"], {"name": None, "dept": None, "rows": 0})
@@ -2192,28 +2318,51 @@ class StateStore:
         # 只查不写、不持锁；2600 人核验期间调度器与其它后台请求不受影响。
         # 严格按传入顺序扫，第一处错误立即中断（后面的行不再提示）。
         verified: Dict[str, Dict[str, Any]] = {}
+        local: Dict[str, Dict[str, Any]] = {}
         verification_skipped = False
         if not invalid:
-            lookup = self._contacts_verify_batch([row[1] for row in to_insert], role_platform)
-            if lookup is None:
-                verification_skipped = True  # 降级环境 / 企微仅 MCP：保持旧 fail-open 行为
-            else:
-                for row_no, phone, name, dept in to_insert:
-                    status, user = lookup.get(phone, ("error", None))
+            local = self._local_directory_profiles([row[1] for row in to_insert], role_platform)
+            window = contacts_verify_threads()
+            for start in range(0, len(to_insert), window):
+                batch = to_insert[start:start + window]
+                misses = [phone for _, phone, _, _ in batch if phone not in local]
+                lookup = self._contacts_verify_batch(misses, role_platform) if misses else {}
+                if require_directory and lookup is None:
+                    raise BizError(503, "CONTACTS_QUERY_FAILED", "当前平台未配置可按手机号查询的官方通讯录")
+                verification_skipped = verification_skipped or lookup is None
+                for row_no, phone, name, _dept in batch:
+                    profile = local.get(phone)
+                    if profile:
+                        status, user = "ok", profile
+                    elif lookup is None:
+                        continue
+                    else:
+                        status, user = lookup.get(phone, ("error", None))
                     if status != "ok":
-                        invalid.append({"row": row_no, "phone": "",
-                                        "reason": "官方通讯录查询失败，请稍后重试（本次导入已取消，未写入任何数据）"})
-                        break
-                    if user is None:
-                        invalid.append({"row": row_no, "phone": "",
-                                        "reason": f"{phone} 不存在，请确定手机号是否正确（本次导入已取消，未写入任何数据）"})
-                        break
-                    official_name = user.get("name")
-                    if official_name is not None and clean_name_for_match(official_name) != clean_name_for_match(name):
-                        invalid.append({"row": row_no, "phone": "",
-                                        "reason": f"{name}（{phone}）姓名不正确（本次导入已取消，未写入任何数据）"})
-                        break
-                    verified[phone] = user
+                        reason = "官方通讯录查询失败，请稍后重试"
+                    elif user is None:
+                        reason = f"{phone} 不存在，请确定手机号是否正确"
+                    elif require_directory and not (user.get("name") and (user.get("union_id") or user.get("external_id"))):
+                        reason = "官方通讯录返回的成员档案不完整，请稍后重试"
+                    elif user.get("name") is not None and clean_name_for_match(user["name"]) != clean_name_for_match(name):
+                        reason = f"{name}（{phone}）姓名不正确"
+                    else:
+                        if not profile:
+                            verified[phone] = user
+                        continue
+                    invalid.append({"row": row_no, "phone": "",
+                                    "reason": f"{reason}（本次导入已取消，未写入任何数据）"})
+                    break
+                if invalid:
+                    break
+        resolved = {**local, **verified}
+        to_insert = [
+            (row_no, phone, name, (str(resolved[phone].get("department") or "").strip() or None)
+             if phone in resolved else dept)
+            for row_no, phone, name, dept in to_insert
+        ]
+        global_profile_updates = [upd for upd in global_profile_updates if upd["phone"] not in resolved]
+        activation = {"enabled": bool(resolved), "activated": 0, "failed": 0, "skipped": 0, "failed_phones": []}
 
         # ── 阶段三（锁内，单事务）：部门自动建档 + 全量写入 + 全局同步；blocked 一律回滚 ──
         with self.lock, self.conn:
@@ -2222,8 +2371,8 @@ class StateStore:
             created_depts: List[str] = []
             # 2026-11-09：本次自动建档的部门 id（整批拒绝时回滚用）
             created_dept_ids: List[int] = []
-            for _row_no, _phone, _name, _dept in to_insert:
-                if not _dept:
+            for _row_no, _phone, _name, _dept in to_insert if not invalid else []:
+                if not _dept or _phone in resolved:
                     continue
                 if _dept in dept_cache:
                     continue
@@ -2254,21 +2403,48 @@ class StateStore:
             blocked = bool(invalid)
             if not dry_run and not blocked:
                 try:
+                    if not self.conn.execute(
+                        "SELECT 1 FROM role WHERE role_id = ? LOCK IN SHARE MODE", (clean_role_id,),
+                    ).fetchone():
+                        raise BizError(404, "NOT_FOUND", "角色不存在")
+                    if local and self._local_directory_profiles(list(local), role_platform, lock=True) != local:
+                        raise BizError(409, "DIRECTORY_CHANGED", "通讯录档案已刷新，本次导入已取消，请重试")
+                    checked_at = self.now().strftime("%Y-%m-%d %H:%M:%S.%f")
                     for _row_no, phone, name, dept in to_insert:
-                        self.conn.execute(
-                            "INSERT INTO member(role_id, phone, name, dept, enabled, source, created_at, owner_id) "
-                            "VALUES (?, ?, ?, ?, 1, 'import', ?, ?)",
-                            (clean_role_id, phone, name, dept, now_s, int(owner_id)),
+                        profile = resolved.get(phone) or {}
+                        path = str(profile.get("dept_path") or "").strip() or None
+                        member_checked_at = local[phone]["directory_checked_at"] if phone in local else (
+                            checked_at if phone in verified else None
                         )
-                        # 2026-11-11：CSV/导入路径的 dept_path 由阶段二核验结果回填
-                        # （_auto_activate_imported 负责，pre_resolved 复用同一份查询结果）
+                        self.conn.execute(
+                            "INSERT INTO member(role_id, phone, name, dept, dept_path, enabled, source, created_at, owner_id, directory_checked_at) "
+                            "VALUES (?, ?, ?, ?, ?, 1, 'import', ?, ?, ?)",
+                            (clean_role_id, phone, name, dept, path, now_s, int(owner_id), member_checked_at),
+                        )
+                        if phone in local:
+                            activation["skipped"] += 1
+                        elif profile:
+                            uid = str(profile.get("union_id") or profile.get("external_id") or "").strip()
+                            if uid:
+                                ext_type = "union_id" if role_platform == "zdxlz" else "user"
+                                target = self.get_delivery_target(phone, platform=role_platform)
+                                if target and (uid, ext_type) == (target["external_id"], target["external_type"]):
+                                    activation["skipped"] += 1
+                                else:
+                                    self.upsert_delivery_target(phone, uid, platform=role_platform, external_type=ext_type)
+                                    activation["activated"] += 1
+                            else:
+                                activation["failed"] += 1
+                                activation["failed_phones"].append(mask_phone(phone))
                     will_add = len(to_insert)
                     # 2026-11-09：把该号在**所有**管理员名下的行同步成这次的姓名/部门（全局池）
                     if sync_global_profile:
                         for upd in global_profile_updates:
                             ph = upd["phone"]
                             cur = self.conn.execute(
-                                "UPDATE member SET name = ?, dept = ? WHERE phone = ?", (upd["to_name"], upd["to_dept"], ph)
+                                "UPDATE member m JOIN role r ON r.role_id = m.role_id "
+                                "SET m.name = ?, m.dept = ? WHERE m.phone = ? AND r.platform = ?",
+                                (upd["to_name"], upd["to_dept"], ph, role_platform),
                             )
                             synced_global_rows += int(cur.rowcount or 0)
                             if int(cur.rowcount or 0) > 0:
@@ -2305,17 +2481,23 @@ class StateStore:
                       "synced_global_rows": synced_global_rows,
                       "global_profile_updates": global_profile_updates,
                       "contacts_verified": len(verified),
+                      "global_reused": bool(local), "global_reused_count": len(local),
+                      "global_reused_phones": list(local),
                       "verification_skipped": verification_skipped}
             # 2026-11-10 方案A：本批真实写入的成员（事务提交后再做通讯录解析，不持锁跑网络）
             imported_members = (
-                [(str(row[1]).strip(), str(row[2]).strip(), row[3], None) for row in to_insert]
+                [(row[1], row[2], row[3], None) for row in to_insert if row[1] not in resolved]
                 if (not dry_run and not blocked) else []
             )
 
-        # ── 导入即激活：事务外写绑定（fail-open）；2026-11-13 复用阶段二核验结果，通常零额外查询 ──
-        result["auto_activation"] = self._auto_activate_imported(
+        legacy = self._auto_activate_imported(
             imported_members, platform=role_platform, actor=actor, role_id=clean_role_id,
-            pre_resolved=verified if verified else None)
+        )
+        for key in ("activated", "failed", "skipped"):
+            activation[key] += legacy[key]
+        activation["failed_phones"].extend(legacy["failed_phones"])
+        activation["enabled"] = activation["enabled"] or legacy["enabled"]
+        result["auto_activation"] = activation
         return result
 
     def _auto_activate_imported(self, members: List[Tuple[str, str, str, Optional[str]]],
@@ -2640,28 +2822,23 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "模板类型 kind 必须是 form/image/file/notice")
 
         role_ids_raw = merged.get("role_ids")
-        if not isinstance(role_ids_raw, list) or not role_ids_raw:
-            raise BizError(400, "VALIDATION_FAILED", "必须至少选择 1 个适用角色 (role_ids)")
-        role_ids: List[str] = []
-        for rid in role_ids_raw:
-            s_rid = str(rid or "").strip()
-            if s_rid and s_rid not in role_ids:
-                role_ids.append(s_rid)
-        if not role_ids:
-            raise BizError(400, "VALIDATION_FAILED", "必须至少选择 1 个适用角色 (role_ids)")
-
-        placeholders = ",".join("?" for _ in role_ids)
-        found_roles = {r["role_id"] for r in self.conn.execute(f"SELECT role_id FROM role WHERE role_id IN ({placeholders})", tuple(role_ids)).fetchall()}
-        missing_roles = [r for r in role_ids if r not in found_roles]
-        if missing_roles:
-            raise BizError(400, "VALIDATION_FAILED", f"关联角色不存在: {', '.join(missing_roles)}")
-
-        # 2026-11-02 角色按办公软件隔离：一个任务模板只能挂在同一办公软件的角色上，
-        # 否则任务归属会同时出现在两个面板，调度也不知道该按哪边的名册建实例。
-        plat_rows = self.conn.execute(f"SELECT role_id, platform FROM role WHERE role_id IN ({placeholders})", tuple(role_ids)).fetchall()
-        role_plats = {str(r["platform"]) for r in plat_rows}
-        if len(role_plats) > 1:
-            raise BizError(400, "VALIDATION_FAILED", "同一任务模板只能选择同一办公软件下的角色")
+        if not isinstance(role_ids_raw, list):
+            raise BizError(400, "VALIDATION_FAILED", "role_ids 必须为数组")
+        role_ids = list(dict.fromkeys(str(rid or "").strip() for rid in role_ids_raw if str(rid or "").strip()))
+        if role_ids:
+            placeholders = ",".join("?" for _ in role_ids)
+            roles = {
+                r["role_id"]: r["platform"]
+                for r in self.conn.execute(
+                    f"SELECT role_id, platform FROM role WHERE role_id IN ({placeholders}) LOCK IN SHARE MODE",
+                    tuple(role_ids),
+                ).fetchall()
+            }
+            missing_roles = [r for r in role_ids if r not in roles]
+            if missing_roles:
+                raise BizError(400, "VALIDATION_FAILED", f"关联角色不存在: {', '.join(missing_roles)}")
+            if len(set(roles.values())) > 1:
+                raise BizError(400, "VALIDATION_FAILED", "同一任务模板只能选择同一办公软件下的角色")
 
         text_tpl = str(merged.get("text_tpl") or "").strip()
         if not text_tpl:
@@ -3026,7 +3203,8 @@ class StateStore:
         if plat:
             # 任务归属平台 = 模板所选角色所属平台（角色已按平台隔离）
             where_clauses.append(
-                "EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)"
+                "(t.role_ids = '[]' OR EXISTS "
+                "(SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0))"
             )
             params.append(plat)
         where_sql = "WHERE " + " AND ".join(where_clauses)
@@ -3368,7 +3546,7 @@ class StateStore:
             rows = self.conn.execute("SELECT id, name, created_at FROM dept_option ORDER BY id ASC").fetchall()
         return [{"id": int(r["id"]), "name": str(r["name"]), "created_at": r["created_at"]} for r in rows]
 
-    def build_dept_tree(self) -> List[Dict[str, Any]]:
+    def build_dept_tree(self, platform: Optional[str] = None, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """2026-11-12 A3：基于已导入成员的 member.dept_path 聚合部门分级树（超管视图）。
 
         口径：
@@ -3379,11 +3557,18 @@ class StateStore:
           （同一人跨两条不同 dept_path 时，公共祖先只计 1 人）；
         · dept_path 为空/全空段的成员不计入（尚未反查到官方组织路径）。
         """
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT DISTINCT phone, dept_path FROM member "
-                "WHERE enabled = 1 AND dept_path IS NOT NULL AND TRIM(dept_path) <> ''"
-            ).fetchall()
+        filters = ["m.enabled = 1", "m.is_left_org = 0", "m.dept_path IS NOT NULL", "TRIM(m.dept_path) <> ''"]
+        params = []
+        if platform:
+            filters.append("r.platform = ?")
+            params.append(platform)
+        if owner_id is not None:
+            filters.append("r.owner_id = ?")
+            params.append(owner_id)
+        rows = self.conn.execute(
+            "SELECT DISTINCT m.phone, m.dept_path FROM member m JOIN role r ON r.role_id = m.role_id "
+            "WHERE " + " AND ".join(filters), tuple(params),
+        ).fetchall()
         # 手机号 -> 该名下全部 dept_path 的段前缀集合（跨行合并去重，保人数口径）
         phone_prefixes: Dict[str, set] = {}
         for r in rows:
@@ -3608,6 +3793,47 @@ class StateStore:
                 (ref, phone, template_id, file_name, mime, int(size), rel_path, now_s),
             )
             return {"ref": ref, "phone": phone, "template_id": template_id, "file_name": file_name, "mime": mime, "size": int(size), "rel_path": rel_path, "consumed": False, "created_at": now_s}
+
+    def cleanup_orphan_uploads(self, hours: int = 24) -> int:
+        """清理超过保留期的未使用上传，并与提交事务互斥。"""
+        if hours <= 0:
+            raise ValueError("上传保留时间须为正数")
+        cutoff = format_dt(self.now() - timedelta(hours=hours))
+        uploads_dir = (self.data_dir / "uploads").resolve()
+        candidates = self.conn.execute(
+            "SELECT ref FROM upload_ref WHERE consumed = 0 AND created_at < %s", (cutoff,),
+        ).fetchall()
+        removed = 0
+        for candidate in candidates:
+            ref = candidate["ref"]
+            with self.conn:
+                row = self.conn.execute(
+                    "SELECT rel_path FROM upload_ref WHERE ref = %s AND consumed = 0 "
+                    "AND created_at < %s FOR UPDATE", (ref, cutoff),
+                ).fetchone()
+                if row is None:
+                    continue
+                rel_path = Path(str(row["rel_path"] or ""))
+                target = uploads_dir / rel_path
+                try:
+                    if (rel_path.anchor or not rel_path.parts or ".." in rel_path.parts
+                            or target.resolve() != target):
+                        logger.warning("跳过路径异常的孤儿上传 ref=%s", ref)
+                        continue
+                    target.unlink(missing_ok=True)
+                except (OSError, RuntimeError, ValueError):
+                    logger.warning("清理孤儿上传文件失败 ref=%s", ref)
+                    continue
+                self.conn.execute("DELETE FROM upload_ref WHERE ref = %s", (ref,))
+                removed += 1
+                for parent in target.parents:
+                    if parent == uploads_dir:
+                        break
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+        return removed
 
     def get_upload_ref(self, ref: str) -> Optional[Dict[str, Any]]:
         with self.lock:
@@ -3956,6 +4182,12 @@ class StateStore:
             )
             if int(_cas.rowcount or 0) == 0:
                 raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
+            for ref in sorted({str(row["ref"]) for row in ref_rows}):
+                claimed = self.conn.execute(
+                    "UPDATE upload_ref SET consumed = 1 WHERE ref = ? AND consumed = 0", (ref,),
+                )
+                if not claimed.rowcount:
+                    raise BizError(400, "VALIDATION_FAILED", "上传文件已使用或已清理，请重新上传")
             cur = self.conn.execute(
                 "INSERT INTO submission(instance_id, fields_json, file_ref, file_name, mime, size, note, refs_json, source, status, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'user', ?, ?)",
@@ -3966,8 +4198,6 @@ class StateStore:
                 ),
             )
             sub_id = int(cur.lastrowid)
-            for r in ref_rows:
-                self.conn.execute("UPDATE upload_ref SET consumed = 1 WHERE ref = ?", (r["ref"],))
             self.conn.execute(
                 "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL WHERE id = ?",
                 (new_status, now_s, late_submit, int(inst["id"])),
@@ -4087,7 +4317,7 @@ class StateStore:
         """
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
-        if not tpl or not tpl["enabled"]:
+        if not tpl or not tpl["enabled"] or not tpl["role_ids"]:
             return []
         # 2026-11-06 纵深防御（workbuddy）：模板所属管理员被停用 → 也不生成实例。
         # 此前只在 list_active_templates 拦（真实调度链只经那里，业务上不漏发），
