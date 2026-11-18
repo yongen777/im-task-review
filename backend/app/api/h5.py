@@ -535,7 +535,7 @@ def _push_submit_feedback(
             return
         tpl = state.get_template(str(inst.get("template_id") or "")) or {}
         plats = state.role_platforms(list(tpl.get("role_ids") or []))
-        platform = plats.pop() if len(plats) == 1 else ""
+        platform = tpl["platform"] if tpl.get("portal_task") else (plats.pop() if len(plats) == 1 else "")
         nt = (notifiers or {}).get(platform) if (platform and notifiers) else notifier
         if nt is None:
             logger.warning("提交反馈未发送（无可用通道）instance=%s", inst.get("id"))
@@ -601,8 +601,11 @@ def create_h5_router(
     notifier: Optional[NotifierProtocol] = None,
     notifiers: Optional[Dict[str, NotifierProtocol]] = None,
     contacts: Optional[Any] = None,
+    scheduler=None,
 ) -> APIRouter:
     router = APIRouter()
+    from .portal import create_portal_router
+    router.include_router(create_portal_router(state, scheduler=scheduler, uploads_dir=uploads_dir))
 
     def track_instance(request: Request) -> Callable[[int], None]:
         metadata = request.scope.setdefault(H5_ACCESS_META, {})

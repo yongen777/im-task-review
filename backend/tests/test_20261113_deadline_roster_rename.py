@@ -195,27 +195,12 @@ def test_bot_rename_all_texts() -> None:
         assert msgs[-1].startswith("【德阳量密助手】"), msgs[-1]
         assert "尚未录入您的业务权限" in msgs[-1], msgs[-1]
 
-        # ② 已绑定闲聊 → ack 自我介绍
-        code, body, msgs = _inbound(store, "uid_zdxlz_9001", "你好")
-        assert code == 200 and body["bound"] is True, body
-        assert msgs[-1].startswith("【德阳量密助手】"), msgs[-1]
-        assert "我是德阳量密助手" in msgs[-1], msgs[-1]
-        assert "OPS任务调度助手" not in msgs[-1], msgs[-1]
-
-        # ③ 【待办】无未完成任务 → 精确文案（用户拍板逐字）
-        code, body, msgs = _inbound(store, "uid_zdxlz_9001", "【待办】")
-        assert code == 200 and body["path"] == "todo" and body["count"] == 0, body
-        assert msgs[-1] == "【德阳量密助手】当前暂无待提交的任务事项。", msgs[-1]
-
-        # ④ 【菜单】无自主上报事项 → 空态文案
-        code, body, msgs = _inbound(store, "uid_zdxlz_9001", "【菜单】")
-        assert code == 200 and body["path"] == "menu" and body["count"] == 0, body
-        assert msgs[-1] == "【德阳量密助手】当前暂无可自主上报的任务事项。", msgs[-1]
-
-        # ⑤ 菜单编号不存在 → 未找到文案
-        code, body, msgs = _inbound(store, "uid_zdxlz_9001", "99")
-        assert code == 200 and body.get("found") is False, body
-        assert msgs[-1] == "【德阳量密助手】未找到编号为 99 的事项，请回复【菜单】查看最新列表。", msgs[-1]
+        for text in ('你好', '【待办】', '【菜单】', '99'):
+            code, body, msgs = _inbound(store, 'uid_zdxlz_9001', text)
+            assert code == 200 and body['path'] == 'portal'
+            assert msgs[-1].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：')
+            assert '/h5/portal#t=' in msgs[-1]
+            assert '回复' not in msgs[-1]
     finally:
         store.close()
 

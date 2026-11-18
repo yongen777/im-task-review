@@ -55,6 +55,20 @@ BUSINESS_TABLES = (
 VERSION_TABLE = "schema_version"
 
 MYSQL_DDL = """
+CREATE TABLE IF NOT EXISTS portal_event (
+ event_key VARCHAR(64) NOT NULL, created_at VARCHAR(32) NOT NULL, PRIMARY KEY(event_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS portal_grant (
+ owner_id INT NOT NULL, platform VARCHAR(16) NOT NULL, phone VARCHAR(32) NOT NULL,
+ enabled TINYINT NOT NULL DEFAULT 0, scope_json MEDIUMTEXT NOT NULL, updated_at VARCHAR(32) NOT NULL,
+ PRIMARY KEY(owner_id,platform,phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS portal_task (
+ task_id VARCHAR(64) NOT NULL, platform VARCHAR(16) NOT NULL, creator_phone VARCHAR(32) NOT NULL,
+ owner_id INT NOT NULL, template_json MEDIUMTEXT NOT NULL, recipients_json MEDIUMTEXT NOT NULL,
+ created_at VARCHAR(32) NOT NULL, PRIMARY KEY(task_id), KEY ix_portal_creator(platform,creator_phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS schema_version (
   version     INT NOT NULL,
   updated_at  VARCHAR(32) NOT NULL

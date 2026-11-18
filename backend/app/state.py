@@ -3235,6 +3235,9 @@ class StateStore:
             return self._deserialize_template_row(self.conn.execute("SELECT * FROM task_template WHERE template_id = ?", (template_id,)).fetchone())
 
     def get_template(self, template_id: str, include_deleted: bool = False) -> Optional[Dict[str, Any]]:
+        if str(template_id).startswith("pt_"):
+            from .portal import PortalService
+            return PortalService(self).template(template_id)
         with self.lock:
             sql = "SELECT * FROM task_template WHERE template_id = ?" + ("" if include_deleted else " AND deleted = 0")
             row = self.conn.execute(sql, ((template_id or "").strip(),)).fetchone()
@@ -4055,7 +4058,7 @@ class StateStore:
                     "ok": False, "reason": "cooldown",
                     "message": (
                         f"您刚才已获取过【{tpl['name']}】的提交链接，请先完成本次填报；"
-                        f"如需再次上报，请 {self.ADHOC_MENU_COOLDOWN_SECONDS} 秒后再回复对应数字。"
+                        f"如需再次上报，请 {self.ADHOC_MENU_COOLDOWN_SECONDS} 秒后在工作台重新点击该事项。"
                     ),
                 }
             placeholders = ",".join("?" for _ in roles)
@@ -4116,6 +4119,9 @@ class StateStore:
             return "任务已关闭"
         if str(instance.get("status") or "") == "cancelled":
             return "任务已关闭"
+        if template.get("portal_task"):
+            from .portal import PortalService
+            return None if PortalService(self).can_submit(instance, template) else "任务已关闭"
         if not self.is_member_active_for_roles(str(instance.get("phone") or ""), template.get("role_ids") or []):
             return "任务已关闭"
         return None
@@ -4178,6 +4184,8 @@ class StateStore:
         if row["status"] not in MANUAL_SUBMISSION_STATUSES:
             raise BizError(400, "VALIDATION_FAILED", "仅待上传、已逾期或被驳回的任务可以标记为已提交")
         template = self.get_template(row["template_id"])
+        if template and template.get("portal_task"):
+            raise BizError(403, "PORTAL_READONLY", "授权成员发布任务仅可只读监管")
         if not template or template["kind"] == "notice":
             raise BizError(400, "VALIDATION_FAILED", "仅上传任务可以标记为已提交")
         return dict(row), template
@@ -4423,14 +4431,16 @@ class StateStore:
         now_s = self.now_str()
         with self.lock, self.conn:
             # 2026-11-04 多管理员分级：实例归属继承模板的 owner_id（调度器自动建实例时也要带上）
-            tpl_owner = self.conn.execute("SELECT owner_id FROM task_template WHERE template_id = ?", (template_id,)).fetchone()
+            owner_table, owner_key = ("portal_task", "task_id") if str(template_id).startswith("pt_") else ("task_template", "template_id")
+            tpl_owner = self.conn.execute(f"SELECT owner_id FROM {owner_table} WHERE {owner_key} = ?", (template_id,)).fetchone()
             owner_val = int(tpl_owner["owner_id"]) if tpl_owner else 1
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (template_id, phone, name_snap, dept_snap, period_key, deadline_at, now_s, owner_val),
             )
             created = cur.rowcount > 0
-            res = dict(self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND phone = ? AND period_key = ?", (template_id, phone, period_key)).fetchone())
+            # INSERT IGNORE 可能等待另一事务提交；当前读避免 RR 快照看不到刚提交的唯一键行。
+            res = dict(self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND phone = ? AND period_key = ? FOR UPDATE", (template_id, phone, period_key)).fetchone())
             res["created"] = created
             return res
 

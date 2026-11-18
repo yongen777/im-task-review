@@ -169,7 +169,7 @@ class AibotBridge:
                 logger.warning("未注入入站处理器，消息被忽略（userid=%s）", sender)
                 return
             threading.Thread(
-                target=self._dispatch_inbound, args=(handler, sender, content),
+                target=self._dispatch_inbound, args=(handler, sender, content, str(body.get("msgid") or (frame.get("headers") or {}).get("req_id") or "")),
                 name="wecom-aibot-inbound", daemon=True,
             ).start()
         except Exception:  # noqa: BLE001 - 绝不能把异常抛回 SDK 的事件循环
@@ -185,12 +185,13 @@ class AibotBridge:
         except Exception:  # noqa: BLE001
             pass
 
-    def _dispatch_inbound(self, handler: Any, userid: str, text: str) -> None:
+    def _dispatch_inbound(self, handler: Any, userid: str, text: str, event_id: str = "") -> None:
         def _send(reply_text: str, tag: str = "") -> None:  # noqa: ARG001 - 与 zdxlz 的 send(text, tag) 对齐
             res = self.send_markdown(userid, reply_text)
             if not res.ok:
                 logger.warning("智能机器人回复失败 userid=%s: %s", userid, res.error)
 
+        _send.event_id = event_id
         try:
             handler(userid, text, _send)
         except Exception:  # noqa: BLE001

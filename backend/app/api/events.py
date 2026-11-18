@@ -161,31 +161,9 @@ def handle_inbound_text(
     user_name: str = "",
     base_url: str = "",
     user_union_id: str = "",
+    event_id: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
-    """两条通道共用的业务入口：拿到 (user_id, 文本) 之后的全部处理。
-
-    2026-11-10 企微自建应用接入时抽出：
-      · 量子密信：process_app_event 验签+解密后调用本函数；
-      · 企业微信：/api/wecom/callback 解出 XML 明文后调用本函数。
-    ⛔ 业务规则（【待办】指令 / 闲聊 ack / 未绑定拦截）只写这一份，新通道只做格式转换，不复制规则。
-
-    2026-11-11 任务一（用户拍板，收归管理权）：
-      · **废除私聊自激活**：未绑定用户发任意文本一律「不落库、不绑定、不反查」，
-        统一回复固定提醒「尚未录入业务权限，请联系管理员录入激活」；
-      · 唯一激活路径 = 管理后台导入/选入成员（组织架构选择器 / CSV 导入）时自动反查绑定；
-      · 历史「路径 A/C/U」（对话文字、H5 链接、union_id 自动识别）全部停用；
-      · 已绑定用户不受影响。
-
-    2026-11-12 任务E3：原「申请补交」指令（逾期补交审核制）全链路下线，
-      逾期后统一提示「当前任务已过期（截止时间：…），无法提交」；
-      ⛔ 驳回重交（rejected）机制保留，由审核驳回通知里的链接承载。
-
-    2026-11-12 任务E4：新增【待办】指令——
-      支持「待办 / 我的任务 / 未完成」三种触发词（可带【】[] 括号）；
-      查当前用户在本平台 status ∈ {pending, rejected} 且未截止的上传任务（封顶 5 条），
-      逐项签发动态 TTL 链接回复；未绑定用户仍走固定提醒（零落库红线不动）。
-    """
-
+    """两通道统一入口：已注册成员仅发工作台入口，未注册保持零激活兜底。"""
     bound_member = (
         state.touch_delivery_target_by_external_id(user_union_id, platform=platform or None)
         if user_union_id else None
@@ -193,110 +171,21 @@ def handle_inbound_text(
     if bound_member is None:
         bound_member = state.touch_delivery_target_by_external_id(user_id, platform=platform or None)
     if bound_member is not None:
-        # 2026-11-12 任务E4：【待办】指令——去首尾【】[] 后匹配「待办 / 我的任务 / 未完成」。
-        apply_text = (msg_text or "").strip().strip("【】[]　 ")
-        if apply_text in ("待办", "我的任务", "未完成"):
-            try:
-                todo_items = state.list_pending_todo(
-                    bound_member["phone"], platform=platform or None, limit=5,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("待办查询异常 user=%s: %s", user_id, exc)
-                todo_items = []
-            if not todo_items:
-                # 2026-11-13 用户口径：机器人全局更名「德阳量密助手」，无待办文案精确到字
-                reply = "【德阳量密助手】当前暂无待提交的任务事项。"
-            else:
-                lines = [f"【待办任务】您当前有 {len(todo_items)} 项未完成的任务："]
-                for idx, it in enumerate(todo_items, start=1):
-                    deadline_at = effective_instance_deadline(it)
-                    dl_disp = format_deadline_display(deadline_at, ref_dt=state.now()) if deadline_at else "不限"
-                    try:
-                        ttl_hours = calc_h5_token_ttl_hours(it, state.now())
-                        raw_token = state.issue_h5_token(
-                            phone=str(it["phone"]), template_id=str(it["template_id"]),
-                            period_key=str(it["period_key"]), instance_id=int(it["id"]),
-                            purpose="submit", ttl_hours=ttl_hours,
-                        )
-                        link = f"{(base_url or '').rstrip('/')}/h5/task#t={raw_token}"
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("待办链接签发失败 instance=%s: %s", it.get("id"), exc)
-                        continue
-                    lines.append(f"{idx}. {it.get('template_name') or '任务'}（截止：{dl_disp}）")
-                    lines.append(f"提交链接：{link}")
-                reply = "\n".join(lines)
-            send(reply, f"todo_{len(todo_items)}")
-            return 200, {"ok": True, "path": "todo", "bound": True, "count": len(todo_items)}
-
-        # ── 2026-11-12 晚 · 不定期任务（菜单自选，Pull 模式）──────────────────
-        # 触发词**唯一锁定【菜单】**；数字回复即刻签发一次性专属填报链接；
-        # 无推送提醒、无截止时间，随到随报、提交即焚、支持一人多次上报。
-        if apply_text == "菜单":
-            try:
-                menu_items = state.list_adhoc_menu_items(bound_member["phone"], platform=platform or None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("菜单查询异常 user=%s: %s", user_id, exc)
-                menu_items = []
-            if not menu_items:
-                reply = "【德阳量密助手】当前暂无可自主上报的任务事项。"
-            else:
-                lines = [
-                    "【自主上报事项清单】",
-                    "请直接回复对应【数字编号】获取专属提交链接：",
-                ]
-                for it in menu_items:
-                    lines.append(f"{it['no']}. 【{it['name']}】")
-                lines.append("（直接回复数字如\"1\"即可进入填报）")
-                reply = "\n".join(lines)
-            send(reply, "menu_items")
-            return 200, {"ok": True, "path": "menu", "bound": True, "count": len(menu_items)}
-
-        if re.fullmatch(r"\d{1,3}", apply_text or ""):
-            num = int(apply_text)
-            try:
-                item = state.get_adhoc_menu_item_by_number(
-                    bound_member["phone"], num, platform=platform or None)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("菜单数字定位异常 user=%s: %s", user_id, exc)
-                item = None
-            issued: Optional[Dict[str, Any]] = None
-            if item is not None:
-                try:
-                    issued = state.create_adhoc_instance_and_token(
-                        item["template_id"], bound_member["phone"], platform=platform or None)
-                except Exception as exc:  # noqa: BLE001 - 含权限/下线 BizError → 统一按「未找到」拦截
-                    logger.warning("菜单签发异常 user=%s tpl=%s: %s", user_id, item.get("template_id"), exc)
-                    issued = None
-            if item is None or issued is None:
-                # 需求三-3：数字不存在或无权填报 → 按未找到拦截，严禁越权签发
-                send(f"【德阳量密助手】未找到编号为 {num} 的事项，请回复【菜单】查看最新列表。", "menu_miss")
-                return 200, {"ok": True, "path": "menu_number", "found": False, "number": num}
-            if not issued.get("ok"):
-                # 防手抖冷却：不建新实例，只提示（零新写入，重复回调零重复消息）
-                send(str(issued.get("message") or "请稍后再试"), "menu_cooldown")
-                return 200, {"ok": True, "path": "menu_number", "cooldown": True, "number": num}
-            link = f"{(base_url or '').rstrip('/')}/h5/task#t={issued['token']}"
-            reply = (
-                f"请点击链接完成【{issued['name']}】填报：\n"
-                f"👉 提交入口：{link}\n"
-                f"（本链接提交后自动作废；如需再次上报请重新回复\"{num}\"）"
-            )
-            send(reply, "menu_issued")
-            return 200, {"ok": True, "path": "menu_number", "found": True, "number": num,
-                        "instance_id": issued.get("instance_id")}
-
-        # 2026-10-27 用户需求：已绑定用户发送非指令消息时，机器人固定回复确认
-        # （此前已绑定用户发闲聊消息会静默无回复，交互不闭环）。
-        # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）。
-        ack_text = (
-            "【德阳量密助手】\n"
-            "你好，消息已收到。我是德阳量密助手，只负责按设定时间推送任务提醒、收集上报内容。\n"
-            "如需查看待办任务，请回复【待办】。\n"
-            "如需自主上报不定期任务事项，请回复【菜单】。\n"
-            "业务问题请联系对应管理员。"
-        )
-        send(ack_text, "ack_nonphone")
-        return 200, {"ok": True, "bound": True, "phone": bound_member["phone"]}
+        from ..portal import PortalService
+        portal = PortalService(state)
+        plat = platform or state.platform
+        if portal.members(plat, phone=bound_member["phone"]):
+            incoming_id = event_id or getattr(send, "event_id", "")
+            if incoming_id:
+                key = hashlib.sha256(f"{plat}|{user_id}|{incoming_id}".encode()).hexdigest()
+                with state.conn:
+                    claimed = state.conn.execute("INSERT OR IGNORE INTO portal_event(event_key,created_at) VALUES(?,?)", (key, state.now_str())).rowcount
+                if not claimed:
+                    return 200, {"ok": True, "bound": True, "duplicate": True}
+            raw = portal.issue(bound_member["phone"], plat)
+            link = f"{(base_url or '').rstrip('/')}/h5/portal#t={raw}"
+            send("【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：\n  点击进入：" + link, "portal")
+            return 200, {"ok": True, "bound": True, "path": "portal"}
 
     # ── 2026-11-11 任务一（用户拍板）：私聊零落库，统一拦截引导 ──
     # 未绑定用户 = 管理后台尚未录入/激活（member 无此人 → 绑定也不存在）。
@@ -417,6 +306,7 @@ def process_app_event(
         send=lambda text, tag: _send_bot_reply(user_id, text, tag),
         platform="zdxlz", user_name=user_name, base_url=base_url,
         user_union_id=user_union_id,
+        event_id=str(event_payload.get("msgUid") or event_payload.get("msgId") or ""),
     )
 
 

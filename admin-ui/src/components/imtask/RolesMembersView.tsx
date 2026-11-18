@@ -1,3 +1,4 @@
+import { PortalGrantDialog } from './PortalTasksView';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Users,
@@ -115,6 +116,7 @@ const POOL_PAGE_SIZE = 10;
 const MEMBER_PAGE_SIZE = 20;
 
 export const RolesMembersView: React.FC = () => {
+  const [portalPhone, setPortalPhone] = useState<string | null>(null);
   const {
     roles,
     refreshRoles,
@@ -1395,6 +1397,7 @@ export const RolesMembersView: React.FC = () => {
                             </span>
                           ) : (
                             <div className="inline-flex items-center justify-end gap-1.5">
+                              <button className="text-xs text-blue-600 px-2 py-1" onClick={() => setPortalPhone(m.phone)}>H5 创建任务授权</button>
                               <button
                                 onClick={() => void openAssignRolesModal(m)}
                                 title="把该成员同时加入其他业务角色（一人可兼多角色，原角色保留）"
@@ -1692,6 +1695,8 @@ export const RolesMembersView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {portalPhone && <PortalGrantDialog key={platform + portalPhone} phone={portalPhone} platform={platform} onClose={() => setPortalPhone(null)} />}
 
       {/* 新建/编辑角色弹窗（仅需填写角色名称，移除角色编码） */}
       {roleModalMode !== 'none' && (

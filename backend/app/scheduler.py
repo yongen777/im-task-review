@@ -466,6 +466,8 @@ class Scheduler:
         self.notifier: NotifierProtocol = notifier or FakeNotifier(now_fn=self._now_fn)
         # 2026-11-02 多通道并行：platform -> notifier。为空时退回旧单通道逻辑（测试兼容）。
         self.notifiers: Dict[str, NotifierProtocol] = dict(notifiers or {})
+        self._delivery_bucket = TokenBucket(rate_per_sec=delivery_qps())
+        self._delivery_breaker = CircuitBreaker(fail_threshold=breaker_threshold())
         self.image_sender = image_sender  # None 时跳过图片投递（文本照发，不阻塞主链路）
 
     def _targets_for(self, phone: str, only_platform: Optional[str] = None) -> List[Tuple[str, Optional[str], str, NotifierProtocol]]:
@@ -498,6 +500,8 @@ class Scheduler:
 
         角色缺失或跨平台混选（理论上不会发生）→ None = 不过滤，fail-open 全通道。
         """
+        if tpl.get("portal_task"):
+            return tpl["platform"]
         plats = self.state.role_platforms(list(tpl.get("role_ids") or []))
         if len(plats) == 1:
             return plats.pop()
@@ -1064,6 +1068,9 @@ class Scheduler:
             cur_dt = cur_dt.replace(tzinfo=SHANGHAI_TZ)
         now_s = format_dt(cur_dt)
         stats = {"generated_instances": 0, "sent": 0, "skipped": 0, "missed": 0, "failed": 0, "to_overdue": 0, "to_expired": 0}
+
+        from .portal import run_portal_tasks
+        run_portal_tasks(self, cur_dt)
 
         for tpl in self.state.list_active_templates(include_notice=True):
             if not tpl["role_ids"] or not is_template_anchor_day(tpl, cur_dt):

@@ -344,7 +344,7 @@ def test_events_bound_user_still_gets_resubmit_and_ack() -> None:
             user_union_id="union_X",
         )
         assert code == 200 and body.get("bound") is True, body
-        assert any("消息已收到" in t for t, _ in sent), sent
+        assert any("/h5/portal#t=" in t for t, _ in sent), sent
     finally:
         store.close()
 

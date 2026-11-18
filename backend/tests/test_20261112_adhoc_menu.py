@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import sys
+import pytest
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -128,13 +129,10 @@ def test_adhoc_never_overdue_and_h5_hides_deadline() -> None:
     try:
         rid = _seed_zdxlx(store)
         tpl = _adhoc_tpl(store, rid)
-        # 成员私聊数字 → 签发
-        _, _, box = _run(store, UID, "菜单")
-        assert box and "自主上报" in box[0][0], box
-        _, body, box2 = _run(store, UID, "1")
-        assert body["found"] is True, body
-        link = [ln for ln in box2[0][0].splitlines() if "#t=" in ln][0]
-        raw = link.split("#t=", 1)[1].strip()
+        # 2026-11-18：工作台点击事项调用同一签发服务，文本数字已下线。
+        body = store.create_adhoc_instance_and_token(tpl["template_id"], P, platform="zdxlz")
+        assert body["ok"] is True
+        raw = body["token"]
         inst = store.get_instance(int(body["instance_id"]))
         assert inst["deadline_at"] == NO_DEADLINE_SENTINEL, inst["deadline_at"]
         assert inst["period_key"].startswith("adhoc-"), inst["period_key"]
@@ -151,93 +149,49 @@ def test_adhoc_never_overdue_and_h5_hides_deadline() -> None:
 
 # ════════════════════ 二：三个交互场景的精确文案 ════════════════════
 
-def test_menu_scenario_texts_exact() -> None:
-    """场景1（兜底含双入口）/ 场景2（清单文案）/ 场景3（签发与未找到文案）逐句断言。"""
+def test_menu_scenario_texts_exact():
     store = _store()
     try:
         rid = _seed_zdxlx(store)
-        _adhoc_tpl(store, rid, "现场安全隐患排查上报")
-        _adhoc_tpl(store, rid, "突发网络故障紧急报备")
-
-        # 场景 1：非指令文字 → 兜底（含【待办】与【菜单】双指引）
-        _, _, box = _run(store, UID, "你好")
-        assert "回复【待办】" in box[0][0] and "回复【菜单】" in box[0][0], box[0][0]
-
-        # 场景 2：【菜单】→ 清单（两条事项都在 + 编号 1./2. + 结尾指引）
-        # 2026-11-16 方案B：同秒创建的两个模板在 MySQL 下无 rowid 插入序（SQLite 独有），
-        # 排序键退化为 (created_at, template_id)——断集合与结构，不锁创建先后；
-        # 场景 3b 的「回复 1 = 菜单第 1 条」改为动态对位（编号一致性才是被测口径）。
-        _, _, box = _run(store, UID, "菜单")
-        menu = box[0][0]
-        assert menu.startswith("【自主上报事项清单】"), menu
-        assert "请直接回复对应【数字编号】获取专属提交链接：" in menu
-        assert "1. 【" in menu and "2. 【" in menu, menu
-        assert "现场安全隐患排查上报" in menu and "突发网络故障紧急报备" in menu, menu
-        assert "（直接回复数字如\"1\"即可进入填报）" in menu
-        m1 = re.search(r"^1\. 【(.+?)】$", menu, re.MULTILINE)
-        assert m1, menu
-        first_name = m1.group(1)
-
-        # 场景 3a：数字越界 → 未找到
-        _, _, box = _run(store, UID, "99")
-        assert box[0][0] == "【德阳量密助手】未找到编号为 99 的事项，请回复【菜单】查看最新列表。", box[0][0]
-
-        # 场景 3b：数字命中 → 签发一次性链接（模板文案）；签发对象=菜单第 1 条
-        _, body, box = _run(store, UID, "1")
-        msg = box[0][0]
-        assert msg.startswith(f"请点击链接完成【{first_name}】填报："), (msg, first_name)
-        assert "👉 提交入口：http://t.example.com/h5/task#t=" in msg, msg
-        assert "（本链接提交后自动作废；如需再次上报请重新回复\"1\"）" in msg, msg
+        _adhoc_tpl(store, rid, "隐患上报")
+        for text in ("你好", "菜单", "1", "99"):
+            _, body, box = _run(store, UID, text)
+            assert body['path'] == 'portal'
+            assert box[0][0].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：')
+            assert '/h5/portal#t=' in box[0][0]
+            assert '回复' not in box[0][0]
+        assert _row_count(store, 'task_instance') == 0
     finally:
         store.close()
 
 
-def test_menu_scenario2_empty_list_text() -> None:
-    """无任何可报事项 → 场景 2 空清单固定文案。"""
+def test_menu_scenario2_empty_list_text():
     store = _store()
     try:
         _seed_zdxlx(store)
-        _, _, box = _run(store, UID, "菜单")
-        assert box[0][0] == "【德阳量密助手】当前暂无可自主上报的任务事项。", box[0][0]
+        _, body, box = _run(store, UID, "菜单")
+        assert body['path'] == 'portal'
+        assert '/h5/portal#t=' in box[0][0]
+        assert store.list_adhoc_menu_items(P, platform='zdxlz') == []
     finally:
         store.close()
 
 
 # ════════════════════ 三：平台隔离 / 角色权限 / 未在册零写入 / 互斥校验 ════════════════════
 
-def test_menu_platform_isolation_and_role_scope() -> None:
-    """密信用户只看密信平台事项；企微专属事项与无角色用户的菜单都拿不到；数字越权按未找到拦截。"""
+def test_menu_platform_isolation_and_role_scope():
     store = _store()
     try:
-        rid_z = _seed_zdxlx(store)  # 密信角色 + P
-        rid_w = store.create_role("企微报备组", actor="t", platform="wecom")["role_id"]
-        store.add_role_member(rid_w, P2, "赵六", "网运部", actor="t")
-        store.upsert_delivery_target(P2, "uid_wecom_7002", platform="wecom")
-        _adhoc_tpl(store, rid_z, "密信隐患上报")
-        _adhoc_tpl(store, rid_w, "企微专属报备")  # 企微平台事项
-        _adhoc_tpl(store, rid_z, "密信第二事项")
-
-        # 密信用户【菜单】：只看到密信平台的 2 条（企微的不串门）
-        _, _, box = _run(store, UID, "菜单")
-        menu = box[0][0]
-        assert "密信隐患上报" in menu and "密信第二事项" in menu, menu
-        assert "企微专属报备" not in menu, menu
-
-        # 企微用户【菜单】：只看到企微平台事项（数字 1 = 企微专属报备）
-        box_w = _sent()
-        handle_inbound_text(
-            state=store, user_id="uid_wecom_7002", msg_text="菜单",
-            send=lambda t, g: box_w.append((t, g)), platform="wecom", base_url="http://t.example.com",
-        )
-        assert "企微专属报备" in box_w[0][0] and "密信隐患上报" not in box_w[0][0], box_w[0][0]
-
-        # 角色权限：P 属于密信巡查组 → 企微事项对 P 而言「不在菜单」→ 数字按未找到拦截
-        _, _, box = _run(store, UID, "菜单")
-        nos = [ln for ln in box[0][0].splitlines() if ln.startswith(("1.", "2."))]
-        assert len(nos) == 2, box[0][0]
-        _, body, box = _run(store, UID, "3")
-        assert body["found"] is False, body
-        assert "未找到编号为 3" in box[0][0], box[0][0]
+        rz = _seed_zdxlx(store)
+        rw = store.create_role('企微报备组', platform='wecom')['role_id']
+        store.add_role_member(rw, P2, '赵六')
+        store.upsert_delivery_target(P2, 'wecom_user', platform='wecom')
+        z = _adhoc_tpl(store, rz, '密信事项')
+        w = _adhoc_tpl(store, rw, '企微事项')
+        assert [t['template_id'] for t in store.list_adhoc_menu_items(P, platform='zdxlz')] == [z['template_id']]
+        assert [t['template_id'] for t in store.list_adhoc_menu_items(P2, platform='wecom')] == [w['template_id']]
+        with pytest.raises(BizError):
+            store.create_adhoc_instance_and_token(w['template_id'], P, platform='zdxlz')
     finally:
         store.close()
 
@@ -304,10 +258,10 @@ def test_adhoc_one_shot_link_and_multi_report() -> None:
         _adhoc_tpl(store, rid, "隐患上报")
 
         def _issue(n: int = 1) -> str:
-            _, body, box = _run(store, UID, str(n))
-            assert body.get("found") is True, body
-            link_line = [ln for ln in box[0][0].splitlines() if "#t=" in ln][0]
-            return link_line.split("#t=", 1)[1].strip()
+            item = store.list_adhoc_menu_items(P, platform="zdxlz")[n - 1]
+            body = store.create_adhoc_instance_and_token(item["template_id"], P, platform="zdxlz")
+            assert body["ok"] is True
+            return body["token"]
 
         raw1 = _issue(1)
         res = store.submit_h5_task(raw_token=raw1, fields={"summary": "3 号楼消防通道堵塞"}, note="现场情况说明")
@@ -337,19 +291,18 @@ def test_adhoc_one_shot_link_and_multi_report() -> None:
         store.close()
 
 
-def test_adhoc_number_cooldown_blocks_repeat_issuance() -> None:
-    """防手抖：冷却窗口内重复回复同一数字 → 不建新实例、不签新链接，只提示已获取。"""
+def test_adhoc_number_cooldown_blocks_repeat_issuance():
     store = _store()
     try:
         rid = _seed_zdxlx(store)
-        _adhoc_tpl(store, rid)
-        _, body, _ = _run(store, UID, "1")
-        assert body["found"] is True, body
-        n_inst, n_tok = _row_count(store, "task_instance"), _row_count(store, "h5_token")
-        _, body2, box2 = _run(store, UID, "1")  # 同秒再点
-        assert body2.get("cooldown") is True, body2
-        assert "已获取过" in box2[0][0] and "请先完成本次填报" in box2[0][0], box2[0][0]
-        assert _row_count(store, "task_instance") == n_inst and _row_count(store, "h5_token") == n_tok
+        tpl = _adhoc_tpl(store, rid)
+        body = store.create_adhoc_instance_and_token(tpl['template_id'], P, platform='zdxlz')
+        assert body['ok'] is True
+        n_inst, n_tok = _row_count(store, 'task_instance'), _row_count(store, 'h5_token')
+        body2 = store.create_adhoc_instance_and_token(tpl['template_id'], P, platform='zdxlz')
+        assert body2['ok'] is False
+        assert '已获取过' in body2['message']
+        assert (_row_count(store, 'task_instance'), _row_count(store, 'h5_token')) == (n_inst, n_tok)
     finally:
         store.close()
 

@@ -93,6 +93,7 @@ def handle_wecom_event(
         return handle_inbound_text(
             state=state, user_id=userid, msg_text=content, send=_send,
             platform="wecom", base_url=public_base_url,
+            event_id=str(fields.get("MsgId") or ""),
         )
 
     if msg_type == "event":

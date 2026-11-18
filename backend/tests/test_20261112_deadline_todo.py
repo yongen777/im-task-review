@@ -291,10 +291,10 @@ def test_e3_resubmit_channel_decommissioned() -> None:
             send=lambda text, tag: sent.append((text, tag)), platform="zdxlz", base_url="http://e.com",
         )
         assert code == 200 and body["bound"] is True, body
-        assert any(tag == "ack_nonphone" for _, tag in sent), sent
+        assert any(tag == "portal" for _, tag in sent), sent
         # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）
-        assert any("如需查看待办任务，请回复【待办】。" in t for t, _ in sent), sent[0][0]
-        assert any("如需自主上报不定期任务事项，请回复【菜单】。" in t for t, _ in sent), sent[0][0]
+        assert any("/h5/portal#t=" in t for t, _ in sent), sent[0][0]
+        assert any("请点击下方链接进入您的个人任务工作台" in t for t, _ in sent), sent[0][0]
         # 「申请补交」不再出现在任何回复里（该指令已下线）
         assert all("申请补交" not in t for t, _ in sent), sent
         # resubmit_status 保持 NULL（零写库）
@@ -337,35 +337,24 @@ def _collect(sent: list[tuple[str, str]]):
     return lambda text, tag: sent.append((text, tag))
 
 
-def test_e4_todo_command_basic_and_variants() -> None:
+def test_e4_todo_command_basic_and_variants():
+    from app.portal import PortalService
     store = _store()
     try:
         rid = _seed_member(store)
-        t1 = _form_tpl(store, rid, "晨报", deadline_time="18:00")
-        t2 = _form_tpl(store, rid, "晚报", deadline_time="19:30")
-        _ensure_today(store, t1, "2026-11-12 18:00:00")
-        _ensure_today(store, t2, "2026-11-12 19:30:00")
-
-        for text in ("【待办】", "[待办]", " 待办 ", "我的任务", "未完成"):
-            sent: list[tuple[str, str]] = []
-            code, body = handle_inbound_text(
-                state=store, user_id="uid_zdxlz_1001", msg_text=text,
-                send=_collect(sent), platform="zdxlz", base_url="http://e.com",
-            )
-            assert code == 200 and body["path"] == "todo" and body["count"] == 2, body
-            reply = sent[-1][0]
-            assert "您当前有 2 项未完成的任务" in reply, reply
-            # 2026-11-13：截止文案统一具体日期（当天也不再显示「今天」）
-            for kw in ("晨报", "晚报", "提交链接：http://e.com/h5/task#t=", "11月12日 18:00", "11月12日 19:30"):
-                assert kw in reply, reply
-
-        # 签发的 token 有效期为动态值：晨报截止 18:00 → now 09:00 + min(9h+24h, 720h) = 33h
-        rows = store.conn.execute(
-            "SELECT expires_at FROM h5_token WHERE phone = ? AND template_id = ?",
-            (PHONE, t1["template_id"]),
-        ).fetchall()
-        assert rows, "待办回复应签发新 token"
-        assert rows[-1]["expires_at"] == format_dt(CLOCK["now"] + timedelta(hours=33)), dict(rows[-1])
+        t1 = _form_tpl(store, rid, '晨报', deadline_time='18:00')
+        _ensure_today(store, t1, '2026-11-12 18:00:00')
+        portal = PortalService(store)
+        ident = {'phone': PHONE, 'platform': 'zdxlz'}
+        for text in ('【待办】', '[待办]', '我的任务', '未完成'):
+            sent = []
+            code, body = handle_inbound_text(state=store, user_id='uid_zdxlz_1001', msg_text=text,
+                send=_collect(sent), platform='zdxlz', base_url='http://e.com')
+            assert code == 200 and body['path'] == 'portal'
+            assert '/h5/portal#t=' in sent[0][0]
+        inst = portal.todos(ident)[0]
+        raw = portal.task_link(ident, inst['id'])['url'].split('#t=')[1]
+        assert store.get_h5_token(raw)['expires_at'] == format_dt(CLOCK['now'] + timedelta(hours=33))
     finally:
         store.close()
 
@@ -453,10 +442,10 @@ def test_e4_todo_empty_reply_and_unbound_zero_writes() -> None:
             state=store, user_id="uid_zdxlz_1001", msg_text="待办",
             send=_collect(sent), platform="zdxlz", base_url="http://e.com",
         )
-        assert code == 200 and body["path"] == "todo" and body["count"] == 0, body
+        assert code == 200 and body["path"] == "portal", body
         # 2026-11-13 用户拍板：机器人更名「德阳量密助手」，无待办文案精确到字
-        assert sent[-1][0] == "【德阳量密助手】当前暂无待提交的任务事项。", sent
-        assert sent[-1][1].startswith("todo_"), sent
+        assert "/h5/portal#t=" in sent[-1][0], sent
+        assert sent[-1][1] == "portal", sent
 
         # 未绑定用户：零落库红线（不建绑定、不落待归纳、不签 token）
         sent.clear()
@@ -469,7 +458,7 @@ def test_e4_todo_empty_reply_and_unbound_zero_writes() -> None:
         with store.lock:
             token_cnt = store.conn.execute("SELECT COUNT(1) FROM h5_token").fetchone()[0]
             pending_cnt = store.conn.execute("SELECT COUNT(1) FROM pending_member").fetchone()[0]
-        assert token_cnt == 0 and pending_cnt == 0, (token_cnt, pending_cnt)
+        assert token_cnt == 1 and pending_cnt == 0, (token_cnt, pending_cnt)
     finally:
         store.close()
 

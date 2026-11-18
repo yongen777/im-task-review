@@ -358,6 +358,14 @@ def register_admin_guard(app: FastAPI, state: StateStore) -> None:
                 forbidden = _check_path_ownership(state, admin, path)
                 if forbidden is not None:
                     return forbidden
+            # 成员发布的任务只能经独立只读监管接口访问，禁止旧模板/实例写入口旁路。
+            parts = [p for p in path.split("/") if p]
+            if len(parts) >= 4 and parts[2] == "templates" and parts[3].startswith("pt_"):
+                return error_response(403, "PORTAL_READONLY", "授权成员任务仅可只读监管")
+            if len(parts) >= 4 and parts[2] == "instances" and parts[3].isdigit():
+                inst = state.get_instance(int(parts[3]))
+                if inst and inst["template_id"].startswith("pt_"):
+                    return error_response(403, "PORTAL_READONLY", "授权成员任务仅可只读监管")
         return await call_next(request)
 
 
@@ -672,6 +680,8 @@ def create_admin_router(
     notifiers: Optional[Dict[str, Any]] = None, *, require_directory: bool = False,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/admin")
+    from .portal import create_portal_admin_router
+    router.routes.extend(create_portal_admin_router(state).routes)
     # 2026-10-29 逾期补交审核：审核通过后要主动把新链接推给用户。
     # notifier 由 main.py 按现有装配方式注入（⛔ 不造全局单例）；缺省时只记日志不发送。
     _notifier = notifier

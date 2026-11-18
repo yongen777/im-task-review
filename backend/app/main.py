@@ -170,6 +170,7 @@ def create_apps(
                 handle_inbound_text(
                     state=store, user_id=user_id, msg_text=msg_text, send=send,
                     platform="wecom", base_url=cfg.public_base_url,
+                    event_id=getattr(send, "event_id", ""),
                 )
 
             notifiers["wecom"] = WecomAibotNotifier(cfg, on_text=_aibot_inbound)
@@ -273,6 +274,7 @@ def create_apps(
             # 2026-11-03：H5 绑定回执要按「绑定的那个平台」选通道，否则企微用户收不到回执
             notifiers=notifiers,
             contacts=contacts,
+            scheduler=scheduler,
         )
     )
     # 2026-10-30 企业微信自建应用接收回调（独立于量子密信的 /api/app-events）：
