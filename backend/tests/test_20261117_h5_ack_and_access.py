@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import socket
 import threading
@@ -25,6 +26,35 @@ def _app(store, notifier=None):
 
 def _token(store, inst):
     return store.issue_h5_token(inst["phone"], inst["template_id"], inst["period_key"], inst["id"])
+
+
+def test_completed_upload_with_header_is_rejected_without_reading_body():
+    store = _store()
+    try:
+        inst = _instance(store, "zdxlz")
+        token = _token(store, inst)
+        store.submit_h5_task(raw_token=token, fields={"n": 1})
+
+        async def send_upload():
+            async def unread_body():
+                raise AssertionError("已完成的任务不应读取附件请求体")
+                yield b""
+
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_app(store)), base_url="http://test") as client:
+                return await client.post("/api/h5/task/upload", content=unread_body(), headers={
+                    "Content-Type": "multipart/form-data; boundary=preview",
+                    "X-H5-Token": token,
+                })
+
+        response = asyncio.run(send_upload())
+        assert (response.status_code, response.json()["code"]) == (400, "ALREADY_SUBMITTED")
+        assert "已提交完成" in response.json()["message"]
+        with TestClient(_app(store)) as client:
+            legacy = client.post("/api/h5/upload", data={"token": token},
+                                 files={"file": ("photo.png", b"unused", "image/png")})
+        assert (legacy.status_code, legacy.json()["code"]) == (400, "ALREADY_SUBMITTED")
+    finally:
+        store.close()
 
 
 @contextmanager

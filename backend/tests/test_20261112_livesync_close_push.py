@@ -373,9 +373,8 @@ def test_push_now_skips_cancelled_expired_and_past_deadline() -> None:
         store.close()
 
 
-def test_h5_open_allowed_for_submitted_submit_blocked_with_unified_msg() -> None:
-    """已提交实例：H5 打开放行（window_open=True 可渲染表单）；提交终审拦「已上传，请勿重复提交」；
-    历史提交记录不被覆盖；审核通过（approved）同理。"""
+def test_h5_completed_instances_open_readonly_and_keep_submissions() -> None:
+    """已提交和已完成的旧链接仍可读详情，签发新链接也不能再次提交。"""
     store = _store()
     try:
         rid = _seed_two(store)
@@ -385,13 +384,14 @@ def test_h5_open_allowed_for_submitted_submit_blocked_with_unified_msg() -> None
         store.submit_h5_task(raw_token=raw1, fields={"summary": "首交"})
         _set_status(store, insts[P2]["id"], "approved")
 
-        # 旧链接（consumed）重新打开：放行渲染
+        # 旧链接（consumed）重新打开：返回详情与只读状态。
         code, info = process_h5_task_info(state=store, raw_token=raw1)
-        assert code == 200 and info["window_open"] is True, (code, info)
-        # 再签一条新链接（模拟立即推送重发）：同样放行
+        assert code == 200 and info["window_open"] is False, (code, info)
+        assert "已提交" in info["window_reason"]
+        # 再签一条新链接（模拟立即推送重发）：同样只读。
         raw2 = store.issue_h5_token(P1, tpl["template_id"], "2026-11-12", insts[P1]["id"])
         code2, info2 = process_h5_task_info(state=store, raw_token=raw2)
-        assert code2 == 200 and info2["window_open"] is True, (code2, info2)
+        assert code2 == 200 and info2["window_open"] is False, (code2, info2)
         # 提交终审：统一「已上传，请勿重复提交」，历史记录不动
         try:
             store.submit_h5_task(raw_token=raw2, fields={"summary": "想再交"})
@@ -403,10 +403,11 @@ def test_h5_open_allowed_for_submitted_submit_blocked_with_unified_msg() -> None
                 "SELECT fields_json FROM submission WHERE instance_id = ? ORDER BY id ASC",
                 (int(insts[P1]["id"]),)).fetchall()
         assert len(sub_rows) == 1, "历史提交记录不得被覆盖"
-        # approved 实例：打开放行 + 提交同样拦截
+        # approved 实例保持只读，提交同样拦截。
         raw3 = store.issue_h5_token(P2, tpl["template_id"], "2026-11-12", insts[P2]["id"])
         code3, info3 = process_h5_task_info(state=store, raw_token=raw3)
-        assert code3 == 200 and info3["window_open"] is True, (code3, info3)
+        assert code3 == 200 and info3["window_open"] is False, (code3, info3)
+        assert "已完成" in info3["window_reason"] or "审核通过" in info3["window_reason"]
         try:
             store.submit_h5_task(raw_token=raw3, fields={"summary": "x"})
             raise AssertionError("approved 实例必须被终审拦截")

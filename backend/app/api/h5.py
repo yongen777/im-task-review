@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
 
 try:
-    from fastapi import APIRouter, BackgroundTasks, File, Form, Request, UploadFile
+    from fastapi import APIRouter, BackgroundTasks, Request
+    from starlette.datastructures import UploadFile
+    from starlette.exceptions import HTTPException as StarletteHTTPException
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 except ImportError:  # pragma: no cover
-    APIRouter = BackgroundTasks = File = Form = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
+    APIRouter = BackgroundTasks = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
     FileResponse = None  # type: ignore[assignment]
 
 from ..h5log import H5_ACCESS_META
@@ -336,32 +338,49 @@ def _manually_completed(state: StateStore, instance: Dict[str, Any]) -> bool:
     return (state.get_latest_valid_submission(instance["id"]) or {}).get("source") == "admin"
 
 
+def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, Any]) -> Optional[str]:
+    if inst["status"] not in ("submitted", "approved"):
+        return None
+    if _manually_completed(state, inst):
+        label = "已提交" if tpl["need_review"] else "已完成"
+        return f"该任务已由管理员标记为{label}"
+    if tpl.get("is_adhoc"):
+        return "您已完成本次提交"
+    if inst["status"] == "submitted":
+        return "本任务已提交，正在等待管理员审核"
+    if tpl["need_review"]:
+        return "本任务已审核通过，无需重复提交"
+    return "本任务已提交完成，无需重复提交"
+
+
+def _resolve_upload_target(
+    state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
+    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
+    if err:
+        return None, None, err
+    tpl = state.get_template(inst["template_id"], include_deleted=True)
+    close_reason = state.instance_close_reason(inst, tpl)
+    if close_reason:
+        return None, None, (403, {"code": "TASK_CLOSED", "message": close_reason})
+    completed = _completed_message(state, inst, tpl)
+    if completed:
+        return None, None, (400, {"code": "ALREADY_SUBMITTED", "message": completed})
+    window_open, window_reason = _check_submission_window(state, inst, tok)
+    if not window_open:
+        return None, None, (400, {"code": "SUBMISSION_CLOSED", "message": window_reason or "当前任务提交窗口已关闭"})
+    if not any(module in effective_h5_modules(tpl) for module in ("image", "file")):
+        return None, None, (400, {"code": "VALIDATION_FAILED", "message": "当前任务类型不支持上传文件"})
+    return inst, tpl, None
+
+
 def _validate_upload_target_and_limits(
     state: StateStore, raw_token: str, filename: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str, int, int, Optional[Tuple[int, Dict[str, Any]]]]:
-    """前置校验令牌、窗口、模板类型与扩展名，计算该模板允许的最大字节数（未通过前绝不读取或落盘文件体）。"""
-    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
+    """校验任务状态和附件限制。"""
+    inst, tpl, err = _resolve_upload_target(state, raw_token, on_instance_resolved)
     if err:
         return None, None, "", "", 0, 0, err
-
-    tpl = state.get_template(inst["template_id"], include_deleted=True)
-    # 2026-11-12 下午（四）：五类失效统一拦截「任务已关闭」，先于窗口判断；
-    # 模板被物理删除后靠保留的 h5_token 行识别（不再是「该任务已被删除」技术分支）。
-    close_reason = state.instance_close_reason(inst, tpl)
-    if close_reason:
-        return None, None, "", "", 0, 0, (403, {"code": "TASK_CLOSED", "message": close_reason})
-
-    if _manually_completed(state, inst):
-        label = "已提交" if tpl["need_review"] else "已完成"
-        return None, None, "", "", 0, 0, (400, {"code": "ALREADY_SUBMITTED", "message": f"该任务已由管理员标记为{label}"})
-
-    window_open, window_reason = _check_submission_window(state, inst, tok)
-    if not window_open:
-        # 2026-11-12 任务E2：到点后统一错误码 SUBMISSION_CLOSED + 统一文案
-        return None, None, "", "", 0, 0, (400, {"code": "SUBMISSION_CLOSED", "message": window_reason or "当前任务提交窗口已关闭"})
-    allows_upload = any(module in effective_h5_modules(tpl) for module in ("image", "file"))
-    if not allows_upload:
-        return None, None, "", "", 0, 0, (400, {"code": "VALIDATION_FAILED", "message": "当前任务类型不支持上传文件"})
 
     try:
         orig_name, ext, max_mb, max_bytes = task_upload_limits(tpl, filename)
@@ -424,13 +443,7 @@ async def read_upload_file_bounded(file: UploadFile, max_bytes: int) -> Tuple[Op
 def process_h5_task_info(
     *, state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
-    """§9.8 H5 加载任务实例与模板详情。
-
-    2026-11-12 下午（用户拍板，一-1/二-3/四）：旧链接**实时**读模板最新配置——
-    页面渲染的名称/说明/字段/上传组件始终取库里最新的模板行（保存即生效）；
-    已提交/已审核通过实例 H5 **打开放行**（正常渲染表单，window_open=True），
-    重复提交只在最后一步「提交」时由后端终审拦截「已上传，请勿重复提交」。
-    """
+    """返回最新任务详情，已提交或已完成的实例仍可读取但禁止再次上传。"""
     tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
     if err:
         return err
@@ -441,21 +454,10 @@ def process_h5_task_info(
         return 403, {"code": "TASK_CLOSED", "message": close_reason}
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
-    # 已提交/已审核通过 → 页面正常打开渲染表单（removed 只读锁死：用户拍板二-3）；
-    # 令牌已消耗同样放行（提交侧有终审拦截，页面可用性不再由 consumed 决定）。
-    # 2026-11-12 晚 · 不定期任务（菜单自选）例外：链接一次性（需求五-3）——
-    # 提交成功后刷新只显示「您已完成本次提交」，禁止同一链接二次提交（页面锁死）。
-    if inst.get("status") in ("submitted", "approved"):
-        if _manually_completed(state, inst):
-            window_open = False
-            label = "已提交" if tpl["need_review"] else "已完成"
-            window_reason = f"该任务已由管理员标记为{label}"
-        elif bool((tpl or {}).get("is_adhoc")):
-            window_open = False
-            window_reason = "您已完成本次提交"
-        else:
-            window_open = True
-            window_reason = ""
+    completed = _completed_message(state, inst, tpl)
+    if completed:
+        window_open = False
+        window_reason = completed
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":
@@ -617,7 +619,7 @@ def create_h5_router(
 
     @router.get("/h5/task", response_class=HTMLResponse)
     async def h5_task_page():
-        return HTMLResponse(content=load_h5_html("task.html"))
+        return HTMLResponse(content=load_h5_html("task.html"), headers={"Cache-Control": "no-store"})
 
     @router.get("/h5/bind", response_class=HTMLResponse)
     async def h5_bind_page():
@@ -710,31 +712,44 @@ def create_h5_router(
 
     @router.post("/api/h5/upload", include_in_schema=False)
     @router.post("/api/h5/task/upload")
-    async def api_h5_task_upload(request: Request, file: UploadFile = File(...), token: Optional[str] = Form(default=None)):
-        raw_token = _extract_token_from_request(request, token)
-        filename = file.filename or ""
-        metadata = request.scope.setdefault(H5_ACCESS_META, {})
-        basename = os.path.basename(filename.replace("\\", "/"))
-        ext = basename.rsplit(".", 1)[1].lower().strip() if "." in basename else ""
-        metadata["upload_ext"] = ext if re.fullmatch(r"[a-z0-9]{1,12}", ext) else "-"
-        metadata["upload_bytes"] = file.size
-        _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, track_instance(request))
-        if err:
-            return JSONResponse(status_code=err[0], content=err[1])
+    async def api_h5_task_upload(request: Request):
+        raw_token = _extract_token_from_request(request)
+        if raw_token:
+            # New pages send the token in a header so closed tasks are rejected before multipart parsing.
+            _, _, err = _resolve_upload_target(state, raw_token, track_instance(request))
+            if err:
+                return JSONResponse(status_code=err[0], content=err[1])
+        try:
+            async with request.form() as form:
+                file = form.get("file")
+                if not isinstance(file, UploadFile):
+                    return JSONResponse(status_code=422, content={"code": "VALIDATION_FAILED", "message": "请选择上传文件"})
+                raw_token = raw_token or _extract_token_from_request(request, form.get("token"))
+                filename = file.filename or ""
+                metadata = request.scope.setdefault(H5_ACCESS_META, {})
+                basename = os.path.basename(filename.replace("\\", "/"))
+                ext = basename.rsplit(".", 1)[1].lower().strip() if "." in basename else ""
+                metadata["upload_ext"] = ext if re.fullmatch(r"[a-z0-9]{1,12}", ext) else "-"
+                metadata["upload_bytes"] = file.size
+                _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, track_instance(request))
+                if err:
+                    return JSONResponse(status_code=err[0], content=err[1])
 
-        content_bytes, too_large = await read_upload_file_bounded(file, max_bytes)
-        if file.size is None:
-            metadata["upload_bytes"] = file.file.tell()
-        if too_large or content_bytes is None:
-            return JSONResponse(
-                status_code=400,
-                content={"code": "FILE_TOO_LARGE", "message": f"文件大小超出上限（最大 {max_mb}MB）"},
-            )
+                content_bytes, too_large = await read_upload_file_bounded(file, max_bytes)
+                if file.size is None:
+                    metadata["upload_bytes"] = file.file.tell()
+                if too_large or content_bytes is None:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"code": "FILE_TOO_LARGE", "message": f"文件大小超出上限（最大 {max_mb}MB）"},
+                    )
 
-        status_code, content = process_h5_task_upload(
-            state=state, uploads_dir=uploads_dir, raw_token=raw_token, filename=filename, content_bytes=content_bytes
-        )
-        return JSONResponse(status_code=status_code, content=content)
+                status_code, content = process_h5_task_upload(
+                    state=state, uploads_dir=uploads_dir, raw_token=raw_token, filename=filename, content_bytes=content_bytes
+                )
+                return JSONResponse(status_code=status_code, content=content)
+        except StarletteHTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"code": "VALIDATION_FAILED", "message": "上传请求格式错误"})
 
     @router.post("/api/h5/submit", include_in_schema=False)
     @router.post("/api/h5/task/submit")

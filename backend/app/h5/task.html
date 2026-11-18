@@ -168,6 +168,19 @@
           document.getElementById("headDeadline").textContent = "截止 " + (__rule || "不限");
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
+          if (["submitted", "approved"].includes(data.instance.status)) {
+            const tip = document.createElement("div");
+            tip.className = "locked-tip";
+            tip.setAttribute("role", "status");
+            tip.textContent = data.window_reason || (data.instance.status === "submitted"
+              ? "本任务已提交，正在等待管理员审核"
+              : "本任务已提交完成，无需重复提交");
+            contentEl.insertBefore(tip, submitBtn);
+            submitBtn.disabled = true;
+            submitBtn.hidden = true;
+            return;
+          }
+
           const area = document.getElementById("dynamicArea");
           const spec = data.template.spec_json || {};
           h5Modules = Array.isArray(data.template.upload_modules) ? data.template.upload_modules : [];
@@ -313,9 +326,10 @@
                     continue;
                   }
                   const fd = new FormData();
-                  fd.append("token", token);
                   fd.append("file", f);
-                  const r = await fetch("/api/h5/task/upload", { method: "POST", body: fd });
+                  const r = await fetch("/api/h5/task/upload", {
+                    method: "POST", headers: { "X-H5-Token": token }, body: fd
+                  });
                   const res = await r.json();
                   if (!r.ok) {
                     showMsg(
@@ -412,12 +426,6 @@
           /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
           if (!h5Modules.length && data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
 
-          /* 2026-10-28：已提交/已完成的实例把整页锁死，防止用户二次修改或重复提交。
-             只有 pending（待上传）与「驳回后仍在重交窗口内」允许填写和提交。
-             2026-11-12 任务E3：逾期补交通道下线——overdue 不再有可填写分支，
-             统一按锁定态给出「当前任务已过期（截止时间：…），无法提交」提示。
-             2026-11-12 下午（用户拍板，二-3）：**submitted / approved 打开放行**——
-             页面正常渲染表单并允许交互，仅最后一步「提交」由后端终审拦「已上传，请勿重复提交」。 */
           const dl = String(data.instance.deadline_at || "");
           const noDeadline = dl.startsWith("9999-12-31");
           const __status = data.instance.status;
@@ -429,17 +437,6 @@
             tip.textContent = data.instance.resubmit_deadline
               ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
               : "该提交已被驳回，请按审核意见修改后重新提交。";
-            contentEl.insertBefore(tip, submitBtn);
-          } else if ((__status === "submitted" || __status === "approved") && !!data.window_open) {
-            /* 打开放行：只给状态提示条，不锁控件（提交时后端终审拦截重复提交）。
-               不定期任务（菜单自选）的一次性链接提交后 window_open=False → 落到锁定分支，
-               只显示「您已完成本次提交」（需求五-3）。 */
-            const tip = document.createElement("div");
-            tip.className = "locked-tip";
-
-            tip.textContent = __status === "submitted"
-              ? "本任务已提交，正在等待管理员审核。再次点击「提交上传」会提示「已上传，请勿重复提交」。"
-              : "本任务已审核通过。如需修改请联系管理员驳回后重新提交（再次提交会提示「已上传，请勿重复提交」）。";
             contentEl.insertBefore(tip, submitBtn);
           } else if (__status !== "pending") {
             const LOCKED_TEXT = {
