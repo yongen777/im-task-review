@@ -297,7 +297,8 @@ CREATE TABLE IF NOT EXISTS admin_audit (
   detail      TEXT,
   created_at  VARCHAR(32) NOT NULL,
   PRIMARY KEY (id),
-  KEY ix_audit_user_time (username, id)
+  KEY ix_audit_user_time (username, id),
+  KEY ix_audit_target_action (target_type, target_id, action, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS data_snapshot (
@@ -694,6 +695,8 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
 
     if not proxy.execute("SHOW INDEX FROM reminder_log WHERE Key_name='ix_rem_instance_sent'").fetchone():
         proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")
+    if not proxy.execute("SHOW INDEX FROM admin_audit WHERE Key_name='ix_audit_target_action'").fetchone():
+        proxy.execute("ALTER TABLE admin_audit ADD INDEX ix_audit_target_action (target_type, target_id, action, id)")
 
 
 def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn) -> None:

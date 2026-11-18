@@ -156,7 +156,7 @@ def test_menu_scenario_texts_exact():
         for text in ("你好", "菜单", "1", "99"):
             _, body, box = _run(store, UID, text)
             assert body['path'] == 'portal'
-            assert box[0][0].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：')
+            assert box[0][0].startswith('【德阳量密助手】您好，请点击下方链接进入个人任务工作台（含待办处理、自主上报、已交回看及授权建任务）：')
             assert '/h5/portal#t=' in box[0][0]
             assert '回复' not in box[0][0]
         assert _row_count(store, 'task_instance') == 0

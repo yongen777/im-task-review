@@ -585,6 +585,7 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
          之前这里读 d.submission 但后端只返回 submissions 数组，详情页永远显示「尚未产生提交」。 */
       submission: d.submission || null,
       submissions: Array.isArray(d.submissions) ? d.submissions : [],
+      submission_timeline: Array.isArray(d.submission_timeline) ? d.submission_timeline : [],
       template: d.template || null,
       reminders: (d.reminders || d.items || []).map(remToMock),
     } as unknown as T;

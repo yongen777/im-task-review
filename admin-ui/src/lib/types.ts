@@ -306,6 +306,13 @@ export interface TaskInstanceDetail {
   instance: TaskInstanceItem;
   submission: SubmissionData | null;
   submissions?: Array<{ id: number; status: InstanceStatus; source?: string; created_at: string }>;
+  submission_timeline?: Array<{
+    id: string;
+    submission_id: number;
+    at: string;
+    kind: 'user_submit' | 'admin_submit' | 'user_edit' | 'admin_edit';
+    status: InstanceStatus | null;
+  }>;
   reminders: ReminderLogItem[];
   /** 模板快照（详情页用来把字段 key 还原成中文标签） */
   template?: {

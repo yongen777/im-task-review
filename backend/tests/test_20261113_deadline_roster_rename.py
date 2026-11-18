@@ -198,7 +198,7 @@ def test_bot_rename_all_texts() -> None:
         for text in ('你好', '【待办】', '【菜单】', '99'):
             code, body, msgs = _inbound(store, 'uid_zdxlz_9001', text)
             assert code == 200 and body['path'] == 'portal'
-            assert msgs[-1].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：')
+            assert msgs[-1].startswith('【德阳量密助手】您好，请点击下方链接进入个人任务工作台（含待办处理、自主上报、已交回看及授权建任务）：')
             assert '/h5/portal#t=' in msgs[-1]
             assert '回复' not in msgs[-1]
     finally:

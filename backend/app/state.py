@@ -3905,6 +3905,35 @@ class StateStore:
                 items.append(d)
             return items
 
+    def submission_timeline(self, instance_id: int, submissions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        submission_ids = {item['id'] for item in submissions}
+        if not submission_ids:
+            return []
+        events = [{
+            'id': f"submission-{item['id']}", 'submission_id': item['id'], 'at': item['created_at'],
+            'kind': 'admin_submit' if item['source'] == 'admin' else 'user_submit', 'status': item['status'],
+        } for item in submissions]
+        edits = self.conn.execute(
+            "SELECT id, username, detail, created_at FROM admin_audit "
+            "WHERE target_type='task_instance' AND target_id=? AND action='instance.edit_submission' ORDER BY id",
+            (str(instance_id),),
+        ).fetchall()
+        for edit in edits:
+            try:
+                detail = json.loads(edit['detail'] or '{}')
+            except ValueError:
+                continue
+            if not isinstance(detail, dict) or not isinstance(detail.get('submission_id'), int):
+                continue
+            submission_id = detail['submission_id']
+            if submission_id not in submission_ids:
+                continue
+            source = detail.get('editor_source') or ('user' if re.fullmatch(r'h5:\d{11}', edit['username']) else 'admin')
+            events.append({'id': f"edit-{edit['id']}", 'submission_id': submission_id, 'at': edit['created_at'],
+                           'kind': 'user_edit' if source == 'user' else 'admin_edit', 'status': None})
+        # Stable sort keeps the audit ID order for edits made within the same second.
+        return sorted(events, key=lambda item: (item['at'], item['submission_id']))
+
     def is_instance_window_closed(self, instance: Dict[str, Any], now_dt: Optional[datetime] = None) -> bool:
         """该实例的提交窗口是否已关闭。
 
@@ -4295,7 +4324,8 @@ class StateStore:
                      first.get("mime"), first.get("size"), submission["id"]),
                 )
                 self._insert_audit_unlocked(actor, "instance.edit_submission", "task_instance", str(instance['id']),
-                                            {"submission_id": submission["id"], "previous_refs": current_refs,
+                                            {"submission_id": submission["id"], "editor_source": "user" if h5_token else "admin",
+                                             "previous_refs": current_refs,
                                              "refs": refs, "fields_changed": old_values != values,
                                              "note_changed": submission["note"] != new_note}, self.now_str())
         except Exception:

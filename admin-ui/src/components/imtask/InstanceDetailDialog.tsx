@@ -97,7 +97,6 @@ function completedStatus(label: string) {
 const reminderKindLabels: Record<string, string> = {
   remind: '定时下发',
   manual_push: '手动推送',
-  submit_ack: '提交回执',
   reject: '驳回通知',
   overdue: '逾期提醒',
   notice: '通知',
@@ -409,6 +408,7 @@ export function InstanceDetailDialog({
     && detailData.instance.kind !== 'notice'
     && ['pending', 'overdue', 'rejected'].includes(detailData.instance.status);
   const latestRecord = detailData?.submissions?.at(-1);
+  const submissionTimeline = detailData?.submission_timeline ?? [];
   const canEditSubmission = !isSuperAdmin && me.role_level === 'sub_admin'
     && me.id != null && detailData?.instance.owner_id === me.id
     && detailData.instance.kind !== 'notice' && ['submitted', 'approved'].includes(detailData.instance.status)
@@ -816,39 +816,37 @@ export function InstanceDetailDialog({
                 onCancel={() => setEditSubmissionOpen(false)} onConfirm={(body) => void save('edit', body)} />
             )}
 
-            {detailData.instance.kind !== 'notice' && !!detailData.submissions?.length && (
+            {detailData.instance.kind !== 'notice' && (
               <section className="space-y-2.5">
-                <h4 className="font-bold text-slate-900">提交记录（{detailData.submissions.length}）</h4>
-                <div className="overflow-x-auto rounded-xl border border-slate-200">
+                <h4 className="font-bold text-slate-900">任务提交时间（{submissionTimeline.length}）</h4>
+                {submissionTimeline.length ? <div className="overflow-x-auto rounded-xl border border-slate-200">
                   <table className="w-full whitespace-nowrap text-left text-xs">
                     <thead className="bg-slate-50 text-slate-600">
-                      <tr><th className="px-3 py-2">提交时间</th><th className="px-3 py-2">提交方式</th><th className="px-3 py-2">执行状态</th><th className="px-3 py-2">内容</th></tr>
+                      <tr><th className="px-3 py-2">操作时间</th><th className="px-3 py-2">操作类型</th><th className="px-3 py-2">记录</th></tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
-                      {[...detailData.submissions].reverse().map((record) => {
-                        const current = record.id === detailData.submission?.id;
-                        const status = getInstanceStatusMeta({ ...detailData.instance, status: record.status });
+                      {submissionTimeline.map((record) => {
+                        const current = record.submission_id === detailData.submission?.id;
+                        const labels = { user_submit: '员工自交', admin_submit: '管理员代交', user_edit: '员工修改', admin_edit: '管理员修改' };
                         return (
                           <tr key={record.id}>
-                            <td className="px-3 py-2 tabular-nums text-slate-600">{record.created_at}</td>
-                            <td className="px-3 py-2">{record.source === 'admin'
-                              ? <span className="rounded-md bg-blue-50 px-2 py-1 font-semibold text-blue-700">管理员代交</span>
-                              : '员工自交'}</td>
-                            <td className="px-3 py-2">{status.label}</td>
-                            <td className="px-3 py-2">{current ? <span className="text-slate-500">正在查看</span>
+                            <td className="px-3 py-2 tabular-nums text-slate-600">{record.at}</td>
+                            <td className="px-3 py-2">{labels[record.kind]}</td>
+                            <td className="px-3 py-2">{record.status === null ? <span className="text-slate-500">内容已更新</span>
+                              : current ? <span className="text-slate-500">正在查看</span>
                               : <button type="button" disabled={manualSubmissionBusy || manualSubmissionOpen || editSubmissionOpen}
-                                onClick={() => setSelectedSubmissionId(record.id)} className="font-semibold text-blue-700 hover:underline disabled:opacity-50">查看</button>}</td>
+                                onClick={() => setSelectedSubmissionId(record.submission_id)} className="font-semibold text-blue-700 hover:underline disabled:opacity-50">查看</button>}</td>
                           </tr>
                         );
                       })}
                     </tbody>
                   </table>
-                </div>
+                </div> : <p className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-slate-500">暂无提交记录。</p>}
               </section>
             )}
 
             {/* 3. 提醒发送记录 */}
-            <div className="space-y-2.5">
+            {detailData.instance.kind === 'notice' && <div className="space-y-2.5">
               <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
                 <Send className="w-3.5 h-3.5 text-blue-600" />
                 <span>办公软件提醒发送记录 ({detailData.reminders.length})</span>
@@ -899,7 +897,7 @@ export function InstanceDetailDialog({
                   </table>
                 </div>
               )}
-            </div>
+            </div>}
 
             {/* 弹窗底部：仅分级管理员可审核通过/驳回；超管只读查看 */}
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">

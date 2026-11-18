@@ -2191,7 +2191,7 @@ def create_admin_router(
             if not submissions:
                 return error_response(404, "NOT_FOUND", "任务实例不存在")
             inst["submitted_at"] = inst["submitted_at"] or submissions[-1]["created_at"]
-        reminders = state.list_reminder_logs(instance_id=instance_id)
+        reminders = [row for row in state.list_reminder_logs(instance_id=instance_id) if row['kind'] != 'submit_ack']
         inst["late_submit"] = bool(inst.get("late_submit", 0))
         # 2026-10-29：详情页的执行时间也要取模板计划时刻（原来拿 submitted_at 兜底，
         # 没提交就显示「待到达执行时刻」），与列表列共用同一份数据。
@@ -2260,6 +2260,7 @@ def create_admin_router(
             "instance": inst,
             "template": tpl,
             "submissions": submissions,
+            "submission_timeline": state.submission_timeline(instance_id, submissions),
             "submission": submission_view,
             "reminders": reminders,
         }

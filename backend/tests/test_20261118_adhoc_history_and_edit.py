@@ -1,8 +1,63 @@
 import json
+from datetime import timedelta
 
 from app.portal import PortalService
 from app.state import NO_DEADLINE_SENTINEL
 from test_20261117_manual_mark_submitted import PNG, ctx
+
+
+def test_submission_timeline_keeps_four_actions_and_filters_legacy_receipt(ctx):
+    state, _, _, _, owner, _, template, instance = ctx
+    iid = instance['id']
+    path = f'/api/admin/instances/{iid}'
+    start = state.now()
+
+    def move(minutes):
+        state._now_fn = lambda: start + timedelta(minutes=minutes)
+        return state.now_str()
+
+    def detail():
+        response = owner.get(path)
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    state.update_template(template['template_id'], {'need_review': True, 'spec': {'upload_modules': ['fields', 'text']}})
+    raw = state.issue_h5_token(instance['phone'], template['template_id'], instance['period_key'], iid)
+    content = {'fields': {'qty': 2, 'summary': '测量'}, 'note': '提交内容'}
+    original = move(1)
+    assert owner.post('/api/h5/task/submit', json={'token': raw, **content}).status_code == 200
+    state.review_instance(iid, 'reject', 'manual_owner', '请补充说明')
+    delegated = move(2)
+    assert owner.post(path + '/mark-submitted', json=content).status_code == 200
+    admin_id = detail()['submission']['id']
+    admin_changed = move(3)
+    res = owner.put(path + '/submission', json={'revision': detail()['submission']['revision'], 'note': '管理员更正'})
+    assert res.status_code == 200, res.text
+
+    portal = PortalService(state)
+    ident = {'phone': instance['phone'], 'platform': 'zdxlz'}
+    history = portal.submission_history_link(ident, iid)['url'].partition('#t=')[2]
+    user_changed = move(4)
+    res = owner.post('/api/h5/task/save-edit', headers={'Authorization': 'Bearer ' + history}, json={
+        **content, 'revision': detail()['submission']['revision'], 'retained_refs': [], 'refs': [],
+    })
+    assert res.status_code == 200, res.text
+    # Legacy corrections predate the explicit editor_source marker.
+    legacy = move(5)
+    state.write_audit('h5:' + instance['phone'], 'instance.edit_submission', 'task_instance', str(iid), {'submission_id': admin_id})
+    state.record_reminder_log(template_id=template['template_id'], instance_id=iid, phone=instance['phone'],
+                              kind='submit_ack', planned_at=original, sent_at=original,
+                              result='sent', error=None, retry=0, idem_key='legacy-timeline-ack')
+    result = detail()
+    assert [(item['kind'], item['at']) for item in result['submission_timeline']] == [
+        ('user_submit', original), ('admin_submit', delegated), ('admin_edit', admin_changed),
+        ('user_edit', user_changed), ('user_edit', legacy),
+    ]
+    assert result['instance']['submitted_at'] == delegated
+    assert result['submission']['id'] == admin_id
+    assert len(result['submissions']) == 2
+    assert result['reminders'] == []
+    assert state.list_reminder_logs(instance_id=iid)[0]['kind'] == 'submit_ack'
 
 
 def test_adhoc_open_submit_and_history(ctx):
