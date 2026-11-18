@@ -83,7 +83,7 @@
 'use strict';
 const token=new URLSearchParams(location.hash.slice(1)).get('t')||'',prefix=location.pathname.split('/h5/')[0];
 let toastTimer;
-let info=null,tab='todo',scope=null,busy=false,requestId=crypto.randomUUID(),selected=new Set(),expired=false;
+let info=null,tab='todo',scope=null,busy=false,selected=new Set(),expired=false;
 const main=document.getElementById('main'),toastBox=document.getElementById('toast');
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(text){toastBox.textContent=text;toastBox.classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastBox.classList.add('hidden'),3500)}
@@ -246,7 +246,9 @@ async function form() {
   }
   if (!view.isConnected || expired) return;
   selected.clear();
-  requestId = crypto.randomUUID();
+  // getRandomValues also works in the HTTP WebViews used by the portal.
+  const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+    byte => byte.toString(16).padStart(2, '0')).join('');
   main.innerHTML = `<form class="card" id="form">
     <h2>新建任务</h2>
     <label class="field" for="name">任务名称</label>
