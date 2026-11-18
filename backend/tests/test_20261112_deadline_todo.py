@@ -281,7 +281,7 @@ def test_e3_resubmit_channel_decommissioned() -> None:
         # state 层函数已删除
         for name in ("request_resubmit", "approve_resubmit", "reject_resubmit", "list_overdue_in_window"):
             assert not hasattr(store, name), f"{name} 应随补交链路删除"
-        # 「申请补交」文本不再有专门分支 → 落到带【待办】指引的常规 ack，且零写库
+        # 「申请补交」文本不再有专门分支，统一返回工作台入口。
         rid = _seed_member(store)
         tpl = _form_tpl(store, rid, "补交遗留", deadline_time="18:00")
         inst = _ensure_today(store, tpl, "2026-11-12 18:00:00")
@@ -292,9 +292,8 @@ def test_e3_resubmit_channel_decommissioned() -> None:
         )
         assert code == 200 and body["bound"] is True, body
         assert any(tag == "portal" for _, tag in sent), sent
-        # 2026-11-12 晚：兜底文案按用户规范更新（【待办】+【菜单】双入口指引）
         assert any("/h5/portal#t=" in t for t, _ in sent), sent[0][0]
-        assert any("请点击下方链接进入您的个人任务工作台" in t for t, _ in sent), sent[0][0]
+        assert any("请点击下方链接进入个人任务工作台" in t for t, _ in sent), sent[0][0]
         # 「申请补交」不再出现在任何回复里（该指令已下线）
         assert all("申请补交" not in t for t, _ in sent), sent
         # resubmit_status 保持 NULL（零写库）
