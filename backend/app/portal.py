@@ -39,6 +39,9 @@ class PortalService:
             args.append(phone)
         return [dict(r) for r in self.s.conn.execute(sql, tuple(args)).fetchall()]
 
+    def admin_contacts(self, ident):
+        return self.s.member_admin_contacts(ident['phone'], ident['platform'])
+
     def directory(self, platform):
         c = getattr(self.s, 'wecom_contacts' if platform == 'wecom' else 'contacts', None)
         if c is None:
@@ -233,11 +236,18 @@ class PortalService:
         scopes = [json.loads(grant['scope_json']) for grant in grants]
         root_ids = {did for scope in scopes for did in scope['dept_ids']}
         nodes, users, directory_error = [], {}, ''
-        if root_ids:
-            try:
+        try:
+            if not root_ids:
+                roots = self.department_children(ident['platform'])
+                default = self.default_department(ident['platform'], ident['phone'], roots)
+                if default:
+                    root_ids = {default['dept_id']}
+                    for scope in scopes:
+                        scope['dept_ids'] = [default['dept_id']]
+            if root_ids:
                 nodes, users = self.organization(ident['platform'], root_ids)
-            except BizError as exc:
-                directory_error = exc.message
+        except BizError as exc:
+            directory_error = exc.message
         all_members, allowed_nodes, roles = {}, set(), {}
         for grant, scope in zip(grants, scopes):
             ds = self.descendants(nodes, scope['dept_ids'])
@@ -297,15 +307,26 @@ class PortalService:
         payload.setdefault('deadline_time', '23:59')
         if mode == 'once':
             payload.update({'remind_at': '00:00', 'has_deadline': False})
-        modules = data.get('upload_modules', ['text'])
-        if not isinstance(modules, list) or not modules or any(m not in ('text', 'image') for m in modules):
-            raise BizError(400, 'INVALID_MODULES', '请选择文字说明或图片')
+        raw_spec = data.get('spec')
+        if raw_spec is None:
+            raw_spec = {}
+        if not isinstance(raw_spec, dict):
+            raise BizError(400, 'INVALID_MODULES', '提交内容配置格式错误')
+        modules = data.get('upload_modules', raw_spec.get('upload_modules', ['text']))
+        if not isinstance(modules, list) or not modules or any(m not in ('fields', 'text', 'image', 'file') for m in modules):
+            raise BizError(400, 'INVALID_MODULES', '请至少选择一种提交内容类型')
+        spec = {key: raw_spec[key] for key in ('fields', 'allow_multiple_images', 'allow_multiple_files') if key in raw_spec}
+        for key in ('allow_multiple_images', 'allow_multiple_files'):
+            if key in data and key not in spec:
+                spec[key] = data[key]
+        spec.update({'upload_modules': list(dict.fromkeys(modules)), 'require_review': False,
+                     'text_label': '文字情况说明', 'text_placeholder': '请填写补充说明…'})
         payload.update({'role_ids': sorted({r for m in selected for r in m['member_role_ids']}),
-                        'kind': 'form', 'need_review': False, 'is_adhoc': False,
+                        'kind': 'upload', 'need_review': False, 'is_adhoc': False,
                         'period': mode if mode != 'once' else 'day', 'enabled': True,
                         'text_tpl': data.get('description') or data.get('name') or '',
-                        'schema_json': [], 'allow_note': True,
-                        'spec_json': {'upload_modules': list(dict.fromkeys(modules))}, 'max_file_mb': 10})
+                        'schema_json': data.get('schema_json'), 'allow_note': True,
+                        'spec': spec, 'max_file_mb': 10 if 'file' in modules else 9})
         # 周期和动态截止字段统一由现有模板校验器处理。
         norm = self.s._validate_and_normalize_template_unlocked(payload, existing=None)
         norm['role_ids'] = json.loads(norm.pop('role_ids_json'))

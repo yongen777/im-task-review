@@ -1,463 +1,2025 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="referrer" content="no-referrer"><title>个人任务工作台</title>
-<style>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>个人任务工作台</title>
+  <style>
     :root {
       --blue: #15558a;
+      --blue-hover: #114775;
+      --blue-active: #0d395e;
+      --blue-soft: #eef4fa;
+      --blue-line: #c7d9ea;
       --ink: #182530;
-      --secondary: #485761;
-      --muted: #596876;
-      --paper: #fff;
-      --canvas: #f3f5f7;
-      --line: #d5dde4;
-      --selection: #edf4fa;
+      --secondary: #495966;
+      --muted: #60707d;
+      --paper: #ffffff;
+      --canvas: #f4f6f8;
+      --backdrop: #e9edf2;
+      --track: #edf1f5;
+      --surface-subtle: #f7f9fb;
+      --line: #e2e8ee;
+      --line-strong: #ccd5de;
       --panel: 12px;
       --control: 8px;
-      font: 400 16px/1.55 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+      --tag: 6px;
+      font: 400 15px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
       font-variant-numeric: tabular-nums;
       color: var(--ink);
       background: var(--canvas);
+      -webkit-tap-highlight-color: transparent;
     }
+
     * { box-sizing: border-box; }
-    body { margin: 0; }
+    html, body { margin: 0; padding: 0; min-height: 100%; background: var(--canvas); overflow-x: clip; }
     h1, h2, h3, strong { font-weight: 600; }
     button, input, select, textarea { font: inherit; color: inherit; }
-    button { cursor: pointer; }
-    button:disabled { opacity: .55; cursor: default; }
+    button { cursor: pointer; touch-action: manipulation; }
+    button:disabled { opacity: 0.55; cursor: default; }
     :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
-    .btn, .primary, .secondary {
-      min-height: 44px; padding: 8px 16px; border: 1px solid transparent;
-      border-radius: var(--control); background: var(--blue); color: white; font-weight: 500;
+
+    .shell {
+      width: 100%;
+      max-width: 480px;
+      min-height: 100vh;
+      min-height: 100dvh;
+      margin: 0 auto;
+      background: var(--canvas);
+      display: flex;
+      flex-direction: column;
     }
-    .secondary { background: var(--paper); border-color: var(--line); color: var(--blue); }
-    .btn:active, .primary:active { background: #10436e; }
-    .secondary:active { background: var(--selection); }
-    .icon { width: 18px; height: 18px; flex: none; vertical-align: middle; }
-    header { background: var(--paper); border-top: 4px solid var(--blue); }
-    header div, main, nav { max-width: 800px; margin: auto; }
-    header div { padding: 16px 16px 12px; }
-    header small { color: var(--secondary); font-size: 13px; }
-    .intro { margin: 4px 0 0; color: var(--secondary); font-size: 14px; }
-    h1 { font-size: 24px; margin: 4px 0 0; }
-    h2 { font-size: 18px; margin: 0; }
-    h3 { font-size: 17px; margin: 0; overflow-wrap: anywhere; }
-    nav { display: flex; position: sticky; top: 0; z-index: 2; background: var(--paper); border-bottom: 1px solid var(--line); }
-    nav button { flex: 1; min-height: 48px; padding: 8px 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--secondary); font-size: 15px; }
-    nav button.active { color: var(--blue); background: var(--selection); border-bottom-color: var(--blue); font-weight: 500; }
-    nav button:focus-visible { outline-offset: -4px; }
-    main { padding: 16px 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
-    .card { background: var(--paper); border: 1px solid var(--line); border-radius: var(--panel); padding: 16px; margin-bottom: 12px; }
-    .task-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
-    .task-card p { margin: 4px 0 0; }
-    .muted { color: var(--muted); font-size: 14px; }
-    .row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; justify-content: space-between; }
-    .section-row { margin-bottom: 12px; }
-    .empty { padding: 24px 16px; color: var(--secondary); }
-    label.field, .field-label { display: block; margin: 16px 0 8px; font-size: 14px; font-weight: 500; }
-    input:not([type=checkbox]), select, textarea { width: 100%; min-width: 0; min-height: 44px; padding: 8px 12px; border: 1px solid var(--line); background: var(--paper); border-radius: var(--control); }
-    textarea { min-height: 88px; resize: vertical; }
-    input[type=checkbox] { width: 20px; height: 20px; flex: none; margin: 0; accent-color: var(--blue); }
-    .choice { display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 4px 0; font-size: 14px; overflow-wrap: anywhere; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .scope { max-height: 360px; overflow: auto; border: 1px solid var(--line); padding: 0 12px; border-radius: var(--control); }
-    details > summary { cursor: pointer; min-height: 44px; padding: 12px 0; overflow-wrap: anywhere; }
-    .branch, .member-section, .member-detail { border-top: 1px solid var(--line); }
-    .branch > div { margin-left: 8px; padding-left: 8px; border-left: 1px solid var(--line); }
-    .form-actions { position: sticky; bottom: 0; margin-top: 16px; padding: 8px 0 calc(8px + env(safe-area-inset-bottom, 0px)); background: var(--paper); border-top: 1px solid var(--line); }
-    .toast { position: fixed; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); width: max-content; max-width: calc(100% - 32px); background: var(--ink); color: white; border-radius: var(--control); padding: 12px 16px; z-index: 10; }
-    .period-label { display: block; margin: 12px 0 4px; color: var(--secondary); font-size: 14px; }
-    .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; background: var(--selection); padding: 12px; border-radius: var(--control); margin: 12px 0; }
-    .kpis span { font-size: 13px; }
-    .kpis strong { display: block; font-size: 24px; }
-    .progress { display: block; width: 100%; height: 8px; accent-color: var(--blue); margin-bottom: 12px; }
-    .member-detail p { margin: 0 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
-    .attachments { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 12px; }
-    .preview { width: min(680px, calc(100% - 32px)); max-height: 88vh; padding: 16px; border: 1px solid var(--line); border-radius: var(--panel); }
-    .preview::backdrop { background: #182530b3; }
-    .preview img { display: block; width: 100%; max-height: 68vh; object-fit: contain; margin-top: 12px; }
+
+    @media (min-width: 520px) {
+      html, body { background: var(--backdrop); }
+      body { padding: 20px 16px; }
+      .shell {
+        min-height: calc(100vh - 40px);
+        min-height: calc(100dvh - 40px);
+        border-radius: 16px;
+        border: 1px solid rgba(24, 37, 48, 0.08);
+        box-shadow: 0 12px 36px rgba(24, 37, 48, 0.06);
+      }
+      header { border-radius: 15px 15px 0 0; }
+      main { border-radius: 0 0 15px 15px; }
+    }
+
+    @media (max-width: 374px) {
+      header .header-inner { padding: 14px 12px 10px; }
+      header h1 { font-size: 18px; }
+      .header-top { gap: 8px; }
+      nav { padding: 8px 12px; }
+      nav button { font-size: 12.5px; padding: 6px 2px; }
+      main { padding: 12px 12px calc(24px + env(safe-area-inset-bottom, 0px)); }
+      .card { padding: 14px 12px; }
+      .grid, .choice-group, .mod-grid { grid-template-columns: 1fr; }
+      .schema-row-sub { grid-template-columns: 1fr auto; }
+      .form-actions { margin: 16px -12px 0; padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px)); }
+      .filter-dates { grid-template-columns: 1fr; }
+      .filter-sep { display: none; }
+    }
+
+    .btn, .primary, .secondary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 44px;
+      padding: 0 16px;
+      border: 1px solid transparent;
+      border-radius: var(--control);
+      background: var(--blue);
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
+      transition: background-color 150ms ease, border-color 150ms ease, transform 120ms ease;
+    }
+    .primary:hover:not(:disabled), .btn:hover:not(:disabled) { background: var(--blue-hover); }
+    .primary:active:not(:disabled), .btn:active:not(:disabled) { background: var(--blue-active); transform: scale(0.99); }
+
+    .secondary {
+      background: var(--paper);
+      border-color: var(--line-strong);
+      color: var(--blue);
+    }
+    .secondary:hover:not(:disabled) { background: var(--blue-soft); border-color: var(--blue-line); }
+    .secondary:active:not(:disabled) { background: #e3eef8; transform: scale(0.99); }
+
+    .icon { width: 16px; height: 16px; flex: none; }
+    .chev {
+      width: 16px;
+      height: 16px;
+      flex: none;
+      color: var(--muted);
+      transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), color 180ms ease;
+    }
+
+    header {
+      background: var(--paper);
+      border-top: 3px solid var(--blue);
+    }
+    header .header-inner {
+      padding: 16px 16px 12px;
+    }
+    .header-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .header-brand {
+      min-width: 0;
+      flex: 1;
+    }
+    .admin-icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      flex: none;
+      margin: -6px -10px 0 0;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: transparent;
+      color: var(--muted);
+      transition: background-color 150ms ease, color 150ms ease, transform 120ms ease;
+    }
+    .admin-icon-btn svg {
+      width: 22px;
+      height: 22px;
+    }
+    .admin-icon-btn:hover { background: var(--blue-soft); color: var(--blue); }
+    .admin-icon-btn:active { background: #e3eef8; color: var(--blue-active); transform: scale(0.96); }
+    header small {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+    }
+    h1 {
+      font-size: 20px;
+      line-height: 1.3;
+      letter-spacing: -0.01em;
+      margin: 4px 0 0;
+      color: var(--ink);
+    }
+    .intro {
+      margin: 6px 0 0;
+      color: var(--secondary);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    h2 {
+      font-size: 16px;
+      line-height: 1.35;
+      margin: 0;
+      color: var(--ink);
+    }
+    h3 {
+      font-size: 15px;
+      line-height: 1.45;
+      margin: 0;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(255, 255, 255, 0.94);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      padding: 8px 16px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+    .tab-track {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 4px;
+      padding: 4px;
+      background: var(--track);
+      border-radius: 10px;
+    }
+    nav button {
+      min-height: 44px;
+      padding: 6px 4px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+    }
+    nav button.active {
+      color: var(--blue);
+      background: var(--paper);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(24, 37, 48, 0.08), 0 0 0 1px rgba(24, 37, 48, 0.04);
+    }
+    nav button:focus-visible { outline-offset: -3px; }
+
+    main {
+      flex: 1;
+      padding: 16px 16px calc(28px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: var(--panel);
+      padding: 16px;
+      margin-bottom: 12px;
+      box-shadow: 0 1px 2px rgba(24, 37, 48, 0.025);
+    }
+
+    .task-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 12px;
+    }
+    .task-info { min-width: 0; }
+    .task-card p { margin: 6px 0 0; }
+
+    .muted {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .task-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .meta-dot { color: var(--line-strong); }
+    .meta-time { margin-top: 4px !important; font-size: 12.5px; }
+
+    .reject-note {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 8px 10px;
+      background: #fef8ee;
+      border: 1px solid #f7e1bd;
+      border-radius: var(--control);
+      font-size: 12.5px;
+      line-height: 1.5;
+      color: #7c470b;
+    }
+    .reject-reason { overflow-wrap: anywhere; }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: var(--tag);
+      font-size: 12px;
+      font-weight: 500;
+      line-height: 1.4;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .tag-approved { background: #ecf7f1; color: #176049; border-color: #cdebd9; }
+    .tag-submitted { background: var(--blue-soft); color: var(--blue); border-color: var(--blue-line); }
+    .tag-rejected, .tag-warn { background: #fef6e8; color: #8a4f0e; border-color: #f7dfba; }
+    .tag-overdue, .tag-expired { background: #fdf1f0; color: #9b2c2c; border-color: #f6d2cf; }
+    .tag-cancelled, .tag-pending { background: #f0f3f6; color: #51606e; border-color: #dde3ea; }
+
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .section-row { margin: 4px 0 12px; }
+    .section-count {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
+    }
+
+    .empty {
+      padding: 28px 16px;
+      text-align: center;
+      color: var(--secondary);
+      font-size: 14px;
+    }
+    .empty h2 { margin-bottom: 6px; }
+    .empty p { margin: 0 0 14px; color: var(--muted); font-size: 13.5px; }
+    .empty p:last-child { margin-bottom: 0; }
+
+    .form-card { padding-bottom: 0; }
+    .form-head {
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 4px;
+    }
+    .form-sub {
+      margin: 4px 0 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    label.field, .field-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 16px 0 6px;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    input:not([type=checkbox]), select, textarea {
+      width: 100%;
+      min-width: 0;
+      min-height: 44px;
+      padding: 10px 12px;
+      border: 1px solid var(--line-strong);
+      background: var(--paper);
+      border-radius: var(--control);
+      font-size: 15px;
+      color: var(--ink);
+      transition: border-color 150ms ease, box-shadow 150ms ease;
+    }
+    input:not([type=checkbox]):focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(21, 85, 138, 0.12);
+    }
+    input::placeholder, textarea::placeholder { color: #8c9aa6; }
+    textarea { min-height: 92px; resize: vertical; line-height: 1.55; }
+
+    select {
+      appearance: none;
+      -webkit-appearance: none;
+      padding-right: 36px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%2360707d' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6l4 4 4-4'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      background-size: 16px 16px;
+    }
+
+    input[type=checkbox] {
+      appearance: none;
+      -webkit-appearance: none;
+      width: 20px;
+      height: 20px;
+      flex: none;
+      margin: 0;
+      border: 1.5px solid var(--line-strong);
+      border-radius: 5px;
+      background: var(--paper);
+      cursor: pointer;
+      transition: background-color 140ms ease, border-color 140ms ease;
+    }
+    input[type=checkbox]:checked {
+      background-color: var(--blue);
+      border-color: var(--blue);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 14px 14px;
+    }
+    input[type=checkbox]:indeterminate {
+      background-color: var(--blue);
+      border-color: var(--blue);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M4 8h8'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: center;
+      background-size: 14px 14px;
+    }
+    input[type=checkbox]:disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+
+    .choice {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 44px;
+      padding: 6px 12px;
+      font-size: 14px;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+      cursor: pointer;
+      border-radius: var(--control);
+      transition: background-color 120ms ease;
+    }
+    .choice:active { background: var(--blue-soft); }
+    .choice-card {
+      border: 1px solid var(--line);
+      background: var(--surface-subtle);
+      margin-top: 8px;
+    }
+    .choice-group {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .choice-group .choice {
+      border: 1px solid var(--line);
+      background: var(--surface-subtle);
+    }
+    .member-phone {
+      margin-left: auto;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .scope {
+      max-height: 360px;
+      overflow: auto;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--control);
+      background: var(--paper);
+    }
+
+    details > summary {
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      cursor: pointer;
+      min-height: 44px;
+      padding: 10px 12px;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--ink);
+      overflow-wrap: anywhere;
+      user-select: none;
+      transition: background-color 120ms ease;
+    }
+    details > summary::-webkit-details-marker { display: none; }
+    details > summary:active { background: var(--surface-subtle); }
+    details[open] > summary .chev {
+      transform: rotate(90deg);
+      color: var(--blue);
+    }
+
+    .summary-main {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-width: 0;
+    }
+    .summary-count {
+      font-size: 12.5px;
+      font-weight: 400;
+      color: var(--muted);
+    }
+
+    .branch, .member-section { border-top: 1px solid var(--line); }
+    .scope > details:first-child { border-top: 0; }
+    .branch > div {
+      padding: 4px 0 4px 14px;
+      border-top: 1px solid var(--line);
+      background: #fbfcfd;
+    }
+
+    .form-tip {
+      margin: 12px 0 0;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .field-hint {
+      margin: 6px 0 0;
+      font-size: 12.5px;
+      line-height: 1.45;
+      color: var(--muted);
+    }
+    .form-section {
+      margin-top: 18px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line);
+    }
+    .form-section .field-label:first-child,
+    .form-section > label.field:first-child {
+      margin-top: 0;
+    }
+    .seg-track {
+      display: grid;
+      gap: 4px;
+      padding: 4px;
+      background: var(--track);
+      border-radius: 10px;
+    }
+    .seg-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .seg-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .seg-track button {
+      min-height: 44px;
+      padding: 6px 4px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+    }
+    .seg-track button.active {
+      background: var(--paper);
+      color: var(--blue);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(24, 37, 48, 0.08);
+    }
+    .preset-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .mini-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0 10px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: var(--paper);
+      color: var(--secondary);
+      font-size: 12.5px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+    }
+    .mini-btn:hover { background: var(--blue-soft); border-color: var(--blue-line); color: var(--blue); }
+    .week-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
+      gap: 6px;
+    }
+    .dom-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(44px, 1fr));
+      gap: 6px;
+    }
+    .day-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 44px;
+      padding: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--control);
+      background: var(--surface-subtle);
+      color: var(--secondary);
+      font-size: 13.5px;
+      font-weight: 500;
+      transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+    }
+    .dom-grid .day-btn { font-size: 13px; }
+    .day-btn.active {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #ffffff;
+      font-weight: 600;
+    }
+    .mod-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .mod-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 4px;
+      min-height: 62px;
+      padding: 10px 12px;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--control);
+      background: var(--surface-subtle);
+      text-align: left;
+      transition: background-color 140ms ease, border-color 140ms ease;
+    }
+    .mod-btn.active {
+      background: var(--blue-soft);
+      border-color: var(--blue);
+    }
+    .mod-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+    }
+    .mod-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .mod-btn.active .mod-title { color: var(--blue); }
+    .mod-check {
+      width: 18px;
+      height: 18px;
+      border-radius: 5px;
+      border: 1.5px solid var(--line-strong);
+      background: var(--paper);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: none;
+    }
+    .mod-btn.active .mod-check {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #ffffff;
+    }
+    .mod-desc {
+      font-size: 12px;
+      line-height: 1.35;
+      color: var(--muted);
+    }
+    .sub-panel {
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--control);
+      background: var(--surface-subtle);
+    }
+    .sub-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .schema-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .schema-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .schema-row:first-child {
+      padding-top: 0;
+      border-top: 0;
+    }
+    .schema-row-sub {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 8px;
+    }
+    .schema-row-sub select {
+      min-height: 44px;
+      padding: 6px 32px 6px 10px;
+      font-size: 13.5px;
+    }
+    .choice-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 44px;
+      padding: 0 6px;
+      font-size: 13px;
+      color: var(--secondary);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .remove-btn {
+      min-height: 44px;
+      padding: 0 10px;
+      border: 1px solid #f6d2cf;
+      border-radius: var(--control);
+      background: #fdf1f0;
+      color: #9b2c2c;
+      font-size: 12.5px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .remove-btn:disabled { opacity: 0.4; }
+    .sub-field-label {
+      display: block;
+      margin: 10px 0 6px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--secondary);
+    }
+    .sub-field-label:first-child { margin-top: 0; }
+
+    .form-actions {
+      position: sticky;
+      bottom: 0;
+      z-index: 15;
+      display: grid;
+      grid-template-columns: 1fr 1.6fr;
+      gap: 10px;
+      margin: 20px -16px 0;
+      padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      border-top: 1px solid var(--line);
+      border-radius: 0 0 var(--panel) var(--panel);
+    }
+
+    .toast {
+      position: fixed;
+      bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+      left: 50%;
+      transform: translateX(-50%);
+      width: max-content;
+      max-width: min(448px, calc(100% - 32px));
+      background: var(--ink);
+      color: #ffffff;
+      border-radius: var(--control);
+      padding: 11px 16px;
+      font-size: 13.5px;
+      line-height: 1.45;
+      box-shadow: 0 8px 24px rgba(24, 37, 48, 0.22);
+      z-index: 40;
+    }
+
+    .period-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 12px 0 0;
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .period-label select {
+      flex: 1;
+      max-width: 220px;
+      min-height: 44px;
+      padding: 6px 32px 6px 10px;
+      font-size: 13.5px;
+    }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--line);
+      padding: 12px 8px;
+      border-radius: 10px;
+      margin: 12px 0;
+      text-align: center;
+    }
+    .kpis span {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .kpis strong {
+      display: block;
+      margin-top: 2px;
+      font-size: 22px;
+      line-height: 1.2;
+      color: var(--ink);
+    }
+    .kpis span:nth-child(2) strong { color: var(--blue); }
+
+    .progress-wrap { margin-bottom: 12px; }
+    .progress-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12.5px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .progress {
+      display: block;
+      width: 100%;
+      height: 6px;
+      border: 0;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #e3e9ef;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    .progress::-webkit-progress-bar {
+      background: #e3e9ef;
+      border-radius: 999px;
+    }
+    .progress::-webkit-progress-value {
+      background: var(--blue);
+      border-radius: 999px;
+      transition: width 240ms ease;
+    }
+    .progress::-moz-progress-bar {
+      background: var(--blue);
+      border-radius: 999px;
+    }
+
+    .member-detail { border-top: 1px solid var(--line); }
+    .member-detail summary { padding: 10px 4px; }
+    .member-body { padding: 0 4px 12px; }
+    .member-detail p {
+      margin: 0 0 10px;
+      font-size: 13.5px;
+      line-height: 1.55;
+      color: var(--secondary);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .member-detail p:last-child { margin-bottom: 0; }
+    .attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .preview {
+      width: min(448px, calc(100% - 32px));
+      max-height: 88vh;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--panel);
+      background: var(--paper);
+      box-shadow: 0 20px 48px rgba(24, 37, 48, 0.24);
+    }
+    .preview::backdrop {
+      background: rgba(24, 37, 48, 0.56);
+      backdrop-filter: blur(2px);
+    }
+    .preview-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .preview-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .preview img {
+      display: block;
+      width: 100%;
+      max-height: 66vh;
+      object-fit: contain;
+      margin-top: 12px;
+      border-radius: var(--control);
+      background: var(--surface-subtle);
+    }
+
+    .admin-dialog {
+      overflow: hidden;
+      padding: 0;
+    }
+    .admin-dialog .preview-head {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .admin-dialog-desc {
+      margin: 0;
+      padding: 12px 16px 4px;
+      font-size: 13px;
+      line-height: 1.5;
+      color: var(--secondary);
+    }
+    .admin-dialog-body {
+      max-height: min(60vh, 420px);
+      overflow: auto;
+      padding: 8px 16px 16px;
+    }
+    .admin-count {
+      font-size: 12.5px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .admin-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      border-top: 1px solid var(--line);
+    }
+    .admin-item {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 4px 12px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .admin-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--ink);
+      line-height: 1.4;
+      overflow-wrap: anywhere;
+    }
+    .admin-phone {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--secondary);
+      user-select: text;
+      white-space: nowrap;
+    }
+    .admin-phone-empty {
+      font-weight: 400;
+      color: var(--muted);
+    }
+    .admin-empty {
+      padding: 20px 8px;
+      text-align: center;
+      font-size: 13.5px;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+    .preview.fallback-open {
+      display: block;
+      position: fixed;
+      inset: 50% auto auto 50%;
+      transform: translate(-50%, -50%);
+      z-index: 60;
+    }
+
+    .pager {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .pager button { flex: 1; }
+
+    .history-filter {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: var(--panel);
+      padding: 12px;
+      margin-bottom: 12px;
+      box-shadow: 0 1px 2px rgba(24, 37, 48, 0.025);
+    }
+    .filter-presets {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 4px;
+      padding: 3px;
+      background: var(--track);
+      border-radius: 9px;
+    }
+    .filter-presets button {
+      min-height: 44px;
+      padding: 4px 2px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+    }
+    .filter-presets button.active {
+      background: var(--paper);
+      color: var(--blue);
+      font-weight: 600;
+      box-shadow: 0 1px 2px rgba(24, 37, 48, 0.08);
+    }
+    .filter-dates {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .filter-dates input[type="date"] {
+      min-height: 44px;
+      padding: 8px 10px;
+      font-size: 13.5px;
+    }
+    .filter-sep {
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .filter-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .filter-clear {
+      min-width: 44px;
+      min-height: 44px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--blue);
+      font-size: 12.5px;
+      font-weight: 500;
+    }
+    .filter-clear:hover { background: var(--blue-soft); }
+
     .hidden { display: none !important; }
-</style></head><body><header><div><small>德阳量密助手</small><h1>个人任务工作台</h1><p class="intro">查看待办、发起自主上报，或更正已提交的内容。</p></div></header><nav aria-label="工作台页签"><button data-tab="todo" class="active">我的待办</button><button data-tab="adhoc">自主上报</button><button data-tab="history">已提交</button><button data-tab="create">创建任务</button></nav><main id="main" aria-live="polite">正在加载工作台…</main><div id="toast" class="toast hidden" role="status"></div>
-<dialog class="preview" id="attachment-preview" aria-label="提交图片预览">
-  <form method="dialog"><button class="secondary">关闭预览</button></form>
-  <img alt="员工提交图片">
-</dialog>
-<script>
-'use strict';
-const params = new URLSearchParams(location.hash.slice(1));
-const token=params.get('t')||'',prefix=location.pathname.split('/h5/')[0];
-let toastTimer;
-let info=null,tab=['adhoc','history'].includes(params.get('tab')) ? params.get('tab') : 'todo',scope=null,busy=false,selected=new Set(),expired=false;
-const main=document.getElementById('main'),toastBox=document.getElementById('toast');
-const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function toast(text){toastBox.textContent=text;toastBox.classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastBox.classList.add('hidden'),3500)}
-function expiry(){expired=true;const preview=document.getElementById('attachment-preview');if(preview.open)preview.close();main.innerHTML='<div class="card empty"><h2>链接已过期</h2><p>请回到聊天框向机器人发送任意消息，重新获取最新工作台入口。</p></div>'}
-async function api(action,data={},blob=false) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), action === 'recipients' ? 45000 : 20000);
-  try {
-    const r = await fetch(prefix+'/api/h5/portal/'+action,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(data),cache:'no-store',signal:controller.signal});
-    if (r.status===401) { expiry(); throw Error('链接已过期'); }
-    if (blob && r.ok) return await r.blob();
-    const v = await r.json(); if (!r.ok) throw Error(v.message || '请求失败');
-    return v;
-  } catch (error) {
-    if (controller.signal.aborted) throw Error('操作超时，请稍后重试');
-    throw error;
-  } finally { clearTimeout(timeout); }
-}
-async function refresh(render=true){try{info=await api('info');if(render)show()}catch(e){if(!expired){main.textContent='加载失败';toast(e.message)}}}
-const reportStatus = { submitted: '待审核', approved: '已完成', rejected: '已驳回', cancelled: '已取消', expired: '已过期' };
-function historyCards(items, showType) {
-  return items.map(row => '<article class="card task-card"><div><h3>' + esc(row.name) + '</h3>' +
-    '<p class="muted">' + (showType ? (row.is_adhoc ? '自主上报 · ' : '发布任务 · ') : '') +
-    esc(reportStatus[row.status] || row.status) + '</p><p class="muted">完成时间 ' + esc(row.submitted_at) +
-    '</p></div><button class="secondary" data-history="' + esc(row.id) + '">查看详情</button></article>').join('');
-}
-function bindHistory(root) {
-  root.querySelectorAll('[data-history]').forEach(button => {
-    button.onclick = async () => {
-      button.disabled = true;
-      try {
-        const result = await api('history-open', { instance_id: Number(button.dataset.history) });
-        location.href = prefix + result.url + '&from=portal';
-      } catch (error) { toast(error.message); button.disabled = false; }
-    };
-  });
-}
-async function showHistory(offset = 0) {
-  const section = document.createElement('section');
-  section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div><p class="muted">正在读取提交记录…</p>';
-  main.replaceChildren(section);
-  try {
-    const result = await api('history', { offset });
-    if (!section.isConnected) return;
-    section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
-      (result.items.length ? historyCards(result.items, true) : '<div class="card empty">暂无提交记录</div>') +
-      (offset || result.has_more ? '<div class="row">' +
-        (offset ? '<button class="secondary" data-page="' + Math.max(0, offset - 30) + '">上一页</button>' : '') +
-        (result.has_more ? '<button class="secondary" data-page="' + (offset + 30) + '">下一页</button>' : '') + '</div>' : '');
-    bindHistory(section);
-    section.querySelectorAll('[data-page]').forEach(button => button.onclick = () => showHistory(Number(button.dataset.page)));
-  } catch (error) {
-    if (!section.isConnected) return;
-    section.innerHTML = '<div class="card empty"><p></p><button class="secondary">重试</button></div>';
-    section.querySelector('p').textContent = error.message;
-    section.querySelector('button').onclick = () => showHistory(offset);
-    toast(error.message);
-  }
-}
-function show() {
-  if (expired || !info) return;
-  if (tab === 'create') { creator(); return; }
-  if (tab === 'history') { showHistory(); return; }
-  const todo = tab === 'todo';
-  const rows = todo ? info.todos : info.adhoc;
-  const focusKey = document.activeElement?.dataset.open;
-  main.innerHTML =
-    '<div class="row section-row"><h2>' + (todo ? '当前可提交任务' : '自主上报事项') +
-    '</h2><span class="muted">' + rows.length + ' 项</span></div>' +
-    (rows.length ? rows.map(row => {
-      const key = todo ? row.id : row.template_id;
-      const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
-      const review = todo && row.status === 'rejected' ? '<p class="muted">待重交' +
-        (row.reject_reason ? ' · 驳回原因：' + esc(row.reject_reason) : '') + '</p>' : '';
-      return '<article class="card task-card"><div><h3>' + esc(row.template_name || row.name) +
-        '</h3>' + deadline + review + '</div><button class="primary" data-open="' + esc(key) + '">' +
-        (todo ? '去完成' : '进入上报') + '</button></article>';
-    }).join('') : '<div class="card empty">' +
-      (todo ? '当前暂无待提交的任务事项' : '当前暂无可自主上报的任务事项') + '</div>');
-  if (!todo && info.adhoc_history?.length) {
-    main.insertAdjacentHTML('beforeend', '<div class="row section-row"><h2>已上报记录</h2></div>' +
-      historyCards(info.adhoc_history, false));
-    bindHistory(main);
-  }
-  main.querySelectorAll('[data-open]').forEach((button, index) => {
-    if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
-    button.onclick = async () => {
-      button.disabled = true;
-      try {
-        const item = rows[index];
-        const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: item.id } : { template_id: item.template_id });
-        location.href = prefix + result.url + '&from=portal';
-      } catch (error) {
-        toast(error.message);
-        button.disabled = false;
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="header-inner">
+        <div class="header-top">
+          <div class="header-brand">
+            <small>德阳量密助手</small>
+            <h1>个人任务工作台</h1>
+          </div>
+          <button type="button" id="admin-btn" class="admin-icon-btn" aria-label="有问题就找管理员" title="有问题就找管理员" aria-haspopup="dialog" aria-controls="admin-dialog">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="10" cy="10" r="7.5"/>
+              <path d="M7.9 7.8a2.15 2.15 0 0 1 4.1.7c0 1.4-2 1.85-2 3.1"/>
+              <circle cx="10" cy="14.1" r="0.65" fill="currentColor" stroke="none"/>
+            </svg>
+          </button>
+        </div>
+        <p class="intro">查看待办、发起自主上报、创建任务或更正已提交的内容。</p>
+      </div>
+    </header>
+    <nav aria-label="工作台页签">
+      <div class="tab-track">
+        <button type="button" data-tab="todo" class="active">我的待办</button>
+        <button type="button" data-tab="adhoc">自主上报</button>
+        <button type="button" data-tab="history">提交记录</button>
+        <button type="button" data-tab="create">创建任务</button>
+      </div>
+    </nav>
+    <main id="main" aria-live="polite">
+      <div class="card empty">正在加载工作台…</div>
+    </main>
+  </div>
+  <div id="toast" class="toast hidden" role="status"></div>
+  <dialog class="preview" id="attachment-preview" aria-label="提交图片预览">
+    <div class="preview-head">
+      <span class="preview-title">提交图片预览</span>
+      <form method="dialog"><button class="secondary">关闭预览</button></form>
+    </div>
+    <img alt="员工提交图片">
+  </dialog>
+  <dialog class="preview admin-dialog" id="admin-dialog" aria-labelledby="admin-dialog-title">
+    <div class="preview-head">
+      <span class="preview-title" id="admin-dialog-title">我的管理员</span>
+      <button type="button" class="secondary" id="admin-close">关闭</button>
+    </div>
+    <p class="admin-dialog-desc">有问题就找管理员。以下为管理您当前账号的全部管理员，请选择需要联系的人员：</p>
+    <div class="admin-dialog-body" id="admin-dialog-body"></div>
+  </dialog>
+  <script>
+    'use strict';
+    const CHEVRON_SVG = '<svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4l4 4-4 4"/></svg>';
+    const ATTACHMENT_ICON_SVG = '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5 6.5 10a1.4 1.4 0 0 1-2-2l4.8-4.8a2.7 2.7 0 0 1 3.8 3.8l-5.6 5.6a3.7 3.7 0 0 1-5.2-5.2l4.9-4.9"/></svg>';
+    const params = new URLSearchParams(location.hash.slice(1));
+    const token = params.get('t') || '', prefix = location.pathname.split('/h5/')[0];
+    let toastTimer;
+    let info = null, tab = ['adhoc', 'history'].includes(params.get('tab')) ? params.get('tab') : 'todo', scope = null, busy = false, selected = new Set(), expired = false;
+    const main = document.getElementById('main'), toastBox = document.getElementById('toast');
+    const adminDialog = document.getElementById('admin-dialog'), adminBody = document.getElementById('admin-dialog-body');
+    const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    function toast(text) { toastBox.textContent = text; toastBox.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toastBox.classList.add('hidden'), 3500); }
+    function closeAdminDialog() {
+      if (!adminDialog) return;
+      if (typeof adminDialog.close === 'function' && adminDialog.open) adminDialog.close();
+      adminDialog.classList.remove('fallback-open');
+    }
+    function normalizeAdmins(data) {
+      const list = Array.isArray(data?.admins) ? data.admins
+        : (Array.isArray(data?.managers) ? data.managers
+          : (Array.isArray(data?.admin_contacts) ? data.admin_contacts : []));
+      return list
+        .filter(item => item && typeof item === 'object')
+        .map(item => ({
+          name: String(item.name || item.display_name || item.username || '管理员').trim(),
+          phone: String(item.phone || item.mobile || '').trim(),
+        }));
+    }
+    function renderAdminBody() {
+      if (!adminBody) return;
+      if (!info) {
+        adminBody.innerHTML = '<div class="admin-empty">正在读取管理员信息…</div>';
+        return;
+      }
+      const list = normalizeAdmins(info);
+      if (!list.length) {
+        adminBody.innerHTML = '<div class="admin-empty">暂未查询到您的管理员联系方式，请联系所在部门负责人或稍后重试。</div>';
+        return;
+      }
+      adminBody.innerHTML = '<div class="admin-count">共 ' + list.length + ' 位管理员</div><ul class="admin-list">' +
+        list.map(item => '<li class="admin-item"><span class="admin-name">' + esc(item.name) +
+          '</span><span class="admin-phone' + (item.phone ? '' : ' admin-phone-empty') + '">' +
+          esc(item.phone || '暂未登记手机号') + '</span></li>'
+        ).join('') + '</ul>';
+    }
+    document.getElementById('admin-btn').onclick = async () => {
+      if (expired) { expiry(); return; }
+      renderAdminBody();
+      if (typeof adminDialog.showModal === 'function') {
+        if (!adminDialog.open) adminDialog.showModal();
+      } else {
+        adminDialog.classList.add('fallback-open');
+      }
+      if (!info) {
+        await refresh(true);
+        renderAdminBody();
       }
     };
-  });
-}
-
-const tabs = document.querySelectorAll('[data-tab]');
-tabs.forEach(button => {
-  button.classList.toggle('active', button.dataset.tab === tab);
-  button.setAttribute('aria-pressed', String(button.dataset.tab === tab));
-  button.onclick = () => {
-    if (expired || !info) return;
-    if (button.dataset.tab === 'create' && !info.can_create) {
-      toast('您还未开放此权限，具体请找相关管理员');
-      return;
-    }
-    if (tab === button.dataset.tab) return;
-    tab = button.dataset.tab;
-    params.set('tab', tab);
-    history.replaceState(null, '', '#' + params.toString());
-    tabs.forEach(item => {
-      item.classList.toggle('active', item === button);
-      item.setAttribute('aria-pressed', String(item === button));
+    document.getElementById('admin-close').onclick = closeAdminDialog;
+    adminDialog.addEventListener('click', event => { if (event.target === adminDialog) closeAdminDialog(); });
+    document.getElementById('attachment-preview').addEventListener('click', event => {
+      if (event.target === event.currentTarget) event.currentTarget.close();
     });
-    show();
-  };
-});
-
-async function creator() {
-  main.innerHTML = '<div class="row section-row"><h2>我发布的任务</h2>' +
-    '<button id="new" class="primary">新建并发布任务</button></div><div id="tasks">正在加载统计…</div>';
-  document.getElementById('new').onclick = form;
-  await stats();
-}
-
-function renderPeriod(container, task, period, opened) {
-  const now = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
-  container.innerHTML = '<div class="kpis"><span>应交<strong>' + period.expected +
-    '</strong></span><span>已交<strong>' + period.submitted + '</strong></span><span>未交<strong>' +
-    period.pending + '</strong></span></div><progress class="progress" aria-label="收集进度" value="' +
-    period.submitted + '" max="' + Math.max(period.expected, 1) + '"></progress>' + period.members.map(member => {
-      const status = member.status === 'approved' ? '已完成' : member.deadline_at < now ? '已逾期' : '未提交';
-      const submission = member.submission;
-      const content = submission ? '<p>' + esc(submission.note || '') + '</p><div class="attachments">' +
-        refs(submission).map((ref, index) => '<button class="secondary" data-ref="' + esc(ref) +
-          '">查看图片 ' + (index + 1) + '</button>').join('') + '</div>' : '<p class="muted">暂无提交内容</p>';
-      return '<details class="member-detail" data-member="' + esc(member.id) + '"' +
-        (opened.has(String(member.id)) ? ' open' : '') + '><summary>' +
-        esc(member.name_snap) + ' · ' + status + '</summary>' + content + '</details>';
-    }).join('');
-  container.querySelectorAll('[data-ref]').forEach(button => {
-    button.onclick = async () => {
-      button.disabled = true;
+    function expiry() { expired = true; const preview = document.getElementById('attachment-preview'); if (preview.open) preview.close(); closeAdminDialog(); main.innerHTML = '<div class="card empty"><h2>链接已过期</h2><p>请回到聊天框向机器人发送任意消息，重新获取最新工作台入口。</p></div>'; }
+    async function api(action, data = {}, attachment = false) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), action === 'recipients' ? 45000 : 20000);
       try {
-        const blob = await api('attachment', { task_id: task.task_id, ref: button.dataset.ref }, true);
-        const dialog = document.getElementById('attachment-preview');
-        const url = URL.createObjectURL(blob);
-        if (typeof dialog.showModal !== 'function') {
-          const link = document.createElement('a');
-          link.href = url;
-          link.target = '_blank';
-          link.rel = 'noopener';
-          link.textContent = '打开图片';
-          button.replaceWith(link);
-          window.addEventListener('pagehide', () => URL.revokeObjectURL(url), { once: true });
+        const r = await fetch(prefix + '/api/h5/portal/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token }, body: JSON.stringify(data), cache: 'no-store', signal: controller.signal });
+        if (r.status === 401) { expiry(); throw Error('链接已过期'); }
+        if (attachment && r.ok) {
+          const disposition = r.headers.get('Content-Disposition') || '';
+          const encoded = /filename\*=utf-8''([^;]+)/i.exec(disposition);
+          const filename = encoded ? decodeURIComponent(encoded[1]) : /filename="([^"]+)"/i.exec(disposition)?.[1];
+          return { blob: await r.blob(), filename: filename || '附件' };
+        }
+        const v = await r.json(); if (!r.ok) throw Error(v.message || '请求失败');
+        return v;
+      } catch (error) {
+        if (controller.signal.aborted) throw Error('操作超时，请稍后重试');
+        throw error;
+      } finally { clearTimeout(timeout); }
+    }
+    async function refresh(render = true) { try { info = await api('info'); if (adminDialog.open || adminDialog.classList.contains('fallback-open')) renderAdminBody(); if (render) show(); } catch (e) { if (!expired) { main.innerHTML = '<div class="card empty">加载失败</div>'; toast(e.message); } } }
+    const reportStatus = { submitted: '待审核', approved: '已完成', rejected: '已驳回', cancelled: '已取消', expired: '已过期' };
+    const reportTagClass = { submitted: 'tag-submitted', approved: 'tag-approved', rejected: 'tag-rejected', cancelled: 'tag-cancelled', expired: 'tag-expired' };
+    function historyCards(items, showType) {
+      return items.map(row => '<article class="card task-card"><div class="task-info"><h3>' + esc(row.name) + '</h3>' +
+        '<div class="task-meta"><span class="tag ' + (reportTagClass[row.status] || 'tag-pending') + '">' + esc(reportStatus[row.status] || row.status) + '</span>' +
+        (showType ? '<span class="meta-dot" aria-hidden="true">·</span><span>' + (row.is_adhoc ? '自主上报' : '发布任务') + '</span>' : '') +
+        '</div><p class="muted meta-time">完成时间 ' + esc(row.submitted_at) +
+        '</p></div><button type="button" class="secondary" data-history="' + esc(row.id) + '">查看详情</button></article>').join('');
+    }
+    function bindHistory(root) {
+      root.querySelectorAll('[data-history]').forEach(button => {
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const result = await api('history-open', { instance_id: Number(button.dataset.history) });
+            location.href = prefix + result.url + '&from=portal';
+          } catch (error) { toast(error.message); button.disabled = false; }
+        };
+      });
+    }
+    const historyFilter = { preset: 'all', start: '', end: '' };
+    function shanghaiToday() {
+      return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
+    }
+    function shiftYmd(ymd, deltaDays) {
+      const [y, m, d] = ymd.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+      return dt.toISOString().slice(0, 10);
+    }
+    function applyHistoryPreset(preset) {
+      historyFilter.preset = preset;
+      const today = shanghaiToday();
+      if (preset === 'today') {
+        historyFilter.start = today;
+        historyFilter.end = today;
+      } else if (preset === '7d') {
+        historyFilter.start = shiftYmd(today, -6);
+        historyFilter.end = today;
+      } else if (preset === 'month') {
+        historyFilter.start = today.slice(0, 8) + '01';
+        historyFilter.end = today;
+      } else {
+        historyFilter.start = '';
+        historyFilter.end = '';
+      }
+    }
+    function renderHistoryFilterBar(countText, showClear) {
+      const p = historyFilter.preset;
+      return '<div class="history-filter">' +
+        '<div class="filter-presets" role="group" aria-label="按时间快速筛选">' +
+        '<button type="button" data-preset="all" class="' + (p === 'all' ? 'active' : '') + '">全部</button>' +
+        '<button type="button" data-preset="today" class="' + (p === 'today' ? 'active' : '') + '">今天</button>' +
+        '<button type="button" data-preset="7d" class="' + (p === '7d' ? 'active' : '') + '">近7天</button>' +
+        '<button type="button" data-preset="month" class="' + (p === 'month' ? 'active' : '') + '">本月</button>' +
+        '</div>' +
+        '<div class="filter-dates">' +
+        '<input type="date" id="history-start" aria-label="开始日期" value="' + esc(historyFilter.start) + '">' +
+        '<span class="filter-sep" aria-hidden="true">至</span>' +
+        '<input type="date" id="history-end" aria-label="结束日期" value="' + esc(historyFilter.end) + '">' +
+        '</div>' +
+        (countText || showClear ? '<div class="filter-foot"><span>' + esc(countText) + '</span>' +
+          (showClear ? '<button type="button" class="filter-clear" data-reset-filter>清空筛选</button>' : '') + '</div>' : '') +
+        '</div>';
+    }
+    function bindHistoryFilter(section, maxPages) {
+      section.querySelectorAll('[data-preset]').forEach(btn => {
+        btn.onclick = () => {
+          applyHistoryPreset(btn.dataset.preset);
+          showHistory(0);
+        };
+      });
+      const startInp = section.querySelector('#history-start');
+      const endInp = section.querySelector('#history-end');
+      const onDateChange = () => {
+        historyFilter.preset = 'custom';
+        historyFilter.start = startInp.value;
+        historyFilter.end = endInp.value;
+        if (historyFilter.start && historyFilter.end && historyFilter.start > historyFilter.end) {
+          const tmp = historyFilter.start;
+          historyFilter.start = historyFilter.end;
+          historyFilter.end = tmp;
+        }
+        if (!historyFilter.start && !historyFilter.end) historyFilter.preset = 'all';
+        showHistory(0);
+      };
+      if (startInp) startInp.onchange = onDateChange;
+      if (endInp) endInp.onchange = onDateChange;
+      section.querySelectorAll('[data-reset-filter]').forEach(btn => {
+        btn.onclick = () => {
+          applyHistoryPreset('all');
+          showHistory(0);
+        };
+      });
+      const moreBtn = section.querySelector('[data-scan-more]');
+      if (moreBtn) {
+        moreBtn.onclick = () => showHistory(0, maxPages + 10);
+      }
+    }
+    async function showHistory(offset = 0, maxPages = 10) {
+      const hasFilter = Boolean(historyFilter.start || historyFilter.end);
+      const section = document.createElement('section');
+      section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
+        renderHistoryFilterBar('', hasFilter) +
+        '<div class="card empty">正在读取提交记录…</div>';
+      main.replaceChildren(section);
+      bindHistoryFilter(section, maxPages);
+      try {
+        if (!hasFilter) {
+          const result = await api('history', { offset });
+          if (!section.isConnected) return;
+          section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
+            renderHistoryFilterBar('', false) +
+            (result.items.length ? historyCards(result.items, true) : '<div class="card empty">暂无提交记录</div>') +
+            (offset || result.has_more ? '<div class="pager">' +
+              (offset ? '<button type="button" class="secondary" data-page="' + Math.max(0, offset - 30) + '">上一页</button>' : '') +
+              (result.has_more ? '<button type="button" class="secondary" data-page="' + (offset + 30) + '">下一页</button>' : '') + '</div>' : '');
+          bindHistory(section);
+          bindHistoryFilter(section, maxPages);
+          section.querySelectorAll('[data-page]').forEach(button => button.onclick = () => showHistory(Number(button.dataset.page)));
           return;
         }
-        const img = dialog.querySelector('img');
-        img.src = url;
-        dialog.addEventListener('close', () => {
-          img.removeAttribute('src');
-          URL.revokeObjectURL(url);
-        }, { once: true });
-        dialog.showModal();
+        const matched = [];
+        let cursor = 0;
+        let pages = 0;
+        let hasMore = false;
+        while (pages < maxPages) {
+          const result = await api('history', { offset: cursor });
+          if (!section.isConnected) return;
+          const items = result.items || [];
+          for (const row of items) {
+            const day = String(row.submitted_at || '').slice(0, 10);
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+            if (historyFilter.start && day < historyFilter.start) continue;
+            if (historyFilter.end && day > historyFilter.end) continue;
+            matched.push(row);
+          }
+          pages++;
+          hasMore = Boolean(result.has_more);
+          const lastDay = items.length ? String(items[items.length - 1].submitted_at || '').slice(0, 10) : '';
+          if (!hasMore || !items.length || (historyFilter.start && /^\d{4}-\d{2}-\d{2}$/.test(lastDay) && lastDay < historyFilter.start)) {
+            hasMore = false;
+            break;
+          }
+          cursor += 30;
+        }
+        section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
+          renderHistoryFilterBar('共筛选出 ' + matched.length + ' 条记录', true) +
+          (matched.length ? historyCards(matched, true) : '<div class="card empty"><p>该时间范围内暂无提交记录</p><button type="button" class="secondary" data-reset-filter>查看全部记录</button></div>') +
+          (hasMore ? '<div class="pager"><button type="button" class="secondary" data-scan-more>继续加载更早记录</button></div>' : '');
+        bindHistory(section);
+        bindHistoryFilter(section, maxPages);
+      } catch (error) {
+        if (!section.isConnected) return;
+        section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
+          renderHistoryFilterBar('', hasFilter) +
+          '<div class="card empty"><p></p><button type="button" class="secondary">重试</button></div>';
+        section.querySelector('.empty p').textContent = error.message;
+        section.querySelector('.empty button').onclick = () => showHistory(offset, maxPages);
+        bindHistoryFilter(section, maxPages);
+        toast(error.message);
+      }
+    }
+    function show() {
+      if (expired || !info) return;
+      if (tab === 'create') { creator(); return; }
+      if (tab === 'history') { showHistory(); return; }
+      const todo = tab === 'todo';
+      const rows = todo ? info.todos : info.adhoc;
+      const focusKey = document.activeElement?.dataset.open;
+      main.innerHTML =
+        '<div class="row section-row"><h2>' + (todo ? '当前可提交任务' : '自主上报事项') +
+        '</h2><span class="section-count">' + rows.length + ' 项</span></div>' +
+        (rows.length ? rows.map(row => {
+          const key = todo ? row.id : row.template_id;
+          const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
+          const review = todo && row.status === 'rejected' ? '<div class="reject-note"><span class="tag tag-warn">待重交</span>' +
+            (row.reject_reason ? '<span class="reject-reason">驳回原因：' + esc(row.reject_reason) + '</span>' : '') + '</div>' : '';
+          return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name || row.name) +
+            '</h3>' + deadline + review + '</div><button type="button" class="primary" data-open="' + esc(key) + '">' +
+            (todo ? '去完成' : '进入上报') + '</button></article>';
+        }).join('') : '<div class="card empty">' +
+          (todo ? '当前暂无待提交的任务事项' : '当前暂无可自主上报的任务事项') + '</div>');
+      main.querySelectorAll('[data-open]').forEach((button, index) => {
+        if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const item = rows[index];
+            const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: item.id } : { template_id: item.template_id });
+            location.href = prefix + result.url + '&from=portal';
+          } catch (error) {
+            toast(error.message);
+            button.disabled = false;
+          }
+        };
+      });
+    }
+
+    const tabs = document.querySelectorAll('[data-tab]');
+    tabs.forEach(button => {
+      button.classList.toggle('active', button.dataset.tab === tab);
+      button.setAttribute('aria-pressed', String(button.dataset.tab === tab));
+      button.onclick = () => {
+        if (expired || !info) return;
+        if (button.dataset.tab === 'create' && !info.can_create) {
+          toast('您还未开放此权限，具体请找相关管理员');
+          return;
+        }
+        if (tab === button.dataset.tab) return;
+        tab = button.dataset.tab;
+        params.set('tab', tab);
+        history.replaceState(null, '', '#' + params.toString());
+        tabs.forEach(item => {
+          item.classList.toggle('active', item === button);
+          item.setAttribute('aria-pressed', String(item === button));
+        });
+        show();
+      };
+    });
+
+    async function creator() {
+      main.innerHTML = '<div class="row section-row"><h2>我发布的任务</h2>' +
+        '<button type="button" id="new" class="primary">新建并发布任务</button></div><div id="tasks"><div class="card empty">正在加载统计…</div></div>';
+      document.getElementById('new').onclick = form;
+      await stats();
+    }
+
+    function renderPeriod(container, task, period, opened) {
+      const now = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+      const pct = period.expected > 0 ? Math.min(100, Math.round((period.submitted / period.expected) * 100)) : 0;
+      container.innerHTML = '<div class="kpis"><span>应交<strong>' + period.expected +
+        '</strong></span><span>已交<strong>' + period.submitted + '</strong></span><span>未交<strong>' +
+        period.pending + '</strong></span></div><div class="progress-wrap"><div class="progress-head"><span>收集进度</span><span>' +
+        period.submitted + ' / ' + period.expected + ' · ' + pct + '%</span></div><progress class="progress" aria-label="收集进度" value="' +
+        period.submitted + '" max="' + Math.max(period.expected, 1) + '"></progress></div>' + period.members.map(member => {
+          const status = member.status === 'approved' ? '已完成'
+            : member.status === 'submitted' ? '待审核'
+            : member.status === 'rejected' ? '已驳回'
+            : member.deadline_at < now ? '已逾期' : '未提交';
+          const tagClass = member.status === 'approved' ? 'tag-approved'
+            : member.status === 'submitted' ? 'tag-submitted'
+            : member.status === 'rejected' ? 'tag-rejected'
+            : member.deadline_at < now ? 'tag-overdue' : 'tag-pending';
+          const submission = member.submission;
+          const attachments = submission ? refs(submission) : [];
+          const content = submission ? '<div class="member-body">' + (submission.note ? '<p>' + esc(submission.note) + '</p>' : '') +
+            (attachments.length ? '<div class="attachments">' +
+              attachments.map((ref, index) => '<button type="button" class="secondary" data-ref="' + esc(ref) +
+                '">' + ATTACHMENT_ICON_SVG + '<span>查看附件 ' + (index + 1) + '</span></button>').join('') + '</div>' : (!submission.note ? '<p class="muted">已提交</p>' : '')) +
+            '</div>' : '<div class="member-body"><p class="muted">暂无提交内容</p></div>';
+          return '<details class="member-detail" data-member="' + esc(member.id) + '"' +
+            (opened.has(String(member.id)) ? ' open' : '') + '><summary><span class="summary-main">' +
+            esc(member.name_snap) + '<span class="tag ' + tagClass + '">' + status + '</span></span>' + CHEVRON_SVG + '</summary>' + content + '</details>';
+        }).join('');
+      container.querySelectorAll('[data-ref]').forEach(button => {
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            const { blob, filename } = await api('attachment', { task_id: task.task_id, ref: button.dataset.ref }, true);
+            const dialog = document.getElementById('attachment-preview');
+            const url = URL.createObjectURL(blob);
+            if (!blob.type.startsWith('image/')) {
+              const link = document.createElement('a');
+              link.href = url;
+              link.download = filename;
+              document.body.appendChild(link);
+              link.click();
+              link.remove();
+              setTimeout(() => URL.revokeObjectURL(url), 30000);
+              return;
+            }
+            if (typeof dialog.showModal !== 'function') {
+              const link = document.createElement('a');
+              link.href = url;
+              link.target = '_blank';
+              link.rel = 'noopener';
+              link.textContent = '打开图片';
+              button.replaceWith(link);
+              window.addEventListener('pagehide', () => URL.revokeObjectURL(url), { once: true });
+              return;
+            }
+            const img = dialog.querySelector('img');
+            img.src = url;
+            dialog.addEventListener('close', () => {
+              img.removeAttribute('src');
+              URL.revokeObjectURL(url);
+            }, { once: true });
+            dialog.showModal();
+          } catch (error) {
+            toast(error.message);
+          } finally {
+            button.disabled = false;
+          }
+        };
+      });
+    }
+
+    async function stats() {
+      const el = document.getElementById('tasks');
+      try {
+        const result = await api('tasks');
+        if (!el || !el.isConnected) return;
+        const now = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+        const overdue = result.items.map(task => task.periods.map(period =>
+          period.members.map(member => member.status !== 'approved' && member.deadline_at < now)));
+        const snapshot = JSON.stringify([result.items, overdue]);
+        if (el.dataset.snapshot === snapshot) return;
+        el.dataset.snapshot = snapshot;
+        const previous = new Map([...el.querySelectorAll('[data-period-task]')].map(select => [
+          select.dataset.periodTask,
+          { period: select.value, opened: new Set([...select.closest('article').querySelectorAll('[data-member][open]')]
+            .map(detail => detail.dataset.member)) }
+        ]));
+        el.innerHTML = result.items.map(task => '<article class="card"><h3>' + esc(task.name) +
+          (task.periods.length ? '</h3><label class="period-label"><span>统计周期</span><select data-period-task="' +
+            esc(task.task_id) + '">' + task.periods.map(period => '<option value="' + esc(period.period_key) + '">' +
+              esc(period.period_key === 'once' ? '一次性任务' : period.period_key) + '</option>').join('') +
+            '</select></label><div data-period-panel></div>' : '</h3><p class="muted" style="margin:8px 0 0;">等待首个执行周期</p>') +
+          '</article>').join('') || '<div class="card empty">还没有发布任务</div>';
+        const tasks = new Map(result.items.map(task => [task.task_id, task]));
+        el.querySelectorAll('[data-period-task]').forEach(select => {
+          const task = tasks.get(select.dataset.periodTask);
+          const saved = previous.get(task.task_id);
+          if (saved && task.periods.some(period => period.period_key === saved.period)) select.value = saved.period;
+          const panel = select.closest('article').querySelector('[data-period-panel]');
+          const render = opened => renderPeriod(panel, task, task.periods.find(period => period.period_key === select.value), opened);
+          select.onchange = () => render(new Set());
+          render(saved?.opened || new Set());
+        });
+      } catch (error) { toast(error.message); }
+    }
+    function refs(s) {
+      let items;
+      try { items = JSON.parse(s.refs_json || '[]'); } catch { items = []; }
+      return [...new Set([...(Array.isArray(items) ? items : []), s.file_ref].filter(Boolean))];
+    }
+    async function form() {
+      const view = document.getElementById('tasks');
+      const trigger = document.getElementById('new');
+      trigger.disabled = true;
+      try {
+        scope = await api('recipients');
       } catch (error) {
         toast(error.message);
+        return;
       } finally {
-        button.disabled = false;
+        trigger.disabled = false;
       }
-    };
-  });
-}
+      if (!view.isConnected || expired) return;
+      selected.clear();
+      // getRandomValues also works in the HTTP WebViews used by the portal.
+      const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+        byte => byte.toString(16).padStart(2, '0')).join('');
 
-async function stats() {
-  const el = document.getElementById('tasks');
-  try {
-    const result = await api('tasks');
-    if (!el || !el.isConnected) return;
-    const now = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
-    const overdue = result.items.map(task => task.periods.map(period =>
-      period.members.map(member => member.status !== 'approved' && member.deadline_at < now)));
-    const snapshot = JSON.stringify([result.items, overdue]);
-    if (el.dataset.snapshot === snapshot) return;
-    el.dataset.snapshot = snapshot;
-    const previous = new Map([...el.querySelectorAll('[data-period-task]')].map(select => [
-      select.dataset.periodTask,
-      { period: select.value, opened: new Set([...select.closest('article').querySelectorAll('[data-member][open]')]
-        .map(detail => detail.dataset.member)) }
-    ]));
-    el.innerHTML = result.items.map(task => '<article class="card"><h3>' + esc(task.name) +
-      (task.periods.length ? '</h3><label class="period-label">统计周期<select data-period-task="' +
-        esc(task.task_id) + '">' + task.periods.map(period => '<option value="' + esc(period.period_key) + '">' +
-          esc(period.period_key === 'once' ? '一次性任务' : period.period_key) + '</option>').join('') +
-        '</select></label><div data-period-panel></div>' : '</h3><p class="muted">等待首个执行周期</p>') +
-      '</article>').join('') || '<div class="card empty">还没有发布任务</div>';
-    const tasks = new Map(result.items.map(task => [task.task_id, task]));
-    el.querySelectorAll('[data-period-task]').forEach(select => {
-      const task = tasks.get(select.dataset.periodTask);
-      const saved = previous.get(task.task_id);
-      if (saved && task.periods.some(period => period.period_key === saved.period)) select.value = saved.period;
-      const panel = select.closest('article').querySelector('[data-period-panel]');
-      const render = opened => renderPeriod(panel, task, task.periods.find(period => period.period_key === select.value), opened);
-      select.onchange = () => render(new Set());
-      render(saved?.opened || new Set());
-    });
-  } catch (error) { toast(error.message); }
-}
-function refs(s){try{return JSON.parse(s.refs_json||'[]')}catch{return []}}
-async function form() {
-  const view = document.getElementById('tasks');
-  const trigger = document.getElementById('new');
-  trigger.disabled = true;
-  try {
-    scope = await api('recipients');
-  } catch (error) {
-    toast(error.message);
-    return;
-  } finally {
-    trigger.disabled = false;
-  }
-  if (!view.isConnected || expired) return;
-  selected.clear();
-  // getRandomValues also works in the HTTP WebViews used by the portal.
-  const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-    byte => byte.toString(16).padStart(2, '0')).join('');
-  main.innerHTML = `<form class="card" id="form">
-    <h2>新建任务</h2>
-    <label class="field" for="name">任务名称</label>
-    <input id="name" required maxlength="128" placeholder="请输入任务名称">
-    <label class="field" for="description">任务要求</label>
-    <textarea id="description" required maxlength="2000" placeholder="说明需要提交的文本和图片内容"></textarea>
-    <div class="field-label">接收成员 <span class="muted" id="count" role="status">已选 0 人</span></div>
-    ${scope.directory_error ? `<p class="muted" role="status">${esc(scope.directory_error)}</p>` : ''}
-    <div class="scope" id="scope"></div>
-    <label class="field" for="mode">发布周期</label>
-    <select id="mode"><option value="once">一次性 · 立即推送</option><option value="day">每日</option><option value="week">每周</option><option value="month">每月</option></select>
-    <div id="once">
-    <label class="field" for="deadline_at">截止时间（留空不限）</label>
-    <input type="datetime-local" id="deadline_at"></div>
-    <div id="recurring" class="hidden">
-    <label class="field" for="remind_at">执行时刻</label>
-    <input type="time" id="remind_at" value="08:00">
-    <div id="weekly" class="hidden">
-    <label class="field" for="weekday">执行星期（1–7，周一至周日）</label>
-    <input type="number" id="weekday" min="1" max="7" value="1"></div>
-    <div id="monthly" class="hidden">
-    <label class="field" for="dom">每月执行日（1–31）</label>
-    <input type="number" id="dom" min="1" max="31" value="1"></div>
-    <label class="choice">
-    <input type="checkbox" id="has_deadline" checked>设置动态截止</label>
-    <div class="grid">
-    <select id="deadline_type" aria-label="截止日期规则"><option value="same_day">执行当天</option><option value="weekend">本周末</option><option value="month_end">本月底</option></select>
-    <input type="time" id="deadline_time" aria-label="截止时刻" value="23:59"></div></div>
-    <div class="field-label">收集内容（至少选择一项）</div>
-    <label class="choice">
-    <input type="checkbox" id="collect_text" checked>文字说明</label>
-    <label class="choice">
-    <input type="checkbox" id="collect_image">图片</label>
-    <p class="muted">固定免审，提交即完成。</p>
-    <div class="row form-actions">
-    <button class="secondary" type="button" id="back">返回统计</button>
-    <button type="submit" class="primary" id="publish">发布任务</button></div></form>`;
-  const box = document.getElementById('scope');
-  const departments = scope.departments;
-  const deptIds = new Set(departments.map(dept => dept.dept_id));
-  const children = new Map();
-  departments.forEach(dept => {
-    const parent = deptIds.has(dept.parent_id) ? dept.parent_id : '';
-    if (!children.has(parent)) children.set(parent, []);
-    children.get(parent).push(dept);
-  });
-  function memberRows(members) {
-    return members.map(member => '<label class="choice"><input type="checkbox" data-phone="' +
-      esc(member.phone) + '">' + esc(member.name) + ' <span class="muted">' +
-      esc(member.phone.slice(0, 3) + '****' + member.phone.slice(-4)) + '</span></label>').join('');
-  }
-  function groupToggle(members, label) {
-    return '<label class="choice"><input type="checkbox" data-group="' +
-      esc(members.map(member => member.phone).join(',')) + '"' + (members.length ? '' : ' disabled') +
-      '>' + esc(label) + '</label>';
-  }
-  function branchIds(id) {
-    return [id, ...(children.get(id) || []).flatMap(dept => branchIds(dept.dept_id))];
-  }
-  function departmentBranch(dept) {
-    const ids = new Set(branchIds(dept.dept_id));
-    const members = scope.members.filter(member => member.dept_ids.some(id => ids.has(id)));
-    const direct = members.filter(member => member.dept_ids.includes(dept.dept_id));
-    return '<details class="branch"><summary>' + esc(dept.name) + ' · ' + members.length +
-      ' 人</summary><div>' + groupToggle(members, '全选本部门及下级') + memberRows(direct) +
-      (children.get(dept.dept_id) || []).map(departmentBranch).join('') + '</div></details>';
-  }
-  box.innerHTML = (departments.length ? '<details open><summary>按部门选择</summary>' +
-    (children.get('') || []).map(departmentBranch).join('') + '</details>' : '') +
-    (scope.roles.length ? '<details class="member-section"><summary>按角色选择</summary>' +
-      scope.roles.map(role => {
-        const members = scope.members.filter(member => member.role_ids.includes(role.role_id));
-        return '<details class="branch"><summary>' + esc(role.name) + ' · ' + members.length +
-          ' 人</summary><div>' + groupToggle(members, '全选本角色') + memberRows(members) + '</div></details>';
-      }).join('') + '</details>' : '') +
-    '<details class="member-section"' + (!departments.length && !scope.roles.length ? ' open' : '') +
-    '><summary>全部可选成员 · ' + scope.members.length + ' 人</summary>' +
-    memberRows(scope.members) + '</details>';
-  function sync() {
-    box.querySelectorAll('[data-phone]').forEach(input => {
-      input.checked = selected.has(input.dataset.phone);
-    });
-    box.querySelectorAll('[data-group]').forEach(input => {
-      const phones = input.dataset.group.split(',').filter(Boolean);
-      input.checked = phones.length > 0 && phones.every(phone => selected.has(phone));
-      input.indeterminate = !input.checked && phones.some(phone => selected.has(phone));
-    });
-    document.getElementById('count').textContent = '已选 ' + selected.size + ' 人';
-  }
-  box.onchange = event => {
-    const input = event.target;
-    const phones = input.dataset.phone ? [input.dataset.phone] : (input.dataset.group || '').split(',').filter(Boolean);
-    phones.forEach(phone => {
-      if (input.checked) selected.add(phone);
-      else selected.delete(phone);
-    });
-    sync();
-  };
-  document.getElementById('back').onclick = creator;
-  document.getElementById('mode').onchange = event => {
-    const mode = event.target.value;
-    document.getElementById('once').classList.toggle('hidden', mode !== 'once');
-    document.getElementById('recurring').classList.toggle('hidden', mode === 'once');
-    document.getElementById('weekly').classList.toggle('hidden', mode !== 'week');
-    document.getElementById('monthly').classList.toggle('hidden', mode !== 'month');
-  };
-  document.getElementById('form').onsubmit = async event => {
-    event.preventDefault();
-    if (busy) return;
-    const val = id => document.getElementById(id).value;
-    const mode = val('mode');
-    const data = {
-      upload_modules: [
-        ...(document.getElementById('collect_text').checked ? ['text'] : []),
-        ...(document.getElementById('collect_image').checked ? ['image'] : []),
-      ],
-      request_id: requestId,
-      name: val('name'),
-      description: val('description'),
-      phones: [...selected],
-      mode,
-      deadline_at: val('deadline_at'),
-      remind_at: val('remind_at'),
-      has_deadline: document.getElementById('has_deadline').checked,
-      deadline_type: val('deadline_type'),
-      deadline_time: val('deadline_time'),
-    };
-    if (mode === 'week') data.anchor_weekday = +val('weekday');
-    if (mode === 'month') data.anchor_dom = +val('dom');
-    busy = true;
-    document.getElementById('publish').disabled = true;
-    try {
-      await api('create', data);
-      toast('任务已发布');
-      await creator();
-    } catch (error) {
-      toast(error.message);
-    } finally {
-      busy = false;
-      const button = document.getElementById('publish');
-      if (button) button.disabled = false;
+      const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
+      const WEEKDAY_NAMES = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+      const MODULE_META = [
+        { key: 'fields', title: '字段报数', desc: '数字/文本/布尔填报' },
+        { key: 'text', title: '文字说明', desc: '补充情况或原因' },
+        { key: 'image', title: '图片上传', desc: '现场照片截图凭证' },
+        { key: 'file', title: '文件上传', desc: '表格或文档附件' }
+      ];
+      const MOD_CHECK_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6.5"/></svg>';
+
+      let scheduleKind = 'once';
+      let execWeekdays = [1, 2, 3, 4, 5, 6, 7];
+      let execDomDays = [1];
+      let deadlineType = 'same_day';
+      const uploadModules = new Set(['text']);
+      const schemaFields = [
+        { key: 'field_1', label: '今日累计完成数', type: 'number', required: true }
+      ];
+
+      function localDatetimeNowValue() {
+        const now = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        return now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
+          'T' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+      }
+
+      function parseLocalDatetimeMs(valStr) {
+        const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(valStr);
+        if (!m) return NaN;
+        return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0), 0).getTime();
+      }
+
+      function describeWeekdays(days) {
+        const s = [...new Set(days)].sort((a, b) => a - b);
+        if (s.length === 7) return '每天执行';
+        if (s.length === 0) return '尚未选择（请至少选 1 天）';
+        if (s.length === 5 && s.every((d, i) => d === i + 1)) return '仅工作日（周一至周五）';
+        if (s.length === 2 && s[0] === 6 && s[1] === 7) return '仅周末（周六、周日）';
+        return '每' + s.map(d => WEEKDAY_NAMES[d - 1]).join('、');
+      }
+
+      function describeDomDays(days) {
+        const s = [...new Set(days)].sort((a, b) => a - b);
+        if (s.length === 0) return '尚未选择（请至少选 1 天）';
+        return '每月 ' + s.map(d => (d === 31 ? '31（含月底）' : String(d))).join('、') + ' 号执行';
+      }
+
+      main.innerHTML = `<form class="card form-card" id="form" novalidate>
+        <div class="form-head">
+          <h2>新建任务</h2>
+          <p class="form-sub">配置任务要求、接收成员、执行周期与提交内容</p>
+        </div>
+
+        <label class="field" for="name">任务名称</label>
+        <input id="name" required maxlength="128" placeholder="例如：外出队伍晒图与意向单报数上传">
+
+        <label class="field" for="description">发送给用户的提醒文本（自动附上专属 H5 链接）</label>
+        <textarea id="description" required maxlength="2000" placeholder="请输入下发给用户的提醒文案，系统将在消息底部自动附上专属 H5 上传链接…"></textarea>
+        <p class="field-hint">系统下发消息时将在底部自动附上专属 H5 上传链接。</p>
+
+        <div class="field-label"><span>接收成员</span><span class="muted" id="count" role="status">已选 0 人</span></div>
+        ${scope.directory_error ? `<p class="muted" role="status">${esc(scope.directory_error)}</p>` : ''}
+        <div class="scope" id="scope"></div>
+
+        <div class="form-section">
+          <div class="field-label"><span>执行方式</span></div>
+          <div class="seg-track seg-3" role="group" aria-label="执行方式">
+            <button type="button" data-schedule="once" class="active">一次性推送</button>
+            <button type="button" data-schedule="weekly">每周执行</button>
+            <button type="button" data-schedule="monthly">每月执行</button>
+          </div>
+
+          <div id="once-panel">
+            <label class="field" for="deadline_at">截止时间（留空不限）</label>
+            <input type="datetime-local" id="deadline_at">
+            <p class="field-hint">发布后立即向所选成员推送一次；不填截止时间则长期有效。</p>
+          </div>
+
+          <div id="recurring-panel" class="hidden">
+            <div id="weekly-panel">
+              <div class="field-label">
+                <span>执行日</span>
+                <div class="preset-actions">
+                  <button type="button" class="mini-btn" id="preset-workday">工作日</button>
+                  <button type="button" class="mini-btn" id="preset-everyday">每天</button>
+                </div>
+              </div>
+              <div class="week-grid" id="weekday-grid"></div>
+              <p class="field-hint" id="weekday-summary"></p>
+            </div>
+
+            <div id="monthly-panel" class="hidden">
+              <div class="field-label">
+                <span>每月执行日</span>
+                <div class="preset-actions">
+                  <button type="button" class="mini-btn" id="preset-monthend">每月月底（31号）</button>
+                </div>
+              </div>
+              <div class="dom-grid" id="dom-grid"></div>
+              <p class="field-hint" id="dom-summary"></p>
+            </div>
+
+            <label class="field" for="remind_at">执行时间</label>
+            <input type="time" id="remind_at" value="08:15">
+
+            <div class="field-label"><span>截止配置</span></div>
+            <label class="choice choice-card"><input type="checkbox" id="has_deadline" checked><span>设置截止时间</span></label>
+            <div id="deadline-detail">
+              <div class="seg-track seg-3" style="margin-top:8px;" role="group" aria-label="截止日期规则">
+                <button type="button" data-dltype="same_day" class="active">当天截止</button>
+                <button type="button" data-dltype="weekend">本周日截止</button>
+                <button type="button" data-dltype="month_end">本月月底</button>
+              </div>
+              <label class="sub-field-label" for="deadline_time">截止时刻</label>
+              <input type="time" id="deadline_time" value="18:00">
+            </div>
+            <p class="field-hint" id="deadline-hint">到截止时刻后 H5 提交入口关闭；不设截止时任务长期有效。</p>
+          </div>
+        </div>
+
+        <div class="form-section">
+          <div class="field-label"><span>选择需要员工提交的内容类型（可多选）</span></div>
+          <div class="mod-grid" id="module-grid"></div>
+
+          <div id="cfg-fields" class="sub-panel hidden">
+            <div class="sub-panel-head">
+              <span>配置报数字段列表</span>
+              <button type="button" class="mini-btn" id="add-schema-field">+ 添加字段</button>
+            </div>
+            <div class="schema-list" id="schema-list"></div>
+          </div>
+
+          <div id="cfg-image" class="sub-panel hidden">
+            <label class="choice"><input type="checkbox" id="multiple_images"><span>允许上传多张图片（最多 10 张）</span></label>
+          </div>
+
+          <div id="cfg-file" class="sub-panel hidden">
+            <label class="choice"><input type="checkbox" id="multiple_files"><span>允许上传多个文件（最多 10 个）</span></label>
+          </div>
+        </div>
+
+        <div class="form-actions">
+          <button class="secondary" type="button" id="back">返回统计</button>
+          <button type="submit" class="primary" id="publish">确认发布</button>
+        </div>
+      </form>`;
+
+      const box = document.getElementById('scope');
+      const departments = scope.departments;
+      const deptIds = new Set(departments.map(dept => dept.dept_id));
+      const children = new Map();
+      departments.forEach(dept => {
+        const parent = deptIds.has(dept.parent_id) ? dept.parent_id : '';
+        if (!children.has(parent)) children.set(parent, []);
+        children.get(parent).push(dept);
+      });
+      function memberRows(members) {
+        return members.map(member => '<label class="choice"><input type="checkbox" data-phone="' +
+          esc(member.phone) + '"><span>' + esc(member.name) + '</span><span class="member-phone">' +
+          esc(member.phone.slice(0, 3) + '****' + member.phone.slice(-4)) + '</span></label>').join('');
+      }
+      function groupToggle(members, label) {
+        return '<label class="choice"><input type="checkbox" data-group="' +
+          esc(members.map(member => member.phone).join(',')) + '"' + (members.length ? '' : ' disabled') +
+          '><span>' + esc(label) + '</span></label>';
+      }
+      function branchIds(id) {
+        return [id, ...(children.get(id) || []).flatMap(dept => branchIds(dept.dept_id))];
+      }
+      function departmentBranch(dept) {
+        const ids = new Set(branchIds(dept.dept_id));
+        const members = scope.members.filter(member => member.dept_ids.some(id => ids.has(id)));
+        const direct = members.filter(member => member.dept_ids.includes(dept.dept_id));
+        return '<details class="branch"><summary><span class="summary-main">' + esc(dept.name) + '<span class="summary-count">' + members.length +
+          ' 人</span></span>' + CHEVRON_SVG + '</summary><div>' + groupToggle(members, '全选本部门及下级') + memberRows(direct) +
+          (children.get(dept.dept_id) || []).map(departmentBranch).join('') + '</div></details>';
+      }
+      box.innerHTML = (departments.length ? '<details open><summary><span class="summary-main">按部门选择</span>' + CHEVRON_SVG + '</summary>' +
+        (children.get('') || []).map(departmentBranch).join('') + '</details>' : '') +
+        (scope.roles.length ? '<details class="member-section"><summary><span class="summary-main">按角色选择</span>' + CHEVRON_SVG + '</summary>' +
+          scope.roles.map(role => {
+            const members = scope.members.filter(member => member.role_ids.includes(role.role_id));
+            return '<details class="branch"><summary><span class="summary-main">' + esc(role.name) + '<span class="summary-count">' + members.length +
+              ' 人</span></span>' + CHEVRON_SVG + '</summary><div>' + groupToggle(members, '全选本角色') + memberRows(members) + '</div></details>';
+          }).join('') + '</details>' : '') +
+        '<details class="member-section"' + (!departments.length && !scope.roles.length ? ' open' : '') +
+        '><summary><span class="summary-main">全部可选成员<span class="summary-count">' + scope.members.length + ' 人</span></span>' + CHEVRON_SVG + '</summary>' +
+        memberRows(scope.members) + '</details>';
+      function syncScope() {
+        box.querySelectorAll('[data-phone]').forEach(input => {
+          input.checked = selected.has(input.dataset.phone);
+        });
+        box.querySelectorAll('[data-group]').forEach(input => {
+          const phones = input.dataset.group.split(',').filter(Boolean);
+          input.checked = phones.length > 0 && phones.every(phone => selected.has(phone));
+          input.indeterminate = !input.checked && phones.some(phone => selected.has(phone));
+        });
+        document.getElementById('count').textContent = '已选 ' + selected.size + ' 人';
+      }
+      box.onchange = event => {
+        const input = event.target;
+        const phones = input.dataset.phone ? [input.dataset.phone] : (input.dataset.group || '').split(',').filter(Boolean);
+        phones.forEach(phone => {
+          if (input.checked) selected.add(phone);
+          else selected.delete(phone);
+        });
+        syncScope();
+      };
+
+      function renderWeekdays() {
+        const grid = document.getElementById('weekday-grid');
+        grid.innerHTML = WEEKDAYS.map((lbl, idx) => {
+          const day = idx + 1;
+          const active = execWeekdays.includes(day);
+          return '<button type="button" class="day-btn' + (active ? ' active' : '') + '" data-wd="' + day + '" aria-pressed="' + active + '">' + lbl + '</button>';
+        }).join('');
+        grid.querySelectorAll('[data-wd]').forEach(btn => {
+          btn.onclick = () => {
+            const d = Number(btn.dataset.wd);
+            if (execWeekdays.includes(d)) {
+              if (execWeekdays.length === 1) { toast('至少保留 1 个执行日'); return; }
+              execWeekdays = execWeekdays.filter(x => x !== d);
+            } else {
+              execWeekdays = [...execWeekdays, d].sort((a, b) => a - b);
+            }
+            renderWeekdays();
+          };
+        });
+        document.getElementById('weekday-summary').textContent = describeWeekdays(execWeekdays) + '（未选日子不提醒、不产生逾期）';
+      }
+
+      function renderDomDays() {
+        const grid = document.getElementById('dom-grid');
+        grid.innerHTML = Array.from({ length: 31 }, (_, i) => i + 1).map(day => {
+          const active = execDomDays.includes(day);
+          return '<button type="button" class="day-btn' + (active ? ' active' : '') + '" data-dom="' + day + '" aria-pressed="' + active + '">' + day + '</button>';
+        }).join('');
+        grid.querySelectorAll('[data-dom]').forEach(btn => {
+          btn.onclick = () => {
+            const d = Number(btn.dataset.dom);
+            if (execDomDays.includes(d)) execDomDays = execDomDays.filter(x => x !== d);
+            else execDomDays = [...execDomDays, d].sort((a, b) => a - b);
+            renderDomDays();
+          };
+        });
+        document.getElementById('dom-summary').textContent = describeDomDays(execDomDays) + '（选 31 号自动适配大小月最后一天）';
+      }
+
+      function renderSchedule() {
+        document.querySelectorAll('[data-schedule]').forEach(btn => {
+          btn.classList.toggle('active', btn.dataset.schedule === scheduleKind);
+        });
+        document.getElementById('once-panel').classList.toggle('hidden', scheduleKind !== 'once');
+        document.getElementById('recurring-panel').classList.toggle('hidden', scheduleKind === 'once');
+        document.getElementById('weekly-panel').classList.toggle('hidden', scheduleKind !== 'weekly');
+        document.getElementById('monthly-panel').classList.toggle('hidden', scheduleKind !== 'monthly');
+      }
+
+      function renderDeadlineDetail() {
+        const on = document.getElementById('has_deadline').checked;
+        document.getElementById('deadline-detail').classList.toggle('hidden', !on);
+        document.getElementById('deadline-hint').textContent = on
+          ? '到截止时刻后 H5 提交入口关闭，逾期后统一提示「当前任务已过期，无法提交」。'
+          : '无截止时间：任务长期有效，H5 页面显示「截止 不限」。';
+        document.querySelectorAll('[data-dltype]').forEach(btn => {
+          btn.classList.toggle('active', btn.dataset.dltype === deadlineType);
+        });
+      }
+
+      function renderModules() {
+        const grid = document.getElementById('module-grid');
+        grid.innerHTML = MODULE_META.map(mod => {
+          const active = uploadModules.has(mod.key);
+          return '<button type="button" class="mod-btn' + (active ? ' active' : '') + '" data-mod="' + mod.key + '" aria-pressed="' + active + '">' +
+            '<div class="mod-head"><span class="mod-title">' + mod.title + '</span><span class="mod-check">' + (active ? MOD_CHECK_SVG : '') + '</span></div>' +
+            '<span class="mod-desc">' + mod.desc + '</span></button>';
+        }).join('');
+        grid.querySelectorAll('[data-mod]').forEach(btn => {
+          btn.onclick = () => {
+            const key = btn.dataset.mod;
+            if (uploadModules.has(key)) {
+              if (uploadModules.size === 1) { toast('至少保留一种提交内容类型'); return; }
+              uploadModules.delete(key);
+            } else {
+              uploadModules.add(key);
+              if (key === 'fields' && schemaFields.length === 0) {
+                schemaFields.push({ key: 'field_1', label: '今日累计完成数', type: 'number', required: true });
+              }
+            }
+            renderModules();
+          };
+        });
+        document.getElementById('cfg-fields').classList.toggle('hidden', !uploadModules.has('fields'));
+        document.getElementById('cfg-image').classList.toggle('hidden', !uploadModules.has('image'));
+        document.getElementById('cfg-file').classList.toggle('hidden', !uploadModules.has('file'));
+      }
+
+      function renderSchemaFields() {
+        const list = document.getElementById('schema-list');
+        list.innerHTML = schemaFields.map((f, idx) => '<div class="schema-row" data-fidx="' + idx + '">' +
+          '<input type="text" maxlength="40" placeholder="字段名称，如：今日累计上门户数" value="' + esc(f.label) + '" data-flabel="' + idx + '">' +
+          '<div class="schema-row-sub">' +
+          '<select aria-label="字段类型" data-ftype="' + idx + '">' +
+          '<option value="number"' + (f.type === 'number' ? ' selected' : '') + '>数字报数</option>' +
+          '<option value="text"' + (f.type === 'text' ? ' selected' : '') + '>单行文本</option>' +
+          '<option value="boolean"' + (f.type === 'boolean' ? ' selected' : '') + '>布尔（是／否）</option>' +
+          '<option value="date"' + (f.type === 'date' ? ' selected' : '') + '>日期</option>' +
+          '</select>' +
+          '<label class="choice-inline"><input type="checkbox" data-freq="' + idx + '"' + (f.required ? ' checked' : '') + '><span>必填</span></label>' +
+          '<button type="button" class="remove-btn" data-fdel="' + idx + '"' + (schemaFields.length <= 1 ? ' disabled' : '') + '>删除</button>' +
+          '</div></div>').join('');
+        list.querySelectorAll('[data-flabel]').forEach(inp => {
+          inp.oninput = () => { schemaFields[Number(inp.dataset.flabel)].label = inp.value; };
+        });
+        list.querySelectorAll('[data-ftype]').forEach(sel => {
+          sel.onchange = () => { schemaFields[Number(sel.dataset.ftype)].type = sel.value; };
+        });
+        list.querySelectorAll('[data-freq]').forEach(chk => {
+          chk.onchange = () => { schemaFields[Number(chk.dataset.freq)].required = chk.checked; };
+        });
+        list.querySelectorAll('[data-fdel]').forEach(btn => {
+          btn.onclick = () => {
+            if (schemaFields.length <= 1) return;
+            schemaFields.splice(Number(btn.dataset.fdel), 1);
+            renderSchemaFields();
+          };
+        });
+      }
+
+      document.querySelectorAll('[data-schedule]').forEach(btn => {
+        btn.onclick = () => { scheduleKind = btn.dataset.schedule; renderSchedule(); };
+      });
+      document.getElementById('preset-workday').onclick = () => { execWeekdays = [1, 2, 3, 4, 5]; renderWeekdays(); };
+      document.getElementById('preset-everyday').onclick = () => { execWeekdays = [1, 2, 3, 4, 5, 6, 7]; renderWeekdays(); };
+      document.getElementById('preset-monthend').onclick = () => { execDomDays = [31]; renderDomDays(); };
+      document.getElementById('has_deadline').onchange = renderDeadlineDetail;
+      document.querySelectorAll('[data-dltype]').forEach(btn => {
+        btn.onclick = () => { deadlineType = btn.dataset.dltype; renderDeadlineDetail(); };
+      });
+      document.getElementById('add-schema-field').onclick = () => {
+        if (schemaFields.length >= 20) { toast('最多添加 20 个报数字段'); return; }
+        schemaFields.push({ key: 'field_' + (schemaFields.length + 1), label: '', type: 'number', required: true });
+        renderSchemaFields();
+      };
+
+      const onceDeadlineInput = document.getElementById('deadline_at');
+      const syncOnceDeadlineMin = () => { onceDeadlineInput.min = localDatetimeNowValue(); };
+      syncOnceDeadlineMin();
+      onceDeadlineInput.addEventListener('focus', syncOnceDeadlineMin);
+
+      renderWeekdays();
+      renderDomDays();
+      renderSchedule();
+      renderDeadlineDetail();
+      renderModules();
+      renderSchemaFields();
+
+      document.getElementById('back').onclick = creator;
+      document.getElementById('form').onsubmit = async event => {
+        event.preventDefault();
+        if (busy) return;
+        const val = id => document.getElementById(id).value;
+        const taskName = val('name').trim();
+        const taskDesc = val('description').trim();
+        if (!taskName) { toast('请输入任务名称'); return; }
+        if (!taskDesc) { toast('请输入发送给用户的提醒文本'); return; }
+        if (selected.size === 0) { toast('请至少选择 1 名接收成员'); return; }
+        if (scheduleKind === 'weekly' && execWeekdays.length === 0) { toast('请至少选择 1 个每周执行日'); return; }
+        if (scheduleKind === 'monthly' && execDomDays.length === 0) { toast('请至少选择 1 个每月执行日'); return; }
+
+        const onceDeadline = val('deadline_at').trim();
+        if (scheduleKind === 'once' && onceDeadline) {
+          const dlMs = parseLocalDatetimeMs(onceDeadline);
+          if (Number.isNaN(dlMs) || dlMs <= Date.now()) {
+            toast('一次性推送的截止时间必须晚于当前时间');
+            return;
+          }
+        }
+
+        const hasDeadline = document.getElementById('has_deadline').checked;
+        const remindAt = val('remind_at').trim();
+        const deadlineTime = val('deadline_time').trim();
+        if (scheduleKind !== 'once') {
+          if (!remindAt) { toast('请填写执行时间'); return; }
+          if (hasDeadline) {
+            if (!deadlineTime) { toast('请填写截止时刻'); return; }
+            if (deadlineType === 'same_day' && deadlineTime !== '00:00' && remindAt >= deadlineTime) {
+              toast('当天截止时，执行时间必须早于截止时刻');
+              return;
+            }
+          }
+        }
+
+        const modules = ['fields', 'text', 'image', 'file'].filter(m => uploadModules.has(m));
+        if (!modules.length) { toast('请至少选择一种需要员工提交的内容类型'); return; }
+
+        let normalizedFields = [];
+        if (uploadModules.has('fields')) {
+          if (!schemaFields.length) { toast('请至少添加 1 个报数字段'); return; }
+          for (let i = 0; i < schemaFields.length; i++) {
+            const label = String(schemaFields[i].label || '').trim();
+            if (!label) { toast('请填写第 ' + (i + 1) + ' 个报数字段的名称'); return; }
+            normalizedFields.push({
+              key: 'field_' + (i + 1),
+              label,
+              type: schemaFields[i].type || 'number',
+              required: Boolean(schemaFields[i].required),
+            });
+          }
+        }
+
+        const multipleImages = uploadModules.has('image') && document.getElementById('multiple_images').checked;
+        const multipleFiles = uploadModules.has('file') && document.getElementById('multiple_files').checked;
+        const textLabel = '文字情况说明';
+        const textPlaceholder = '请填写补充说明…';
+        const mode = scheduleKind === 'once' ? 'once' : 'day';
+
+        const data = {
+          request_id: requestId,
+          name: taskName,
+          description: taskDesc,
+          phones: [...selected],
+          mode,
+          deadline_at: scheduleKind === 'once' ? onceDeadline : '',
+          remind_at: scheduleKind === 'once' ? '00:00' : remindAt,
+          has_deadline: scheduleKind === 'once' ? Boolean(onceDeadline) : hasDeadline,
+          deadline_type: scheduleKind === 'once' ? null : (hasDeadline ? deadlineType : null),
+          deadline_time: scheduleKind === 'once' ? null : (hasDeadline ? deadlineTime : null),
+          exec_weekdays: scheduleKind === 'weekly'
+            ? (execWeekdays.length === 7 ? null : [...execWeekdays].sort((a, b) => a - b))
+            : null,
+          exec_dom_days: scheduleKind === 'monthly'
+            ? [...execDomDays].sort((a, b) => a - b)
+            : [],
+          upload_modules: modules,
+          need_review: false,
+          schema_json: normalizedFields,
+          allow_multiple_images: multipleImages,
+          allow_multiple_files: multipleFiles,
+          text_label: textLabel,
+          text_placeholder: textPlaceholder,
+          spec: {
+            require_review: false,
+            upload_modules: modules,
+            allow_multiple_images: multipleImages,
+            allow_multiple_files: multipleFiles,
+            fields: normalizedFields,
+            text_label: textLabel,
+            text_placeholder: textPlaceholder,
+          },
+        };
+
+        busy = true;
+        document.getElementById('publish').disabled = true;
+        try {
+          await api('create', data);
+          toast('任务已发布');
+          await creator();
+        } catch (error) {
+          toast(error.message);
+        } finally {
+          busy = false;
+          const button = document.getElementById('publish');
+          if (button) button.disabled = false;
+        }
+      };
     }
-  };
-}
-refresh();setInterval(()=>{if(document.hidden||expired)return;if(tab==='create'){if(document.getElementById('tasks'))stats();else refresh(false)}else if(tab!=='history')refresh()},30000);window.addEventListener('pageshow',event=>{if(event.persisted&&!expired&&tab!=='create')refresh()});
-</script></body></html>
+    refresh();
+    setInterval(() => {
+      if (document.hidden || expired) return;
+      if (tab === 'create') {
+        if (document.getElementById('tasks')) stats();
+        else if (!document.getElementById('form')) refresh(false);
+      } else if (tab !== 'history') refresh();
+    }, 30000);
+    window.addEventListener('pageshow', event => { if (event.persisted && !expired && tab !== 'create') refresh(); });
+  </script>
+</body>
+</html>

@@ -135,6 +135,7 @@ def test_completed_h5_displays_fields_note_and_scoped_attachments(seeded):
     with TestClient(app) as client:
         info = client.post("/api/h5/task/info", json={"token": first_token}).json()
         assert info["window_open"] is False
+        assert info["window_reason"] is None
         assert info["submission"]["fields"] == {"qty": 2}
         assert info["submission"]["note"] == "交接完成"
         assert {a["file_name"] for a in info["submission"]["attachments"]} == files.keys()

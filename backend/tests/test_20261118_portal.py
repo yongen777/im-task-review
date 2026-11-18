@@ -287,7 +287,7 @@ def test_http_publish_upload_submit_and_private_attachment(portal):
     headers = {'Authorization': 'Bearer ' + p.issue(ident['phone'], ident['platform'])}
     response = client.post('/api/h5/portal/create', headers=headers, json={
         'name': '图片采集', 'description': '请提交现场照片', 'request_id': 'http-publish-001',
-        'phones': [ident['phone']], 'mode': 'once', 'upload_modules': ['text', 'image']})
+        'phones': [ident['phone']], 'mode': 'once', 'upload_modules': ['text', 'image', 'file']})
     assert response.status_code == 200, response.text
     task_id = response.json()['task_id']
     items = client.post('/api/h5/portal/info', headers=headers, json={}).json()['todos']
@@ -299,10 +299,18 @@ def test_http_publish_upload_submit_and_private_attachment(portal):
     uploaded = client.post('/api/h5/task/upload', data={'token': raw}, files={'file': ('photo.png', stream.getvalue(), 'image/png')})
     assert uploaded.status_code == 200, uploaded.text
     ref = uploaded.json()['ref']
-    submitted = client.post('/api/h5/task/submit', json={'token': raw, 'note': '现场正常', 'refs': [ref]})
+    document = b'%PDF-1.4\n'
+    uploaded_file = client.post('/api/h5/task/upload', data={'token': raw}, files={'file': ('交接.pdf', document, 'application/pdf')})
+    assert uploaded_file.status_code == 200, uploaded_file.text
+    file_ref = uploaded_file.json()['ref']
+    submitted = client.post('/api/h5/task/submit', json={'token': raw, 'note': '现场正常', 'refs': [ref, file_ref]})
     assert submitted.status_code == 200 and submitted.json()['status'] == 'approved', submitted.text
     attachment = client.post('/api/h5/portal/attachment', headers=headers, json={'task_id': task_id, 'ref': ref})
     assert attachment.status_code == 200 and attachment.content == stream.getvalue()
+    download = client.post('/api/h5/portal/attachment', headers=headers, json={'task_id': task_id, 'ref': file_ref})
+    assert download.status_code == 200 and download.content == document
+    assert download.headers['content-type'] == 'application/pdf'
+    assert download.headers['content-disposition'] == "inline; filename*=utf-8''%E4%BA%A4%E6%8E%A5.pdf"
     assert owner.get(f'/api/admin/portal-tasks/{task_id}/attachments/{ref}').content == stream.getvalue()
     assert client.post('/api/h5/portal/attachment', headers=headers, json={'task_id': task_id, 'ref': 'foreign_ref'}).status_code == 404
     assert client.post('/api/h5/portal/attachment', headers=headers, json={'task_id': 'pt_foreign', 'ref': ref}).status_code == 403

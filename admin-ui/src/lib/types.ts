@@ -7,6 +7,7 @@ export interface AdminAccountItem {
   id: number;
   username: string;
   display_name: string;
+  phone?: string;
   role_level: AdminRoleLevel;
   enabled: boolean;
   must_change_password: boolean;

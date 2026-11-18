@@ -870,6 +870,7 @@ def create_admin_router(
             acct = state.create_admin_account(
                 username=str(body.get("username") or ""),
                 display_name=str(body.get("display_name") or ""),
+                phone=body.get("phone", ""),
                 allowed_platforms=body.get("allowed_platforms"),
                 actor=sess["username"],
             )
@@ -894,6 +895,7 @@ def create_admin_router(
             acct = state.update_admin_account(
                 admin_id,
                 display_name=body.get("display_name"),
+                phone=body.get("phone"),
                 allowed_platforms=body.get("allowed_platforms"),
                 enabled=(None if enabled is None else bool(enabled)),
                 actor=sess["username"],

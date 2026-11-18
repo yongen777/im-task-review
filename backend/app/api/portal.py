@@ -25,6 +25,7 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
             ident = p.authenticate(request.headers.get('Authorization', '').removeprefix('Bearer '))
             if action == 'info':
                 return {'ok': True, 'can_create': bool(p.grants(ident)), 'todos': p.todos(ident),
+                        'admins': p.admin_contacts(ident),
                         'adhoc': state.list_adhoc_menu_items(ident['phone'], platform=ident['platform']),
                         'adhoc_history': p.submission_history(ident, adhoc_only=True, limit=10)}
             if action == 'open':
@@ -80,7 +81,8 @@ def attachment_response(state, task, ref, uploads_dir):
     path = (base / upload['rel_path']).resolve()
     if not path.is_relative_to(base) or not path.is_file():
         raise BizError(404, 'NOT_FOUND', '附件不存在')
-    return FileResponse(path, media_type=upload['mime'], headers={'Cache-Control': 'no-store'})
+    return FileResponse(path, media_type=upload['mime'], filename=upload['file_name'], content_disposition_type='inline',
+                        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
 
 
 def create_portal_admin_router(state):

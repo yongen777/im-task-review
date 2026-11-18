@@ -344,6 +344,9 @@ def _manually_completed(state: StateStore, instance: Dict[str, Any]) -> bool:
     return (state.get_latest_valid_submission(instance["id"]) or {}).get("source") == "admin"
 
 
+COMPLETED_NO_REVIEW_MESSAGE = "本任务已提交完成，无需重复提交"
+
+
 def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, Any]) -> Optional[str]:
     if inst["status"] not in ("submitted", "approved"):
         return None
@@ -356,7 +359,7 @@ def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, A
         return "本任务已提交，正在等待管理员审核"
     if tpl["need_review"]:
         return "本任务已审核通过，无需重复提交"
-    return "本任务已提交完成，无需重复提交"
+    return COMPLETED_NO_REVIEW_MESSAGE
 
 
 def _completed_submission(state: StateStore, instance: Dict[str, Any], *, history=False) -> Optional[Dict[str, Any]]:
@@ -513,6 +516,8 @@ def process_h5_task_info(
     if completed or history:
         window_open = False
         window_reason = completed or "正在查看历史上报"
+    if window_reason == COMPLETED_NO_REVIEW_MESSAGE:
+        window_reason = None
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":

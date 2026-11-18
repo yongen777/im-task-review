@@ -43,12 +43,14 @@ export const AdminAccountsView: React.FC = () => {
   const [createOpen, setCreateOpen] = useState(false);
   const [newUsername, setNewUsername] = useState('');
   const [newDisplayName, setNewDisplayName] = useState('');
+  const [newPhone, setNewPhone] = useState('');
   const [newPlatforms, setNewPlatforms] = useState<OfficePlatform[]>(['zdxlz']);
   const [creating, setCreating] = useState(false);
 
   // 编辑办公软件权限与名称弹窗
   const [editTarget, setEditTarget] = useState<AdminAccountItem | null>(null);
   const [editDisplayName, setEditDisplayName] = useState('');
+  const [editPhone, setEditPhone] = useState('');
   const [editPlatforms, setEditPlatforms] = useState<OfficePlatform[]>(['zdxlz']);
   const [savingEdit, setSavingEdit] = useState(false);
 
@@ -108,12 +110,14 @@ export const AdminAccountsView: React.FC = () => {
       await api.post('/api/admin/accounts', {
         username: u,
         display_name: d,
+        phone: newPhone.trim(),
         password: DEFAULT_SUB_ADMIN_PASSWORD,
         allowed_platforms: newPlatforms,
       });
       setCreateOpen(false);
       setNewUsername('');
       setNewDisplayName('');
+      setNewPhone('');
       setNewPlatforms(['zdxlz']);
       await loadAccounts();
       toast.success(
@@ -130,6 +134,7 @@ export const AdminAccountsView: React.FC = () => {
   const openEditModal = (acc: AdminAccountItem) => {
     setEditTarget(acc);
     setEditDisplayName(acc.display_name || acc.username);
+    setEditPhone(acc.phone || '');
     setEditPlatforms(
       Array.isArray(acc.allowed_platforms) && acc.allowed_platforms.length > 0
         ? [...acc.allowed_platforms]
@@ -148,6 +153,7 @@ export const AdminAccountsView: React.FC = () => {
     try {
       await api.put(`/api/admin/accounts/${editTarget.id}`, {
         display_name: editDisplayName.trim() || editTarget.username,
+        phone: editPhone.trim(),
         allowed_platforms: editPlatforms,
       });
       const targetName = editDisplayName.trim() || editTarget.username;
@@ -546,6 +552,17 @@ export const AdminAccountsView: React.FC = () => {
                 />
               </div>
 
+              <label className="block font-semibold text-slate-700">
+                管理员联系手机号（选填）
+                <input
+                  type="tel"
+                  autoComplete="tel"
+                  value={newPhone}
+                  onChange={(e) => setNewPhone(e.target.value)}
+                  className="mt-1 w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                />
+              </label>
+
               <div>
                 <label className="font-semibold text-slate-700 block mb-1.5">
                   分配开通办公软件权限（可单选或多选） <span className="text-rose-500">*</span>
@@ -641,6 +658,17 @@ export const AdminAccountsView: React.FC = () => {
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
                 />
               </div>
+
+              <label className="block font-semibold text-slate-700">
+                管理员联系手机号（选填）
+                <input
+                  type="tel"
+                  autoComplete="tel"
+                  value={editPhone}
+                  onChange={(e) => setEditPhone(e.target.value)}
+                  className="mt-1 w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
+                />
+              </label>
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1.5">

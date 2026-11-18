@@ -735,6 +735,26 @@ class StateStore:
             return ""
         return str(row["display_name"] or row["username"] or "")
 
+    def member_admin_contacts(self, phone: str, platform: str) -> List[Dict[str, str]]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT a.id, a.display_name, a.username, a.phone, a.allowed_platforms "
+                "FROM member m JOIN role r ON r.role_id = m.role_id AND r.owner_id = m.owner_id "
+                "JOIN admin_user a ON a.id = m.owner_id "
+                "WHERE m.phone = ? AND r.platform = ? AND a.enabled = 1 AND a.role_level = ? ORDER BY a.id",
+                (phone, platform, self.SUB_ADMIN),
+            ).fetchall()
+        return [
+            {"name": row["display_name"] or row["username"], "phone": row["phone"]}
+            for row in rows if platform in self.parse_admin_account(row)["allowed_platforms"]
+        ]
+
+    @staticmethod
+    def _normalize_admin_phone(phone: Any) -> str:
+        if not isinstance(phone, str) or (phone.strip() and not is_valid_phone(phone)):
+            raise BizError(400, "VALIDATION_FAILED", "请输入有效的 11 位管理员手机号")
+        return phone.strip()
+
     def create_admin_account(
         self,
         username: str,
@@ -743,10 +763,12 @@ class StateStore:
         actor: str = "system",
         role_level: str = SUB_ADMIN,
         password: Optional[str] = None,
+        phone: str = "",
     ) -> Dict[str, Any]:
         """新建分级管理员：初始密码固定 Hds22999!（可覆盖），强制首登改密。"""
         clean_user = (username or "").strip()
         clean_disp = (display_name or "").strip() or clean_user
+        clean_phone = self._normalize_admin_phone(phone)
         if not clean_user:
             raise BizError(400, "VALIDATION_FAILED", "用户名不能为空")
         if not clean_user.replace("_", "").replace("-", "").isalnum():
@@ -766,9 +788,9 @@ class StateStore:
             if self.conn.execute("SELECT 1 FROM admin_user WHERE username = ?", (clean_user,)).fetchone():
                 raise BizError(409, "USERNAME_TAKEN", "该用户名已存在")
             cur = self.conn.execute(
-                "INSERT INTO admin_user(username, pwd_hash, must_change, created_at, display_name, role_level, allowed_platforms, enabled) "
-                "VALUES (?, ?, 1, ?, ?, ?, ?, 1)",
-                (clean_user, hash_password(pwd), now_s, clean_disp, str(role_level or self.SUB_ADMIN),
+                "INSERT INTO admin_user(username, pwd_hash, must_change, created_at, display_name, phone, role_level, allowed_platforms, enabled) "
+                "VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1)",
+                (clean_user, hash_password(pwd), now_s, clean_disp, clean_phone, str(role_level or self.SUB_ADMIN),
                  json.dumps(plats, ensure_ascii=False)),
             )
             admin_id = int(cur.lastrowid)
@@ -777,7 +799,7 @@ class StateStore:
                 {"username": clean_user, "display_name": clean_disp, "allowed_platforms": plats,
                  "role_level": str(role_level or self.SUB_ADMIN)}, now_s,
             )
-        return {"id": admin_id, "username": clean_user, "display_name": clean_disp,
+        return {"id": admin_id, "username": clean_user, "display_name": clean_disp, "phone": clean_phone,
                 "role_level": str(role_level or self.SUB_ADMIN), "allowed_platforms": plats, "enabled": 1}
 
     def list_admin_accounts(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1125,6 +1147,7 @@ class StateStore:
         allowed_platforms: Optional[List[str]] = None,
         enabled: Optional[bool] = None,
         actor: str = "system",
+        phone: Optional[str] = None,
     ) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
@@ -1141,6 +1164,9 @@ class StateStore:
             if display_name is not None:
                 sets.append("display_name = ?")
                 params.append((display_name or "").strip())
+            if phone is not None:
+                sets.append("phone = ?")
+                params.append(self._normalize_admin_phone(phone))
             if allowed_platforms is not None:
                 plats = [str(p).strip().lower() for p in allowed_platforms if str(p).strip()]
                 plats = [p for p in plats if p in self.ALL_PLATFORMS]
@@ -1157,7 +1183,8 @@ class StateStore:
                 )
                 self._insert_audit_unlocked(
                     actor, "admin.account.update", "admin_user", str(int(admin_id)),
-                    {"display_name": display_name, "allowed_platforms": allowed_platforms, "enabled": enabled}, now_s,
+                    {"display_name": display_name, "allowed_platforms": allowed_platforms, "enabled": enabled,
+                     "phone_updated": phone is not None}, now_s,
                 )
             if enabled is False:
                 self.conn.execute("DELETE FROM admin_session WHERE user_id = ?", (int(admin_id),))

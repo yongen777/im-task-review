@@ -258,6 +258,7 @@ CREATE TABLE IF NOT EXISTS admin_user (
   pwd_hash         VARCHAR(255) NOT NULL,
   must_change      TINYINT     NOT NULL DEFAULT 0,
   display_name     VARCHAR(128) NOT NULL DEFAULT '',
+  phone            VARCHAR(11)  NOT NULL DEFAULT '',
   role_level       VARCHAR(16)  NOT NULL DEFAULT 'sub_admin',
   allowed_platforms VARCHAR(255) NOT NULL DEFAULT '["zdxlz","wecom"]',
   enabled          TINYINT      NOT NULL DEFAULT 1,
@@ -692,6 +693,9 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         proxy.execute("ALTER TABLE member ADD COLUMN is_left_org TINYINT NOT NULL DEFAULT 0")
     if "directory_checked_at" not in member_columns:
         proxy.execute("ALTER TABLE member ADD COLUMN directory_checked_at VARCHAR(32) DEFAULT NULL")
+
+    if not proxy.execute("SHOW COLUMNS FROM admin_user LIKE 'phone'").fetchone():
+        proxy.execute("ALTER TABLE admin_user ADD COLUMN phone VARCHAR(11) NOT NULL DEFAULT ''")
 
     if not proxy.execute("SHOW INDEX FROM reminder_log WHERE Key_name='ix_rem_instance_sent'").fetchone():
         proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")
