@@ -29,6 +29,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 from app.api.admin import create_admin_router  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -55,7 +56,7 @@ def _login(app, username, password):
 def _setup():
     store, app = _app()
     admin = _login(app, "admin", "Admin@2026")
-    r = admin.post("/api/admin/accounts", json={"username": "sub1", "display_name": "分级甲"})
+    r = post_verified_admin(admin, {"username": "sub1", "display_name": "分级甲"})
     assert r.status_code == 200, r.text
     sub = _login(app, "sub1", PWD)
     sub.post("/api/admin/change-password",
@@ -121,7 +122,7 @@ def test_creator_cannot_change_directory_profile():
     store, app, admin, sub, role = _setup()
     try:
         # 再造一个同平台管理员的名册行，验证两边均保留原档案
-        r = admin.post("/api/admin/accounts", json={"username": "sub2", "display_name": "分级乙"})
+        r = post_verified_admin(admin, {"username": "sub2", "display_name": "分级乙"})
         assert r.status_code == 200, r.text
         sub2 = _login(app, "sub2", PWD)
         sub2.post("/api/admin/change-password", json={"old_password": PWD, "new_password": "NewPass@2026"})

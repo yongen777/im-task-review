@@ -867,12 +867,14 @@ def create_admin_router(
             return forbidden
         body = await _read_json_body(request)
         try:
-            acct = state.create_admin_account(
+            acct = await asyncio.to_thread(
+                state.create_admin_account,
                 username=str(body.get("username") or ""),
                 display_name=str(body.get("display_name") or ""),
                 phone=body.get("phone", ""),
                 allowed_platforms=body.get("allowed_platforms"),
                 actor=sess["username"],
+                require_directory=True,
             )
         except BizError as exc:
             return biz_error_response(exc)

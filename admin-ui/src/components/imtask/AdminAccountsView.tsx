@@ -96,9 +96,18 @@ export const AdminAccountsView: React.FC = () => {
   const handleCreateSubAdmin = async (e: React.FormEvent) => {
     e.preventDefault();
     const u = newUsername.trim();
-    const d = newDisplayName.trim() || u;
+    const d = newDisplayName.trim();
+    const phone = newPhone.trim();
     if (!u || u.length < 2) {
       toast.warning('请输入至少 2 位字符的分级管理员账号名');
+      return;
+    }
+    if (!d) {
+      toast.warning('请填写管理员姓名');
+      return;
+    }
+    if (!/^1[3-9]\d{9}$/.test(phone)) {
+      toast.warning('请输入有效的 11 位管理员手机号');
       return;
     }
     if (newPlatforms.length === 0) {
@@ -110,7 +119,7 @@ export const AdminAccountsView: React.FC = () => {
       await api.post('/api/admin/accounts', {
         username: u,
         display_name: d,
-        phone: newPhone.trim(),
+        phone,
         password: DEFAULT_SUB_ADMIN_PASSWORD,
         allowed_platforms: newPlatforms,
       });
@@ -541,22 +550,24 @@ export const AdminAccountsView: React.FC = () => {
 
               <div>
                 <label className="font-semibold text-slate-700 block mb-1">
-                  管理员显示名称 / 所属部门备注
+                  管理员姓名 <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
                   value={newDisplayName}
                   onChange={(e) => setNewDisplayName(e.target.value)}
-                  placeholder="例如：张三（城西支局管理员）"
+                  placeholder="请填写公司通讯录中的姓名"
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"
                 />
               </div>
 
               <label className="block font-semibold text-slate-700">
-                管理员联系手机号（选填）
+                管理员联系手机号 <span className="text-rose-500">*</span>
                 <input
                   type="tel"
                   autoComplete="tel"
+                  inputMode="tel"
+                  maxLength={11}
                   value={newPhone}
                   onChange={(e) => setNewPhone(e.target.value)}
                   className="mt-1 w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500"

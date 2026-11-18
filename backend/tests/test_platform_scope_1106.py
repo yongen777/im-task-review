@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -136,11 +137,11 @@ def test_accounts_stats_platform_scoped() -> None:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         app = _app(store)
         admin = _login(app, "admin", "Admin@2026")
-        s1 = int(admin.post("/api/admin/accounts", json={
+        s1 = int(post_verified_admin(admin, {
             "username": "sa", "display_name": "sa",
             "allowed_platforms": ["zdxlz", "wecom"]}).json()["account"]["id"])
         # 未开通企微、也没建过任何数据的第二位分级管理员
-        admin.post("/api/admin/accounts", json={
+        post_verified_admin(admin, {
             "username": "sb", "display_name": "sb", "allowed_platforms": ["zdxlz"]})
 
         rz1 = store.create_role("密信组1", actor="sa", platform="zdxlz", owner_id=s1)["role_id"]
@@ -198,7 +199,7 @@ def test_member_pool_platform_scoped_and_ops() -> None:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         app = _app(store)
         admin = _login(app, "admin", "Admin@2026")
-        s1 = int(admin.post("/api/admin/accounts", json={
+        s1 = int(post_verified_admin(admin, {
             "username": "sa", "display_name": "sa",
             "allowed_platforms": ["zdxlz", "wecom"]}).json()["account"]["id"])
         rz = store.create_role("密信组", actor="sa", platform="zdxlz", owner_id=s1)["role_id"]

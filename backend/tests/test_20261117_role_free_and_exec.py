@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -272,7 +273,7 @@ def _seed_stats_ctx():
     store.upsert_admin_user("admin", "Admin@2026", must_change=False)
     app = _app(store)
     admin = _login(app, "admin", "Admin@2026")
-    admin.post("/api/admin/accounts", json={"username": "rd1", "display_name": "rd1"})
+    post_verified_admin(admin, {"username": "rd1", "display_name": "rd1"})
     c = _login(app, "rd1", StateStore.DEFAULT_SUB_ADMIN_PASSWORD)
     c.post("/api/admin/change-password",
            json={"old_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD, "new_password": "NewPass@2026"})

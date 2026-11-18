@@ -25,6 +25,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -81,7 +82,7 @@ def test_admin_is_super_admin_and_can_create_sub_admin() -> None:
         assert me["is_super_admin"] is True
         assert me["allowed_platforms"] == ["zdxlz", "wecom"], me
 
-        r = c.post("/api/admin/accounts", json={
+        r = post_verified_admin(c, {
             "username": "zhangsan", "display_name": "张三", "allowed_platforms": ["zdxlz"]})
         assert r.status_code == 200, r.text
         acct = r.json()["account"]
@@ -99,7 +100,7 @@ def test_sub_admin_login_with_fullwidth_bang_and_must_change() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "lisi", "display_name": "李四",
+        post_verified_admin(c, {"username": "lisi", "display_name": "李四",
                                            "allowed_platforms": ["zdxlz", "wecom"]})
         # 全角感叹号也要能登录
         c2 = TestClient(c.app)
@@ -119,8 +120,8 @@ def test_data_isolation_between_sub_admins() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "a1", "display_name": "甲"})
-        c.post("/api/admin/accounts", json={"username": "b1", "display_name": "乙"})
+        post_verified_admin(c, {"username": "a1", "display_name": "甲"})
+        post_verified_admin(c, {"username": "b1", "display_name": "乙"})
         # 两人各建一个角色
         for user, name in (("a1", "甲组"), ("b1", "乙组")):
             cc = _login2(c.app, user, PWD)
@@ -148,8 +149,8 @@ def test_sub_admin_cannot_touch_others_resources() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "a1", "display_name": "甲"})
-        c.post("/api/admin/accounts", json={"username": "b1", "display_name": "乙"})
+        post_verified_admin(c, {"username": "a1", "display_name": "甲"})
+        post_verified_admin(c, {"username": "b1", "display_name": "乙"})
         cc = _login2(c.app, "b1", PWD)
         cc.post("/api/admin/change-password", json={"old_password": PWD, "new_password": "NewPass@2026"})
         role_b = cc.post("/api/admin/roles", json={"name": "乙组", "platform": "zdxlz"}).json()["role_id"]
@@ -184,7 +185,7 @@ def test_platform_authorization_limits_sub_admin() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "only_zd", "display_name": "只密信",
+        post_verified_admin(c, {"username": "only_zd", "display_name": "只密信",
                                            "allowed_platforms": ["zdxlz"]})
         cc = _login2(c.app, "only_zd", PWD)
         cc.post("/api/admin/change-password", json={"old_password": PWD, "new_password": "NewPass@2026"})
@@ -201,7 +202,7 @@ def test_global_activation_is_shared_across_admins() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "a1", "display_name": "甲"})
+        post_verified_admin(c, {"username": "a1", "display_name": "甲"})
         # 模拟"别的管理员/机器人已激活过该手机号"
         store.upsert_delivery_target(PHONE, "zdx_uid_1", platform="zdxlz")
         cc = _login2(c.app, "a1", PWD)
@@ -224,7 +225,7 @@ def test_account_reset_password_and_delete_rules() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        created = c.post("/api/admin/accounts", json={"username": "tmp1", "display_name": "临时"}).json()
+        created = post_verified_admin(c, {"username": "tmp1", "display_name": "临时"}).json()
         aid = created["account"]["id"]
         # 重置密码 → 回到初始密码 + 强制改密
         r = c.post(f"/api/admin/accounts/{aid}/reset-password")
@@ -252,7 +253,7 @@ def test_owner_filter_applies_to_templates_and_instances() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        c.post("/api/admin/accounts", json={"username": "a1", "display_name": "甲"})
+        post_verified_admin(c, {"username": "a1", "display_name": "甲"})
         cc = _login2(c.app, "a1", PWD)
         cc.post("/api/admin/change-password", json={"old_password": PWD, "new_password": "NewPass@2026"})
         role = cc.post("/api/admin/roles", json={"name": "甲组", "platform": "zdxlz"}).json()["role_id"]
@@ -280,7 +281,7 @@ def test_transfer_owner_moves_history() -> None:
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
         c = _client(store, "admin", "Admin@2026")
-        acct = c.post("/api/admin/accounts", json={"username": "zhengjia", "display_name": "张三"}).json()["account"]
+        acct = post_verified_admin(c, {"username": "zhengjia", "display_name": "张三"}).json()["account"]
         # 历史数据用 state 直建（模拟"多管理员体系之前就有的数据"），归属默认落在 admin(id=1)
         role = store.create_role("历史组", platform="zdxlz")["role_id"]
         store.add_role_member(role, PHONE, "老成员", "市场部")

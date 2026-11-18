@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
@@ -56,7 +57,7 @@ def _mk_admin(c: TestClient, username: str, platforms=None, display="") -> int:
     body = {"username": username, "display_name": display or username}
     if platforms is not None:
         body["allowed_platforms"] = platforms
-    r = c.post("/api/admin/accounts", json=body)
+    r = post_verified_admin(c, body)
     assert r.status_code == 200, r.text
     return int(r.json()["account"]["id"])
 
@@ -273,7 +274,7 @@ def test_no_password_hash_in_any_account_response() -> None:
             body = c.get(url).text
             assert "pwd_hash" not in body, body[:300]
             assert "pbkdf2" not in body, body[:300]
-        created = c.post("/api/admin/accounts", json={"username": "s2"}).text
+        created = post_verified_admin(c, {"username": "s2"}).text
         assert "pwd_hash" not in created, created[:300]
         reset = c.post(f"/api/admin/accounts/{aid}/reset-password").text
         assert "pwd_hash" not in reset, reset[:300]

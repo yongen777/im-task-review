@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler  # noqa: E402
@@ -56,7 +57,7 @@ def _login(app: FastAPI, username: str, password: str) -> TestClient:
 
 
 def _sub(app: FastAPI, admin: TestClient, username: str) -> int:
-    r = admin.post("/api/admin/accounts", json={"username": username, "display_name": username})
+    r = post_verified_admin(admin, {"username": username, "display_name": username})
     assert r.status_code == 200, r.text
     return int(r.json()["account"]["id"])
 

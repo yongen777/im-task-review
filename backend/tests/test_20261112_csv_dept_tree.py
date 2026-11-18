@@ -27,6 +27,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
@@ -63,7 +64,7 @@ def _sub(app: FastAPI, username: str, platforms: Optional[List[str]] = None) -> 
     body: Dict[str, Any] = {"username": username, "display_name": username}
     if platforms is not None:
         body["allowed_platforms"] = platforms
-    r = admin.post("/api/admin/accounts", json=body)
+    r = post_verified_admin(admin, body)
     assert r.status_code == 200, r.text
     c = _login(app, username, PWD)
     c.post("/api/admin/change-password", json={"old_password": PWD, "new_password": "NewPass@2026"})

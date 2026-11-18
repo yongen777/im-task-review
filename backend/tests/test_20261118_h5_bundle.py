@@ -1,6 +1,7 @@
 import pytest
 
 from app.state import BizError, task_attachment_limits
+from admin_test_helpers import post_verified_admin
 from test_20261117_manual_mark_submitted import ctx
 from test_20261118_portal import portal, publish
 
@@ -20,7 +21,7 @@ def test_h5_lists_all_enabled_role_owners_without_creator_grants(portal):
         ('other_platform', 'wecom', ['wecom'], True),
         ('revoked_platform', 'zdxlz', ['wecom'], True),
     ):
-        response = admin.post('/api/admin/accounts', json={
+        response = post_verified_admin(admin, {
             'username': username, 'phone': '13900009502', 'allowed_platforms': ['zdxlz', 'wecom'],
         })
         assert response.status_code == 200, response.text

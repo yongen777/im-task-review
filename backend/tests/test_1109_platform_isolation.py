@@ -20,6 +20,7 @@ import sys as _sys
 from pathlib import Path
 _sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 from app.state import StateStore  # noqa: E402
 
 
@@ -184,12 +185,12 @@ def test_assume_endpoint_rejects_unauthorized_platform():
     admin_c.headers.update({"X-CSRF-Token": r.json()["csrf_token"]})
 
     # 建两个分级管理员：一个只授权 zdxlz，一个两个平台都有
-    r1 = admin_c.post("/api/admin/accounts", json={
+    r1 = post_verified_admin(admin_c, {
         "username": "subonlyzd", "display_name": "仅密信", "allowed_platforms": ["zdxlz"],
     })
     assert r1.status_code == 200, r1.text
     sub_only_zd = int(r1.json()["account"]["id"])
-    r2 = admin_c.post("/api/admin/accounts", json={
+    r2 = post_verified_admin(admin_c, {
         "username": "subboth", "display_name": "双平台", "allowed_platforms": ["zdxlz", "wecom"],
     })
     assert r2.status_code == 200, r2.text

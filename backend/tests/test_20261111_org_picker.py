@@ -28,6 +28,7 @@ import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.state import StateStore  # noqa: E402
 
@@ -120,7 +121,7 @@ def _login(app: FastAPI, username: str = "admin", password: str = "Admin@2026") 
 def _sa_ready(app: FastAPI, username: str = "sa") -> TestClient:
     """超管建号 + 分级改密 + 登录（业务写归分级管理员，超管只读 4.2）。"""
     admin = _login(app)
-    rr = admin.post("/api/admin/accounts", json={"username": username, "display_name": username})
+    rr = post_verified_admin(admin, {"username": username, "display_name": username})
     assert rr.status_code == 200, rr.text
     c = TestClient(app)
     r = c.post("/api/admin/login", json={"username": username, "password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD})

@@ -12,6 +12,7 @@ from app.api.admin import create_admin_router, register_admin_guard
 from app.api.h5 import create_h5_router
 from app.scheduler import FakeNotifier, Scheduler
 from app.state import StateStore
+from admin_test_helpers import post_verified_admin
 from mysql_testbank import mysql_test_cfg
 
 
@@ -40,7 +41,7 @@ def ctx(tmp_path):
         return client
 
     def sub(username):
-        response = admin.post("/api/admin/accounts", json={"username": username, "display_name": username})
+        response = post_verified_admin(admin, {"username": username, "display_name": username})
         assert response.status_code == 200, response.text
         first_password = StateStore.DEFAULT_SUB_ADMIN_PASSWORD
         client = login(username, first_password)

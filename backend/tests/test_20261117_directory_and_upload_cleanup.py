@@ -11,6 +11,7 @@ from app.channels.wecom_contacts import WecomContacts
 from app.channels.zdxlz_contacts import ZdxlzContacts
 from app.config import format_dt
 from app.state import BizError, StateStore
+from admin_test_helpers import post_verified_admin
 from mysql_testbank import mysql_test_cfg
 
 
@@ -270,7 +271,7 @@ def test_read_only_department_and_sync_endpoints_are_owner_and_platform_scoped(s
         return c
 
     admin = login("admin", "Admin@2026")
-    response = admin.post("/api/admin/accounts", json={
+    response = post_verified_admin(admin, {
         "username": "branch", "display_name": "分部", "allowed_platforms": ["zdxlz"],
     })
     assert response.status_code == 200, response.text

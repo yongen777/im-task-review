@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.api.h5 import process_h5_task_info  # noqa: E402
@@ -68,7 +69,7 @@ def _login(app: FastAPI, username: str, password: str) -> TestClient:
 
 
 def _new_sub_admin(app: FastAPI, super_admin: TestClient, username: str) -> TestClient:
-    r = super_admin.post("/api/admin/accounts", json={"username": username, "display_name": username})
+    r = post_verified_admin(super_admin, {"username": username, "display_name": username})
     assert r.status_code == 200, r.text
     c = _login(app, username, DEFAULT_SUB_ADMIN_PASSWORD)
     r = c.post("/api/admin/change-password",

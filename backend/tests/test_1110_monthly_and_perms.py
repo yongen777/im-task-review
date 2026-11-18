@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mysql_testbank import mysql_test_cfg  # noqa: E402
+from admin_test_helpers import post_verified_admin
 
 from app.api.admin import create_admin_router, register_admin_guard  # noqa: E402
 from app.scheduler import FakeNotifier, Scheduler, is_template_anchor_day  # noqa: E402
@@ -49,7 +50,7 @@ def _login(app: FastAPI, username: str, password: str) -> TestClient:
 
 
 def _sub_ready(app: FastAPI, admin: TestClient, username: str) -> tuple:
-    aid = int(admin.post("/api/admin/accounts", json={"username": username, "display_name": username}).json()["account"]["id"])
+    aid = int(post_verified_admin(admin, {"username": username, "display_name": username}).json()["account"]["id"])
     c = _login(app, username, StateStore.DEFAULT_SUB_ADMIN_PASSWORD)
     c.post("/api/admin/change-password", json={"old_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD, "new_password": "NewPass@2026"})
     return aid, _login(app, username, "NewPass@2026")

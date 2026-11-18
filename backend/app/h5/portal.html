@@ -76,8 +76,6 @@
       .grid, .choice-group, .mod-grid { grid-template-columns: 1fr; }
       .schema-row-sub { grid-template-columns: 1fr auto; }
       .form-actions { margin: 16px -12px 0; padding: 12px 12px calc(12px + env(safe-area-inset-bottom, 0px)); }
-      .filter-dates { grid-template-columns: 1fr; }
-      .filter-sep { display: none; }
     }
 
     .btn, .primary, .secondary {
@@ -1019,19 +1017,32 @@
     }
     .filter-dates {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr);
       align-items: center;
       gap: 8px;
       margin-top: 10px;
     }
     .filter-dates input[type="date"] {
+      display: block;
+      max-width: 100%;
       min-height: 44px;
       padding: 8px 10px;
       font-size: 13.5px;
+      -webkit-appearance: none;
+      appearance: none;
     }
+    .filter-dates input[type="date"]::-webkit-date-and-time-value { text-align: start; }
     .filter-sep {
+      justify-self: center;
       font-size: 12.5px;
       color: var(--muted);
+    }
+    @media (min-width: 520px) {
+      .filter-dates { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+      .filter-dates input[type="date"] {
+        -webkit-appearance: auto;
+        appearance: auto;
+      }
     }
     .filter-foot {
       display: flex;

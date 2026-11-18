@@ -755,6 +755,28 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "请输入有效的 11 位管理员手机号")
         return phone.strip()
 
+    def _verify_admin_directory_identity(self, name: str, phone: str, platforms: List[str]) -> None:
+        queried = failed = False
+        for platform in dict.fromkeys(platforms):
+            result = self._contacts_verify_batch([phone], platform, fresh=True)
+            if result is None:
+                continue
+            queried = True
+            status, profile = result[phone]
+            if status != "ok" or (profile is not None and not clean_name_for_match(profile.get("name"))):
+                failed = True
+                continue
+            if profile is None:
+                continue
+            if clean_name_for_match(profile["name"]) != clean_name_for_match(name):
+                raise BizError(400, "NAME_MISMATCH", "管理员姓名与官方通讯录不一致，请核对姓名和手机号")
+            return
+        if not queried:
+            raise BizError(503, "CONTACTS_QUERY_FAILED", "所选平台未配置可按手机号核验的官方通讯录")
+        if failed:
+            raise BizError(503, "CONTACTS_QUERY_FAILED", "官方通讯录查询失败，请稍后重试")
+        raise BizError(400, "PHONE_NOT_IN_CONTACTS", "官方通讯录查无此手机号，请核对后重试")
+
     def create_admin_account(
         self,
         username: str,
@@ -764,11 +786,19 @@ class StateStore:
         role_level: str = SUB_ADMIN,
         password: Optional[str] = None,
         phone: str = "",
+        *,
+        require_directory: bool = False,
     ) -> Dict[str, Any]:
         """新建分级管理员：初始密码固定 Hds22999!（可覆盖），强制首登改密。"""
         clean_user = (username or "").strip()
-        clean_disp = (display_name or "").strip() or clean_user
+        clean_disp = (display_name or "").strip()
         clean_phone = self._normalize_admin_phone(phone)
+        if require_directory:
+            if not clean_name_for_match(clean_disp):
+                raise BizError(400, "VALIDATION_FAILED", "请填写管理员姓名")
+            if not clean_phone:
+                raise BizError(400, "VALIDATION_FAILED", "请填写管理员手机号")
+        clean_disp = clean_disp or clean_user
         if not clean_user:
             raise BizError(400, "VALIDATION_FAILED", "用户名不能为空")
         if not clean_user.replace("_", "").replace("-", "").isalnum():
@@ -783,16 +813,23 @@ class StateStore:
         pwd_err = validate_new_password(pwd)
         if pwd_err:
             raise BizError(400, "VALIDATION_FAILED", pwd_err)
+        if require_directory:
+            self._verify_admin_directory_identity(clean_disp, clean_phone, plats)
         now_s = self.now_str()
         with self.lock, self.conn:
             if self.conn.execute("SELECT 1 FROM admin_user WHERE username = ?", (clean_user,)).fetchone():
                 raise BizError(409, "USERNAME_TAKEN", "该用户名已存在")
-            cur = self.conn.execute(
-                "INSERT INTO admin_user(username, pwd_hash, must_change, created_at, display_name, phone, role_level, allowed_platforms, enabled) "
-                "VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1)",
-                (clean_user, hash_password(pwd), now_s, clean_disp, clean_phone, str(role_level or self.SUB_ADMIN),
-                 json.dumps(plats, ensure_ascii=False)),
-            )
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO admin_user(username, pwd_hash, must_change, created_at, display_name, phone, role_level, allowed_platforms, enabled) "
+                    "VALUES (?, ?, 1, ?, ?, ?, ?, ?, 1)",
+                    (clean_user, hash_password(pwd), now_s, clean_disp, clean_phone, str(role_level or self.SUB_ADMIN),
+                     json.dumps(plats, ensure_ascii=False)),
+                )
+            except IntegrityError as exc:
+                if exc.args[0] != 1062:
+                    raise
+                raise BizError(409, "USERNAME_TAKEN", "该用户名已存在") from exc
             admin_id = int(cur.lastrowid)
             self._insert_audit_unlocked(
                 actor, "admin.account.create", "admin_user", str(admin_id),
