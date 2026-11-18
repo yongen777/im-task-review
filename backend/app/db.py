@@ -146,6 +146,8 @@ CREATE TABLE IF NOT EXISTS task_template (
   enabled         TINYINT      NOT NULL DEFAULT 1,
   deleted         TINYINT      NOT NULL DEFAULT 0,
   is_adhoc        TINYINT      NOT NULL DEFAULT 0,
+  is_manual       TINYINT      NOT NULL DEFAULT 0,
+  manual_deadline_at VARCHAR(32) DEFAULT NULL,
   attach_image         TINYINT      NOT NULL DEFAULT 0,
   data_keys            VARCHAR(1024) DEFAULT NULL,
   attach_image_path    VARCHAR(255)  DEFAULT NULL,
@@ -696,6 +698,10 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
 
     if not proxy.execute("SHOW COLUMNS FROM admin_user LIKE 'phone'").fetchone():
         proxy.execute("ALTER TABLE admin_user ADD COLUMN phone VARCHAR(11) NOT NULL DEFAULT ''")
+    if not proxy.execute("SHOW COLUMNS FROM task_template LIKE 'is_manual'").fetchone():
+        proxy.execute("ALTER TABLE task_template ADD COLUMN is_manual TINYINT NOT NULL DEFAULT 0")
+    if not proxy.execute("SHOW COLUMNS FROM task_template LIKE 'manual_deadline_at'").fetchone():
+        proxy.execute("ALTER TABLE task_template ADD COLUMN manual_deadline_at VARCHAR(32) DEFAULT NULL")
 
     if not proxy.execute("SHOW INDEX FROM reminder_log WHERE Key_name='ix_rem_instance_sent'").fetchone():
         proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")

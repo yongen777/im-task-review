@@ -32,6 +32,7 @@ interface PanelTask {
   exec_weekdays?: number[] | null;
   exec_dom_days?: number[] | null;
   is_adhoc: boolean;
+  is_manual?: boolean;
   need_review: boolean;
 }
 
@@ -409,11 +410,11 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           <select className={fieldClass} value={task.template_id} onChange={(e) => onTaskChange(e.target.value)}>
             {tasks.map((item) => <option key={item.template_id} value={item.template_id}>{item.name}</option>)}
           </select>
-          <span className="font-normal text-slate-500">执行周期 {execCycleText(task)}{task.remind_at && !task.is_adhoc ? ' · 执行时间 ' + task.remind_at : ''}</span>
+          <span className="font-normal text-slate-500">{task.is_manual ? '立即推送' : <>执行周期 {execCycleText(task)}{task.remind_at && !task.is_adhoc ? ' · 执行时间 ' + task.remind_at : ''}</>}</span>
         </label>
         <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
-          {periodLabel[task.statistics_period]}
-          {task.statistics_period === 'week' ? (
+          {task.is_manual ? '推送批次' : periodLabel[task.statistics_period]}
+          {task.is_manual ? <span className={fieldClass}>一次性推送</span> : task.statistics_period === 'week' ? (
             <select className={fieldClass} value={periodKey} onChange={(e) => selectPeriod(e.target.value)}>
               {weekOptions(task.current_period_key).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
             </select>

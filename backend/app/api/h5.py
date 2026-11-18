@@ -681,7 +681,7 @@ def create_h5_router(
         if FileResponse is None or HTMLResponse is None:  # pragma: no cover
             return JSONResponse(status_code=500, content={"code": "UNAVAILABLE", "message": "服务未就绪"})
         clean = (name or "").strip().lower()
-        if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png)", clean):
+        if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png|webp)", clean):
             return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
         img_dir = (uploads_dir.parent / "public_img").resolve()
         target = (img_dir / clean).resolve()

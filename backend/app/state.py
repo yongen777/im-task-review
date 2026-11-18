@@ -259,6 +259,10 @@ def format_deadline_rule(template: Optional[Dict[str, Any]], ref_dt: Optional[da
     """
     if not template:
         return "不限"
+    if template.get("is_manual"):
+        from .scheduler import format_deadline_display
+
+        return format_deadline_display(template.get("manual_deadline_at") or NO_DEADLINE_SENTINEL, ref_dt)
     _hd = template.get("has_deadline")
     if _hd is not None and not int(_hd):
         return "不限"
@@ -2876,11 +2880,14 @@ class StateStore:
             "data_keys": data_keys, "spec_json": spec_json,
             # 2026-11-12 晚 · 不定期任务（菜单自选）：True = 无推送/无截止/调度物理隔离
             "is_adhoc": bool(int(d.get("is_adhoc") if d.get("is_adhoc") is not None else 0)),
+            "is_manual": bool(d.get("is_manual")), "manual_deadline_at": d.get("manual_deadline_at"),
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
 
     def _validate_and_normalize_template_unlocked(self, payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if existing is not None:
+            if "is_manual" in payload and payload["is_manual"] != existing.get("is_manual", False):
+                raise BizError(400, "MODE_IMMUTABLE", "任务创建后不可切换立即推送模式")
             if "period" in payload and str(payload.get("period") or "").strip() not in ("", existing["period"]):
                 raise BizError(400, "PERIOD_IMMUTABLE", "任务周期创建后不可修改")
             if "kind" in payload and str(payload.get("kind") or "").strip() not in ("", existing["kind"]):
@@ -2888,6 +2895,13 @@ class StateStore:
 
         merged: Dict[str, Any] = dict(existing) if existing else {}
         merged.update(payload)
+        _payload_spec = payload.get("spec")
+        _spec_payload = _payload_spec if isinstance(_payload_spec, dict) else merged.get("spec_json")
+        if isinstance(_spec_payload, str):
+            try:
+                _spec_payload = json.loads(_spec_payload)
+            except ValueError:
+                _spec_payload = None
 
         # ── 2026-11-12 任务B：kind="upload" 归一 ─────────────────────────────
         # 前端重构后「上传任务」统一传 kind="upload"（不再细分 form/image/file），
@@ -2953,16 +2967,44 @@ class StateStore:
         if _adhoc_raw is None:
             _adhoc_raw = (existing or {}).get("is_adhoc") or 0
         is_adhoc = bool(int(_adhoc_raw or 0))
+        is_manual = merged.get("is_manual", False)
+        if not isinstance(is_manual, bool):
+            raise BizError(400, "VALIDATION_FAILED", "is_manual 必须为布尔值")
+        if is_manual and is_adhoc:
+            raise BizError(400, "VALIDATION_FAILED", "立即推送与自主上报不可同时启用")
+        manual_deadline = None
+        if is_manual and kind != "notice" and merged.get("manual_deadline_at"):
+            value = str(merged["manual_deadline_at"]).strip().replace("T", " ")
+            if len(value) == 16:
+                value += ":00"
+            try:
+                manual_deadline = format_dt(parse_dt(value))
+            except ValueError:
+                raise BizError(400, "INVALID_DEADLINE", "请输入有效的截止日期和时刻") from None
+            if manual_deadline != (existing or {}).get("manual_deadline_at") and manual_deadline <= self.now_str():
+                raise BizError(400, "INVALID_DEADLINE", "截止时间必须晚于当前时间")
+        notice_items = _spec_payload.get("notice_items") if isinstance(_spec_payload, dict) else None
+        notice_images = []
+        if kind == "notice" and isinstance(notice_items, list):
+            for item in notice_items:
+                if not isinstance(item, dict) or item.get("format") != "file" or not item.get("image_path"):
+                    continue
+                path = str(item["image_path"]).strip()
+                root = (self.data_dir / "notice_attach").resolve()
+                if (not re.fullmatch(r"notice_attach/[A-Za-z0-9_.-]+\.(?:png|jpe?g|webp)", path, re.IGNORECASE)
+                        or not (self.data_dir / path).resolve().is_relative_to(root)):
+                    raise BizError(400, "VALIDATION_FAILED", "通知图片须从模板素材入口上传")
+                notice_images.append(path)
         if is_adhoc and kind == "notice":
             raise BizError(400, "VALIDATION_FAILED", "通知类模板不支持自主上报")
         if is_adhoc:
             text_tpl = ""
-        elif not text_tpl:
+        elif not text_tpl and not (kind == "notice" and (notice_images or merged.get("attach_image_path"))):
             raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
 
-        if kind == "notice":
+        if kind == "notice" or is_manual:
             if str(merged.get("period") or "day").strip() != "day":
-                raise BizError(400, "VALIDATION_FAILED", "通知类模板 period 固定为 day")
+                raise BizError(400, "VALIDATION_FAILED", "通知或立即推送模板 period 固定为 day")
             period = "day"
         else:
             period = str(merged.get("period") or "").strip()
@@ -2990,7 +3032,9 @@ class StateStore:
         # 2026-11-12 任务E1：截止配置三件套默认值（notice 分支不参与，保持数据库列默认）
         has_deadline, deadline_type, deadline_time = True, None, None
 
-        if kind == "notice":
+        if kind == "notice" and is_manual:
+            has_deadline = False
+        elif kind == "notice":
             nt_raw = merged.get("notice_times")
             if isinstance(nt_raw, str):
                 try:
@@ -3011,7 +3055,7 @@ class StateStore:
             # 不写这里会让每次保存都把执行时间清空，列表显示空白、下次编辑还得重填。
             remind_at = clean_times[0]
         else:
-            if is_adhoc:
+            if is_adhoc or is_manual:
                 # 2026-11-12 晚 · 不定期任务：推送时刻强制置空（调度链物理隔离）+ 截止强制无。
                 # remind_at=None 跳过 HH:MM 校验；has_deadline=False 走下面的无截止分支。
                 remind_at = None
@@ -3023,7 +3067,7 @@ class StateStore:
 
             # ── 2026-11-12 任务E1：截止配置三件套（has_deadline / deadline_type / deadline_time）──
             # 部分更新语义：键未提交 → 保留 existing 原值（与其他可选字段一致）。
-            if is_adhoc:
+            if is_adhoc or is_manual:
                 has_deadline = False  # 需求三-4：不定期任务强制无截止（无视 payload，杜绝脏配置）
             elif "has_deadline" in payload:
                 has_deadline = bool(payload.get("has_deadline"))
@@ -3155,7 +3199,7 @@ class StateStore:
 
         # 2026-10-29 执行日（exeс_weekdays）：只有 day 周期可以配周几。
         # 未提供 → 更新时保留原值（与 need_review 同款部分更新语义）；空/坏 → 全周（调度层 fail-open）。
-        if "exec_weekdays" in payload:
+        if "exec_weekdays" in payload and not is_manual:
             raw_ew = payload.get("exec_weekdays")
             if raw_ew is None:
                 exec_weekdays_norm: Optional[List[int]] = None
@@ -3182,7 +3226,7 @@ class StateStore:
 
         # 2026-11-10 月度执行日：同一套部分更新语义。None = 未提交（更新保留原值）；
         # [] = 显式清空（切回每周模式）；非空 = 每月几号（1~31，选中 31 含每月最后一天）。
-        if "exec_dom_days" in payload:
+        if "exec_dom_days" in payload and not is_manual:
             raw_ed = payload.get("exec_dom_days")
             if raw_ed is None:
                 exec_dom_days_norm: Optional[List[int]] = None
@@ -3209,21 +3253,11 @@ class StateStore:
             exec_dom_days_norm = (existing or {}).get("exec_dom_days")
 
         # 2026-11-12 晚 · 不定期任务：无执行日概念（无推送时刻 → 调度链物理隔离），强制置空。
-        if is_adhoc:
+        if is_adhoc or is_manual:
             exec_weekdays_norm = None
             exec_dom_days_norm = None
-
-        # 2026-10-29 修复：前端提交的键是 `spec`（notice_items 里带上传时的**原始文件名**
-        # 与管理员填的描述），后端一直只读 `spec_json` → 这些配置从来没落库，
-        # 每次重新打开模板都被前端按 attach_image_path 重建，于是名字/描述回到默认值。
-        # 这里两种键都接受，优先 payload 里的 spec。
-        _payload_spec = payload.get("spec")
-        _spec_payload = _payload_spec if isinstance(_payload_spec, dict) else merged.get("spec_json")
-        if isinstance(_spec_payload, str):
-            try:
-                _spec_payload = json.loads(_spec_payload)
-            except Exception:  # noqa: BLE001
-                _spec_payload = None
+        if is_manual:
+            has_deadline = bool(manual_deadline)
 
         # 2026-10-29：spec 里的正文/描述同样要把**字面量** `\n`（反斜杠+n）归一成真换行。
         # text_tpl 早就有这层归一，但 notice_items.text_content 一直漏了，
@@ -3254,6 +3288,7 @@ class StateStore:
             "need_review": 1 if need_review else 0, "max_file_mb": max_file_mb, "enabled": 1 if bool(merged.get("enabled", True)) else 0,
             # 2026-11-12 晚 · 不定期任务（菜单自选）：持久化 flag（调度链按它物理隔离）
             "is_adhoc": 1 if is_adhoc else 0,
+            "is_manual": int(is_manual), "manual_deadline_at": manual_deadline,
             "attach_image": 1 if attach_image else 0, "attach_image_path": attach_image_path,
             "attach_image_name": attach_image_name,
             "exec_weekdays": json.dumps(exec_weekdays_norm, ensure_ascii=False) if exec_weekdays_norm else None,
@@ -3268,8 +3303,8 @@ class StateStore:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
-                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, is_adhoc, deleted, created_by, created_at, updated_at, owner_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
+                "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, is_adhoc, is_manual, manual_deadline_at, deleted, created_by, created_at, updated_at, owner_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                 (
                     template_id, norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"],
                     norm["allow_note"], norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"],
@@ -3277,7 +3312,7 @@ class StateStore:
                     norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
                     norm["need_review"], norm["max_file_mb"], norm["attach_image"], norm["attach_image_path"],
                     norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
-                    norm["enabled"], norm["is_adhoc"], actor, now_s, now_s, int(owner_id),
+                    norm["enabled"], norm["is_adhoc"], norm["is_manual"], norm["manual_deadline_at"], actor, now_s, now_s, int(owner_id),
                 ),
             )
             self._insert_audit_unlocked(actor, "template.create", "task_template", template_id, {"name": norm["name"], "kind": norm["kind"], "period": norm["period"]}, now_s)
@@ -3338,7 +3373,7 @@ class StateStore:
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
                 "remind_at = ?, notice_times = ?, deadline = ?, anchor_weekday = ?, anchor_dom = ?, deadline_offset = ?, "
                 "has_deadline = ?, deadline_type = ?, deadline_time = ?, "
-                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, is_adhoc = ?, updated_at = ? WHERE template_id = ?",
+                "need_review = ?, max_file_mb = ?, attach_image = ?, attach_image_path = ?, attach_image_name = ?, exec_weekdays = ?, exec_dom_days = ?, data_keys = ?, spec_json = ?, enabled = ?, is_adhoc = ?, manual_deadline_at = ?, updated_at = ? WHERE template_id = ?",
                 (
                     norm["name"], norm["kind"], norm["role_ids_json"], norm["schema_json"], norm["allow_note"],
                     norm["text_tpl"], norm["remind_at"], norm["notice_times"], norm["deadline"], norm["anchor_weekday"],
@@ -3346,7 +3381,7 @@ class StateStore:
                     norm["has_deadline"], norm["deadline_type"], norm["deadline_time"],
                     norm["need_review"], norm["max_file_mb"],
                     norm["attach_image"], norm["attach_image_path"], norm["attach_image_name"], norm["exec_weekdays"], norm["exec_dom_days"], norm["data_keys"], norm["spec_json"],
-                    norm["enabled"], norm["is_adhoc"], now_s, clean_id,
+                    norm["enabled"], norm["is_adhoc"], norm["manual_deadline_at"], now_s, clean_id,
                 ),
             )
             cancelled_on_disable = self._cancel_pending_scope(clean_id) if not norm["enabled"] else 0
@@ -3578,7 +3613,7 @@ class StateStore:
             sql = (
                 "SELECT t.* FROM task_template t "
                 "LEFT JOIN admin_user u ON u.id = t.owner_id "
-                "WHERE t.enabled = 1 AND t.deleted = 0 AND COALESCE(u.enabled, 1) = 1"
+                "WHERE t.enabled = 1 AND t.deleted = 0 AND t.is_manual = 0 AND COALESCE(u.enabled, 1) = 1"
                 + (" AND t.is_adhoc = 0" if not include_adhoc else "")
                 + ("" if include_notice else " AND t.kind != 'notice'")
                 + " ORDER BY t.template_id ASC"
@@ -4723,7 +4758,7 @@ class StateStore:
         """
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
-        if not tpl or not tpl["enabled"] or not tpl["role_ids"]:
+        if not tpl or not tpl["enabled"] or not tpl["role_ids"] or (tpl.get("is_manual") and period_key != "once"):
             return []
         # 2026-11-06 纵深防御（workbuddy）：模板所属管理员被停用 → 也不生成实例。
         # 此前只在 list_active_templates 拦（真实调度链只经那里，业务上不漏发），
@@ -4792,7 +4827,7 @@ class StateStore:
     def instance_published_at(self, instance_id: int) -> Optional[str]:
         row = self.conn.execute(
             "SELECT MIN(sent_at) AS published_at FROM reminder_log WHERE instance_id=? AND result='sent' "
-            "AND kind IN ('remind','manual_push','notice','portal')", (instance_id,),
+            "AND kind IN ('remind','manual_push','notice','notice_img','notice_img_link','portal')", (instance_id,),
         ).fetchone()
         return row["published_at"] if row else None
 
@@ -4859,6 +4894,7 @@ class StateStore:
         clean_id = (template_id or "").strip()
         # 读判 + 占位记账放同一个锁事务内：并发双击只放一个过（防抖护栏不许有窗口）
         with self.lock, self.conn:
+            self.conn.execute("SELECT template_id FROM task_template WHERE template_id = ? FOR UPDATE", (clean_id,)).fetchone()
             row = self.conn.execute(
                 "SELECT attempted_at FROM reminder_log WHERE template_id = ? AND kind = 'manual_push' ORDER BY id DESC LIMIT 1",
                 (clean_id,),
@@ -4905,6 +4941,12 @@ class StateStore:
                 (template_id, instance_id, phone, kind, planned_at, attempt_ts, sent_at, result, error, int(retry), idem_key),
             )
             return int(cur.lastrowid) if cur.rowcount > 0 else None
+
+    def complete_claimed_reminder(self, log_id: int, *, sent_at: Optional[str], result: str, error: Optional[str]) -> None:
+        self.conn.execute(
+            "UPDATE reminder_log SET sent_at=?, result=?, error=? WHERE id=? AND result='pending'",
+            (sent_at, result, error, int(log_id)),
+        )
 
     def list_reminder_logs(self, template_id: Optional[str] = None, instance_id: Optional[int] = None, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         where, params = [], []
@@ -5186,6 +5228,8 @@ class StateStore:
         月 'YYYY-MM' → 月键 + 'YYYY-MM-' 前缀（兼容按日推送/月推送两种实例）。
         """
         pk = (period_key or "").strip()
+        if pk == "once":
+            return {"keys": [pk], "like": ""}
         if re.match(r"^\d{4}-\d{2}-\d{2}$", pk):
             return {"keys": [pk], "like": ""}
         m = re.match(r"^(\d{4})-W(\d{1,2})$", pk)

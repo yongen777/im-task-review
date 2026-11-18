@@ -422,10 +422,11 @@ def _instance_filter_sql(
     if period_key and period_key.strip():
         key = period_key.strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
-            where.append("(i.period_key=? OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
+            where.append("(i.period_key=? OR (t.is_manual=1 AND i.period_key='once' AND LEFT(i.created_at,10)=?) "
+                         "OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
                          "OR (i.submitted_at IS NULL AND EXISTS (SELECT 1 FROM submission s "
                          "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
-            params.extend((key, key, key))
+            params.extend((key, key, key, key))
         else:
             where.append("i.period_key=?")
             params.append(key)
@@ -532,7 +533,7 @@ def _query_instances(
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
             f"t.notice_times AS template_notice_times, "
             f"(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id=i.id AND l.result='sent' "
-            f"AND l.kind IN ('remind','manual_push','notice','portal')) AS published_at, "
+            f"AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','portal')) AS published_at, "
             # 2026-11-04 多管理员分级：超管全局查看时需要看到「创建人」
             f"u.username AS owner_username, u.display_name AS owner_display_name "
             # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），
@@ -1286,7 +1287,7 @@ def create_admin_router(
             return error_response(404, "NOT_FOUND", "任务模板不存在")
         if not _tpl.get("enabled"):
             return error_response(404, "NOT_FOUND", "任务模板已停用，请先启用再推送")
-        if _tpl.get("kind") == "notice":
+        if _tpl.get("kind") == "notice" and not _tpl.get("is_manual"):
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         if _tpl.get("is_adhoc"):
             return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
@@ -2754,7 +2755,8 @@ def create_admin_router(
                     "template_id": t["template_id"], "name": t["name"],
                     "kind": t.get("kind"), "period": t.get("period"),
                     "statistics_period": stats_period,
-                    "current_period_key": period_key(stats_period, state.now()),
+                    "current_period_key": "once" if t.get("is_manual") else period_key(stats_period, state.now()),
+                    "is_manual": bool(t.get("is_manual")),
                     "is_adhoc": bool(t.get("is_adhoc")),
                     "remind_at": t.get("remind_at"),
                     "anchor_weekday": t.get("anchor_weekday"),

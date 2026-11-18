@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -27,6 +28,7 @@ from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例�
     BizError,
     calc_h5_token_ttl_hours,
     calc_resubmit_deadline,
+    effective_instance_deadline,
     is_no_deadline,
     is_valid_hhmm,
 )
@@ -231,6 +233,8 @@ def calc_instance_deadline(template: Dict[str, Any], anchor_dt: DateLike) -> str
     应允许创建并在次日 0 点才过期（与 calc_deadline_at 旧口径同步）。
     """
     # has_deadline 显式为 0/False → 无截止；None/缺键（旧调用方、raw dict）→ 按有截止处理
+    if template.get("is_manual"):
+        return template.get("manual_deadline_at") or NO_DEADLINE_SENTINEL
     _hd = template.get("has_deadline")
     if _hd is not None and not int(_hd):
         return NO_DEADLINE_SENTINEL
@@ -544,7 +548,7 @@ class Scheduler:
 
     def ensure_instances_for_template(self, template: Dict[str, Any], now_dt: Optional[datetime] = None) -> List[Dict[str, Any]]:
         # 2026-10-28 方案A：notice 也生成实例（pending → sent），与上传类统一在「任务实例」页展示。
-        if not template.get("enabled") or template.get("deleted"):
+        if not template.get("enabled") or template.get("deleted") or template.get("is_manual"):
             return []
         cur_dt = now_dt or self.now()
         if not is_template_anchor_day(template, cur_dt):
@@ -569,7 +573,7 @@ class Scheduler:
         if not attempts:
             return 0
         for row in attempts:
-            if row["result"] in ("sent", "missed", "skipped"):
+            if row["result"] in ("sent", "missed", "skipped", "pending"):
                 return None
             if row.get("error") and "NO_SESSION_500" in str(row.get("error")):
                 return None
@@ -610,7 +614,7 @@ class Scheduler:
             pub_dir = data_dir / "public_img"
             pub_dir.mkdir(parents=True, exist_ok=True)
             suffix = src.suffix.lower()
-            if suffix not in (".jpg", ".jpeg", ".png"):
+            if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
                 suffix = ".jpg"
             name = f"{uuid.uuid4().hex}{suffix}"
             shutil.copyfile(src, pub_dir / name)
@@ -647,65 +651,67 @@ class Scheduler:
         template_id: str, instance_id: int, phone: str,
         planned_str: str, now_s: str, stats: Dict[str, int],
         notifier: Optional[NotifierProtocol] = None,
-    ) -> bool:
-        """发一条**原生图片消息**（企微智能机器人，2026-11-02 起支持）。
-
-        返回 True = 这一轮不用再走链接兜底（已发出，或失败但可重试、留给下一轮）；
-        返回 False = 永久失败，调用方应降级发 H5 链接，别让用户什么都收不到。
-
-        ⚠️ 幂等门控必须在**发送之前**（2026-11-02 刷屏事故的根因就是这个顺序错了）。
-        """
+        once: bool = False,
+    ) -> Tuple[bool, bool]:
+        """返回（是否由原生图片路径处理，本次是否发出）。永久失败才降级为链接。"""
+        previous = self.state.get_reminder_by_idem_key(idem, sent_only=False)
+        if previous and str(previous.get("error") or "").startswith("IMAGE_LINK_FALLBACK:"):
+            return False, False
+        task = self._prepare_delivery(
+            template_id=template_id, instance_id=instance_id, phone=phone, external_id=external_id,
+            kind="notice_img", planned_str=planned_str, delay_sec=0, idem_key=idem,
+            msg_text_fn=lambda: "", cur_dt=parse_dt(now_s), now_s=now_s, stats=stats, claim=True, once=once,
+        )
+        if task is None:
+            return True, False
+        fallback = False
         try:
-            if self.state.has_sent_reminder(idem):
-                return True
-            res = (notifier or self.notifier).send_image(external_id, image_path, idem)
-            self.state.record_reminder_log(
-                template_id=template_id, instance_id=instance_id, phone=phone, kind="notice_img",
-                planned_at=planned_str, attempted_at=now_s,
-                sent_at=now_s if res.ok else None, result="sent" if res.ok else "failed",
-                retry=0, error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=idem,
-            )
-            if res.ok:
-                return True
-            if getattr(res, "retryable", False):
-                # 长连接抖动 / 上传频率限制：交给下一个 tick 重试，此时别补发链接（会重复）
-                return True
-            stats["failed"] = stats.get("failed", 0) + 1
-            return False
+            self._delivery_bucket.acquire()
+            if not self._instance_still_deliverable(instance_id, "notice"):
+                res = SendResult(ok=False, result="skipped", error="TASK_CLOSED")
+            else:
+                res = (notifier or self.notifier).send_image(external_id, image_path, idem)
+                fallback = not res.ok and not getattr(res, "retryable", False)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("附图图片消息发送异常 external=%s: %s", external_id, exc)
-            return False
+            res = SendResult(ok=False, result="failed", error=f"EXC:{exc}"[:120])
+        error = None if res.ok else (res.error or "SEND_FAILED")
+        self.state.complete_claimed_reminder(task["claim_id"], sent_at=now_s if res.ok else None,
+                                            result=res.result, error=f"IMAGE_LINK_FALLBACK:{error}" if fallback else error)
+        if fallback:
+            stats["failed"] += 1
+        return not fallback, res.ok
 
-    def _send_image_link(self, external_id: str, image_url: str, image_name: Optional[str], base_idem: str,
-                         template_id: str, instance_id: Optional[int], phone: str,
+    def _send_image_link(self, external_id: str, image_url_fn: Callable[[], str], image_name: Optional[str], base_idem: str,
+                         template_id: str, instance_id: int, phone: str,
                          planned_str: str, now_s: str, stats: Dict[str, int],
-                         notifier: Optional[NotifierProtocol] = None, external_type: str = "user") -> None:
-        """附图唯一发送通道：发一条含直链的短文本（图片消息在手机端打不开，2026-10-30 起不再发）。失败只记日志，绝不影响主链路。
-
-        2026-10-29 H5.5：文本改为「{图片名称}（点击查看）：\n{链接}」，
-        名称由管理员在模板编辑时填写（attach_image_name），无名称时回退「数据图片」。
-        2026-11-10 方案A：external_type 转为 receive_type（union_id 绑定不依赖会话）。
-        """
+                         notifier: Optional[NotifierProtocol] = None, external_type: str = "user",
+                         once: bool = False) -> bool:
+        """密信以独立的图片查看链接送达，同一素材先占位再发布和发信。"""
+        link_idem = self._link_idem(base_idem)
+        task = self._prepare_delivery(
+            template_id=template_id, instance_id=instance_id, phone=phone, external_id=external_id,
+            kind="notice_img_link", planned_str=planned_str, delay_sec=0, idem_key=link_idem,
+            msg_text_fn=lambda: "", cur_dt=parse_dt(now_s), now_s=now_s, stats=stats, claim=True, once=once,
+        )
+        if task is None:
+            return False
         try:
-            link_idem = self._link_idem(base_idem)
-            # 2026-11-02 P0 刷屏修复：**发送动作之前**先查重。
-            # 原实现是「先发、后记账」，reminder_log 的 UNIQUE 只拦住记录，
-            # 消息在 30 秒一轮的调度里已经被发出去了 —— 到点后每轮都发一条。
-            if self.state.has_sent_reminder(link_idem):
-                return
-            display = (image_name or "").strip() or "数据图片"
-            text = f"{display}（点击查看）：\n{image_url}"
-            res = (notifier or self.notifier).send_text(external_id, text, link_idem, receive_type=external_type)
-            self.state.record_reminder_log(
-                template_id=template_id, instance_id=instance_id, phone=phone, kind="notice_img_link",
-                planned_at=planned_str, attempted_at=now_s,
-                sent_at=now_s if res.ok else None, result="sent" if res.ok else "failed",
-                retry=0, error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=link_idem,
-            )
-            if not res.ok:
-                stats["failed"] = stats.get("failed", 0) + 1
+            if not self._instance_still_deliverable(instance_id, "notice"):
+                res = SendResult(ok=False, result="skipped", error="TASK_CLOSED")
+            elif not (url := image_url_fn()):
+                res = SendResult(ok=False, result="failed", error="NOTICE_IMAGE_UNAVAILABLE")
+            else:
+                self._delivery_bucket.acquire()
+                display = (image_name or "").strip() or "数据图片"
+                res = (notifier or self.notifier).send_text(external_id, f"{display}（点击查看）：\n{url}",
+                                                           link_idem, receive_type=external_type)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("附图直链文本发送异常 external=%s: %s", external_id, exc)
+            res = SendResult(ok=False, result="failed", error=f"EXC:{exc}"[:120])
+        self.state.complete_claimed_reminder(task["claim_id"], sent_at=now_s if res.ok else None,
+                                            result=res.result, error=None if res.ok else (res.error or "SEND_FAILED"))
+        if not res.ok and res.result != "skipped":
+            stats["failed"] += 1
+        return res.ok
 
     def _prepare_delivery(
         self,
@@ -722,6 +728,8 @@ class Scheduler:
         cur_dt: datetime,
         now_s: str,
         stats: Dict[str, int],
+        claim: bool = False,
+        once: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """主线程 DB 预处理（幂等占位 + 前置记账），返回「待网络发送任务」或 None（已记账/已跳过）。
 
@@ -729,7 +737,7 @@ class Scheduler:
         多线程并发投递时 **worker 只做网络 IO**，查重占位与记账全部留在主线程串行完成，
         规避 sqlite 单连接跨线程 + 保证「查重→发送→记录」的原子互斥（幂等红线）。
         """
-        retry_no = self._resolve_retry_slot(idem_key, cur_dt=cur_dt)
+        retry_no = 0 if once else self._resolve_retry_slot(idem_key, cur_dt=cur_dt)
         if retry_no is None:
             return None
         if retry_no == 0 and delay_sec > self.COMPENSATION_WINDOW_SECONDS:
@@ -748,11 +756,20 @@ class Scheduler:
             )
             stats["skipped"] += 1
             return None
+        claim_id = None
+        if claim:
+            claim_id = self.state.record_reminder_log(
+                template_id=template_id, instance_id=instance_id, phone=phone, kind=kind,
+                planned_at=planned_str, attempted_at=now_s, sent_at=None, result="pending", error=None,
+                retry=retry_no, idem_key=idem_key,
+            )
+            if claim_id is None:
+                return None
         return {
             "template_id": template_id, "instance_id": instance_id, "phone": phone,
             "external_id": external_id, "kind": kind, "planned_str": planned_str,
             "idem_key": idem_key, "retry_no": retry_no, "msg_text": msg_text_fn(),
-            "now_s": now_s,
+            "now_s": now_s, "claim_id": claim_id,
         }
 
     def _instance_still_deliverable(self, instance_id: int, kind: str) -> bool:
@@ -768,18 +785,27 @@ class Scheduler:
         if instance["status"] not in statuses[kind]:
             return False
         template = self.state.get_template(instance["template_id"])
+        if template and template.get("is_manual"):
+            if effective_instance_deadline(instance) <= format_dt(self.now()):
+                return False
+            if not self.state._template_owner_enabled(template["owner_id"]) or not self.state._template_platform_allowed(template):
+                return False
         return bool(template and not template.get("is_adhoc")
                     and self.state.instance_close_reason(instance, template) is None)
 
     def _record_delivery(self, task: Dict[str, Any], send_res: Optional[SendResult], stats: Dict[str, int]) -> bool:
         """主线程记账（worker 纯网络 IO，DB 全部回主线程串行写）。返回是否真的发出。"""
         ok = bool(send_res is not None and send_res.ok)
-        self.state.record_reminder_log(
-            template_id=task["template_id"], instance_id=task["instance_id"], phone=task["phone"],
-            kind=task["kind"], planned_at=task["planned_str"], attempted_at=task["now_s"],
-            sent_at=task["now_s"] if ok else None, result=send_res.result if send_res else "failed",
-            retry=task["retry_no"], error=send_res.error if send_res else "CIRCUIT_OPEN", idem_key=task["idem_key"],
-        )
+        outcome = {"sent_at": task["now_s"] if ok else None, "result": send_res.result if send_res else "failed",
+                   "error": send_res.error if send_res else "CIRCUIT_OPEN"}
+        if task.get("claim_id") is not None:
+            self.state.complete_claimed_reminder(task["claim_id"], **outcome)
+        else:
+            self.state.record_reminder_log(
+                template_id=task["template_id"], instance_id=task["instance_id"], phone=task["phone"],
+                kind=task["kind"], planned_at=task["planned_str"], attempted_at=task["now_s"],
+                retry=task["retry_no"], idem_key=task["idem_key"], **outcome,
+            )
         if send_res is not None and send_res.result == "skipped":
             stats["skipped"] += 1
         elif ok:
@@ -991,14 +1017,19 @@ class Scheduler:
         tpl = self.state.get_template(template_id, include_deleted=False)
         if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
             raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
-        if tpl["kind"] == "notice":
+        manual = tpl.get("is_manual", False)
+        if tpl["kind"] == "notice" and not manual:
             raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         # 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式，与定时调度物理隔离——
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
-        p_key = period_key(tpl["period"], cur_dt)
+        p_key = "once" if manual else period_key(tpl["period"], cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)
+        if tpl["kind"] == "notice":
+            deadline_at = format_dt(cur_dt + timedelta(hours=24))
+        if manual and deadline_at <= now_s:
+            raise BizError(400, "INVALID_DEADLINE", "任务已到截止时间，无法推送")
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
         instances = self.state.ensure_template_instances(
             tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
@@ -1024,9 +1055,15 @@ class Scheduler:
         tpl = self.state.get_template(template_id, include_deleted=False)
         if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
             raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
-        if tpl["kind"] == "notice":
+        manual = tpl.get("is_manual", False)
+        if tpl["kind"] == "notice" and not manual:
             raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
+        if (manual and p_key != "once") or tpl.get("is_adhoc"):
+            raise BizError(400, "VALIDATION_FAILED", "任务的推送配置已变更")
         instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
+
+        if tpl["kind"] == "notice":
+            return self._push_manual_notice(tpl, instances, cur_dt)
 
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         push_seq: Dict[str, int] = {}
@@ -1076,14 +1113,14 @@ class Scheduler:
                 for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                     # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
                     # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
-                    base_idem = make_idem_key(
-                        tpl["template_id"], inst["phone"], p_key, "manual_push", seq, f"{now_s}|push|{seq}"
-                    )
+                    base_idem = make_idem_key(tpl["template_id"], phone, p_key, "manual_push", seq,
+                                              "" if manual else f"{now_s}|push|{seq}")
                     idem = self._idem_for(base_idem, platform)
                     task = self._prepare_delivery(
                         template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                         external_id=ext_id, kind="manual_push", planned_str=now_s, delay_sec=0,
                         idem_key=idem, msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                        claim=manual, once=manual,
                     )
                     if task is None:
                         continue
@@ -1092,6 +1129,129 @@ class Scheduler:
             oks = self._deliver_batch_concurrent(batch, stats)
             if any(oks):
                 stats["pushed_instances"] += 1
+        return stats
+
+    @staticmethod
+    def _notice_body(template, instance, now, values):
+        return render_text_tpl(
+            template["text_tpl"], member_name=instance["name_snap"], member_dept=instance.get("dept_snap"),
+            template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=now, extra_vars=values,
+        ).strip()
+
+    def _notice_images(self, tpl, period, seq, now_s, values):
+        """优先使用通知条目中的所有上传图片，再兼容旧字段和旧数据看板。"""
+        root = Path(self.state.data_dir).resolve()
+        primary = str(tpl.get("attach_image_path") or "").strip()
+        spec = tpl.get("spec_json")
+        items = spec.get("notice_items") if isinstance(spec, dict) else None
+        images = {}
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and item.get("format") == "file" and item.get("image_path"):
+                    rel = str(item["image_path"]).strip()
+                    if re.fullmatch(r"notice_attach/[A-Za-z0-9_.-]+\.(?:png|jpe?g|webp)", rel, re.IGNORECASE):
+                        if (root / rel).resolve().is_relative_to((root / "notice_attach").resolve()):
+                            images.setdefault(rel, item.get("file_caption") or item.get("file_name"))
+        if not images and primary:
+            images[primary] = tpl.get("attach_image_name")
+        if images:
+            for rel, title in images.items():
+                target = (root / rel).resolve()
+                if (target.is_relative_to(root) and target.is_file()
+                        and target.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")):
+                    yield str(target), title, rel, rel == primary
+            return
+
+        data_keys = tpl.get("data_keys") or []
+        if not tpl.get("attach_image") or not any(str(values.get(dk["key"]) or "").strip() for dk in data_keys):
+            return
+        try:
+            from .dashboard import render_snapshot_dashboard
+
+            target = root / "dashboards" / f"{tpl['template_id']}_{period}_{seq}.png"
+            render_snapshot_dashboard(title=f"{tpl['name']} · 数据看板", subtitle=f"{period} · 春促按角色提醒",
+                                      data_keys=data_keys, values=values, out_path=str(target),
+                                      note=f"数据截至 {now_s} · 数据来源：人工填报")
+        except Exception as exc:
+            logger.warning("通知看板生成失败 template=%s: %s", tpl["template_id"], exc)
+            return
+        yield str(target), tpl.get("attach_image_name"), "dashboard", True
+
+    def _deliver_notice_images(self, tpl, instances, period, seq, planned_str, now_s, values, stats, *, once=False):
+        delivered = []
+        platform = self._template_platform(tpl)
+        for source, title, asset, legacy in self._notice_images(tpl, period, seq, now_s, values):
+            link_url = None
+
+            def publish_link():
+                nonlocal link_url
+                if link_url is None:
+                    link_url = self._publish_image_link(source, title) or ""
+                return link_url
+
+            for inst in instances:
+                for channel, external_id, external_type, notifier in self._targets_for(inst["phone"], only_platform=platform):
+                    if not external_id:
+                        continue
+
+                    def image_idem(kind, plan):
+                        return self._idem_for(make_idem_key(tpl["template_id"], inst["phone"], period,
+                                                           kind, seq, plan), channel)
+
+                    plan = f"{'once' if once else planned_str}|{asset}"
+                    media_idem = image_idem("notice_img", plan)
+                    link_idem = image_idem("notice_img_link", plan)
+                    known_sent = self.state.has_sent_reminder
+                    if known_sent(media_idem) or known_sent(self._link_idem(link_idem)):
+                        continue
+                    if legacy and not once and (known_sent(image_idem("notice_img", planned_str))
+                                                or known_sent(self._link_idem(image_idem("notice_img_link", planned_str)))):
+                        continue
+                    instance_id = int(inst["id"])
+                    if channel != "zdxlz" and callable(getattr(notifier, "send_image", None)):
+                        handled, sent = self._send_image_media(
+                            external_id=external_id, image_path=source, idem=media_idem, template_id=tpl["template_id"],
+                            instance_id=instance_id, phone=inst["phone"], planned_str=planned_str, now_s=now_s,
+                            stats=stats, notifier=notifier, once=once,
+                        )
+                        if handled:
+                            if sent:
+                                delivered.append(instance_id)
+                            continue
+                    if self._send_image_link(external_id, publish_link, title, link_idem, tpl["template_id"],
+                                             instance_id, inst["phone"], planned_str, now_s, stats, notifier,
+                                             external_type, once):
+                        delivered.append(instance_id)
+        return delivered
+
+    def _push_manual_notice(self, tpl, instances, now):
+        stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
+        now_s = format_dt(now)
+        instances = [inst for inst in instances if inst["status"] == "pending"
+                     and self.state.instance_close_reason(inst, tpl) is None]
+        platform = self._template_platform(tpl)
+        values = self.state.get_data_snapshot_values(tpl["template_id"], period_key(tpl["period"], now)) if tpl.get("data_keys") else {}
+        batch = []
+        if tpl["text_tpl"]:
+            for inst in instances:
+                for channel, external_id, external_type, notifier in self._targets_for(inst["phone"], only_platform=platform):
+                    idem = self._idem_for(make_idem_key(tpl["template_id"], inst["phone"], "once", "notice"), channel)
+                    task = self._prepare_delivery(
+                        template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
+                        external_id=external_id, kind="notice", planned_str=now_s, delay_sec=0, idem_key=idem,
+                        msg_text_fn=lambda: self._notice_body(tpl, inst, now, values),
+                        cur_dt=now, now_s=now_s, stats=stats, claim=True, once=True,
+                    )
+                    if task:
+                        task["send_fn"] = functools.partial(notifier.send_text, receive_type=external_type)
+                        batch.append(task)
+        delivered = {task["instance_id"] for task, sent in zip(batch, self._deliver_batch_concurrent(batch, stats)) if sent}
+        image_deliveries = self._deliver_notice_images(tpl, instances, "once", 1, now_s, now_s, values, stats, once=True)
+        stats["sent"] += len(image_deliveries)
+        delivered.update(image_deliveries)
+        for instance_id in delivered:
+            self.state.update_instance_status(instance_id, "sent")
+        stats["pushed_instances"] = len(delivered)
         return stats
 
     def run_once(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
@@ -1163,16 +1323,11 @@ class Scheduler:
                       with self.state.conn:
                         for inst in instances[_c0:_c0 + 400]:
 
-                            def _make_notice_msg(instance=inst, template=tpl, planned=planned_dt) -> str:
-                                # 2026-10-29 用户定档：通知类消息**只发管理员配置的正文**。
-                                # ⛔ 不加「今日通知：」标题、不加【模板名】、不加发送时间、不加任何其它内容。
-                                body = render_text_tpl(
-                                    template["text_tpl"], member_name=instance["name_snap"],
-                                    member_dept=instance.get("dept_snap"),
-                                    template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=cur_dt,
-                                    extra_vars=snap_values,
-                                )
-                                return body.strip()
+                            if not tpl["text_tpl"]:
+                                continue
+
+                            def _make_notice_msg(instance=inst) -> str:
+                                return self._notice_body(tpl, instance, cur_dt, snap_values)
 
                             # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
                             for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
@@ -1183,7 +1338,7 @@ class Scheduler:
                                 task = self._prepare_delivery(
                                     template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                                     external_id=ext_id, kind="notice", planned_str=planned_str, delay_sec=delay_sec,
-                                    idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
+                                    idem_key=idem, msg_text_fn=_make_notice_msg, cur_dt=cur_dt, now_s=now_s, stats=stats, claim=True,
                                 )
                                 if task is None:
                                     continue
@@ -1198,102 +1353,11 @@ class Scheduler:
                         if ok:
                             self.state.update_instance_status(inst_id, "sent")
 
-                    # 2026-10-28 通知类附图：优先推管理员上传的图片（attach_image_path），
-                    # 没上传图时才退回「数据看板自动出图」的旧路径（依赖当天人工填报的快照值）。
-                    attach_rel = str(tpl.get("attach_image_path") or "").strip()
-                    want_dash = bool(tpl.get("attach_image")) and bool(data_keys)
-                    # 2026-11-02 订正：量子密信那条「图片消息手机端点不开」的结论，
-                    # **不适用于企业微信** —— 企微机器人发的是原生图片消息，实测点开正常，
-                    # 所以企微通道优先发图片（_send_image_media），失败再降级 H5 链接。
-                    # 量子密信没有 send_image，仍然走链接，行为不变。
-                    if attach_rel or want_dash:
-                        img_src_path: Optional[str] = None
-                        if attach_rel:
-                            try:
-                                base_dir = Path(self.state.data_dir)
-                                # 2026-10-29 P2-1：运行时再兜一道，越界路径直接跳过，不外读
-                                _target = (base_dir / attach_rel).resolve()
-                                # 2026-10-29 补丁3：is_relative_to 比字符串前缀更可靠（data_other 不会被误判在 data 内）
-                                if not _target.is_relative_to(base_dir.resolve()):
-                                    logger.warning("通知附图路径越界已拦截 template=%s path=%s", tpl["template_id"], attach_rel)
-                                    raise ValueError("path_out_of_data_dir")
-                                img_src_path = str(_target)
-                            except Exception as exc:
-                                logger.warning("通知附图加载失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
-                        if img_src_path is None and want_dash:
-                            has_any_value = any(
-                                str(snap_values.get(str(dk.get("key") or "")) or "").strip() for dk in data_keys
-                            )
-                            if has_any_value:
-                                try:
-                                    from .dashboard import render_snapshot_dashboard
-
-                                    data_dir = Path(self.state.data_dir)
-                                    out_dir = data_dir / "dashboards"
-                                    out_png = str(out_dir / f"{tpl['template_id']}_{p_key}_{seq_idx}.png")
-                                    note_text = f"数据截至 {now_s} · 数据来源：人工填报"
-                                    render_snapshot_dashboard(
-                                        title=f"{tpl['name']} · 数据看板",
-                                        subtitle=f"{p_key} · 春促按角色提醒",
-                                        data_keys=data_keys,
-                                        values=snap_values,
-                                        note=note_text,
-                                        out_path=out_png,
-                                    )
-                                    img_src_path = out_png
-                                except Exception as exc:  # 看板渲染/上传失败不影响文本主链路
-                                    logger.warning("看板渲染或上传失败 template=%s seq=%s: %s", tpl["template_id"], seq_idx, exc)
-                        if img_src_path:
-                            # 2026-10-30 用户口径：企业微信发原生图片，量子密信没有 send_image 仍发 H5 链接。
-                            # 2026-11-02 多通道：按「该成员的每个绑定通道」分别判断形态与幂等键。
-                            img_title = str(tpl.get("attach_image_name") or "").strip() or None
-                            # 先筛「本轮真正还需要发的人」：一个人都不需要就既不发布副本、也不发消息。
-                            pending: List[tuple] = []
-                            for inst in instances:
-                                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                                    idem_link = self._idem_for(make_idem_key(
-                                        tpl["template_id"], inst["phone"], p_key, "notice_img_link", seq_idx, planned_str
-                                    ), platform)
-                                    idem_media = self._idem_for(make_idem_key(
-                                        tpl["template_id"], inst["phone"], p_key, "notice_img", seq_idx, planned_str
-                                    ), platform)
-                                    # 两种形态都要查：换形态之后，历史记录也得认，避免切换当天补发。
-                                    if (self.state.has_sent_reminder(self._link_idem(idem_link))
-                                            or self.state.has_sent_reminder(idem_media)):
-                                        continue
-                                    if not ext_id:
-                                        continue  # 未激活成员文本链路已记 skipped，附图同样跳过
-                                    pending.append((inst, ext_id, ext_type, nt, platform, idem_link, idem_media))
-                            if pending:
-                                link_url: Optional[str] = None
-                                for inst, ext_id, ext_type, nt, platform, idem_link, idem_media in pending:
-                                    if not self._instance_still_deliverable(int(inst["id"]), "notice"):
-                                        continue
-                                    handled = False
-                                    # 2026-11-03：量子密信永远不发原生图片（手机端点不开，10-29 实测口径），
-                                    # 直接走 H5 链接。此前密信侧 send_image 签名不匹配，每次靠 TypeError
-                                    # 异常兜底才落到链接（08:15 日志实锤），现在显式跳过。
-                                    if platform != "zdxlz" and callable(getattr(nt, "send_image", None)):
-                                        handled = self._send_image_media(
-                                            external_id=ext_id, image_path=img_src_path, idem=idem_media,
-                                            template_id=tpl["template_id"], instance_id=int(inst["id"]),
-                                            phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
-                                            notifier=nt,
-                                        )
-                                    if handled:
-                                        continue
-                                    # 降级：H5 链接（发布副本按需做，只做一次）
-                                    if link_url is None:
-                                        link_url = self._publish_image_link(img_src_path, img_title) or ""
-                                    if not link_url:
-                                        break
-                                    self._send_image_link(
-                                        external_id=ext_id, image_url=link_url, image_name=img_title or "",
-                                        base_idem=idem_link,
-                                        template_id=tpl["template_id"], instance_id=int(inst["id"]),
-                                        phone=inst["phone"], planned_str=planned_str, now_s=now_s, stats=stats,
-                                        notifier=nt, external_type=ext_type,
-                                    )
+                    delivered_images = self._deliver_notice_images(
+                        tpl, instances, p_key, seq_idx, planned_str, now_s, snap_values, stats,
+                    )
+                    for instance_id in set(delivered_images):
+                        self.state.update_instance_status(instance_id, "sent")
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])
@@ -1375,7 +1439,7 @@ class Scheduler:
                     if cur_dt < overdue_planned_dt:
                         continue
                     tpl = self.state.get_template(inst["template_id"])
-                    if not tpl or not tpl.get("enabled") or tpl.get("deleted"):
+                    if not tpl or not tpl.get("enabled") or tpl.get("deleted") or tpl.get("is_manual"):
                         continue
 
                     planned_str = format_dt(overdue_planned_dt)

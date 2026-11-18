@@ -118,7 +118,7 @@ def test_publish_once_three_ticks_completion_and_isolation(portal):
     assert stats['periods'][0]['members'][0]['submission']['note'] == '真实提交内容'
     assert owner.get('/api/admin/portal-tasks').status_code == 200
     assert owner.get('/api/admin/portal-tasks').json()['items'][0]['task_id'] == t['template_id']
-    assert admin.get('/api/admin/portal-tasks').status_code == 200
+    assert admin.get('/api/admin/portal-tasks').status_code == 403
     assert owner.post(f"/api/admin/instances/{inst['id']}/mark-submitted", json={}).status_code == 403
     assert owner.put('/api/admin/templates/' + t['template_id'], json={'name': '代改'}).status_code == 403
     assert owner.put('/api/admin/portal-tasks/' + t['template_id'], json={}).status_code in (404, 405)

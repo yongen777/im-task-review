@@ -101,6 +101,8 @@ export interface TemplateItem {
   /* 2026-11-12 晚 · 不定期任务（菜单自选）：无推送时刻/无截止，调度物理隔离——
      成员私聊回复【菜单】自主获取一次性填报链接（Pull 模式） */
   is_adhoc?: boolean;
+  is_manual?: boolean;
+  manual_deadline_at?: string | null;
   text_tpl: string;
   spec: TemplateSpec;
   enabled: boolean;

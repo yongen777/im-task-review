@@ -119,7 +119,9 @@ def create_portal_admin_router(state):
         if err is not None:
             return err
         admin = _admin_profile(state, sess)
-        if not _is_super_admin(admin) and platform not in (admin.get('allowed_platforms') or []):
+        if _is_super_admin(admin):
+            return JSONResponse({'message': '此面板仅限分级管理员使用'}, status_code=403)
+        if platform not in (admin.get('allowed_platforms') or []):
             return JSONResponse({'message': '无权访问该平台'}, status_code=403)
         return {'ok': True, 'items': [p.statistics(t) for t in p.tasks(owner=_owner_filter(admin, None), platform=platform)]}
 
@@ -129,8 +131,10 @@ def create_portal_admin_router(state):
         if err is not None:
             return err
         admin = _admin_profile(state, sess)
+        if _is_super_admin(admin):
+            return JSONResponse({'message': '此面板仅限分级管理员使用'}, status_code=403)
         task = p.template(task_id)
-        if not task or (not _is_super_admin(admin) and (task['owner_id'] != admin['id'] or task['platform'] not in (admin.get('allowed_platforms') or []))):
+        if not task or task['owner_id'] != admin['id'] or task['platform'] not in (admin.get('allowed_platforms') or []):
             return JSONResponse({'message': '无权查看'}, status_code=403)
         try:
             return attachment_response(state, task, ref, None)

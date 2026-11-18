@@ -193,6 +193,8 @@ function tplToMock(t: any): TemplateItem {
     deadline_time: t.deadline_time || null,
     /* 2026-11-12 晚 · 不定期任务（菜单自选）：此前同样漏映射，后台勾选保存/回显全部失效 */
     is_adhoc: !!t.is_adhoc,
+    is_manual: !!t.is_manual,
+    manual_deadline_at: t.manual_deadline_at || null,
     text_tpl: t.text_tpl || '',
     spec,
     enabled: t.enabled !== false,
@@ -281,6 +283,8 @@ function tplFromMock(t: any, partial = false) {
     if (t.deadline_time !== undefined) out.deadline_time = t.deadline_time || null;
     /* 2026-11-12 晚 · 不定期任务（菜单自选）：同层补齐 */
     if (t.is_adhoc !== undefined) out.is_adhoc = !!t.is_adhoc;
+    if (t.is_manual !== undefined) out.is_manual = !!t.is_manual;
+    if (t.manual_deadline_at !== undefined) out.manual_deadline_at = t.manual_deadline_at || null;
     if (t.notice_times !== undefined) out.notice_times = t.notice_times;
     if (t.text_tpl !== undefined || hasNoticeItems) out.text_tpl = text;
     if (t.enabled !== undefined) out.enabled = t.enabled !== false;
@@ -320,6 +324,8 @@ function tplFromMock(t: any, partial = false) {
   out.deadline_time = isNotice || !out.has_deadline ? null : (t.deadline_time || t.deadline || null);
   /* 2026-11-12 晚 · 不定期任务（菜单自选） */
   out.is_adhoc = !isNotice && !!t.is_adhoc;
+  out.is_manual = !!t.is_manual;
+  out.manual_deadline_at = t.manual_deadline_at || null;
   out.period = t.period || 'day';
   out.attach_image = attach;
   out.attach_image_path = t.attach_image_path || null;

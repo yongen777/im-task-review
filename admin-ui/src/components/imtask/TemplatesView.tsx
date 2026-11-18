@@ -103,15 +103,34 @@ function createDefaultNoticeItems(): NoticeMessageItem[] {
       format: 'text',
       text_content: '一、文字提醒：\n请按时完成本时段重点工作安排与点检。',
     },
-    {
-      id: `ni_${Date.now()}_2`,
-      format: 'file',
-      /* 2026-10-29：不再预填假文件名/假描述（「支局1+1155…截图.png」「二、数据提醒：…」）。
-         上传后自动带出真实原始文件名；描述是**必填**（保存时校验），所以这里留空等管理员填。 */
-      file_name: '',
-      file_caption: '',
-    },
   ];
+}
+
+function formatManualDeadline(value?: string | null): string {
+  if (!value) return '不限';
+  const [year, month, day] = value.slice(0, 10).split('-').map(Number);
+  return `${year}年${month}月${day}日 ${value.slice(11, 16)}`;
+}
+
+function NoticePhonePreview({ items }: { items: NoticeMessageItem[] }) {
+  const body = summarizeNoticeItemsToText(items).replace(/\\r\\n|\\n/g, '\n');
+  const images = items.filter(item => item.format === 'file' && item.image_path);
+  return <aside aria-label="量子密信通知预览" className="rounded-2xl border border-slate-200 bg-slate-50 overflow-hidden">
+    <h4 className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 text-sm font-semibold">
+      <Smartphone className="size-4 text-blue-700" />量子密信通知预览
+    </h4>
+    <div className="space-y-3 p-4">
+      {body && <p className="rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words">{body}</p>}
+      {images.map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+        <p>{item.file_caption?.trim() || '数据图片'}（点击查看）：</p>
+        <a className="text-blue-700 break-all hover:underline" target="_blank" rel="noreferrer"
+           href={`/api/admin/template-assets/${encodeURIComponent(item.image_path!.split('/').pop() || '')}`}>
+          打开图片预览
+        </a>
+      </div>)}
+      {!body && !images.length && <p className="text-slate-500">添加文本或图片后可预览。</p>}
+    </div>
+  </aside>;
 }
 
 function summarizeNoticeItemsToText(items: NoticeMessageItem[]): string {
@@ -138,6 +157,7 @@ function resolveUploadModules(tpl: TemplateItem): UploadH5Module[] {
 /* ================================================================== */
 interface UploadH5PreviewProps {
   isAdhoc: boolean;
+  isManual: boolean;
   taskName: string;
   remindAt: string;
   deadline: string;
@@ -186,6 +206,7 @@ export const formatDeadlineRuleLabel = (
 
 const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   isAdhoc,
+  isManual,
   taskName,
   remindAt,
   deadline,
@@ -200,7 +221,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   const step = isAdhoc ? 'h5' : previewStep;
   /* 截止时间展示：统一规则样式（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
    与实发消息里后端解析出的具体时间戳互补——预览层按用户选择的规则展示。 */
-  const deadlineText = deadline ? formatDeadlineRuleLabel(deadlineType, deadline) : '不限';
+  const deadlineText = isManual ? formatManualDeadline(deadline) : deadline ? formatDeadlineRuleLabel(deadlineType, deadline) : '不限';
 
   const displayTitle = taskName.trim() || '当日上门走访晒图与意向单报数';
   const displayRemindText =
@@ -243,7 +264,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
       <div className="bg-slate-100 rounded-2xl overflow-hidden text-slate-800 border-2 border-indigo-200/90 shadow-inner min-h-[410px] flex flex-col">
         {/* 手机顶部状态栏 */}
         <div className="bg-white px-4 py-2.5 border-b border-slate-200 flex items-center justify-between text-[11px]">
-          {!isAdhoc && <span className="font-mono font-bold text-slate-700">{remindAt || '16:30'}</span>}
+          {!isAdhoc && <span className="font-mono font-bold text-slate-700">{isManual ? '立即推送' : (remindAt || '16:30')}</span>}
           <span className="font-bold text-slate-900 truncate max-w-[180px]">
             {step === 'im' ? '办公软件 · 任务助手' : displayTitle}
           </span>
@@ -296,7 +317,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
               </div>
               {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
               <div className="text-[11px] text-slate-500">
-                提交人：张三{!isAdhoc && ` · 执行时间：${remindAt || '16:30'}`} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
+                提交人：张三{!isAdhoc && !isManual && ` · 执行时间：${remindAt || '16:30'}`} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
               </div>
             </div>
 
@@ -451,6 +472,7 @@ export const TemplatesView: React.FC = () => {
     setOwnerFilter,
     adminAccounts,
     setStatsFocus,
+    platform,
   } = useAppStore();
   const toast = useToast();
 
@@ -471,6 +493,9 @@ export const TemplatesView: React.FC = () => {
   // 弹窗表单状态（任务类型简化为两大类：'notice' 纯通知提醒 | 'upload' 上传任务）
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'notice' | 'upload'>('notice');
+  const [isManual, setIsManual] = useState(false);
+  const [manualDeadline, setManualDeadline] = useState('');
+  const hasPreview = kind === 'upload' || platform === 'zdxlz';
   /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null）。
      2026-11-02 用户口径：去掉「执行周期」下拉，只按这里选的星期几触发。 */
   const [execWeekdays, setExecWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
@@ -493,8 +518,7 @@ export const TemplatesView: React.FC = () => {
 
   // 纯通知提醒专用状态
   const [noticeItems, setNoticeItems] = useState<NoticeMessageItem[]>(createDefaultNoticeItems);
-  /** 正在上传数据图片的通知项下标（用于禁用按钮 + 显示上传中） */
-  const [uploadingAssetId, setUploadingAssetId] = useState<number | null>(null);
+  const [uploadingAssetId, setUploadingAssetId] = useState<string | null>(null);
 
   // 上传任务专用状态（提醒文本 + 选择 H5 上传项 [字段/文本/图片/文件] + 是否需要审核）
   const [uploadRemindText, setUploadRemindText] = useState(
@@ -584,6 +608,8 @@ export const TemplatesView: React.FC = () => {
     setName('');
     setKind(defaultKind);
     setIsAdhoc(false);
+    setIsManual(false);
+    setManualDeadline('');
     setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
     setExecMode('weekly');
     setExecDomDays([]);
@@ -615,6 +641,8 @@ export const TemplatesView: React.FC = () => {
     setEditingTpl(tpl);
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
+    setIsManual(Boolean(tpl.is_manual));
+    setManualDeadline(tpl.manual_deadline_at?.slice(0, 16).replace(' ', 'T') || '');
     /* 2026-11-12 晚 · 不定期任务回显：菜单模式（无推送时刻/无截止，界面禁用两项配置） */
     setIsAdhoc(Boolean(tpl.is_adhoc) && tpl.kind !== 'notice');
     /* 2026-10-29 执行日：null/空 = 每天 → 七天全上 */
@@ -716,41 +744,43 @@ export const TemplatesView: React.FC = () => {
     setNoticeItems((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  /* 2026-10-28：数据图片提醒改为「真上传」——图片先落到服务端 notice_attach/，
-     保存模板时把 image_path 一起提交，到点由调度器直接推送这张图。 */
-  const handleNoticeImageUpload = async (idx: number, file: File | null) => {
-    if (!file) return;
-    const okExt = /\.(png|jpg|jpeg|webp)$/i.test(file.name);
-    if (!okExt) {
-      toast.warning('数据图片提醒只支持 png / jpg / jpeg / webp 图片', '文件类型不支持');
+  const handleNoticeImageUpload = async (itemId: string, files: File[]) => {
+    if (!files.length || uploadingAssetId !== null) return;
+    if (files.some(file => !/\.(png|jpg|jpeg|webp)$/i.test(file.name))) {
+      toast.warning('仅支持 PNG、JPG、JPEG、WebP 图片', '文件类型不支持');
       return;
     }
-    if (file.size > 9 * 1024 * 1024) {
-      toast.warning('图片不能超过 9MB，请压缩后再上传', '图片过大');
+    if (files.some(file => file.size > 9 * 1024 * 1024)) {
+      toast.warning('每张图片不能超过 9MB，请压缩后再上传', '图片过大');
       return;
     }
-    setUploadingAssetId(idx);
+    setUploadingAssetId(itemId);
+    const uploaded: NoticeMessageItem[] = [];
     try {
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error('读取本地文件失败'));
-        reader.readAsDataURL(file);
-      });
-      const res = await api.post<{ ok: boolean; path: string; file_name: string; size: number }>(
-        '/api/admin/template-assets',
-        { filename: file.name, content_base64: dataUrl },
-      );
-      updateNoticeItem(idx, {
-        image_path: res.path,
-        file_name: res.file_name || file.name,
-        file_size: res.size || file.size,
-        file_mime: file.type,
-      });
-      toast.success(`已上传「${res.file_name || file.name}」，到点会随提醒一起推送。`, '图片已就绪');
+      for (const file of files) {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('读取本地文件失败'));
+          reader.readAsDataURL(file);
+        });
+        const res = await api.post<{ path: string; file_name: string; size: number }>(
+          '/api/admin/template-assets', { filename: file.name, content_base64: dataUrl },
+        );
+        const fileName = res.file_name || file.name;
+        uploaded.push({ id: res.path, format: 'file', image_path: res.path, file_name: fileName,
+          file_size: res.size || file.size, file_mime: file.type, file_caption: fileName.replace(/\.[^.]+$/, '') || fileName });
+      }
+      toast.success(`已上传 ${uploaded.length} 张图片`, '图片已就绪');
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '图片上传失败');
     } finally {
+      if (uploaded.length) {
+        const [first, ...rest] = uploaded;
+        setNoticeItems(previous => previous.flatMap(item => item.id === itemId
+          ? [{ ...first, id: item.id, file_caption: item.file_caption || first.file_caption }, ...rest]
+          : [item]));
+      }
       setUploadingAssetId(null);
     }
   };
@@ -802,17 +832,17 @@ export const TemplatesView: React.FC = () => {
       toast.warning('请填写任务模板名称');
       return;
     }
-    if (!isAdhoc && !remindAt.trim()) {
+    if (!isAdhoc && !isManual && !remindAt.trim()) {
       toast.warning('请填写执行时间');
       return;
     }
     /* 2026-10-29 执行日：必须至少选一天，否则永远不会执行（2026-11-02 起周期固定按周）*/
     /* 2026-11-10 月度模式：切换为「每月执行」时必须至少选一个日期 */
-    if (!isAdhoc && execMode === 'weekly' && execWeekdays.length === 0) {
+    if (!isAdhoc && !isManual && execMode === 'weekly' && execWeekdays.length === 0) {
       toast.warning('请至少选择一天「执行日」', '缺少执行日');
       return;
     }
-    if (!isAdhoc && execMode === 'monthly' && execDomDays.length === 0) {
+    if (!isAdhoc && !isManual && execMode === 'monthly' && execDomDays.length === 0) {
       toast.warning('每月执行至少选择一个日期（或点「每月月底」快捷）', '缺少执行日');
       return;
     }
@@ -860,7 +890,7 @@ export const TemplatesView: React.FC = () => {
       };
     } else {
       // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
-      if (!isAdhoc && hasDeadline && !deadlineTime.trim()) {
+      if (!isAdhoc && !isManual && hasDeadline && !deadlineTime.trim()) {
         toast.warning('请填写截止时刻');
         return;
       }
@@ -915,17 +945,19 @@ export const TemplatesView: React.FC = () => {
          无截止 → has_deadline=false（deadline/deadline_type/deadline_time 全空）；
          有截止 → deadline_type ∈ {same_day, weekend, month_end} + deadline_time（HH:MM）。
          旧列 deadline 同步存 deadline_time，保证未升级的读取链路一致。 */
-      const finalDeadline = kind === 'notice' || !hasDeadline ? '' : deadlineTime.trim();
-      const finalHasDeadline = kind !== 'notice' && hasDeadline && !isAdhoc;
+      const finalHasDeadline = kind !== 'notice' && hasDeadline && !isAdhoc && !isManual;
+      const finalDeadline = finalHasDeadline ? deadlineTime.trim() : '';
       const finalDeadlineType = finalHasDeadline ? deadlineType : null;
       const finalDeadlineTime = finalHasDeadline ? deadlineTime.trim() : null;
+      const manualConfig = { is_manual: isManual, manual_deadline_at: isManual && kind === 'upload' ? manualDeadline || null : null };
       if (editingTpl) {
         await api.put(`/api/admin/templates/${editingTpl.id}`, {
           name: name.trim(),
           role_id: roleIds[0],
           role_ids: roleIds,
-          remind_at: isAdhoc ? '' : remindAt.trim(),
+          remind_at: isAdhoc || isManual ? '' : remindAt.trim(),
           is_adhoc: kind !== 'notice' && isAdhoc,
+          ...manualConfig,
           deadline: finalDeadline,
           has_deadline: finalHasDeadline,
           deadline_type: finalDeadlineType,
@@ -936,15 +968,15 @@ export const TemplatesView: React.FC = () => {
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null
              2026-11-10：月度模式时 exec_dom_days 带选中几号（每周字段随 UI 状态一并提交，
              后端以 exec_dom_days 非空优先判定）；切回每周时显式 [] 清空月度 */
-          exec_weekdays: isAdhoc ? null : execWeekdays.length === 7 ? null : execWeekdays,
-          exec_dom_days: isAdhoc ? [] : execMode === 'monthly' ? execDomDays : [],
+          exec_weekdays: isAdhoc || isManual || execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: !isAdhoc && !isManual && execMode === 'monthly' ? execDomDays : [],
           /* 2026-10-28：审核开关以前只塞进 spec.require_review，后端读的是顶层 need_review，
              导致「需要审核」永远不生效、提交后直接变已完成。这里显式带上。 */
           need_review: kind === 'notice' ? false : requireReview,
           /* 通知类模板的每个提醒时刻都存在 notice_times，界面上只有一个「执行时间」输入框，
              必须显式映射过去，否则改了时间不会真的改发送时刻（后端对该类模板忽略 remind_at）。 */
           ...(kind === 'notice'
-            ? { notice_times: [remindAt.trim()], attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
+            ? { notice_times: isManual ? [] : [remindAt.trim()], attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
             : {}),
         });
         await refreshTemplates();
@@ -960,8 +992,9 @@ export const TemplatesView: React.FC = () => {
           period: 'day',
           role_id: roleIds[0],
           role_ids: roleIds,
-          remind_at: isAdhoc ? '' : remindAt.trim(),
+          remind_at: isAdhoc || isManual ? '' : remindAt.trim(),
           is_adhoc: kind !== 'notice' && isAdhoc,
+          ...manualConfig,
           deadline: finalDeadline,
           has_deadline: finalHasDeadline,
           deadline_type: finalDeadlineType,
@@ -970,8 +1003,8 @@ export const TemplatesView: React.FC = () => {
           spec,
           enabled,
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
-          exec_weekdays: isAdhoc ? null : execWeekdays.length === 7 ? null : execWeekdays,
-          exec_dom_days: isAdhoc ? [] : execMode === 'monthly' ? execDomDays : [],
+          exec_weekdays: isAdhoc || isManual || execWeekdays.length === 7 ? null : execWeekdays,
+          exec_dom_days: !isAdhoc && !isManual && execMode === 'monthly' ? execDomDays : [],
           need_review: kind === 'notice' ? false : requireReview,
           ...(kind === 'notice'
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
@@ -1230,7 +1263,9 @@ export const TemplatesView: React.FC = () => {
 
                       {/* 4. 执行时间 */}
                       <td className="py-4 px-3 whitespace-nowrap">
-                        {tpl.is_adhoc && !isNotice ? (
+                        {tpl.is_manual ? (
+                          <span className="font-semibold text-blue-700">立即推送</span>
+                        ) : tpl.is_adhoc && !isNotice ? (
                           /* 不定期任务无推送时刻（调度物理隔离） */
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-violet-50/80 text-violet-700 border border-violet-200/70 font-mono text-xs font-bold">
                             <Clock className="w-3.5 h-3.5 shrink-0" />
@@ -1391,7 +1426,7 @@ export const TemplatesView: React.FC = () => {
                               {/* 2026-11-12 下午（用户拍板）：截止展示统一**规则样式**——
                                   本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限（与预览、H5 徽章一字不差） */}
                               {(() => {
-                                const dlLabel = formatDeadlineRuleLabel(
+                                const dlLabel = tpl.is_manual ? formatManualDeadline(tpl.manual_deadline_at) : formatDeadlineRuleLabel(
                                   tpl.has_deadline === false ? null : (tpl.deadline_type ?? 'same_day'),
                                   tpl.deadline_time || tpl.deadline || '',
                                 );
@@ -1475,19 +1510,19 @@ export const TemplatesView: React.FC = () => {
                               </button>
                             )}
                             {/* 2026-11-12 任务D：一键推送（上传任务专属；notice 按时刻自动发）。 */}
-                            {tpl.kind !== 'notice' && !tpl.is_adhoc && (
+                            {(tpl.is_manual || (tpl.kind !== 'notice' && !tpl.is_adhoc)) && (
                               <button
                                 onClick={() => setPushConfirmTpl(tpl)}
                                 disabled={!tpl.enabled || busyId === tpl.id || pushingId === tpl.id}
                                 title={
                                   tpl.enabled
-                                    ? '立即向待提交成员推送一条提醒（测试用；不影响当期定时提醒，同模板 2 分钟内不可重复推送）'
+                                    ? (tpl.is_manual ? '立即向当前符合资格的成员发送一次' : '手动推送当期提醒，同模板 2 分钟内不可重复推送')
                                     : '模板已停用，请先启用再推送'
                                 }
                                 className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
                               >
                                 <Send className="w-3.5 h-3.5 shrink-0" />
-                                <span>{pushingId === tpl.id ? '推送中…' : '推送'}</span>
+                                <span>{pushingId === tpl.id ? '推送中…' : tpl.is_manual ? '一键推送' : '推送'}</span>
                               </button>
                             )}
                             <button
@@ -1522,7 +1557,7 @@ export const TemplatesView: React.FC = () => {
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div
             className={`bg-white rounded-2xl w-full p-6 shadow-2xl border border-slate-200 my-8 space-y-4 max-h-[92vh] overflow-y-auto transition-all ${
-              kind === 'upload' ? 'max-w-5xl' : 'max-w-2xl'
+              hasPreview ? 'max-w-5xl' : 'max-w-2xl'
             }`}
           >
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -1535,8 +1570,9 @@ export const TemplatesView: React.FC = () => {
                     {editingTpl ? `编辑任务模板 · ${editingTpl.name}` : '新建任务模板'}
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    {kind === 'notice'
-                      ? '纯通知提醒模式：到点向角色成员发送文本或文件/图片通知'
+                    {isManual ? '保存后在任务模板列表点击「一键推送」。'
+                      : kind === 'notice'
+                      ? '到达执行时间后，向角色成员发送文本或图片提醒。'
                       : isAdhoc ? '成员可在个人工作台随时发起上报。'
                         : '到达执行时间后，向接收成员发送提醒和专属 H5 提交链接。'}
                   </p>
@@ -1553,11 +1589,11 @@ export const TemplatesView: React.FC = () => {
             <form onSubmit={handleSaveTemplate} className="space-y-4 text-xs">
               <div
                 className={`grid grid-cols-1 ${
-                  kind === 'upload' ? 'lg:grid-cols-12 gap-6' : 'gap-4'
+                  hasPreview ? 'lg:grid-cols-12 gap-6' : 'gap-4'
                 } items-start`}
               >
                 {/* 左侧表单配置区 */}
-                <div className={kind === 'upload' ? 'lg:col-span-7 space-y-4' : 'space-y-4'}>
+                <div className={hasPreview ? 'lg:col-span-7 space-y-4' : 'space-y-4'}>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
                     <div className="sm:col-span-2">
                       <label className="font-semibold text-slate-700 block mb-1">
@@ -1674,8 +1710,20 @@ export const TemplatesView: React.FC = () => {
                       </select>
                     </div>
 
-                    {/* 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式开关（仅上传任务可勾） */}
-                    {kind === 'upload' && (
+                    <label className="font-semibold text-slate-700 sm:col-span-2">
+                      推送方式
+                      <select value={isManual ? 'manual' : 'scheduled'} disabled={Boolean(editingTpl)}
+                        onChange={(event) => {
+                          setIsManual(event.target.value === 'manual');
+                          if (event.target.value === 'manual') setIsAdhoc(false);
+                        }}
+                        className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-slate-800 disabled:opacity-70">
+                        <option value="scheduled">定时推送</option>
+                        <option value="manual">立即推送</option>
+                      </select>
+                    </label>
+
+                    {kind === 'upload' && !isManual && (
                       <div className="sm:col-span-2 -mt-1">
                         <label
                           className={`inline-flex items-start gap-2 rounded-xl border px-3 py-2 cursor-pointer transition-colors ${
@@ -1702,7 +1750,7 @@ export const TemplatesView: React.FC = () => {
 
                     {/* 2026-11-02 用户口径：去掉「执行周期」概念 —— 管理员只选星期几，固定在每周选中的那几天触发 */}
                     {/* 2026-11-10 双模式：每周（周几）/ 每月（几号）；月底=31（调度自动适配小月/闰年） */}
-                    {!isAdhoc && <>
+                    {!isAdhoc && !isManual && <>
                     <div>
                       <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
                         <span>执行日</span>
@@ -1897,6 +1945,13 @@ export const TemplatesView: React.FC = () => {
                     )}
 
                     </>}
+                    {isManual && kind === 'upload' && (
+                      <label className="font-semibold text-slate-700 sm:col-span-2">
+                        截止日期和时刻（留空不限）
+                        <input type="datetime-local" value={manualDeadline} onChange={(event) => setManualDeadline(event.target.value)}
+                          className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 font-mono text-slate-800" />
+                      </label>
+                    )}
                     {/* 立即启用自动调度（重排版：独占一行，与上方字段左对齐） */}
                     <div className="sm:col-span-2 pt-1">
                       <label className="inline-flex items-center gap-2 cursor-pointer select-none">
@@ -1906,7 +1961,7 @@ export const TemplatesView: React.FC = () => {
                           onChange={(e) => setEnabled(e.target.checked)}
                           className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500"
                         />
-                        <span className="font-semibold text-slate-800">{isAdhoc ? '在个人工作台开放自主上报' : '立即启用自动调度'}</span>
+                        <span className="font-semibold text-slate-800">{isAdhoc ? '在个人工作台开放自主上报' : isManual ? '启用一键推送' : '立即启用自动调度'}</span>
                       </label>
                     </div>
                   </div>
@@ -1917,7 +1972,7 @@ export const TemplatesView: React.FC = () => {
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <label className="font-bold text-slate-800 flex items-center gap-1.5">
                           <Layers className="w-4 h-4 text-blue-600" />
-                          <span>办公软件提醒内容配置（支持同时间多条并列下发）</span>
+                          <span>提醒内容</span>
                           <span className="text-rose-500">*</span>
                         </label>
                         <div className="flex items-center gap-1.5">
@@ -1935,7 +1990,7 @@ export const TemplatesView: React.FC = () => {
                             className="px-2.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-semibold text-[11px] inline-flex items-center gap-1 cursor-pointer"
                           >
                             <Plus className="w-3.5 h-3.5" />
-                            <span>新增文件/图片提醒</span>
+                            <span>新增图片提醒</span>
                           </button>
                         </div>
                       </div>
@@ -1974,7 +2029,7 @@ export const TemplatesView: React.FC = () => {
                                     }`}
                                   >
                                     <ImageIcon className="w-3 h-3" />
-                                    <span>文件（含图片）</span>
+                                    <span>图片</span>
                                   </button>
                                 </div>
                               </div>
@@ -2007,20 +2062,21 @@ export const TemplatesView: React.FC = () => {
                                 <div className="flex flex-wrap items-center gap-2">
                                   <label
                                     className={`px-3.5 py-2 rounded-xl font-semibold text-[11px] inline-flex items-center justify-center gap-1.5 shrink-0 ${
-                                      uploadingAssetId === idx
+                                      uploadingAssetId === item.id
                                         ? 'bg-slate-300 text-white cursor-wait'
                                         : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
                                     }`}
                                   >
                                     <Upload className="w-3.5 h-3.5" />
-                                    <span>{uploadingAssetId === idx ? '上传中…' : item.image_path ? '重新上传图片' : '上传数据提醒图片'}</span>
+                                    <span>{uploadingAssetId === item.id ? '上传中…' : item.image_path ? '替换图片' : '选择图片（可多选）'}</span>
                                     <input
                                       type="file"
                                       accept="image/png,image/jpeg,image/webp"
+                                      multiple
                                       className="hidden"
-                                      disabled={uploadingAssetId === idx}
+                                      disabled={uploadingAssetId !== null}
                                       onChange={(e) => {
-                                        void handleNoticeImageUpload(idx, e.target.files?.[0] || null);
+                                        void handleNoticeImageUpload(item.id, Array.from(e.target.files || []));
                                         e.currentTarget.value = '';
                                       }}
                                     />
@@ -2042,7 +2098,7 @@ export const TemplatesView: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="text-[11px] text-slate-500 leading-relaxed">
-                                  到点会把这张图随提醒发给成员（企业微信直接发图片消息，量子密信发可点开的图片链接），请填写图片名称（如「上午上门情况统计图」），成员看到的就是这张图。
+                                  {platform === 'zdxlz' ? '量子密信会逐张发送图片查看链接。' : '企业微信会逐张发送图片消息。'}
                                 </div>
                                 {item.image_path ? (
                                   <div className="space-y-1.5">
@@ -2236,9 +2292,10 @@ export const TemplatesView: React.FC = () => {
                   <div className="lg:col-span-5">
                     <UploadFlowPhonePreview
                       isAdhoc={isAdhoc}
+                      isManual={isManual}
                       taskName={name}
                       remindAt={remindAt}
-                      deadline={hasDeadline ? deadlineTime : ''}
+                      deadline={isManual ? manualDeadline : hasDeadline ? deadlineTime : ''}
                       deadlineType={hasDeadline ? deadlineType : null}
                       remindText={uploadRemindText}
                       modules={uploadModules}
@@ -2247,6 +2304,9 @@ export const TemplatesView: React.FC = () => {
                       textPlaceholder={textPlaceholder}
                     />
                   </div>
+                )}
+                {kind === 'notice' && platform === 'zdxlz' && (
+                  <div className="lg:col-span-5"><NoticePhonePreview items={noticeItems} /></div>
                 )}
               </div>
 
@@ -2260,7 +2320,7 @@ export const TemplatesView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  disabled={saving}
+                  disabled={saving || uploadingAssetId !== null}
                   className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
                 >
                   {saving ? '正在保存…' : editingTpl ? '保存修改' : '确认创建'}
@@ -2320,13 +2380,15 @@ export const TemplatesView: React.FC = () => {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
+            {pushConfirmTpl.is_manual ? <p className="text-xs text-slate-600 leading-relaxed">
+              将立即向模板「{pushConfirmTpl.name}」中符合资格且尚未推送的成员发送{pushConfirmTpl.kind === 'notice' ? '通知' : '填报提醒'}。
+            </p> : <p className="text-xs text-slate-600 leading-relaxed">
               将立即向模板「
               <span className="font-bold text-slate-900">{pushConfirmTpl.name}</span>
               」当前<b>待提交</b>的成员各推送一条提醒（内容与定时提醒一致）。
               <br />
               此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 2 分钟内不可重复推送。
-            </p>
+            </p>}
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setPushConfirmTpl(null)}
