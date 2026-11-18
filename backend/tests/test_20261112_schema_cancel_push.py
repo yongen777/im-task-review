@@ -11,7 +11,7 @@ B —— 上传任务 schema_json 改可选：
 C —— 成员移除后未完成实例作废（新状态 cancelled）：
     图二实锤：人已移出「测试」角色，17:14 生成的实例还挂着待上传。修复：移除时未完成
     实例（pending/overdue/rejected）标 cancelled（留痕可审计、不再提醒/流转/可提交）；
-    已完成实例（submitted/sent/approved/expired）保持 11-09「移除删干净」口径。
+    已完成实例（submitted/sent/approved/expired）与提交保留。
 
 D —— 上传任务一键推送（创建者分级管理员专属）：
     用户拍板原话：9 点推送和 10 点定时各发一条一模一样的提醒（测试用按钮，管理员自行
@@ -227,8 +227,8 @@ def test_b_submit_skips_field_validation_when_fields_not_rendered() -> None:
 
 # ═══════════════════ C：移除作废（cancelled）═══════════════════
 
-def test_c_remove_member_cancels_open_and_deletes_done() -> None:
-    """移除成员：未完成实例 → cancelled（留痕）；已完成实例 → 删除（11-09 口径保持）。"""
+def test_c_remove_member_cancels_open_and_preserves_done() -> None:
+    """移除成员：未完成实例 → cancelled（留痕）；已完成实例与提交保留。"""
     store = _store()
     try:
         store.upsert_admin_user("admin", "Admin@2026", must_change=False)
@@ -249,8 +249,9 @@ def test_c_remove_member_cancels_open_and_deletes_done() -> None:
 
         store.delete_role_member(rid, PHONE_A, actor="t")
 
-        # 已完成 → 删干净（历史口径不回归）
-        assert store.get_instance(i_today[0]["id"]) is None
+        # 已完成实例和提交必须保留。
+        assert store.get_instance(i_today[0]["id"])["status"] == "approved"
+        assert len(store.list_submissions_for_instance(i_today[0]["id"])) == 1
         # 未完成 → cancelled 留痕
         kept = store.get_instance(i_next[0]["id"])
         assert kept is not None and kept["status"] == "cancelled", (kept or {}).get("status")
@@ -261,7 +262,7 @@ def test_c_remove_member_cancels_open_and_deletes_done() -> None:
         assert audit is not None
         import json as _json
         detail = _json.loads(audit["detail"])
-        assert detail.get("removed_instances") == 1 and detail.get("cancelled_instances") == 1, detail
+        assert detail.get("removed_instances") == 0 and detail.get("cancelled_instances") == 1, detail
     finally:
         store.close()
 

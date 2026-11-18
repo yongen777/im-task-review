@@ -744,6 +744,21 @@ class Scheduler:
             "now_s": now_s,
         }
 
+    def _instance_still_deliverable(self, instance_id: int, kind: str) -> bool:
+        instance = self.state.get_instance(instance_id)
+        if not instance:
+            return False
+        statuses = {
+            "notice": ("pending", "sent"),
+            "remind": ("pending",),
+            "overdue": ("overdue",),
+            "manual_push": ("pending", "overdue", "rejected", "submitted", "approved"),
+        }
+        if instance["status"] not in statuses[kind]:
+            return False
+        template = self.state.get_template(instance["template_id"])
+        return self.state.instance_close_reason(instance, template) is None
+
     def _record_delivery(self, task: Dict[str, Any], send_res: Optional[SendResult], stats: Dict[str, int]) -> bool:
         """主线程记账（worker 纯网络 IO，DB 全部回主线程串行写）。返回是否真的发出。"""
         ok = bool(send_res is not None and send_res.ok)
@@ -753,7 +768,9 @@ class Scheduler:
             sent_at=task["now_s"] if ok else None, result=send_res.result if send_res else "failed",
             retry=task["retry_no"], error=send_res.error if send_res else "CIRCUIT_OPEN", idem_key=task["idem_key"],
         )
-        if ok:
+        if send_res is not None and send_res.result == "skipped":
+            stats["skipped"] += 1
+        elif ok:
             stats["sent"] += 1
         else:
             stats["failed"] += 1
@@ -786,6 +803,10 @@ class Scheduler:
                 return None
             # 令牌桶挡在**真实网络发送前**（worker 侧全局限流；主线程只负责喂任务不阻塞）
             bucket.acquire()
+            if (task.get("instance_id") is not None
+                    and task["kind"] in ("notice", "remind", "overdue", "manual_push")
+                    and not self._instance_still_deliverable(int(task["instance_id"]), task["kind"])):
+                return SendResult(ok=False, result="skipped", error="TASK_CLOSED")
             return task["send_fn"](task["external_id"], task["msg_text"], task["idem_key"])
 
         results: List[Optional[Tuple[Dict[str, Any], Optional[SendResult]]]] = [None] * len(tasks)
@@ -801,7 +822,7 @@ class Scheduler:
                     breaker.record_success()
                 elif res is None and breaker.is_open():
                     breaker.record_failure()  # 熔断开启后的剩余任务按失败记账（保持节奏统计）
-                elif res is not None and not res.ok:
+                elif res is not None and not res.ok and res.result != "skipped":
                     breaker.record_failure()
                 results[idx] = (tasks[idx], res)
 
@@ -1092,6 +1113,9 @@ class Scheduler:
                 before_cnt = len(self.state.list_instances_for_period(tpl["template_id"], p_key))
                 instances = self.state.ensure_template_instances(tpl["template_id"], p_key, notice_deadline)
                 stats["generated_instances"] += max(0, len(instances) - before_cnt)
+                enabled_phones = {member["phone"] for member in members}
+                instances = [inst for inst in instances if inst["phone"] in enabled_phones
+                             and inst["status"] in ("pending", "sent")]
 
                 for seq_idx, nt_hhmm in enumerate(tpl.get("notice_times") or [], start=1):
                     planned_dt = self._build_planned_dt(cur_dt, nt_hhmm)
@@ -1231,6 +1255,8 @@ class Scheduler:
                             if pending:
                                 link_url: Optional[str] = None
                                 for inst, ext_id, ext_type, nt, platform, idem_link, idem_media in pending:
+                                    if not self._instance_still_deliverable(int(inst["id"]), "notice"):
+                                        continue
                                     handled = False
                                     # 2026-11-03：量子密信永远不发原生图片（手机端点不开，10-29 实测口径），
                                     # 直接走 H5 链接。此前密信侧 send_image 签名不匹配，每次靠 TypeError

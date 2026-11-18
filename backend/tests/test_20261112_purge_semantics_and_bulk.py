@@ -71,15 +71,13 @@ def _add_member(store: StateStore, rid: str, phone: str, *, dept: str = "测试�
 def _inst_rows(store: StateStore, tid: str) -> list:
     with store.lock:
         return [dict(r) for r in store.conn.execute(
-            "SELECT id, phone, status FROM task_instance WHERE template_id = ? ORDER BY phone", (tid,)).fetchall()]
+            "SELECT id, phone, status, period_key FROM task_instance WHERE template_id = ? ORDER BY phone", (tid,)).fetchall()]
 
 
-# ════════════════════ P1：模板编辑移除角色 → 实例物理删除 ════════════════════
+# ════════════════════ P1：模板编辑移除角色 → 取消未完成并保留历史 ════════════════════
 
-def test_p1_tpl_remove_role_purges_orphan_member_instances() -> None:
-    """图一 bug 主用例：模板从 [测试, A组] 改 [测试] ——
-    只属于 A组 的成员：实例（未完成+已完成）、提交、令牌全部物理删除；
-    还挂在 测试 组的人（一人多角色）：实例原样保留。"""
+def test_p1_tpl_remove_role_cancels_only_orphan_open_instances() -> None:
+    """移除关联角色时，仅取消已失去派单资格的未完成实例。"""
     store = _store()
     try:
         r_test = _seed(store, "测试", "17313771297")          # 角色测试：郑佳 17313771297
@@ -119,24 +117,13 @@ def test_p1_tpl_remove_role_purges_orphan_member_instances() -> None:
         store.update_template(tpl["template_id"], {"role_ids": [r_test]}, actor="t")
 
         rows = _inst_rows(store, tpl["template_id"])
-        phones = [r["phone"] for r in rows]
-        # 只有 2002 的没了（含上一周期已完成实例）；郑佳与 双角色3003 保留
-        assert "13900002002" not in phones, f"A组成员实例未清：{rows}"
-        assert "17313771297" in phones and "13900003003" in phones, rows
-        with store.lock:
-            left_submission = store.conn.execute(
-                "SELECT COUNT(1) FROM submission WHERE instance_id NOT IN (SELECT id FROM task_instance)").fetchone()[0]
-            # 2026-11-12 下午（四-4）：被移除成员的 h5_token 行**保留**作 tombstone，
-            # 旧链接点开统一提示「任务已关闭」（不再是无效令牌）
-            left_token = store.conn.execute(
-                "SELECT COUNT(1) FROM h5_token WHERE instance_id NOT IN (SELECT id FROM task_instance)").fetchone()[0]
-        assert int(left_submission) == 0, "被删实例的提交残留"
-        assert int(left_token) >= 1, "被移除成员的令牌必须保留作「任务已关闭」识别"
-        with store.lock:
-            purged = store.conn.execute(
-                "SELECT COUNT(1) FROM task_instance WHERE template_id=? AND phone='13900002002'",
-                (tpl["template_id"],)).fetchone()[0]
-        assert purged == 0, "A组成员（含已完成）实例必须物理删除"
+        by_key = {(r["phone"], r["period_key"]): r for r in rows}
+        assert by_key[("13900002002", pkey)]["status"] == "cancelled"
+        assert by_key[("13900002002", "2026-11-11")]["status"] == "approved"
+        assert by_key[("13900003003", pkey)]["status"] == "pending"
+        assert len(store.list_submissions_for_instance(_i2002["id"])) == 1
+        assert store.conn.execute("SELECT COUNT(1) FROM h5_token WHERE instance_id=?",
+                                  (_i2002["id"],)).fetchone()[0] == 1
     finally:
         store.close()
 

@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from datetime import timedelta
+from io import BytesIO
 from urllib.request import ProxyHandler, build_opener
 import webbrowser
 
@@ -19,10 +20,17 @@ LOOPBACK = "127.0.0.1"
 DB_NAME = "im_task_test"
 DEMO_USER = "imt_local_preview"
 DEMO_MEMBERS = (
-    ("13900009761", "周宁（演示）", "网络运营部", "preview-root"),
+    ("13900009761", "周宁（演示）", "网络运营部", "preview-network"),
     ("13900009762", "李青（演示）", "交换维护组", "preview-switch"),
-    ("13900009763", "陈明（演示）", "交换维护组", "preview-switch"),
+    ("13900009763", "陈明（演示）", "服务保障部", "preview-service"),
+    ("13900009764", "许文（演示）", "交换维护组", "preview-switch"),
 )
+DEMO_DEPARTMENTS = {
+    "preview-root": ("本地演示组织", None),
+    "preview-network": ("网络运营部", "preview-root"),
+    "preview-switch": ("交换维护组", "preview-network"),
+    "preview-service": ("服务保障部", "preview-root"),
+}
 H5_FILES = {"portal": "portal.html", "task": "task.html", "image": "image.html"}
 
 
@@ -56,13 +64,15 @@ def isolate_network():
 
 class DemoDirectory:
     def get_department(self, dept_id):
-        for key, name in (("preview-root", "网络运营部"), ("preview-switch", "交换维护组")):
-            if dept_id == key:
-                return {"dept_id": key, "name": name, "user_count": 2, "full_name": name}
-        return None
+        if dept_id not in DEMO_DEPARTMENTS:
+            return None
+        name, parent = DEMO_DEPARTMENTS[dept_id]
+        path = self.get_department(parent)["full_name"] + "/" + name if parent else name
+        return {"dept_id": dept_id, "name": name, "full_name": path,
+                "user_count": len(self.dept_users_all(dept_id))}
 
     def department_children(self, dept_id):
-        return [self.get_department("preview-switch")] if dept_id == "preview-root" else []
+        return [self.get_department(key) for key, (_, parent) in DEMO_DEPARTMENTS.items() if parent == dept_id]
 
     def dept_users_all(self, dept_id):
         return [
@@ -73,70 +83,175 @@ class DemoDirectory:
     def search_by_phone_strict(self, phone):
         for number, name, dept, dept_id in DEMO_MEMBERS:
             if number == phone:
-                path = dept if dept_id == "preview-root" else "网络运营部/" + dept
+                path = self.get_department(dept_id)["full_name"]
                 return "ok", {"name": name, "department": dept, "dept_path": path,
                               "union_id": "local-preview-" + phone}
         return "ok", None
 
 
-def seed(store, scheduler, password):
+def demo_files():
+    from PIL import Image, ImageDraw
+
+    drawing = Image.new("RGB", (800, 480), "#eef2f5")
+    pen = ImageDraw.Draw(drawing)
+    pen.text((48, 48), "IMTask / Equipment inspection / Demo", fill="#172e43")
+    for row in range(5):
+        y = 104 + row * 60
+        pen.rounded_rectangle((48, y, 752, y + 42), radius=4, fill="#244c6a")
+        for led in range(6):
+            x = 552 + led * 24
+            pen.ellipse((x, y + 16, x + 8, y + 24), fill="#a3e8b3")
+    png, pdf = BytesIO(), BytesIO()
+    drawing.save(png, format="PNG")
+    drawing.save(pdf, format="PDF")
+    return "机柜巡检照片.png", png.getvalue(), "交接明细.pdf", pdf.getvalue()
+
+
+def seed(store, password):
+    from app.api.h5 import prepare_task_upload, process_h5_task_upload, task_upload_limits
     from app.config import format_dt
-    from app.portal import PortalService, run_portal_tasks
+    from app.portal import PortalService
+    from app.scheduler import period_key
 
     account = store.get_admin_by_username(DEMO_USER)
     if not account:
         account = store.create_admin_account(DEMO_USER, "本地演示管理员", ["zdxlz"], password=password)
     owner = account["id"]
     store.change_admin_password(owner, password)
-    role_name = "本地预览 · 交换值守"
-    roles = store.list_roles(platform="zdxlz", owner_id=owner)
-    role = next((item for item in roles if item["name"] == role_name), None)
-    role = role or store.create_role(role_name, owner_id=owner)
-    role_id = role["role_id"]
-    registered = store.role_member_phones(role_id)
-    for phone, name, _, _ in DEMO_MEMBERS:
-        if phone not in registered:
-            store.add_role_member(role_id, phone, name, owner_id=owner)
-        store.upsert_delivery_target(phone, "local-preview-" + phone, platform="zdxlz")
+    roles = {item["name"]: item for item in store.list_roles(platform="zdxlz", owner_id=owner)}
 
-    phone, name, dept, _ = DEMO_MEMBERS[0]
-    ident = {"phone": phone, "platform": "zdxlz"}
+    def role(title, members):
+        row = roles.get(title) or store.create_role(title, owner_id=owner)
+        rid = row["role_id"]
+        registered = store.role_member_phones(rid)
+        for phone, name, _, _ in members:
+            if phone not in registered:
+                store.add_role_member(rid, phone, name, owner_id=owner)
+            store.upsert_delivery_target(phone, "local-preview-" + phone, platform="zdxlz")
+        return rid
+
+    role_id = role("本地预览 · 交换值守", DEMO_MEMBERS)
+    cross_role = role("本地预览 · 跨组联查", [DEMO_MEMBERS[0], DEMO_MEMBERS[2]])
+    leader, employee, cross, standby = DEMO_MEMBERS
+    ident = {"phone": leader[0], "platform": "zdxlz"}
     portal = PortalService(store)
-    portal.save_grant("zdxlz", owner, phone, {
-        "enabled": True, "dept_ids": ["preview-root"], "role_ids": [role_id],
+    grants = portal.grant_options("zdxlz", owner, leader[0])
+    portal.save_grant("zdxlz", owner, leader[0], {
+        "enabled": True, "dept_ids": [*grants["default_dept_ids"], "preview-service"], "role_ids": [cross_role],
     }, DEMO_USER)
     templates = {item["name"]: item for item in store.list_templates(owner_id=owner, size=100)["items"]}
     now = store.now()
-    deadline = format_dt(now + timedelta(days=7))
+    today, yesterday = period_key("day", now), period_key("day", now - timedelta(days=1))
+    deadline = format_dt(now + timedelta(days=2))
+    past_deadline = format_dt(now - timedelta(hours=2))
     run_id = secrets.token_hex(8)
-    task_url = None
-    for title, description, modules, adhoc in (
-        ("光交箱巡检回报", "检查箱门、标签和周边环境，填写说明并上传现场图。", ["text", "image"], False),
-        ("值班交接记录", "记录未结事项和下一班需要跟进的工作。", ["text"], False),
-        ("机房环境异常上报", "记录异常位置、时间与现场情况。", ["text"], True),
-        ("交换设备隐患上报", "描述异常设备及受影响范围。", ["text", "image"], True),
-    ):
-        template = templates.get(title) or store.create_template({
-            "name": title, "text_tpl": description, "role_ids": [role_id], "kind": "form",
-            "period": "day", "remind_at": "08:00", "has_deadline": False,
-            "schema_json": [], "allow_note": True, "is_adhoc": adhoc,
-            "spec_json": {"upload_modules": modules},
-        }, owner_id=owner)
-        if not adhoc:
-            inst = store.ensure_instance(template["template_id"], phone, name, dept, "preview-" + run_id, deadline)
-            task_url = task_url or portal.task_link(ident, inst["id"])["url"]
+    upload_dir = store.data_dir / "uploads"
+    image_name, image, pdf_name, pdf = demo_files()
+    schema = [
+        {"key": "qty", "label": "核查设备数", "type": "number", "required": True},
+        {"key": "position", "label": "设备位置", "type": "text"},
+        {"key": "date", "label": "巡检日期", "type": "date"},
+        {"key": "normal", "label": "设备是否正常", "type": "boolean"},
+        {"key": "shift", "label": "班次", "type": "select", "options": ["早班", "中班", "晚班"]},
+    ]
+    fields = {"qty": 6, "position": "机房 A 区第 3 排", "date": today, "normal": True, "shift": "晚班"}
 
-    published = portal.create_task(ident, {
-        "name": "晚班交换设备巡检", "description": "核对机房设备状态并回报现场情况。",
-        "phones": [member[0] for member in DEMO_MEMBERS], "mode": "once",
-        "deadline_at": deadline, "request_id": "preview-" + run_id, "upload_modules": ["text"],
-    })
-    run_portal_tasks(scheduler, now)
-    for row in store.list_instances_for_period(published["task_id"], "once"):
-        if row["phone"] == DEMO_MEMBERS[1][0]:
-            raw = portal.task_link({"phone": row["phone"], "platform": "zdxlz"}, row["id"])["url"].split("#t=")[1]
-            store.submit_h5_task(raw_token=raw, note="交换机运行正常，机柜温度 24°C。")
-    return owner, "/h5/portal#t=" + portal.issue(phone, "zdxlz"), task_url
+    def template(title, description, modules, *, review=False, adhoc=False):
+        # Keep earlier local runs intact while still creating fresh states on restart.
+        name = title if title not in templates else f"{title} · {now:%H%M%S}"
+        row = store.create_template({
+            "name": name, "text_tpl": description, "role_ids": [role_id], "kind": "form",
+            "period": "day", "remind_at": "08:00", "has_deadline": False,
+            "schema_json": schema if "fields" in modules else [], "allow_note": True,
+            "is_adhoc": adhoc, "need_review": review, "spec": {"upload_modules": modules},
+        }, owner_id=owner)
+        return row["template_id"]
+
+    def create_instance(tid, member, *, period=today, due=deadline):
+        return store.ensure_instance(tid, member[0], member[1], member[2], period, due)
+
+    def token(row):
+        return store.issue_h5_token(row["phone"], row["template_id"], row["period_key"], row["id"], ttl_hours=168)
+
+    def submit(row, *, data=None, note, attachments=(), raw=None):
+        raw = raw or token(row)
+        refs = []
+        for name, content in attachments:
+            code, uploaded = process_h5_task_upload(state=store, uploads_dir=upload_dir,
+                                                    raw_token=raw, filename=name, content_bytes=content)
+            if code != 200:
+                raise RuntimeError(f"演示附件写入失败：{uploaded}")
+            refs.append(uploaded["ref"])
+        store.submit_h5_task(raw_token=raw, fields=data, note=note, refs=refs)
+        return raw
+
+    broad = template("光交箱巡检回报", "核对设备数量、机柜状态，附现场图及交接明细。", ["fields", "text", "image", "file"])
+    review = template("值班交接记录", "登记未结事项，交由班长确认。", ["text", "image"], review=True)
+    late = template("逾期演示 · 机房温湿度", "示例：此任务已经截止。", ["text"])
+    adhoc_text = template("机房环境异常上报", "描述环境异常位置及情况。", ["text"], adhoc=True)
+    adhoc_image = template("交换设备隐患上报", "填写设备情况并拍照。", ["text", "image"], adhoc=True)
+
+    pending = token(create_instance(broad, leader))
+    completed = submit(create_instance(broad, employee), data=fields,
+                       note="设备运行正常。巡检记录和交接明细已附。", attachments=[(image_name, image), (pdf_name, pdf)])
+    delegated = create_instance(broad, cross)
+    with BytesIO(image) as stream:
+        upload = prepare_task_upload(stream, len(image), task_upload_limits(store.get_template(broad), image_name))
+        store.manual_mark_submitted(delegated["id"], owner, DEMO_USER, uploads_dir=upload_dir,
+                                    fields=fields, note="管理员代交，现场回执已核对。", uploads=(upload,))
+    delegated_token = token(delegated)
+
+    awaiting = submit(create_instance(review, employee), note="晚班交接已记录，等待审核。", attachments=[(image_name, image)])
+    needs_retry = create_instance(review, leader)
+    submit(needs_retry, note="交接初稿。", attachments=[(image_name, image)])
+    store.review_instance(needs_retry["id"], "reject", DEMO_USER, "请补充巡检点位和处理时间。")
+    rejected = token(needs_retry)
+    overdue = token(create_instance(late, leader, due=past_deadline))
+
+    # An earlier completed ad hoc item and a fresh one exercise history and live cooldown.
+    original_clock = store._now_fn
+    try:
+        store._now_fn = lambda: now - timedelta(hours=1)
+        earlier = store.create_adhoc_instance_and_token(adhoc_text, leader[0], "zdxlz")
+        submit(store.get_instance(earlier["instance_id"]), note="机房空调温度已恢复正常。", raw=earlier["token"])
+    finally:
+        store._now_fn = original_clock
+    cooldown = store.create_adhoc_instance_and_token(adhoc_image, leader[0], "zdxlz")
+
+    for mode, title in (("once", "晚班设备联查"), ("week", "每周交换机检查")):
+        issued = portal.create_task(ident, {
+            "name": title, "description": "核对机房设备状态并提交文字和现场图片。",
+            "phones": [member[0] for member in DEMO_MEMBERS], "mode": mode,
+            "has_deadline": False, "request_id": f"preview-{run_id}-{mode}", "upload_modules": ["text", "image"],
+        })
+        tid = issued["task_id"]
+        period = "once" if mode == "once" else period_key("week", now)
+        create_instance(tid, leader, period=period)
+        submit(create_instance(tid, employee, period=period), note="交换机运行正常，机柜温度 24°C。",
+               attachments=[(image_name, image)])
+        create_instance(tid, cross, period=period, due=past_deadline)
+        create_instance(tid, standby, period=period)
+        if mode == "week":
+            previous = period_key("week", now - timedelta(days=7))
+            submit(create_instance(tid, employee, period=previous), note="上一周期：完成设备核验。",
+                   attachments=[(image_name, image)])
+
+    create_instance(broad, standby, period=yesterday, due=past_deadline)
+    store.advance_instance_statuses(now)
+    expired = store.issue_h5_token(leader[0], "", "zdxlz", None, purpose="portal", ttl_hours=-1)
+    routes = {
+        "H5 工作台 A · 授权领导 (168h)": "/h5/portal#t=" + portal.issue(leader[0], "zdxlz"),
+        "H5 工作台 B · 普通成员 (168h)": "/h5/portal#t=" + portal.issue(employee[0], "zdxlz"),
+        "H5 工作台 C · 已过期": "/h5/portal#t=" + expired,
+        "H5 填报 · 待提交": "/h5/task#t=" + pending,
+        "H5 填报 · 免审已完成": "/h5/task#t=" + completed,
+        "H5 填报 · 待审核": "/h5/task#t=" + awaiting,
+        "H5 填报 · 已驳回待重交": "/h5/task#t=" + rejected,
+        "H5 填报 · 已逾期只读": "/h5/task#t=" + overdue,
+        "H5 填报 · 管理员代交": "/h5/task#t=" + delegated_token,
+        "H5 填报 · 自主上报冷却演示": "/h5/task#t=" + cooldown["token"],
+    }
+    return owner, routes
 
 
 def make_app(store, scheduler, owner, open_key):
@@ -220,8 +335,9 @@ def show_when_ready(server, vite, origin, urls, login, no_open):
                         for label, url in urls.items():
                             print(f"{label}: {url}")
                         if not no_open:
-                            for url in urls.values():
-                                webbrowser.open(login if url == origin + "/" else url, new=2)
+                            for label, url in urls.items():
+                                if "工作台 A" in label or "待提交" in label or url == origin + "/":
+                                    webbrowser.open(login if url == origin + "/" else url, new=2)
                         return
         except OSError:
             pass
@@ -265,9 +381,10 @@ def main():
     try:
         state.contacts = DemoDirectory()
         scheduler = Scheduler(state, backend, notifier=FakeNotifier())
-        owner, portal, task = seed(state, scheduler, "Preview@" + secrets.token_hex(12))
+        owner, routes = seed(state, "Preview@" + secrets.token_hex(12))
         key = secrets.token_urlsafe(24)
-        urls = {"H5 portal (168h)": backend + portal, "H5 task": backend + task, "PC admin (Vite HMR)": origin + "/"}
+        urls = {label: backend + path for label, path in routes.items()}
+        urls["PC admin (Vite HMR)"] = origin + "/"
         login = origin + "/__preview/open/" + key
         print("Local admin auto-login:", login)
         app = make_app(state, scheduler, owner, key)

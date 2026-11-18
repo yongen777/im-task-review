@@ -260,8 +260,8 @@ def test_sync5_completed_history_isolated() -> None:
 
 # ════════════════════ 一-3 / 四：停用 + 五类「任务已关闭」 ════════════════════
 
-def test_close_member_disabled_blocks_and_restore() -> None:
-    """成员账号停用（enabled=0）→ 该成员未完成任务链接关闭；恢复启用 → 可用。"""
+def test_close_member_disabled_cancels_previous_instance() -> None:
+    """成员停用后取消待办，恢复启用不重新开放已取消实例。"""
     store = _store()
     try:
         rid = _seed_two(store)
@@ -280,7 +280,8 @@ def test_close_member_disabled_blocks_and_restore() -> None:
 
         store.update_role_member(rid, P1, enabled=True, actor="t")
         code2, info2 = process_h5_task_info(state=store, raw_token=raw)
-        assert code2 == 200 and info2["window_open"] is True, (code2, info2)
+        assert (code2, info2["code"]) == (403, "TASK_CLOSED")
+        assert store.get_instance(insts[P1]["id"])["status"] == "cancelled"
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()

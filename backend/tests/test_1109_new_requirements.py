@@ -112,8 +112,8 @@ def test_next_day_gets_full_day():
         s.close()
 
 
-# ── ③ 删成员 → 本组模板下实例全删（含已发送）；其它组不动 ──────
-def test_remove_member_deletes_terminal_instances_of_that_role():
+# ── ③ 移除成员时保留已发送历史和其他在用分组实例 ──────
+def test_remove_member_preserves_terminal_instances_of_that_role():
     s = _store()
     try:
         ra = _role(s, "A组")
@@ -129,8 +129,8 @@ def test_remove_member_deletes_terminal_instances_of_that_role():
         s.conn.commit()
 
         s.delete_role_member(ra, "13700000004", actor="t")
-        left_a = s.conn.execute("SELECT COUNT(*) FROM task_instance WHERE template_id = ?", (tpl_a,)).fetchone()[0]
-        assert left_a == 0, "本组模板下的已发送实例也应删除"
+        sent = s.get_instance_by_key(tpl_a, "13700000004", "2026-11-09")
+        assert sent["status"] == "sent", "本组模板下的已发送实例必须保留"
         left_ab = s.conn.execute("SELECT COUNT(*) FROM task_instance WHERE template_id = ?", (tpl_ab,)).fetchone()[0]
         assert left_ab == 1, "还在其它组的共用模板实例要保留"
     finally:

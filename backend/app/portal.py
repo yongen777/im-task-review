@@ -259,6 +259,18 @@ class PortalService:
                                     ttl_hours=calc_h5_token_ttl_hours(inst, self.s.now()))
         return {'ok': True, 'url': '/h5/task#t=' + raw}
 
+    def adhoc_history(self, ident):
+        rows = self.s.conn.execute(
+            "SELECT t.name, i.submitted_at, i.status FROM task_instance i "
+            "JOIN task_template t ON t.template_id=i.template_id "
+            "WHERE i.phone=? AND t.is_adhoc=1 AND t.deleted=0 "
+            "AND i.status IN ('submitted','approved','rejected') AND i.submitted_at IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM role r WHERE r.platform=? AND INSTR(t.role_ids,r.role_id)>0) "
+            "ORDER BY i.submitted_at DESC, i.id DESC LIMIT 20",
+            (ident["phone"], ident["platform"]),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def tasks(self, ident=None, owner=None, platform=None):
         where, args = [], []
         if ident:
@@ -312,7 +324,7 @@ def run_portal_tasks(scheduler, now):
             if not p.can_submit({'phone': m['phone']}, task):
                 continue
             inst = s.ensure_instance(task['template_id'], m['phone'], m['name'], None, pk, deadline)
-            if now < planned:
+            if inst['status'] != 'pending' or now < planned:
                 continue
             idem = hashlib.sha256(f"portal|{inst['id']}".encode()).hexdigest()
             # 任意已占位结果均不再发送：失败保留给监管，不自动冒险重发。
@@ -329,6 +341,10 @@ def run_portal_tasks(scheduler, now):
                 link, _ = scheduler.build_h5_submit_url(phone=m['phone'], template_id=task['template_id'], period_key_val=pk, instance_id=inst['id'])
                 try:
                     scheduler._delivery_bucket.acquire()
+                    fresh = s.get_instance(inst['id'])
+                    if not fresh or fresh['status'] != 'pending' or not p.can_submit(fresh, task):
+                        s.conn.execute("UPDATE reminder_log SET result='skipped',error='TASK_CLOSED' WHERE idem_key=?", (idem,))
+                        continue
                     res = notifier.send_text(external_id, f"【{task['name']}】\n{task['text_tpl']}\n提交入口：{link}", idem, receive_type=ext_type)
                     result = 'sent' if res.ok else 'failed'
                 except Exception:

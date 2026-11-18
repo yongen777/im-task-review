@@ -2078,10 +2078,41 @@ class StateStore:
         member["reused_binding"] = reused_binding
         return member
 
+    def _cancel_pending_scope(self, template_id: str, *, phone: Optional[str] = None,
+                              include_rejected: bool = False) -> int:
+        statuses = "('pending', 'overdue', 'rejected')" if include_rejected else "('pending')"
+        sql = f"UPDATE task_instance SET status = 'cancelled' WHERE template_id = ? AND status IN {statuses}"
+        params = (template_id,)
+        if phone is not None:
+            sql += " AND phone = ?"
+            params += (phone,)
+        return int(self.conn.execute(sql, params).rowcount or 0)
+
+    def _cancel_unassigned_member_instances(self, role_id: str, phone: str, *, removed: bool) -> int:
+        """Cancel only tasks that lose their last eligible membership."""
+        statuses = "('pending', 'overdue', 'rejected')" if removed else "('pending')"
+        rows = self.conn.execute(
+            f"SELECT DISTINCT template_id FROM task_instance WHERE phone = ? AND status IN {statuses}",
+            (phone,),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            template = self.get_template(row["template_id"])
+            if not template or role_id not in template["role_ids"]:
+                continue
+            if template.get("portal_task"):
+                from .portal import PortalService
+                still_assigned = PortalService(self).can_submit({"phone": phone}, template)
+            else:
+                still_assigned = self.is_member_active_for_roles(phone, template["role_ids"])
+            if not still_assigned:
+                count += self._cancel_pending_scope(template["template_id"], phone=phone, include_rejected=removed)
+        return count
+
     def update_role_member(self, role_id: str, phone: str, name: Optional[str] = None, dept: Optional[str] = None, enabled: Optional[bool] = None, actor: str = "system") -> Dict[str, Any]:
         clean_role_id, clean_phone, now_s = (role_id or "").strip(), (phone or "").strip(), self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone()
+            row = self.conn.execute("SELECT * FROM member WHERE role_id = ? AND phone = ? FOR UPDATE", (clean_role_id, clean_phone)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "成员不存在")
             new_name = str(name).strip() if name is not None else row["name"]
@@ -2090,11 +2121,12 @@ class StateStore:
             new_dept = row["dept"] if dept is None else (str(dept).strip() or None)
             new_enabled = (1 if bool(enabled) else 0) if enabled is not None else int(row["enabled"])
             self.conn.execute("UPDATE member SET name = ?, dept = ?, enabled = ? WHERE id = ?", (new_name, new_dept, new_enabled, int(row["id"])))
+            cancelled = self._cancel_unassigned_member_instances(clean_role_id, clean_phone, removed=False) if enabled is not None and not new_enabled else 0
             # 2026-11-04：同 add_role_member —— 按**角色所属平台**判定激活状态。
             _role_plat = self.conn.execute("SELECT platform FROM role WHERE role_id = ?", (clean_role_id,)).fetchone()
             _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
             _ext = self.external_id_for(clean_phone, _plat_key)
-            self._insert_audit_unlocked(actor, "member.update", "member", f"{clean_role_id}:{clean_phone}", {"name": new_name, "dept": new_dept, "enabled": bool(new_enabled)}, now_s)
+            self._insert_audit_unlocked(actor, "member.update", "member", f"{clean_role_id}:{clean_phone}", {"name": new_name, "dept": new_dept, "enabled": bool(new_enabled), "cancelled_instances": cancelled}, now_s)
             return _fmt_member(int(row["id"]), clean_role_id, clean_phone, new_name, new_dept, new_enabled, row["source"], row["created_at"], _ext)
 
     def delete_role_member(self, role_id: str, phone: str, actor: str = "system") -> None:
@@ -2109,10 +2141,8 @@ class StateStore:
     ) -> Dict[str, Any]:
         """⚠️ 调用方必须已握 self.lock 且处于 self.conn 事务内。
 
-        移除成员的完整语义（2026-11-03 / 11-09 / 11-12 任务C 口径的合并实现）：
-        名册行删除 → 绑定条件删（该平台无其它角色归属才删）→ 该模板实例处置
-        （未完成转 cancelled 留痕、已完成物理删除）。write_audit=False 供级联删除
-        汇总记一条审计（role.purge / member.batch_delete）而不是逐人一条。
+        删除名册和无归属的绑定，失去派单资格的未完成实例改为已取消。
+        完成实例、提交及令牌保留。批量与角色删除可统一记录审计。
         """
         row = self.conn.execute("SELECT * FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone()
         if not row:
@@ -2144,67 +2174,20 @@ class StateStore:
             )
             removed_bindings.append(f"{plat}:{ext_id[-6:]}")
 
-        # 2026-11-03 用户口径：从分组移除后，该用户在该分组模板下的任务实例一并清掉，
-        # 避免人已移出、到点还收到残留实例的提醒（11:50 上午下班打卡实锤）。
-        # 只清「该模板的所有角色都已不含此人」的实例——一人多角色时，只要还挂在同模板的其它角色，实例保留。
-        #
-        # 2026-11-09 用户口径（修正）：**移除要删干净**。
-        # 此前只删 status IN ('pending','submitted','overdue','rejected')，
-        # 已 sent/approved/expired 的实例保留 —— 结果「人已从项目经理组移出，
-        # 但模板下仍有她的 sent 实例」，用户看到的即是这个不一致。
-        #
-        # 2026-11-12 任务C（图二实锤口径修正）：**未完成的实例不再物理删除，
-        # 改标 cancelled（已取消）** —— 后台任务实例页可见「已取消」徽章（留痕可审计），
-        # cancelled 不再触发提醒/逾期通知/流转。已完成/已归档实例保持 11-09「移除删干净」口径。
-        cancelled_instance_ids: List[int] = []
-        removed_instance_ids: List[int] = []
-        open_rows = self.conn.execute(
-            "SELECT id, template_id, status FROM task_instance WHERE phone = ?",
-            (clean_phone,),
-        ).fetchall()
-        for inst in open_rows:
-            trow = self.conn.execute(
-                "SELECT role_ids FROM task_template WHERE template_id = ?", (inst["template_id"],)
-            ).fetchone()
-            # 2026-11-12 晚 · 需求四加固：同款规范解析（脏数据兜底切分）
-            _raw_tpl_roles = str((trow["role_ids"] if trow else "") or "")
-            tpl_roles = parse_role_ids(_raw_tpl_roles)
-            if clean_role_id not in tpl_roles:
-                continue
-            placeholders = ",".join("?" for _ in tpl_roles)
-            still_member = self.conn.execute(
-                f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
-                f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) LIMIT 1",
-                (clean_phone, *tpl_roles),
-            ).fetchone() is not None
-            if still_member:
-                continue
-            inst_status = str(inst["status"] or "")
-            if inst_status in ("pending", "overdue", "rejected"):
-                # 未完成 → 作废留痕（不再发提醒，H5 旧链接提交被拦）
-                self.conn.execute(
-                    "UPDATE task_instance SET status = 'cancelled' WHERE id = ?",
-                    (int(inst["id"]),),
-                )
-                cancelled_instance_ids.append(int(inst["id"]))
-            else:
-                # 完成/归档 → 保持 11-09「移除删干净」
-                self.conn.execute("DELETE FROM submission WHERE instance_id = ?", (int(inst["id"]),))
-                self.conn.execute("DELETE FROM task_instance WHERE id = ?", (int(inst["id"]),))
-                removed_instance_ids.append(int(inst["id"]))
+        cancelled = self._cancel_unassigned_member_instances(clean_role_id, clean_phone, removed=True)
 
         if write_audit:
             self._insert_audit_unlocked(
                 actor, "member.delete", "member", f"{clean_role_id}:{clean_phone}",
                 {"name": row["name"], "dept": row["dept"], "removed_bindings": removed_bindings,
-                 "removed_instances": len(removed_instance_ids),
-                 "cancelled_instances": len(cancelled_instance_ids)}, now_s,
+                 "removed_instances": 0,
+                 "cancelled_instances": cancelled}, now_s,
             )
         return {
             "phone": clean_phone, "name": row["name"],
             "removed_bindings": removed_bindings,
-            "cancelled_instances": len(cancelled_instance_ids),
-            "removed_instances": len(removed_instance_ids),
+            "cancelled_instances": cancelled,
+            "removed_instances": 0,
         }
 
     def delete_role_members(self, role_id: str, phones: List[str], actor: str = "system") -> Dict[str, Any]:
@@ -3281,7 +3264,7 @@ class StateStore:
     def update_template(self, template_id: str, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
         clean_id, now_s = (template_id or "").strip(), self.now_str()
         with self.lock, self.conn:
-            row = self.conn.execute("SELECT * FROM task_template WHERE template_id = ? AND deleted = 0", (clean_id,)).fetchone()
+            row = self.conn.execute("SELECT * FROM task_template WHERE template_id = ? AND deleted = 0 FOR UPDATE", (clean_id,)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "任务模板不存在")
             norm = self._validate_and_normalize_template_unlocked(payload, existing=self._deserialize_template_row(row))
@@ -3300,50 +3283,20 @@ class StateStore:
                     norm["enabled"], norm["is_adhoc"], now_s, clean_id,
                 ),
             )
-            # 2026-11-12 下午修复（图一实锤）：编辑模板移除角色分组后，被移除角色成员的实例
-            # 还挂在「任务实例」页（旧实现只更新模板 role_ids，对实例零处理）。
-            # 处置口径（用户拍板）：**物理删除** —— 模板剩余角色已不含该成员时，其在该模板下的
-            # 全部实例（含未完成与已完成）连同提交/令牌一起清除，列表不再出现；
-            # 仍挂在模板其它角色的成员不动（与 delete_role_member 的「一人多角色」判据同源）。
-            _role_purge: Optional[Dict[str, Any]] = None
-            _old_roles = parse_role_ids(row["role_ids"] or "")
-            _new_roles = parse_role_ids(norm["role_ids_json"] or "")
-            _removed_roles = [r for r in _old_roles if r not in _new_roles]
-            if _removed_roles:
-                _place = ",".join("?" for _ in _removed_roles)
-                _rem_phones = [str(r[0]) for r in self.conn.execute(
-                    f"SELECT DISTINCT phone FROM member WHERE role_id IN ({_place})",
-                    tuple(_removed_roles)).fetchall()]
-                _orphan_phones: List[str] = []
-                for _ph in _rem_phones:
-                    _still = False
-                    if _new_roles:
-                        _keep_place = ",".join("?" for _ in _new_roles)
-                        _still = self.conn.execute(
-                            f"SELECT 1 FROM member WHERE phone = ? AND role_id IN ({_keep_place}) LIMIT 1",
-                            (_ph, *_new_roles)).fetchone() is not None
-                    if _still:
-                        continue
-                    _orphan_phones.append(_ph)
-                _deleted_instances = 0
-                for _ph in _orphan_phones:
-                    _ids = [int(r[0]) for r in self.conn.execute(
-                        "SELECT id FROM task_instance WHERE template_id = ? AND phone = ?",
-                        (clean_id, _ph)).fetchall()]
-                    if not _ids:
-                        continue
-                    _id_place = ",".join("?" for _ in _ids)
-                    self.conn.execute(f"DELETE FROM submission WHERE instance_id IN ({_id_place})", tuple(_ids))
-                    # h5_token 行保留（tombstone）：旧链接点开 → 统一提示「任务已关闭」（四-4 口径）
-                    _deleted_instances += int(self.conn.execute(
-                        f"DELETE FROM task_instance WHERE id IN ({_id_place})", tuple(_ids)).rowcount or 0)
-                _role_purge = {"removed_roles": _removed_roles, "orphan_phones": len(_orphan_phones),
-                               "deleted_instances": _deleted_instances}
-                if _orphan_phones:
-                    self._insert_audit_unlocked(
-                        actor, "template.role_removed_purge", "task_template", clean_id,
-                        _role_purge, now_s,
-                    )
+            cancelled_on_disable = self._cancel_pending_scope(clean_id) if not norm["enabled"] else 0
+            old_roles = parse_role_ids(row["role_ids"])
+            new_roles = parse_role_ids(norm["role_ids_json"])
+            removed_roles = [rid for rid in old_roles if rid not in new_roles]
+            cancelled_on_unbind = 0
+            if removed_roles:
+                placeholders = ",".join("?" for _ in removed_roles)
+                affected = self.conn.execute(
+                    f"SELECT DISTINCT phone FROM member WHERE role_id IN ({placeholders})", tuple(removed_roles),
+                ).fetchall()
+                for member in affected:
+                    phone = member["phone"]
+                    if not self.is_member_active_for_roles(phone, new_roles):
+                        cancelled_on_unbind += self._cancel_pending_scope(clean_id, phone=phone, include_rejected=True)
             # 2026-11-12 下午（用户拍板，一-2）：截止规则编辑后对未完成实例**动态重算**——
             # 基于各实例原本的派发日（created_at 日期）按新规则重算 deadline_at，旧 H5 链接
             # 顶部截止时间同步更新：
@@ -3353,7 +3306,7 @@ class StateStore:
             #   · 已完成（submitted/approved/expired/cancelled）不受影响（历史隔离）；
             #     rejected 的重交窗口按「驳回+24h」已锁定，不随模板截止变化（三口径）。
             _deadline_sync: Dict[str, int] = {}
-            if str(norm.get("kind") or "") != "notice":
+            if norm["enabled"] and str(norm.get("kind") or "") != "notice":
                 from .scheduler import calc_instance_deadline  # 延迟导入：scheduler 模块级依赖本模块，避免循环
                 _fresh_tpl = self._deserialize_template_row(self.conn.execute(
                     "SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
@@ -3388,7 +3341,7 @@ class StateStore:
                             self.conn.execute("UPDATE h5_token SET expires_at = ? WHERE token_id = ?",
                                               (_new_exp_s, str(_tk["token_id"])))
                             _deadline_sync["tokens_extended"] = int(_deadline_sync.get("tokens_extended", 0)) + 1
-            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "role_removed_purge": _role_purge, "deadline_sync": _deadline_sync}, now_s)
+            self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "removed_roles": removed_roles, "cancelled_on_disable": cancelled_on_disable, "cancelled_on_unbind": cancelled_on_unbind, "deadline_sync": _deadline_sync}, now_s)
             return self._deserialize_template_row(self.conn.execute("SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
 
     def _purge_template_rows_unlocked(self, template_id: str, now_s: str, uploads_dir: Optional[Path] = None) -> Dict[str, int]:
@@ -4106,9 +4059,9 @@ class StateStore:
 
         覆盖五类失效（H5 打开/上传/提交三处同口径，且**先于**过期窗口判断）：
           1) 任务模板被删除 —— 物理清除后靠保留的 h5_token 行识别（提示「任务已关闭」而非技术报错）；
-          2) 任务模板被停用 —— 重新启用自动恢复；
+          2) 任务模板被停用 —— 已取消的实例不会因启用恢复；
           3) 成员被移出关联角色（单删/批量删 → 未完成实例已标 cancelled）；
-          4) 编辑模板移除关联角色（role_removed_purge 已物理清实例，旧链接凭令牌识别）；
+          4) 编辑模板移除关联角色（失去资格的未完成实例已取消）；
           5) 成员账号被停用（member.enabled=0，名册行还在）。
         """
         if template is None or template.get("deleted"):

@@ -76,6 +76,11 @@
     .thumb { display: block; width: 56px; height: 56px; object-fit: cover; border-radius: 4px; }
     .thumb-button { padding: 0; border: 0; background: none; flex: none; }
     .attachment-row .secondary { padding: 8px 12px; font-size: 14px; }
+    .saved-content { margin-top: 12px; }
+    .saved-content h2 { margin: 0 0 12px; font-size: 18px; }
+    .saved-content dl, .saved-content dd { margin: 0; }
+    .saved-content dt { color: var(--secondary); font-size: 14px; margin-top: 12px; }
+    .saved-content dd { white-space: pre-wrap; overflow-wrap: anywhere; }
     .locked-tip, .submit-success-banner { padding: 12px; margin: 12px 0; border: 1px solid var(--line); border-radius: var(--control); background: var(--selection); }
     .locked-tip.warning { background: #fff7eb; color: #79460d; }
     .submit-success-banner { color: #1b644e; background: #edf7f2; font-weight: 500; }
@@ -135,6 +140,87 @@
         msgBox.className = "msg " + type;
       }
 
+      async function openSavedAttachment(attachment, button) {
+        button.disabled = true;
+        try {
+          const response = await fetch("/api/h5/task/attachment", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-H5-Token": token },
+            body: JSON.stringify({ ref: attachment.ref })
+          });
+          if (!response.ok) {
+            const error = await response.json();
+            showMsg(error.message || "附件读取失败", "error");
+            return;
+          }
+          const blob = await response.blob();
+          const url = URL.createObjectURL(blob);
+          const dialog = document.getElementById("preview");
+          if (attachment.mime.startsWith("image/") && typeof dialog.showModal === "function") {
+            const image = dialog.querySelector("img");
+            image.src = url;
+            image.alt = attachment.file_name;
+            dialog.addEventListener("close", () => {
+              image.removeAttribute("src");
+              URL.revokeObjectURL(url);
+            }, { once: true });
+            dialog.showModal();
+          } else {
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = attachment.file_name;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 30000);
+          }
+        } catch (error) {
+          showMsg("附件读取失败，请稍后重试", "error");
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      function renderSavedSubmission(submission, template, container) {
+        if (!submission) return;
+        const section = document.createElement("section");
+        section.className = "block saved-content";
+        const title = document.createElement("h2");
+        title.textContent = "已提交内容";
+        section.appendChild(title);
+        const detail = document.createElement("dl");
+        function appendValue(label, value) {
+          const term = document.createElement("dt");
+          term.textContent = label;
+          const description = document.createElement("dd");
+          description.textContent = value;
+          detail.append(term, description);
+        }
+        appendValue(submission.source === "admin" ? "管理员代交时间" : "提交时间", submission.submitted_at);
+        const fields = new Map((template.schema_json || []).map(field => [field.key, field.label]));
+        for (const [key, value] of Object.entries(submission.fields)) {
+          appendValue(fields.get(key) || key, value === true ? "是" : value === false ? "否" : String(value ?? ""));
+        }
+        if (submission.note) appendValue(template.text_label || "文字说明", submission.note);
+        section.appendChild(detail);
+        for (const attachment of submission.attachments) {
+          const row = document.createElement("div");
+          row.className = "attachment-row saved-content";
+          const name = document.createElement("span");
+          name.className = "filename";
+          name.textContent = attachment.file_name;
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "secondary";
+          button.textContent = attachment.mime.startsWith("image/") ? "预览图片" : "下载附件";
+          button.setAttribute("aria-label", button.textContent + " " + attachment.file_name);
+          button.onclick = () => openSavedAttachment(attachment, button);
+          row.append(name, button);
+          section.appendChild(row);
+        }
+        container.appendChild(section);
+      }
+
       if (!token) {
         loadingEl.style.display = "none";
         showMsg("链接缺少任务令牌 (#t=...)", "error");
@@ -175,7 +261,9 @@
             tip.textContent = data.window_reason || (data.instance.status === "submitted"
               ? "本任务已提交，正在等待管理员审核"
               : "本任务已提交完成，无需重复提交");
-            contentEl.insertBefore(tip, submitBtn);
+            const area = document.getElementById("dynamicArea");
+            contentEl.insertBefore(tip, area);
+            renderSavedSubmission(data.submission, data.template, area);
             submitBtn.disabled = true;
             submitBtn.hidden = true;
             return;
@@ -437,6 +525,7 @@
             tip.textContent = data.instance.resubmit_deadline
               ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
               : "该提交已被驳回，请按审核意见修改后重新提交。";
+            if (data.instance.reject_reason) tip.textContent += " 驳回原因：" + data.instance.reject_reason;
             contentEl.insertBefore(tip, submitBtn);
           } else if (__status !== "pending") {
             const LOCKED_TEXT = {

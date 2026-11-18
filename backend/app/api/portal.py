@@ -25,7 +25,8 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
             ident = p.authenticate(request.headers.get('Authorization', '').removeprefix('Bearer '))
             if action == 'info':
                 return {'ok': True, 'can_create': bool(p.grants(ident)), 'todos': p.todos(ident),
-                        'adhoc': state.list_adhoc_menu_items(ident['phone'], platform=ident['platform'])}
+                        'adhoc': state.list_adhoc_menu_items(ident['phone'], platform=ident['platform']),
+                        'adhoc_history': p.adhoc_history(ident)}
             if action == 'open':
                 return p.task_link(ident, int(data.get('instance_id', 0)))
             if action == 'adhoc':

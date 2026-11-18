@@ -102,11 +102,20 @@ function show() {
     (rows.length ? rows.map(row => {
       const key = todo ? row.id : row.template_id;
       const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
+      const review = todo && row.status === 'rejected' ? '<p class="muted">待重交' +
+        (row.reject_reason ? ' · 驳回原因：' + esc(row.reject_reason) : '') + '</p>' : '';
       return '<article class="card task-card"><div><h3>' + esc(row.template_name || row.name) +
-        '</h3>' + deadline + '</div><button class="primary" data-open="' + esc(key) + '">' +
+        '</h3>' + deadline + review + '</div><button class="primary" data-open="' + esc(key) + '">' +
         (todo ? '去完成' : '进入上报') + '</button></article>';
     }).join('') : '<div class="card empty">' +
       (todo ? '当前暂无待提交的任务事项' : '当前暂无可自主上报的任务事项') + '</div>');
+  if (!todo && info.adhoc_history?.length) {
+    const statuses = { submitted: '待审核', approved: '已完成', rejected: '已驳回' };
+    main.insertAdjacentHTML('beforeend', '<div class="row section-row"><h2>已上报记录</h2></div>' +
+      info.adhoc_history.map(record => '<article class="card"><div class="row"><h3>' + esc(record.name) +
+        '</h3><span class="muted">' + esc(statuses[record.status] || record.status) +
+        '</span></div><p class="muted">' + esc(record.submitted_at) + '</p></article>').join(''));
+  }
   main.querySelectorAll('[data-open]').forEach((button, index) => {
     if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
     button.onclick = async () => {

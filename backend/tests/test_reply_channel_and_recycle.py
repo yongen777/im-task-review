@@ -121,7 +121,7 @@ def _notice_tpl(store: StateStore, role_ids: list, name: str) -> str:
     return tpl["template_id"]
 
 
-def test_remove_member_purges_open_instances_of_that_role() -> None:
+def test_remove_member_cancels_open_instances_of_that_role() -> None:
     store = _store()
     try:
         ra = store.create_role("密信A组", actor="t", platform="zdxlz")["role_id"]
@@ -143,12 +143,12 @@ def test_remove_member_purges_open_instances_of_that_role() -> None:
         store.conn.commit()
 
         # 只退出 A 组：仅A组模板的未完成实例转 cancelled（2026-11-12 新口径：作废留痕而非物理删除）；
-        # 共用模板实例保留（还在 B 组）；已完成历史删干净（2026-11-09 口径保持）
+        # 共用模板实例保留（还在 B 组）；已完成历史保留
         store.delete_role_member(ra, PHONE, actor="t")
         _open = store.get_instance_by_key(exclusive_tpl, PHONE, pkey)
         assert _open is not None and _open["status"] == "cancelled", "仅A组任务的未完成实例应转为 cancelled 作废"
         assert store.get_instance_by_key(shared_tpl, PHONE, pkey) is not None, "还在B组，共用模板实例不得删"
-        assert store.get_instance(done["id"]) is None, "移除成员后本组模板下的已完成实例也应删除（2026-11-09 新口径：移除要删干净）"
+        assert store.get_instance(done["id"])["status"] == "approved"
 
         # 再退出 B 组：共用模板的未完成实例同样转 cancelled（不再是物理删除）
         store.delete_role_member(rb, PHONE, actor="t")
@@ -173,6 +173,6 @@ def test_remove_member_keeps_terminal_instances() -> None:
         store.conn.commit()
 
         store.delete_role_member(ra, PHONE, actor="t")
-        assert store.get_instance(inst["id"]) is None, "移除成员后本组模板下的已发送实例也应删除（2026-11-09 新口径）"
+        assert store.get_instance(inst["id"])["status"] == "sent"
     finally:
         store.close()

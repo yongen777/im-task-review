@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -300,7 +301,7 @@ def _resolve_token_and_instance(
     if not token_str:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "缺少 H5 访问令牌"})
     tok = state.get_h5_token(token_str)
-    if not tok:
+    if not tok or tok.get("purpose") != "submit":
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
     if on_instance_resolved is not None and tok.get("instance_id") is not None:
         on_instance_resolved(int(tok["instance_id"]))
@@ -323,7 +324,7 @@ def _resolve_token_and_instance(
         inst = state.get_instance(int(tok["instance_id"]))
     if inst is None and tok.get("template_id") and tok.get("period_key"):
         inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
-    if inst is None:
+    if inst is None or any(str(tok[key]) != str(inst[key]) for key in ("phone", "template_id", "period_key")):
         # 2026-11-12 下午（四）：令牌有效但实例已不存在（模板物理删除/移除角色清理）→
         # 统一「任务已关闭」（不暴露「任务实例不存在」技术报错）
         return None, None, (403, {"code": "TASK_CLOSED", "message": "任务已关闭"})
@@ -351,6 +352,32 @@ def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, A
     if tpl["need_review"]:
         return "本任务已审核通过，无需重复提交"
     return "本任务已提交完成，无需重复提交"
+
+
+def _completed_submission(state: StateStore, instance: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Expose saved values and attachment metadata for this instance only."""
+    if instance["status"] not in ("submitted", "approved"):
+        return None
+    saved = state.get_latest_valid_submission(instance["id"])
+    if not saved:
+        return None
+    try:
+        refs = json.loads(saved.get("refs_json") or "[]")
+    except ValueError:
+        refs = []
+    refs = [ref for ref in refs if isinstance(ref, str)] if isinstance(refs, list) else []
+    if saved.get("file_ref"):
+        refs.append(saved["file_ref"])
+    attachments = []
+    for ref in dict.fromkeys(refs):
+        upload = state.get_upload_ref(ref)
+        if not upload or upload["phone"] != instance["phone"] or upload["template_id"] != instance["template_id"]:
+            continue
+        attachments.append({key: upload[key] for key in ("ref", "file_name", "mime", "size")})
+    return {
+        "fields": saved.get("fields") or {}, "note": saved.get("note"),
+        "submitted_at": saved["created_at"], "source": saved["source"], "attachments": attachments,
+    }
 
 
 def _resolve_upload_target(
@@ -467,6 +494,7 @@ def process_h5_task_info(
         "window_open": window_open,
         "window_reason": window_reason,
         "instance": inst,
+        "submission": _completed_submission(state, inst),
         "template": {
             "template_id": tpl["template_id"],
             "name": tpl["name"],
@@ -750,6 +778,30 @@ def create_h5_router(
                 return JSONResponse(status_code=status_code, content=content)
         except StarletteHTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"code": "VALIDATION_FAILED", "message": "上传请求格式错误"})
+
+    @router.post("/api/h5/task/attachment")
+    async def api_h5_task_attachment(request: Request):
+        _, instance, err = _resolve_token_and_instance(state, _extract_token_from_request(request), track_instance(request))
+        if err:
+            return JSONResponse(status_code=err[0], content=err[1])
+        template = state.get_template(instance["template_id"], include_deleted=True)
+        if state.instance_close_reason(instance, template):
+            return JSONResponse(status_code=403, content={"code": "TASK_CLOSED", "message": "任务已关闭"})
+        try:
+            data = await request.json()
+        except ValueError:
+            data = None
+        ref = data.get("ref") if isinstance(data, dict) else None
+        saved = _completed_submission(state, instance)
+        if saved and isinstance(ref, str) and any(item["ref"] == ref for item in saved["attachments"]):
+            upload = state.get_upload_ref(ref)
+            if upload:
+                base = uploads_dir.resolve()
+                path = (base / upload["rel_path"]).resolve()
+                if path.is_relative_to(base) and path.is_file():
+                    return FileResponse(path, media_type=upload["mime"], filename=upload["file_name"],
+                                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+        return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "附件不存在"})
 
     @router.post("/api/h5/submit", include_in_schema=False)
     @router.post("/api/h5/task/submit")

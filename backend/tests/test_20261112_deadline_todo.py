@@ -465,9 +465,8 @@ def test_e4_todo_empty_reply_and_unbound_zero_writes() -> None:
 
 # ════════════════════ 外加：停用可提交 / 删除关死（含 rejected 挂起） ════════════════════
 
-def test_extra_disabled_template_link_closed_reenable_restores() -> None:
-    """2026-11-12 下午新口径（取代「停用仍可提交」）：停用模板 → 已下发旧链接
-    统一拦截「任务已关闭」；重新启用且未过截止 → 自动恢复可提交。"""
+def test_extra_disabled_template_link_cancelled_stays_closed_after_reenable() -> None:
+    """停用取消待办；重新启用模板仍不能通过旧链接提交已取消实例。"""
     store = _store()
     try:
         rid = _seed_member(store)
@@ -486,13 +485,10 @@ def test_extra_disabled_template_link_closed_reenable_restores() -> None:
         except BizError as exc:
             assert (exc.status_code, exc.code, exc.message) == (403, "TASK_CLOSED", "任务已关闭"), exc
 
-        # 重新启用 → 未过截止 → 自动恢复可用
         store.update_template(tpl["template_id"], {"enabled": True}, actor="t")
         code2, info2 = process_h5_task_info(state=store, raw_token=raw_token)
-        assert code2 == 200 and info2["window_open"] is True, (code2, info2.get("window_reason"))
-        res = store.submit_h5_task(raw_token=raw_token, fields={"summary": "恢复后交"})
-        assert res["status"] == "approved"  # need_review=False
-        assert store.get_instance(inst["id"])["status"] == "approved"
+        assert (code2, info2["code"]) == (403, "TASK_CLOSED")
+        assert store.get_instance(inst["id"])["status"] == "cancelled"
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()
