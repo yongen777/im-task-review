@@ -111,6 +111,8 @@ def test_adhoc_open_submit_and_history(ctx):
     assert detail['readonly_history'] and detail['submission']['note'] == '第一条上报'
     history_headers = {'Authorization': 'Bearer ' + history}
     assert owner.post('/api/h5/task/attachment', headers=history_headers, json={'ref': ref}).content == PNG
+    storage = state.data_dir / 'uploads'
+    old_file = storage / state.get_upload_ref(ref)['rel_path']
     assert owner.post('/api/h5/task/upload', headers=history_headers).status_code == 401
     assert owner.post('/api/h5/task/submit', json={'token': history}).status_code == 404
     edit_image = owner.post('/api/h5/task/edit-upload', headers=history_headers,
@@ -121,6 +123,9 @@ def test_adhoc_open_submit_and_history(ctx):
         'retained_refs': [], 'refs': [edit_image.json()['ref']],
     })
     assert changed.status_code == 200, changed.text
+    new_ref = edit_image.json()['ref']
+    assert not old_file.exists() and state.get_upload_ref(ref) is None
+    assert (storage / state.get_upload_ref(new_ref)['rel_path']).read_bytes() == PNG + b'new'
     assert owner.get(f"/api/admin/instances/{inst['id']}").json()['submission']['note'] == '用户自行更正'
     assert owner.post('/api/h5/task/attachment', headers=history_headers, json={'ref': ref}).status_code == 404
     assert len(state.list_submissions_for_instance(inst['id'])) == 1
@@ -149,6 +154,8 @@ def test_owner_replaces_submission_without_changing_status_or_completion(ctx):
         'token': raw, 'note': '初版', 'fields': {'qty': '2', 'summary': '初版'}, 'refs': uploads,
     }).status_code == 200
     old = owner.get(path).json()['submission']
+    storage = state.data_dir / 'uploads'
+    old_file = storage / state.get_upload_ref(uploads[0])['rel_path']
     payload = {'revision': old['revision'], 'note': '更正', 'fields': {'qty': '3', 'summary': '现场核实'}, 'retained_refs': [uploads[1]]}
     _, outsider = sub('another_edit_admin')
     assert admin.put(path + '/submission', json=payload).status_code == 403
@@ -158,10 +165,13 @@ def test_owner_replaces_submission_without_changing_status_or_completion(ctx):
     })
     assert bad.status_code == 400
     assert owner.get(path).json()['submission'] == old
+    assert old_file.exists() and state.get_upload_ref(uploads[0])
     update = owner.put(path + '/submission', files={
         'payload': (None, json.dumps(payload)), 'attachments': ('更正.png', PNG + b'replacement', 'image/png'),
     })
     assert update.status_code == 200, update.text
+    assert not old_file.exists() and state.get_upload_ref(uploads[0]) is None
+    assert (storage / state.get_upload_ref(uploads[1])['rel_path']).exists()
     assert owner.put(path + '/submission', json=payload).status_code == 409
     detail = owner.get(path).json()
     changed = detail['submission']

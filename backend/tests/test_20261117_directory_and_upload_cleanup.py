@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 
 import pytest
@@ -71,6 +72,34 @@ def test_cleanup_refuses_absolute_and_parent_traversal(store):
     assert store.cleanup_orphan_uploads() == 0
     assert outside.read_bytes() == b"x"
     assert store.get_upload_ref("outside") and store.get_upload_ref("absolute")
+
+
+def test_replaced_cleanup_retries_from_audit_and_preserves_shared_attachments(store, monkeypatch):
+    uploads_dir = store.data_dir / 'uploads'
+    age = timedelta()
+    retired = upload(store, 'retired', age, consumed=True)
+    current = upload(store, 'current', age, consumed=True)
+    for ref in ('shared_legacy', 'shared_json', 'unrelated'):
+        upload(store, ref, age, consumed=True)
+    upload(store, 'outside', age, consumed=True, rel_path='../outside.png', create_file=False)
+    outside = store.data_dir / 'outside.png'
+    outside.write_bytes(b'keep')
+    store.conn.execute("INSERT INTO submission(instance_id,file_ref,refs_json,source,status,created_at) VALUES (1,?,?, 'user','approved',?)",
+                       ('shared_legacy', json.dumps(['shared_json', 'current']), store.now_str()))
+    store.write_audit('admin', 'instance.edit_submission', 'task_instance', '1', {
+        'previous_refs': ['retired', 'shared_legacy', 'shared_json', 'outside'], 'refs': ['current'],
+    })
+    with monkeypatch.context() as patch:
+        def blocked(path, *, missing_ok=False):
+            raise PermissionError('file busy')
+        patch.setattr(Path, 'unlink', blocked)
+        assert store.cleanup_replaced_uploads(uploads_dir) == 0
+    assert retired.exists() and store.get_upload_ref('retired')
+    assert store.cleanup_replaced_uploads(uploads_dir) == 1
+    assert not retired.exists() and store.get_upload_ref('retired') is None
+    assert current.exists() and outside.read_bytes() == b'keep'
+    assert all(store.get_upload_ref(ref) for ref in ('shared_legacy', 'shared_json', 'unrelated', 'outside'))
+    assert store.cleanup_replaced_uploads(uploads_dir) == 0
 
 
 def test_zdxlz_department_priority(monkeypatch):

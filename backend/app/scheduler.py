@@ -48,6 +48,16 @@ PERIOD_DISPLAY_MAP = {"day": "今日", "week": "本周", "month": "本月"}
 
 async def run_upload_cleanup_loop(state: StateStore, stop_event: asyncio.Event) -> None:
     """每天上海时间 03:00 执行，独立于派发扫描。"""
+    async def clean_replaced() -> None:
+        try:
+            removed = await asyncio.to_thread(state.cleanup_replaced_uploads, state.data_dir / 'uploads')
+            if removed:
+                logger.info('替换附件清理完成，移除 %d 条', removed)
+        except Exception:
+            logger.exception('替换附件清理失败')
+
+    if not stop_event.is_set():
+        await clean_replaced()
     while not stop_event.is_set():
         now = datetime.now(SHANGHAI_TZ)
         next_run = now.replace(hour=3, minute=0, second=0, microsecond=0)
@@ -60,6 +70,7 @@ async def run_upload_cleanup_loop(state: StateStore, stop_event: asyncio.Event) 
             pass
         if stop_event.is_set():
             return
+        await clean_replaced()
         try:
             removed = await asyncio.to_thread(state.cleanup_orphan_uploads)
             logger.info("孤儿上传清理完成，移除 %d 条", removed)

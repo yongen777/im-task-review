@@ -14,7 +14,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple
 
 from .config import NowFn, default_now, format_dt, parse_dt
 from .db import Database, IntegrityError
@@ -3877,6 +3877,53 @@ class StateStore:
                         break
         return removed
 
+    def cleanup_replaced_uploads(self, uploads_dir: Path, refs: Optional[Iterable[str]] = None) -> int:
+        """Remove replaced attachments after commit, preserving files still referenced by any submission."""
+        if refs is None:
+            replaced = set()
+            for row in self.conn.execute(
+                "SELECT detail FROM admin_audit WHERE target_type='task_instance' AND action='instance.edit_submission'"
+            ).fetchall():
+                try:
+                    detail = json.loads(row['detail'] or '{}')
+                except ValueError:
+                    continue
+                if not isinstance(detail, dict):
+                    continue
+                before, after = detail.get('previous_refs'), detail.get('refs')
+                if isinstance(before, list) and isinstance(after, list):
+                    replaced.update(ref for ref in before if isinstance(ref, str) and ref and ref not in after)
+            refs = replaced
+
+        base = uploads_dir.resolve()
+        removed = 0
+        for ref in sorted(set(refs)):
+            with self.conn:
+                row = self.conn.execute('SELECT rel_path FROM upload_ref WHERE ref=? AND consumed=1 FOR UPDATE', (ref,)).fetchone()
+                if not row:
+                    continue
+                if self.conn.execute(
+                    "SELECT 1 FROM submission WHERE file_ref=? OR CASE WHEN JSON_VALID(refs_json) "
+                    "THEN JSON_CONTAINS(refs_json,JSON_QUOTE(?)) ELSE INSTR(refs_json,?)>0 END LIMIT 1",
+                    (ref, ref, ref),
+                ).fetchone():
+                    continue
+                relative = Path(row['rel_path'])
+                target = base / relative
+                if self.conn.execute('SELECT 1 FROM upload_ref WHERE rel_path=? AND ref<>? LIMIT 1', (row['rel_path'], ref)).fetchone():
+                    continue
+                try:
+                    if relative.anchor or not relative.parts or '..' in relative.parts or target.resolve() != target:
+                        logger.warning('跳过路径异常的替换附件 ref=%s', ref)
+                        continue
+                    target.unlink(missing_ok=True)
+                except (OSError, RuntimeError, ValueError):
+                    logger.warning('清理替换附件失败，将稍后重试 ref=%s', ref)
+                    continue
+                self.conn.execute('DELETE FROM upload_ref WHERE ref=?', (ref,))
+                removed += 1
+        return removed
+
     def get_upload_ref(self, ref: str) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT * FROM upload_ref WHERE ref = ?", ((ref or "").strip(),)).fetchone()
@@ -4332,6 +4379,12 @@ class StateStore:
             for upload in saved:
                 self._purge_upload_file(uploads_dir, upload["rel_path"])
             raise
+        retired = set(current_refs) - set(refs)
+        if retired:
+            try:
+                self.cleanup_replaced_uploads(uploads_dir, retired)
+            except Exception:
+                logger.exception('替换附件清理失败，将从审计记录重试 instance=%s', instance['id'])
         return {"ok": True, "submission_id": submission["id"]}
 
     def submit_h5_task(
