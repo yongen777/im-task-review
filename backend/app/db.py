@@ -220,7 +220,8 @@ CREATE TABLE IF NOT EXISTS reminder_log (
   idem_key     VARCHAR(64) NOT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_rem_idem_retry (idem_key, retry),
-  KEY ix_rem_idem (idem_key, result)
+  KEY ix_rem_idem (idem_key, result),
+  KEY ix_rem_instance_sent (instance_id, result, kind, sent_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS upload_ref (
@@ -690,6 +691,9 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         proxy.execute("ALTER TABLE member ADD COLUMN is_left_org TINYINT NOT NULL DEFAULT 0")
     if "directory_checked_at" not in member_columns:
         proxy.execute("ALTER TABLE member ADD COLUMN directory_checked_at VARCHAR(32) DEFAULT NULL")
+
+    if not proxy.execute("SHOW INDEX FROM reminder_log WHERE Key_name='ix_rem_instance_sent'").fetchone():
+        proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")
 
 
 def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn) -> None:

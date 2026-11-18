@@ -2878,8 +2878,6 @@ class StateStore:
                 raise BizError(400, "VALIDATION_FAILED", "同一任务模板只能选择同一办公软件下的角色")
 
         text_tpl = str(merged.get("text_tpl") or "").strip()
-        if not text_tpl:
-            raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
         # 2026-10-29：把字面量 \n / \r\n 归一成真实换行再入库，
         # 避免后台编辑框和消息里一直夹着反斜杠 n 这种字符。
         text_tpl = text_tpl.replace("\\r\\n", "\n").replace("\\n", "\n").strip()
@@ -2892,7 +2890,11 @@ class StateStore:
             _adhoc_raw = (existing or {}).get("is_adhoc") or 0
         is_adhoc = bool(int(_adhoc_raw or 0))
         if is_adhoc and kind == "notice":
-            raise BizError(400, "VALIDATION_FAILED", "通知类模板不支持「不定期任务（菜单自选）」模式")
+            raise BizError(400, "VALIDATION_FAILED", "通知类模板不支持自主上报")
+        if is_adhoc:
+            text_tpl = ""
+        elif not text_tpl:
+            raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
 
         if kind == "notice":
             if str(merged.get("period") or "day").strip() != "day":
@@ -3928,8 +3930,6 @@ class StateStore:
 
     # ── 2026-11-12 晚 · 不定期任务（菜单自选）：取数与一次性链接签发 ──────────
 
-    ADHOC_MENU_COOLDOWN_SECONDS = 60  # 同一（成员, 事项）重复数字签发的防手抖冷却
-
     def list_adhoc_menu_items(self, phone: str, platform: Optional[str] = None) -> List[Dict[str, Any]]:
         """【菜单】清单：当前平台下该用户**所在角色有权填报**的已启用不定期任务事项。
 
@@ -3953,7 +3953,8 @@ class StateStore:
             with self.lock:
                 row = self.conn.execute(
                     f"SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
-                    f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) AND m.enabled = 1 "
+                    "JOIN delivery_target d ON d.phone=m.phone AND d.platform=r.platform AND d.usable=1 "
+                    f"WHERE m.phone = ? AND m.role_id IN ({placeholders}) AND m.enabled = 1 AND m.is_left_org=0 "
                     f"AND (? = '' OR r.platform = ?) LIMIT 1",
                     (clean_phone, *roles, plat, plat)).fetchone()
             if row is None:
@@ -3972,71 +3973,36 @@ class StateStore:
                 return it
         return None
 
-    def create_adhoc_instance_and_token(
-        self, template_id: str, phone: str, platform: Optional[str] = None, now_dt: Optional[datetime] = None
-    ) -> Dict[str, Any]:
-        """数字回复匹配成功 → 现场创建**全新一次性实例**并签发专属 H5 链接（需求一-4 / 五-3）。
-
-        · period_key = `adhoc-<签发时刻>-<随机后缀>`：绕开 (template_id, phone, period_key)
-          唯一键 → 同一用户可对同一事项**多次上报**（每次数字回复 = 全新实例+新链接）；
-        · deadline_at 固定哨兵：无截止 → 永不逾期、H5 永不显示截止；
-        · 链接仅供提交 1 次：提交成功后实例转 submitted/approved → 旧链接 H5 关窗
-          「您已完成本次提交」、再提交终审「已上传，请勿重复提交」；
-        · 防手抖刷屏：同一（成员, 事项）冷却窗口内已有未完成/刚提交实例 → 不建新实例，
-          返回 ok=False + 提示文案（零新写入，满足「重复回调不得产生重复消息」红线）。
-        """
-        clean_phone = str(phone or "").strip()
-        clean_tid = str(template_id or "").strip()
-        cur_dt = now_dt or self.now()
-        now_s = format_dt(cur_dt)
-        cooldown_s = format_dt(cur_dt - timedelta(seconds=self.ADHOC_MENU_COOLDOWN_SECONDS))
-        item = None
-        for it in self.list_adhoc_menu_items(clean_phone, platform=platform):
-            if it["template_id"] == clean_tid:
-                item = it
-                break
-        if item is None:
+    def issue_adhoc_report(self, template_id: str, phone: str, platform: str) -> str:
+        """签发表单凭据，实际提交成功时才创建实例。"""
+        period_key = f"adhoc-{platform}-{secrets.token_hex(16)}"
+        tpl = self.get_template(template_id)
+        draft = self.adhoc_report_draft({"phone": phone, "period_key": period_key}, tpl)
+        if draft is None:
             raise BizError(403, "FORBIDDEN", "您没有该事项的填报权限")
-        tpl = self.get_template(clean_tid, include_deleted=False)
-        if not tpl or not tpl.get("is_adhoc") or not tpl.get("enabled"):
-            raise BizError(404, "NOT_FOUND", "该事项不存在或已下线")
-        roles = [str(x).strip() for x in (tpl.get("role_ids") or []) if str(x).strip()]
-        with self.lock, self.conn:
-            recent = self.conn.execute(
-                "SELECT id, status FROM task_instance WHERE template_id = ? AND phone = ? AND created_at > ? "
-                "AND status IN ('pending', 'submitted', 'approved') ORDER BY id DESC LIMIT 1",
-                (clean_tid, clean_phone, cooldown_s)).fetchone()
-            if recent is not None:
-                return {
-                    "ok": False, "reason": "cooldown",
-                    "message": (
-                        f"您刚才已获取过【{tpl['name']}】的提交链接，请先完成本次填报；"
-                        f"如需再次上报，请 {self.ADHOC_MENU_COOLDOWN_SECONDS} 秒后在工作台重新点击该事项。"
-                    ),
-                }
-            placeholders = ",".join("?" for _ in roles)
-            mrow = self.conn.execute(
-                f"SELECT name, dept FROM member WHERE phone = ? AND role_id IN ({placeholders}) "
-                f"AND enabled = 1 ORDER BY id ASC LIMIT 1",
-                (clean_phone, *roles)).fetchone()
-            if mrow is None:
-                raise BizError(403, "FORBIDDEN", "您没有该事项的填报权限")
-            period_key = f"adhoc-{cur_dt.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
-            self.conn.execute(
-                "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) "
-                "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (clean_tid, clean_phone, mrow["name"], mrow["dept"], period_key,
-                 NO_DEADLINE_SENTINEL, now_s, int(tpl.get("owner_id") or 1)),
-            )
-            inst_id = int(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-        # 令牌在锁外签发（issue_h5_token 自带锁；无截止 → 720h 长链）
-        raw_token = self.issue_h5_token(
-            phone=clean_phone, template_id=clean_tid, period_key=period_key,
-            instance_id=inst_id, purpose="submit",
-            ttl_hours=calc_h5_token_ttl_hours({"status": "pending", "deadline_at": NO_DEADLINE_SENTINEL}, cur_dt),
-        )
-        return {"ok": True, "reason": "issued", "instance_id": inst_id, "period_key": period_key,
-                "token": raw_token, "name": tpl["name"]}
+        return self.issue_h5_token(phone, template_id, period_key, None, purpose="adhoc_submit", ttl_hours=24)
+
+    def adhoc_report_draft(self, token, template):
+        if not template or not template.get("is_adhoc") or not template.get("enabled") or template.get("deleted"):
+            return None
+        match = re.fullmatch(r"adhoc-(zdxlz|wecom)-[a-f0-9]{32}", token["period_key"])
+        roles = template["role_ids"]
+        if not match or not roles:
+            return None
+        phone, platform = token["phone"], match[1]
+        placeholders = ",".join("?" for _ in roles)
+        member = self.conn.execute(
+            "SELECT m.name, m.dept FROM member m JOIN role r ON r.role_id=m.role_id "
+            "JOIN delivery_target d ON d.phone=m.phone AND d.platform=r.platform AND d.usable=1 "
+            f"WHERE m.phone=? AND r.platform=? AND m.role_id IN ({placeholders}) "
+            "AND m.enabled=1 AND m.is_left_org=0 ORDER BY m.id LIMIT 1",
+            (phone, platform, *roles),
+        ).fetchone()
+        if member is None:
+            return None
+        return {"id": None, "phone": phone, "template_id": template["template_id"],
+                "period_key": token["period_key"], "name_snap": member["name"], "dept_snap": member["dept"],
+                "status": "pending", "deadline_at": NO_DEADLINE_SENTINEL, "owner_id": template["owner_id"]}
 
     def is_member_active_for_roles(self, phone: str, role_ids: List[str]) -> bool:
         """该手机号在给定角色集合下是否仍有 enabled=1 的名册行。
@@ -4109,7 +4075,8 @@ class StateStore:
                 "FROM task_instance i "
                 "JOIN task_template t ON t.template_id = i.template_id "
                 "WHERE i.phone = ? AND i.status IN ('pending', 'rejected') "
-                "AND t.kind != 'notice' AND t.enabled = 1 AND t.deleted = 0 "
+                "AND t.kind != 'notice' AND t.enabled = 1 AND t.deleted = 0 AND t.is_adhoc=0 "
+                "AND i.period_key NOT LIKE 'adhoc-%' "
                 + plat_sql +
                 "ORDER BY i.deadline_at ASC, i.id ASC LIMIT ?",
                 tuple(params + [max(1, int(limit))]),
@@ -4134,6 +4101,8 @@ class StateStore:
             raise BizError(404, "NOT_FOUND", "任务实例不存在")
         if int(row["owner_id"]) != owner_id:
             raise BizError(403, "FORBIDDEN_OWNER", "只能标记自己名下的任务实例")
+        if row["period_key"].startswith("adhoc-") and not row["submitted_at"]:
+            raise BizError(404, "NOT_FOUND", "自主上报尚未提交")
         if row["status"] not in MANUAL_SUBMISSION_STATUSES:
             raise BizError(400, "VALIDATION_FAILED", "仅待上传、已逾期或被驳回的任务可以标记为已提交")
         template = self.get_template(row["template_id"])
@@ -4209,6 +4178,132 @@ class StateStore:
             raise
         return {"ok": True, "status": new_status, "submission_id": submission_id, "submitted_at": now_s}
 
+    @staticmethod
+    def submission_revision(submission: Dict[str, Any]) -> str:
+        content = [submission[k] for k in ("id", "fields_json", "note", "refs_json", "file_ref", "status")]
+        return hashlib.sha256(json.dumps(content, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def submission_edit_target(self, instance_id: int, owner_id: int, *, for_update: bool = False):
+        row = self.conn.execute("SELECT * FROM task_instance WHERE id=?" + (" FOR UPDATE" if for_update else ""),
+                                (instance_id,)).fetchone()
+        if not row:
+            raise BizError(404, "NOT_FOUND", "任务实例不存在")
+        instance = dict(row)
+        if int(instance["owner_id"]) != owner_id:
+            raise BizError(403, "FORBIDDEN_OWNER", "只能编辑自己名下实例的提交内容")
+        template = self.get_template(instance["template_id"])
+        if template and template.get("portal_task"):
+            raise BizError(403, "PORTAL_READONLY", "授权成员发布任务仅可只读监管")
+        if not template or template["kind"] == "notice" or instance["status"] not in ("submitted", "approved"):
+            raise BizError(400, "INVALID_STATUS", "仅可编辑待审核或已完成的提交")
+        submission = self.get_latest_valid_submission(instance_id)
+        if not submission:
+            raise BizError(404, "NOT_FOUND", "提交记录不存在")
+        return instance, template, submission
+
+    def h5_edit_target(self, token, *, for_update=False):
+        if (not token or token['purpose'] != 'report_history' or not token['instance_id']
+                or token['expires_at'] < self.now_str()):
+            raise BizError(401, 'TOKEN_EXPIRED', '链接已过期，请从工作台重新打开')
+        row = self.conn.execute('SELECT * FROM task_instance WHERE id=?' + (' FOR UPDATE' if for_update else ''),
+                                (token['instance_id'],)).fetchone()
+        instance = dict(row) if row else None
+        if not instance or any(token[key] != instance[key] for key in ('phone', 'template_id', 'period_key')):
+            raise BizError(403, 'FORBIDDEN', '无法编辑这条提交')
+        template = self.get_template(instance['template_id'])
+        if instance['status'] not in ('submitted', 'approved') or self.instance_close_reason(instance, template):
+            raise BizError(403, 'TASK_CLOSED', '这条提交已关闭编辑')
+        submission = self.get_latest_valid_submission(instance['id'])
+        if not submission:
+            raise BizError(404, 'NOT_FOUND', '提交记录不存在')
+        return instance, template, submission
+
+    @staticmethod
+    def h5_edit_upload_key(token):
+        return 'edit-' + token['token_id'][:32]
+
+    def edit_submission(self, instance_id: int, owner_id: Optional[int], actor: str, *, uploads_dir: Path,
+                        revision: str, fields=None, note=None, retained_refs=None, uploads=(), h5_token=None, new_refs=()):
+        saved = []
+        try:
+            with self.conn:
+                if h5_token:
+                    instance, template, submission = self.h5_edit_target(h5_token, for_update=True)
+                else:
+                    instance, template, submission = self.submission_edit_target(instance_id, owner_id, for_update=True)
+                if revision != self.submission_revision(submission):
+                    raise BizError(409, "SUBMISSION_CHANGED", "提交内容已有更新，请重新打开详情后再编辑")
+                current_refs = self.submission_refs(submission)
+                keep = current_refs if retained_refs is None else list(dict.fromkeys(retained_refs))
+                if set(keep) - set(current_refs):
+                    raise BizError(400, "VALIDATION_FAILED", "只能保留本次提交已有的附件")
+                kept = [row for ref in keep if (row := self.get_upload_ref(ref)) is not None]
+                if len(kept) != len(keep):
+                    raise BizError(400, "VALIDATION_FAILED", "保留的附件已不存在")
+                modules = effective_h5_modules(template)
+                note_editable = "text" in modules or bool(h5_token and template.get("allow_note"))
+                if (fields and "fields" not in modules) or (note and not note_editable):
+                    raise BizError(400, "VALIDATION_FAILED", "任务模板未启用对应内容类型")
+                schema = template.get("schema_json") or []
+                old_values = submission["fields"] or {}
+                values = dict(old_values)
+                if fields is not None and "fields" in modules:
+                    allowed = {f["key"] for f in schema}
+                    values = {key: value for key, value in old_values.items() if key not in allowed}
+                    cleaned = validate_form_submission_fields(schema, fields, enforce_required=bool(h5_token))
+                    values.update({key: value for key, value in cleaned.items() if value != ""})
+                try:
+                    fields_json = json.dumps(values, ensure_ascii=False, allow_nan=False) if values else None
+                except ValueError:
+                    raise BizError(400, "VALIDATION_FAILED", "报数字段必须为有限数字") from None
+                new_note = submission["note"] if note is None or not note_editable else note.strip()[:500] or None
+                max_mb = task_upload_max_mb(template)
+                new_files = []
+                for ref in dict.fromkeys(new_refs):
+                    row = self.get_upload_ref(ref)
+                    if (not h5_token or not row or row['consumed'] or row['phone'] != instance['phone']
+                            or row['template_id'] != instance['template_id']
+                            or not row['rel_path'].startswith(self.h5_edit_upload_key(h5_token) + '/')):
+                        raise BizError(400, 'VALIDATION_FAILED', '新上传的附件不属于本次修改，请重新选择')
+                    new_files.append(row)
+                mimes = [row['mime'] for row in kept + new_files] + [upload.mime for upload in uploads]
+                _validate_attachment_counts(template, mimes)
+                if h5_token:
+                    required = required_h5_modules(template)
+                    if 'image' in required and not any(mime.startswith('image/') for mime in mimes):
+                        raise BizError(400, 'VALIDATION_FAILED', '请保留或上传图片')
+                    if 'file' in required and not any(not mime.startswith('image/') for mime in mimes):
+                        raise BizError(400, 'VALIDATION_FAILED', '请保留或上传文件')
+                    if 'text' in required and not new_note:
+                        raise BizError(400, 'VALIDATION_FAILED', '请填写文字说明')
+                for upload in uploads:
+                    module = "image" if upload.mime.startswith("image/") else "file"
+                    if module not in modules or upload.size > max_mb * 1024 * 1024:
+                        raise BizError(400, "VALIDATION_FAILED", "附件类型或大小超出任务配置")
+                    saved.append(self.store_task_upload(instance, upload, uploads_dir))
+                for upload in saved:
+                    self.conn.execute("UPDATE upload_ref SET consumed=1 WHERE ref=?", (upload["ref"],))
+                for ref in sorted(row['ref'] for row in new_files):
+                    if not self.conn.execute('UPDATE upload_ref SET consumed=1 WHERE ref=? AND consumed=0', (ref,)).rowcount:
+                        raise BizError(400, 'VALIDATION_FAILED', '有附件已清理，请重新上传')
+                attachments = kept + saved + new_files
+                refs = [row["ref"] for row in attachments]
+                first = attachments[0] if attachments else {}
+                self.conn.execute(
+                    "UPDATE submission SET fields_json=?, note=?, refs_json=?, file_ref=?, file_name=?, mime=?, size=? WHERE id=?",
+                    (fields_json, new_note, json.dumps(refs) if refs else None, first.get("ref"), first.get("file_name"),
+                     first.get("mime"), first.get("size"), submission["id"]),
+                )
+                self._insert_audit_unlocked(actor, "instance.edit_submission", "task_instance", str(instance['id']),
+                                            {"submission_id": submission["id"], "previous_refs": current_refs,
+                                             "refs": refs, "fields_changed": old_values != values,
+                                             "note_changed": submission["note"] != new_note}, self.now_str())
+        except Exception:
+            for upload in saved:
+                self._purge_upload_file(uploads_dir, upload["rel_path"])
+            raise
+        return {"ok": True, "submission_id": submission["id"]}
+
     def submit_h5_task(
         self, *, raw_token: str, fields: Optional[Dict[str, Any]] = None, file_ref: Optional[str] = None,
         note: Optional[str] = None, refs: Optional[List[str]] = None,
@@ -4216,7 +4311,7 @@ class StateStore:
     ) -> Dict[str, Any]:
         tok = self.get_h5_token(raw_token)
         # 2026-11-12 任务E3：purpose 收窄为 submit（原「补交链接」机制已下线）
-        if not tok or tok.get("purpose") != "submit":
+        if not tok or tok.get("purpose") not in ("submit", "adhoc_submit"):
             raise BizError(404, "NOT_FOUND", "提交链接无效或不存在")
         if on_instance_resolved is not None and tok.get("instance_id") is not None:
             on_instance_resolved(int(tok["instance_id"]))
@@ -4224,8 +4319,11 @@ class StateStore:
         now_s = format_dt(cur_dt)
         self.advance_instance_statuses(cur_dt)
 
+        draft = tok["purpose"] == "adhoc_submit" and tok["instance_id"] is None
         inst = self.get_instance(int(tok["instance_id"])) if tok.get("instance_id") else None
-        tpl = self.get_template(inst["template_id"], include_deleted=True) if inst else None
+        tpl = self.get_template(tok["template_id"], include_deleted=True) if inst or draft else None
+        if draft:
+            inst = self.adhoc_report_draft(tok, tpl)
         # 2026-11-12 下午（用户拍板）：五类失效统一拦截「任务已关闭」，先于过期窗口判断；
         # 模板被物理删除/实例被清除时，靠保留的 h5_token 行识别出「任务已关闭」而非技术报错。
         close_reason = self.instance_close_reason(inst, tpl)
@@ -4276,7 +4374,8 @@ class StateStore:
 
         for ref in clean_refs:
             row = self.get_upload_ref(ref)
-            if not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]:
+            if (not row or row["phone"] != inst["phone"] or row["template_id"] != inst["template_id"]
+                    or (draft and not row["rel_path"].startswith(f"{inst['period_key']}/"))):
                 raise BizError(400, "VALIDATION_FAILED", "上传文件引用无效")
             if row["consumed"]:
                 raise BizError(400, "VALIDATION_FAILED", "该文件已被使用，请重新上传")
@@ -4300,6 +4399,24 @@ class StateStore:
         late_submit = 1 if (now_s > inst["deadline_at"] or int(inst.get("late_submit") or 0) == 1) else 0
 
         with self.lock, self.conn:
+            if draft:
+                claim = self.conn.execute("SELECT consumed FROM h5_token WHERE token_id=? FOR UPDATE", (tok["token_id"],)).fetchone()
+                if not claim or claim["consumed"]:
+                    raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
+                current = self.conn.execute("SELECT * FROM task_template WHERE template_id=? FOR UPDATE", (inst["template_id"],)).fetchone()
+                current_tpl = self._deserialize_template_row(current) if current else None
+                if not self.adhoc_report_draft(tok, current_tpl):
+                    raise BizError(403, "TASK_CLOSED", "任务已关闭")
+                if current_tpl != tpl:
+                    raise BizError(409, "TEMPLATE_CHANGED", "任务配置已更新，请刷新后提交")
+                row = self.conn.execute(
+                    "INSERT INTO task_instance(template_id,phone,name_snap,dept_snap,period_key,status,deadline_at,created_at,owner_id) "
+                    "VALUES (?,?,?,?,?,'pending',?,?,?)",
+                    (inst["template_id"], inst["phone"], inst["name_snap"], inst["dept_snap"], inst["period_key"],
+                     NO_DEADLINE_SENTINEL, now_s, inst["owner_id"]),
+                )
+                inst["id"] = int(row.lastrowid)
+                self.conn.execute("UPDATE h5_token SET instance_id=? WHERE token_id=?", (inst["id"], tok["token_id"]))
             # 与后台代交共用实例行锁，再消费令牌，避免两个有效链接并发写入。
             locked = self.conn.execute(
                 "SELECT * FROM task_instance WHERE id = ? FOR UPDATE", (inst["id"],),
@@ -4341,6 +4458,8 @@ class StateStore:
                 (new_status, now_s, late_submit, int(inst["id"])),
             )
 
+        if draft and on_instance_resolved is not None:
+            on_instance_resolved(inst["id"])
         return {"ok": True, "submission_id": sub_id, "status": new_status, "late_submit": bool(late_submit), "message": "已提交，等待审核" if tpl["need_review"] else "已完成"}
 
     def review_instance(self, instance_id: int, action: str, reviewer: str, reason: Optional[str] = None) -> Dict[str, Any]:
@@ -4522,6 +4641,13 @@ class StateStore:
         with self.lock:
             row = self.conn.execute("SELECT * FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone()
             return dict(row) if row else None
+
+    def instance_published_at(self, instance_id: int) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT MIN(sent_at) AS published_at FROM reminder_log WHERE instance_id=? AND result='sent' "
+            "AND kind IN ('remind','manual_push','notice','portal')", (instance_id,),
+        ).fetchone()
+        return row["published_at"] if row else None
 
     def get_instance_by_key(self, template_id: str, phone: str, period_key: str) -> Optional[Dict[str, Any]]:
         with self.lock:

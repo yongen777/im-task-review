@@ -118,7 +118,7 @@ def test_adhoc_scheduler_physical_isolation_and_push_now_refused() -> None:
             raise AssertionError("adhoc 模板必须拒绝手动推送")
         except BizError as exc:
             assert (exc.status_code, exc.code) == (400, "VALIDATION_FAILED"), exc
-            assert "菜单" in exc.message, exc.message
+            assert "个人工作台" in exc.message, exc.message
     finally:
         store.close()
 
@@ -130,17 +130,16 @@ def test_adhoc_never_overdue_and_h5_hides_deadline() -> None:
         rid = _seed_zdxlx(store)
         tpl = _adhoc_tpl(store, rid)
         # 2026-11-18：工作台点击事项调用同一签发服务，文本数字已下线。
-        body = store.create_adhoc_instance_and_token(tpl["template_id"], P, platform="zdxlz")
-        assert body["ok"] is True
-        raw = body["token"]
-        inst = store.get_instance(int(body["instance_id"]))
-        assert inst["deadline_at"] == NO_DEADLINE_SENTINEL, inst["deadline_at"]
-        assert inst["period_key"].startswith("adhoc-"), inst["period_key"]
+        raw = store.issue_adhoc_report(tpl["template_id"], P, platform="zdxlz")
+        assert _row_count(store, "task_instance") == 0
         # 100 年后也不流转 overdue/expired
         stats = store.advance_instance_statuses(datetime(2099, 1, 1))
         assert stats["to_overdue"] == 0, stats
         code, info = process_h5_task_info(state=store, raw_token=raw)
         assert code == 200 and info["window_open"] is True, (code, info)
+        assert info["instance"]["deadline_at"] == NO_DEADLINE_SENTINEL
+        assert info["template"]["is_adhoc"] is True
+        assert info["published_at"] is None
         assert info["template"]["deadline_rule"] == "不限", info["template"]["deadline_rule"]
         assert info["template"]["has_deadline"] is False
     finally:
@@ -191,7 +190,7 @@ def test_menu_platform_isolation_and_role_scope():
         assert [t['template_id'] for t in store.list_adhoc_menu_items(P, platform='zdxlz')] == [z['template_id']]
         assert [t['template_id'] for t in store.list_adhoc_menu_items(P2, platform='wecom')] == [w['template_id']]
         with pytest.raises(BizError):
-            store.create_adhoc_instance_and_token(w['template_id'], P, platform='zdxlz')
+            store.issue_adhoc_report(w['template_id'], P, platform='zdxlz')
     finally:
         store.close()
 
@@ -222,6 +221,7 @@ def test_adhoc_template_interlock_forces_blank_schedule_and_deadline() -> None:
         rid = _seed_zdxlx(store)
         tpl = _adhoc_tpl(store, rid, "带截止的不定期")  # payload 故意带 remind_at/deadline/执行日
         assert tpl["is_adhoc"] is True
+        assert tpl["text_tpl"] == ""
         assert tpl["remind_at"] is None, tpl["remind_at"]
         assert tpl["has_deadline"] is False
         assert tpl["deadline_time"] is None and tpl["deadline_type"] is None
@@ -229,7 +229,7 @@ def test_adhoc_template_interlock_forces_blank_schedule_and_deadline() -> None:
         assert not tpl["exec_weekdays"] and not tpl["exec_dom_days"], (tpl["exec_weekdays"], tpl["exec_dom_days"])
         # 编辑切换回普通模式：恢复执行时间/截止的显式配置
         upd = store.update_template(tpl["template_id"], {
-            "is_adhoc": False, "remind_at": "09:00", "has_deadline": True,
+            "is_adhoc": False, "remind_at": "09:00", "has_deadline": True, "text_tpl": "请按时填报",
             "deadline_type": "same_day", "deadline_time": "18:00", "exec_weekdays": [1],
         }, actor="t")
         assert upd["is_adhoc"] is False and upd["remind_at"] == "09:00" and upd["has_deadline"] is True
@@ -242,7 +242,7 @@ def test_adhoc_template_interlock_forces_blank_schedule_and_deadline() -> None:
             raise AssertionError("notice + adhoc 必须拒绝")
         except BizError as exc:
             assert (exc.status_code, exc.code) == (400, "VALIDATION_FAILED"), exc
-            assert "不定期" in exc.message, exc.message
+            assert "自主上报" in exc.message, exc.message
     finally:
         store.close()
 
@@ -259,9 +259,7 @@ def test_adhoc_one_shot_link_and_multi_report() -> None:
 
         def _issue(n: int = 1) -> str:
             item = store.list_adhoc_menu_items(P, platform="zdxlz")[n - 1]
-            body = store.create_adhoc_instance_and_token(item["template_id"], P, platform="zdxlz")
-            assert body["ok"] is True
-            return body["token"]
+            return store.issue_adhoc_report(item["template_id"], P, platform="zdxlz")
 
         raw1 = _issue(1)
         res = store.submit_h5_task(raw_token=raw1, fields={"summary": "3 号楼消防通道堵塞"}, note="现场情况说明")
@@ -278,11 +276,10 @@ def test_adhoc_one_shot_link_and_multi_report() -> None:
             assert (exc.status_code, exc.code, exc.message) == (400, "ALREADY_SUBMITTED", "已上传，请勿重复提交"), exc
         assert _row_count(store, "submission") == 1
 
-        # 冷却窗口外再次回复数字 → 全新实例 + 全新链接，可继续上报
-        CLOCK["now"] = CLOCK["now"] + timedelta(seconds=StateStore.ADHOC_MENU_COOLDOWN_SECONDS + 5)
+        # 上一次已提交后可以立即再次打开；新表单成功提交前没有新实例。
         raw2 = _issue(1)
         assert raw2 != raw1
-        assert _row_count(store, "task_instance") == 2, "第二次上报必须创建全新实例"
+        assert _row_count(store, "task_instance") == 1
         res2 = store.submit_h5_task(raw_token=raw2, fields={"summary": "地库渗水"}, note="现场情况说明")
         assert res2["status"] == "approved"
         assert _row_count(store, "submission") == 2
@@ -291,18 +288,21 @@ def test_adhoc_one_shot_link_and_multi_report() -> None:
         store.close()
 
 
-def test_adhoc_number_cooldown_blocks_repeat_issuance():
+def test_adhoc_two_devices_can_open_without_creating_instances():
     store = _store()
     try:
         rid = _seed_zdxlx(store)
         tpl = _adhoc_tpl(store, rid)
-        body = store.create_adhoc_instance_and_token(tpl['template_id'], P, platform='zdxlz')
-        assert body['ok'] is True
-        n_inst, n_tok = _row_count(store, 'task_instance'), _row_count(store, 'h5_token')
-        body2 = store.create_adhoc_instance_and_token(tpl['template_id'], P, platform='zdxlz')
-        assert body2['ok'] is False
-        assert '已获取过' in body2['message']
-        assert (_row_count(store, 'task_instance'), _row_count(store, 'h5_token')) == (n_inst, n_tok)
+        pc = store.issue_adhoc_report(tpl['template_id'], P, platform='zdxlz')
+        mobile = store.issue_adhoc_report(tpl['template_id'], P, platform='zdxlz')
+        assert pc != mobile
+        for token in (pc, mobile):
+            assert process_h5_task_info(state=store, raw_token=token)[1]['window_open'] is True
+        with pytest.raises(BizError):
+            store.submit_h5_task(raw_token=mobile, fields={})
+        assert _row_count(store, 'task_instance') == 0
+        assert _row_count(store, 'submission') == 0
+        assert store.list_pending_todo(P, platform='zdxlz') == []
     finally:
         store.close()
 

@@ -46,6 +46,10 @@
     .msg { display: none; margin-top: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--control); font-size: 14px; }
     .msg.error { display: block; background: #fff3f1; color: #972e27; }
     .msg.success { display: block; background: #edf7f2; color: #1b644e; }
+    .msg.neutral { display: block; color: var(--secondary); }
+    .feedback { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); width: max-content; max-width: calc(100% - 32px); padding: 12px 16px; border-radius: var(--control); background: #182530; color: #fff; z-index: 10; font-size: 14px; }
+    .feedback.success { background: #1b644e; }
+    .task-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     body { padding: 16px 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
     .card { max-width: 640px; margin: auto; }
     .block, .task-head { background: var(--paper); border: 1px solid var(--line); border-radius: var(--panel); padding: 16px; margin-bottom: 12px; }
@@ -81,12 +85,8 @@
     .saved-content dl, .saved-content dd { margin: 0; }
     .saved-content dt { color: var(--secondary); font-size: 14px; margin-top: 12px; }
     .saved-content dd { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .locked-tip, .submit-success-banner { padding: 12px; margin: 12px 0; border: 1px solid var(--line); border-radius: var(--control); background: var(--selection); }
+    .locked-tip { padding: 12px; margin: 12px 0; border: 1px solid var(--line); border-radius: var(--control); background: var(--selection); }
     .locked-tip.warning { background: #fff7eb; color: #79460d; }
-    .submit-success-banner { color: #1b644e; background: #edf7f2; font-weight: 500; }
-    .submit-done-mask { position: fixed; inset: 0; z-index: 4; display: grid; align-content: center; justify-items: center; gap: 12px; padding: 24px; padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px)); background: var(--paper); text-align: center; }
-    .submit-done-title { font-size: 20px; font-weight: 600; color: #1b644e; }
-    .submit-done-sub { color: var(--secondary); font-size: 14px; }
     .btn { width: 100%; position: sticky; bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
     .preview { width: min(640px, calc(100% - 32px)); max-height: 88vh; padding: 16px; border: 1px solid var(--line); border-radius: var(--panel); }
     .preview::backdrop { background: #182530b3; }
@@ -103,17 +103,18 @@
           <span class="deadline" id="headDeadline"></span>
         </div>
         <div class="desc" id="headDesc"></div>
-        <div class="meta">提交人：<span id="memberName"></span> · 周期：<span id="periodKey"></span> · 状态：<span class="badge" id="instStatus"></span></div>
+        <div class="meta">提交人：<span id="memberName"></span><span id="taskTime" hidden></span> · 状态：<span class="badge" id="instStatus"></span></div>
       </div>
       <div id="dynamicArea"></div>
       <div class="block" id="noteField" style="display:none;">
         <div class="block-head"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="name">备注说明（选填）</span></div>
         <div class="field"><textarea id="noteInput" rows="3" placeholder="请输入补充说明"></textarea></div>
       </div>
-      <button class="btn" id="submitBtn" type="button">提交任务</button>
+      <div class="task-actions" id="taskActions"><button class="btn" id="submitBtn" type="button">提交任务</button></div>
     </div>
     <div id="msgBox" class="msg" role="status"></div>
   </div>
+  <div id="feedback" class="feedback" role="status" hidden></div>
   <dialog class="preview" id="preview" aria-label="图片预览">
     <form method="dialog"><button class="secondary">关闭预览</button></form>
     <img alt="">
@@ -122,10 +123,42 @@
     (function () {
       const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
       const token = params.get("t") || "";
+      const wantsEdit = params.get("edit") === "1";
+      const result = params.get("result");
+      const feedback = document.getElementById("feedback");
+      let feedbackTimer, editing = false;
+      if (result) {
+        params.delete("result");
+        history.replaceState(null, "", "#" + params.toString());
+      }
+      function switchView(edit, notice) {
+        if (edit) params.set("edit", "1"); else params.delete("edit");
+        if (notice) params.set("result", notice);
+        history.replaceState(null, "", "#" + params.toString());
+        location.reload();
+      }
+      async function taskRequest(route, options, timeout = 20000) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
+        try {
+          const response = await fetch(route, { ...options, signal: controller.signal, cache: "no-store" });
+          const data = response.ok && route.endsWith("/attachment") ? await response.blob() : await response.json();
+          return { ok: response.ok, data };
+        } catch (error) {
+          throw Error(controller.signal.aborted ? "操作超时，请重试" : "网络请求失败，请重试");
+        } finally { clearTimeout(timer); }
+      }
+      function showTaskTime(instance, publishedAt) {
+        const time = document.getElementById("taskTime");
+        time.hidden = !instance.submitted_at && !publishedAt;
+        time.textContent = instance.submitted_at ? " · 完成时间：" + instance.submitted_at
+          : publishedAt ? " · 执行时间：" + publishedAt : "";
+      }
       const loadingEl = document.getElementById("loading");
       const contentEl = document.getElementById("content");
       const msgBox = document.getElementById("msgBox");
       const submitBtn = document.getElementById("submitBtn");
+      const taskActions = document.getElementById("taskActions");
       let taskInfo = null;
       let uploadedRefs = [];
       let activeUploads = 0;
@@ -138,22 +171,26 @@
       function showMsg(text, type) {
         msgBox.textContent = text;
         msgBox.className = "msg " + type;
+        feedback.textContent = text;
+        feedback.className = "feedback " + type;
+        feedback.hidden = false;
+        clearTimeout(feedbackTimer);
+        feedbackTimer = setTimeout(() => { feedback.hidden = true; }, 3800);
       }
 
       async function openSavedAttachment(attachment, button) {
         button.disabled = true;
         try {
-          const response = await fetch("/api/h5/task/attachment", {
+          const response = await taskRequest("/api/h5/task/attachment", {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-H5-Token": token },
             body: JSON.stringify({ ref: attachment.ref })
           });
           if (!response.ok) {
-            const error = await response.json();
-            showMsg(error.message || "附件读取失败", "error");
+            showMsg(response.data.message || "附件读取失败", "error");
             return;
           }
-          const blob = await response.blob();
+          const blob = response.data;
           const url = URL.createObjectURL(blob);
           const dialog = document.getElementById("preview");
           if (attachment.mime.startsWith("image/") && typeof dialog.showModal === "function") {
@@ -175,7 +212,7 @@
             setTimeout(() => URL.revokeObjectURL(url), 30000);
           }
         } catch (error) {
-          showMsg("附件读取失败，请稍后重试", "error");
+          showMsg(error.message, "error");
         } finally {
           button.disabled = false;
         }
@@ -227,19 +264,27 @@
         return;
       }
 
-      fetch("/api/h5/task/info", {
+      taskRequest("/api/h5/task/info", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: token })
       })
-        .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
         .then(({ ok, data }) => {
           loadingEl.style.display = "none";
           if (!ok) return showMsg(data.message || "任务加载失败", "error");
           taskInfo = data;
+          editing = wantsEdit && data.can_edit;
+          if (params.get("from") === "portal" && !editing) {
+            const back = document.createElement("button");
+            back.type = "button";
+            back.className = "secondary";
+            back.textContent = "返回工作台";
+            back.onclick = () => history.back();
+            taskActions.appendChild(back);
+          }
           contentEl.style.display = "block";
           document.getElementById("memberName").textContent = data.instance.name_snap;
-          document.getElementById("periodKey").textContent = data.instance.period_key;
+          showTaskTime(data.instance, data.published_at);
           /* 2026-11-12 任务E5：cancelled（成员移出分组后作废）补「已取消」徽章；
              无截止模板的截止时间展示「不限」。 */
           const STATUS_TEXT = { pending: "待上传", submitted: "待审核", approved: "已完成", rejected: "已驳回", overdue: "已逾期", expired: "已过期", cancelled: "已取消" };
@@ -252,9 +297,10 @@
              deadline_rule 仅作兜底（模板未建实例时的旧字段）。 */
           const __rule = String(data.template.deadline_display || data.template.deadline_rule || "").trim();
           document.getElementById("headDeadline").textContent = "截止 " + (__rule || "不限");
+          document.getElementById("headDeadline").hidden = data.template.is_adhoc;
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
-          if (["submitted", "approved"].includes(data.instance.status)) {
+          if (!editing && (data.readonly_history || ["submitted", "approved"].includes(data.instance.status))) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
             tip.setAttribute("role", "status");
@@ -266,7 +312,28 @@
             renderSavedSubmission(data.submission, data.template, area);
             submitBtn.disabled = true;
             submitBtn.hidden = true;
+            if (data.can_edit) {
+              const editButton = document.createElement("button");
+              editButton.type = "button";
+              editButton.className = "btn";
+              editButton.textContent = "编辑提交内容";
+              editButton.onclick = () => switchView(true);
+              taskActions.appendChild(editButton);
+            }
+            if (result === "saved") showMsg("修改已保存", "success");
+            else if (result === "cancelled") showMsg("已取消修改，原提交已保留", "neutral");
+            else if (result === "done") showMsg(data.instance.status === "submitted" ? "提交成功，等待审核" : "提交成功，任务已完成", "success");
+            else if (wantsEdit) showMsg("这条提交已关闭编辑", "error");
             return;
+          }
+          if (editing) {
+            submitBtn.textContent = "保存修改";
+            const cancel = document.createElement("button");
+            cancel.type = "button";
+            cancel.className = "secondary";
+            cancel.textContent = "取消修改";
+            cancel.onclick = () => { if (!submitBtn.disabled) switchView(false, "cancelled"); };
+            taskActions.appendChild(cancel);
           }
 
           const area = document.getElementById("dynamicArea");
@@ -344,7 +411,9 @@
             const refList = document.createElement("div");
             refList.className = "ref-list";
             body.appendChild(refList);
-            let uploaded = [];
+            let uploaded = editing ? (data.submission.attachments || [])
+              .filter(item => item.mime.startsWith("image/") === previewImages)
+              .map(item => ({ ref: item.ref, name: item.file_name, saved: item })) : [];
             function renderUploads() {
               moduleRefs[moduleKey] = uploaded.map(item => item.ref);
               syncRefs();
@@ -369,7 +438,15 @@
                 });
                 line.appendChild(remove);
                 refList.appendChild(line);
-                if (item.preview) {
+                if (item.saved) {
+                  const open = document.createElement("button");
+                  open.type = "button";
+                  open.className = "secondary";
+                  open.textContent = previewImages ? "预览" : "下载";
+                  open.setAttribute("aria-label", open.textContent + " " + item.name);
+                  open.onclick = () => openSavedAttachment(item.saved, open);
+                  line.prepend(open);
+                } else if (item.preview) {
                   const img = document.createElement("img");
                   img.className = "thumb";
                   img.src = item.preview;
@@ -394,6 +471,7 @@
                 }
               }
             }
+            renderUploads();
             fileInp.addEventListener("change", async () => {
               const chosen = Array.from(fileInp.files);
               fileInp.value = "";
@@ -415,10 +493,10 @@
                   }
                   const fd = new FormData();
                   fd.append("file", f);
-                  const r = await fetch("/api/h5/task/upload", {
+                  const r = await taskRequest(editing ? "/api/h5/task/edit-upload" : "/api/h5/task/upload", {
                     method: "POST", headers: { "X-H5-Token": token }, body: fd
-                  });
-                  const res = await r.json();
+                  }, 90000);
+                  const res = r.data;
                   if (!r.ok) {
                     showMsg(
                       previewImages && res.code === "FILE_TYPE_REJECTED"
@@ -443,7 +521,7 @@
                   renderUploads();
                 }
               } catch (e) {
-                showMsg("上传网络异常", "error");
+                showMsg(e.message, "error");
               } finally {
                 activeUploads--;
                 uploadStatus.textContent = "";
@@ -485,6 +563,8 @@
                 inp.id = "task-field-" + f.key;
                 lbl.htmlFor = inp.id;
                 inp.dataset.fieldKey = f.key;
+                const saved = editing ? data.submission.fields[f.key] : null;
+                if (saved != null) inp.value = saved === true ? "是" : saved === false ? "否" : String(saved);
                 wrap.appendChild(inp);
                 body.appendChild(wrap);
               });
@@ -513,6 +593,7 @@
           }
           /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
           if (!h5Modules.length && data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
+          if (editing) document.getElementById("noteInput").value = data.submission.note || "";
 
           const dl = String(data.instance.deadline_at || "");
           const noDeadline = dl.startsWith("9999-12-31");
@@ -526,8 +607,8 @@
               ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
               : "该提交已被驳回，请按审核意见修改后重新提交。";
             if (data.instance.reject_reason) tip.textContent += " 驳回原因：" + data.instance.reject_reason;
-            contentEl.insertBefore(tip, submitBtn);
-          } else if (__status !== "pending") {
+            contentEl.insertBefore(tip, taskActions);
+          } else if (!editing && __status !== "pending") {
             const LOCKED_TEXT = {
               rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
               /* 2026-11-12 任务E2：逾期/过期统一口径文案（与后端校验同句式） */
@@ -539,24 +620,24 @@
             tip.className = "locked-tip";
             tip.textContent = LOCKED_TEXT[__status] || (data.window_reason || "当前状态不可提交。");
             const content = document.getElementById("content");
-            content.insertBefore(tip, submitBtn);
+            content.insertBefore(tip, taskActions);
             content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
             submitBtn.disabled = true;
             submitBtn.style.display = "none";
           }
 
-          if (!data.window_open) {
+          if (!editing && !data.window_open) {
             submitBtn.disabled = true;
             showMsg(data.window_reason || "当前任务提交窗口已关闭", "error");
           }
         })
-        .catch(() => {
+        .catch(error => {
           loadingEl.style.display = "none";
-          showMsg("网络请求异常", "error");
+          showMsg(error.message, "error");
         });
 
       submitBtn.addEventListener("click", () => {
-        if (!taskInfo) return;
+        if (!taskInfo || submitBtn.disabled) return;
         if (activeUploads) return showMsg("请等待附件上传完成", "error");
         let payload = {};
         const fieldsObj = {};
@@ -583,72 +664,28 @@
         if (h5Modules.indexOf("file") >= 0 && !((refsByModule["file"] || []).length)) {
           return showMsg("请上传文件后再提交", "error");
         }
+        const idleLabel = editing ? "保存修改" : "提交任务";
+        const saved = new Set((taskInfo.submission?.attachments || []).map(item => item.ref));
+        const requestBody = editing ? {
+          revision: taskInfo.submission.revision,
+          fields: fieldsObj, note,
+          retained_refs: uploadedRefs.filter(ref => saved.has(ref)),
+          refs: uploadedRefs.filter(ref => !saved.has(ref)),
+        } : { token, payload, note };
         submitBtn.disabled = true;
-        submitBtn.textContent = "正在提交…";
-        fetch("/api/h5/task/submit", {
+        submitBtn.textContent = editing ? "正在保存…" : "正在提交…";
+        taskRequest(editing ? "/api/h5/task/save-edit" : "/api/h5/task/submit", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token: token, payload: payload, note: note })
-        })
-          .then(r => r.json().then(d => ({ ok: r.ok, data: d })))
-          .then(({ ok, data }) => {
-            if (!ok) {
-              submitBtn.disabled = false;
-              submitBtn.textContent = "提交任务";
-              return showMsg(data.message || "提交失败", "error");
-            }
-            /* 2026-11-03 用户口径：提交成功后整页立即锁定，防重复提交（刷新后由后端状态兜底锁定）。 */
-            const content = document.getElementById("content");
-            const tip = document.createElement("div");
-            tip.className = "locked-tip";
-            tip.textContent = data.status === "approved"
-              ? "提交成功，任务已完成。本条已锁定，如需修改请联系管理员。"
-              : "提交成功，等待管理员审核。本条已锁定，如需修改请联系管理员驳回后重新提交。";
-            content.insertBefore(tip, submitBtn);
-            content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
-            submitBtn.disabled = true;
-            submitBtn.style.display = "none";
-            /* 2026-11-13 用户拍板（原话）：提交收到 200 成功后 →
-               ① 立即展示醒目绿色成功反馈「提交成功」；
-               ② 延迟 800~1000ms 自动尝试关闭当前页面（微信 WebView / 浏览器四条路径依次尝试）；
-               ③ 若宿主 WebView 拦截脚本关窗（页面仍在），切换为全屏干净的
-                  「提交成功，可安全关闭页面」完成视图。 */
-            showMsg(data.message || "提交成功", "success");
-            const successBanner = document.createElement("div");
-            successBanner.className = "submit-success-banner";
-            successBanner.innerHTML = ' <svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg> 提交成功';
-            content.insertBefore(successBanner, submitBtn);
-            window.setTimeout(function () {
-              try {
-                if (window.WeixinJSBridge && typeof window.WeixinJSBridge.call === "function") {
-                  window.WeixinJSBridge.call("closeWindow");
-                }
-              } catch (e) { /* 宿主拦截：继续下一条路径 */ }
-              try {
-                if (window.wx && typeof window.wx.closeWindow === "function") {
-                  window.wx.closeWindow();
-                }
-              } catch (e) { /* 宿主拦截：继续下一条路径 */ }
-              try { window.history.back(); } catch (e) { /* 无历史/被拦截 */ }
-              try { window.close(); } catch (e) { /* 仅允许脚本关闭的页面生效 */ }
-              /* 兜底：关窗被拦截（页面仍在运行）→ 全屏完成视图，引导用户手动关闭 */
-              window.setTimeout(function () {
-                if (document.querySelector(".submit-done-mask")) return;
-                const mask = document.createElement("div");
-                mask.className = "submit-done-mask";
-                mask.innerHTML =
-                  '<svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg>'
-                  + '<div class="submit-done-title">提交成功，可安全关闭页面</div>'
-                  + '<div class="submit-done-sub">本条已锁定，请勿重复提交；如需修改请联系管理员驳回后重新提交。</div>';
-                document.body.appendChild(mask);
-              }, 500);
-            }, 900);
-          })
-          .catch(() => {
-            submitBtn.disabled = false;
-            submitBtn.textContent = "提交任务";
-            showMsg("提交网络异常", "error");
-          });
+          headers: { "Content-Type": "application/json", "X-H5-Token": token },
+          body: JSON.stringify(requestBody)
+        }).then(({ ok, data }) => {
+          if (!ok) throw Error(data.message || "提交失败");
+          switchView(false, editing ? "saved" : "done");
+        }).catch(error => {
+          submitBtn.disabled = false;
+          submitBtn.textContent = idleLabel;
+          showMsg(error.message, "error");
+        });
       });
     })();
   </script>

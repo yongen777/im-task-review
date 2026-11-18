@@ -68,11 +68,18 @@ class DemoDirectory:
             return None
         name, parent = DEMO_DEPARTMENTS[dept_id]
         path = self.get_department(parent)["full_name"] + "/" + name if parent else name
-        return {"dept_id": dept_id, "name": name, "full_name": path,
+        return {"dept_id": dept_id, "name": name, "full_name": path, "parent_id": parent,
                 "user_count": len(self.dept_users_all(dept_id))}
 
     def department_children(self, dept_id):
         return [self.get_department(key) for key, (_, parent) in DEMO_DEPARTMENTS.items() if parent == dept_id]
+
+    def department_parents(self, dept_id):
+        result = []
+        while (parent := DEMO_DEPARTMENTS[dept_id][1]):
+            result.append(self.get_department(parent))
+            dept_id = parent
+        return result
 
     def dept_users_all(self, dept_id):
         return [
@@ -208,15 +215,15 @@ def seed(store, password):
     rejected = token(needs_retry)
     overdue = token(create_instance(late, leader, due=past_deadline))
 
-    # An earlier completed ad hoc item and a fresh one exercise history and live cooldown.
+    # A completed report for history and a separate entry that has no task instance yet.
     original_clock = store._now_fn
     try:
         store._now_fn = lambda: now - timedelta(hours=1)
-        earlier = store.create_adhoc_instance_and_token(adhoc_text, leader[0], "zdxlz")
-        submit(store.get_instance(earlier["instance_id"]), note="机房空调温度已恢复正常。", raw=earlier["token"])
+        earlier = store.issue_adhoc_report(adhoc_text, leader[0], "zdxlz")
+        store.submit_h5_task(raw_token=earlier, note="机房空调温度已恢复正常。")
     finally:
         store._now_fn = original_clock
-    cooldown = store.create_adhoc_instance_and_token(adhoc_image, leader[0], "zdxlz")
+    adhoc_open = store.issue_adhoc_report(adhoc_image, leader[0], "zdxlz")
 
     for mode, title in (("once", "晚班设备联查"), ("week", "每周交换机检查")):
         issued = portal.create_task(ident, {
@@ -249,7 +256,7 @@ def seed(store, password):
         "H5 填报 · 已驳回待重交": "/h5/task#t=" + rejected,
         "H5 填报 · 已逾期只读": "/h5/task#t=" + overdue,
         "H5 填报 · 管理员代交": "/h5/task#t=" + delegated_token,
-        "H5 填报 · 自主上报冷却演示": "/h5/task#t=" + cooldown["token"],
+        "H5 填报 · 自主上报": "/h5/task#t=" + adhoc_open,
     }
     return owner, routes
 

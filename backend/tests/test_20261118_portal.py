@@ -22,7 +22,9 @@ def portal(ctx, monkeypatch):
              {'dept_id': 'a1', 'name': '下级部门', 'parent_id': 'a'},
              {'dept_id': 'b', 'name': '跨部门', 'parent_id': ''}]
     users = {'a': {inst['phone']}, 'a1': {'13900009402'}, 'b': {'13900009403'}}
-    monkeypatch.setattr(PortalService, 'organization', lambda self, platform: (nodes, users))
+    monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (nodes, users))
+    monkeypatch.setattr(PortalService, 'grant_options', lambda self, *args: {'default_dept_ids': ['a']})
+    monkeypatch.setattr(PortalService, 'department_path', lambda self, platform, did: [n for n in nodes if n['dept_id'] == did])
     for phone in ('13900009402', '13900009403'):
         s.add_role_member(rid, phone, '范围成员', owner_id=tpl['owner_id'])
         s.upsert_delivery_target(phone, phone)
@@ -196,12 +198,12 @@ def test_admin_scope_platform_and_readonly_boundaries(portal):
 def test_new_organization_read_and_directory_failure(portal, monkeypatch):
     p, ident, (s, _, _, _, _, _, tpl, _) = portal
     # fixture 的 organization 是受控通讯录替身；每次发布都重新读取。
-    monkeypatch.setattr(PortalService, 'organization', lambda self, platform: (
+    monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (
         [{'dept_id': 'a', 'parent_id': '', 'name': '本部门'}], {'a': set()}))
     with pytest.raises(BizError) as err:
         publish(p, ident)
     assert err.value.status_code == 403
-    def unavailable(self, platform):
+    def unavailable(self, platform, root_ids=None):
         raise BizError(503, 'DIRECTORY_UNAVAILABLE', '通讯录查询失败')
     monkeypatch.setattr(PortalService, 'organization', unavailable)
     with pytest.raises(BizError) as err:
@@ -236,6 +238,8 @@ def test_official_directory_tree_default_department(monkeypatch):
                 return [{'dept_id': 'child', 'name': '官方当前部门'}] if did == 'root' else []
             def dept_users_all(self, did):
                 return [{'phone': inst['phone']}] if did == 'child' else []
+            def search_by_phone_strict(self, phone):
+                return 'ok', {'dept_path': '官方根部门/官方当前部门'}
         s.contacts = Directory()
         monkeypatch.setenv('IMT_ORG_ROOT_DEPT_ID', 'root')
         p = PortalService(s)

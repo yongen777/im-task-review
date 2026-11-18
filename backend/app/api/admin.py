@@ -11,6 +11,7 @@ import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -404,6 +405,8 @@ def _instance_filter_sql(
     # 2026-10-29 用户口径：停用（enabled=0）或已删除的模板，其历史实例不再出现在
     # 任务实例列表与统计里——否则「停用」了还挂在列表上，看起来像没生效。
     where.append("t.enabled = 1 AND t.deleted = 0")
+    where.append("((t.is_adhoc=0 AND i.period_key NOT LIKE 'adhoc-%') "
+                 "OR EXISTS (SELECT 1 FROM submission s WHERE s.instance_id=i.id))")
 
     # 2026-11-04 多管理员分级：实例按归属（继承模板 owner_id）隔离
     if owner_id is not None:
@@ -417,8 +420,15 @@ def _instance_filter_sql(
         where.append("t.name LIKE ?")
         params.append(f"%{template_name.strip()}%")
     if period_key and period_key.strip():
-        where.append("i.period_key = ?")
-        params.append(period_key.strip())
+        key = period_key.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
+            where.append("(i.period_key=? OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
+                         "OR (i.submitted_at IS NULL AND EXISTS (SELECT 1 FROM submission s "
+                         "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
+            params.extend((key, key, key))
+        else:
+            where.append("i.period_key=?")
+            params.append(key)
     if status and status.strip():
         # 2026-10-29：支持逗号分隔多状态（「已提醒 / 已完成」= approved,sent），
         # 否则统计卡片上的数字与点进去的列表条数对不上。
@@ -521,6 +531,8 @@ def _query_instances(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
             f"t.notice_times AS template_notice_times, "
+            f"(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id=i.id AND l.result='sent' "
+            f"AND l.kind IN ('remind','manual_push','notice','portal')) AS published_at, "
             # 2026-11-04 多管理员分级：超管全局查看时需要看到「创建人」
             f"u.username AS owner_username, u.display_name AS owner_display_name "
             # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），
@@ -547,6 +559,7 @@ def _query_instances(
             # 前端表格按 inst.kind / inst.role_id 渲染任务类型与所属角色，这里直接补齐，
             # 免得每一行都退化成「上传任务 / 业务角色」的兜底文案。
             d["kind"] = d.get("template_kind") or "form"
+            d["is_adhoc"] = d["period_key"].startswith("adhoc-")
             try:
                 role_ids = json.loads(d.get("template_role_ids") or "[]") or []
             except Exception:
@@ -562,6 +575,8 @@ def _query_instances(
             if sub is None:
                 subs = state.list_submissions_for_instance(int(d["id"]))
                 sub = subs[-1] if subs else None
+            if d["is_adhoc"] and sub and not d["submitted_at"]:
+                d["submitted_at"] = sub["created_at"]
             d["latest_submission"] = sub
             items.append(d)
 
@@ -1269,6 +1284,8 @@ def create_admin_router(
             return error_response(404, "NOT_FOUND", "任务模板已停用，请先启用再推送")
         if _tpl.get("kind") == "notice":
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
+        if _tpl.get("is_adhoc"):
+            return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
 
         # 软护栏：同模板 2 分钟内拒绝重复推送（防手抖）；通过即记 marker 占位
         try:
@@ -2163,17 +2180,23 @@ def create_admin_router(
         inst["kind"] = _tpl.get("kind") or "form"
         inst["template_name"] = _tpl.get("name") or inst["template_id"]
         inst["period"] = _tpl.get("period")
+        inst["is_adhoc"] = inst["period_key"].startswith("adhoc-")
         inst["need_review"] = bool(_tpl.get("need_review"))
         inst["role_id"] = _role_ids[0] if _role_ids else ""
         inst["role_ids"] = list(_role_ids)
         inst["modules"] = effective_h5_modules(_tpl)
         inst["attachment_limits"] = task_attachment_limits(_tpl)
         submissions = state.list_submissions_for_instance(instance_id)
+        if inst["is_adhoc"]:
+            if not submissions:
+                return error_response(404, "NOT_FOUND", "任务实例不存在")
+            inst["submitted_at"] = inst["submitted_at"] or submissions[-1]["created_at"]
         reminders = state.list_reminder_logs(instance_id=instance_id)
         inst["late_submit"] = bool(inst.get("late_submit", 0))
         # 2026-10-29：详情页的执行时间也要取模板计划时刻（原来拿 submitted_at 兜底，
         # 没提交就显示「待到达执行时刻」），与列表列共用同一份数据。
         inst["template_remind_at"] = (tpl or {}).get("remind_at")
+        inst["published_at"] = None if inst["is_adhoc"] else state.instance_published_at(instance_id)
         inst["template_notice_times"] = (tpl or {}).get("notice_times")
         inst["resubmit_deadline"] = (
             calc_resubmit_deadline(inst["deadline_at"], inst.get("reviewed_at"))
@@ -2229,6 +2252,7 @@ def create_admin_router(
                 "submitted_at": latest.get("created_at"),
                 "status": latest.get("status"),
                 "source": latest.get("source"),
+                "revision": state.submission_revision(latest),
             }
 
         return {
@@ -2311,6 +2335,7 @@ def create_admin_router(
             "detail": "文本已发送" if res.ok else f"发送失败：{res.error}",
         }
 
+    @router.put("/instances/{instance_id}/submission")
     @router.post("/instances/{instance_id}/mark-submitted")
     async def mark_instance_submitted(instance_id: int, request: Request):
         sess, err = require_session(request, state, check_csrf=True)
@@ -2319,8 +2344,9 @@ def create_admin_router(
         assert sess is not None
         admin = _admin_profile(state, sess)
         if admin.get("role_level") != "sub_admin":
-            return error_response(403, "SUPER_ADMIN_READONLY", "仅归属分级管理员可以标记已提交")
+            return error_response(403, "SUPER_ADMIN_READONLY", "仅归属分级管理员可以维护提交内容")
         owner_id = int(admin["id"])
+        editing = request.method == "PUT"
 
         async def save(raw, uploads=()):
             try:
@@ -2335,14 +2361,24 @@ def create_admin_router(
             if note is not None and not isinstance(note, str):
                 raise BizError(400, "VALIDATION_FAILED", "文字说明必须为文本")
             cfg = getattr(request.app.state, "config", None)
+            uploads_dir = cfg.uploads_dir if cfg else state.data_dir / "uploads"
+            if editing:
+                revision, retained = data.get("revision"), data.get("retained_refs")
+                if not isinstance(revision, str) or (retained is not None and
+                        (not isinstance(retained, list) or any(not isinstance(ref, str) for ref in retained))):
+                    raise BizError(400, "VALIDATION_FAILED", "提交版本或保留附件格式不正确")
+                return await asyncio.to_thread(state.edit_submission, instance_id, owner_id, sess["username"],
+                                               uploads_dir=uploads_dir, revision=revision, fields=fields, note=note,
+                                               retained_refs=retained, uploads=uploads)
             return await asyncio.to_thread(
                 state.manual_mark_submitted, instance_id, owner_id, sess["username"],
-                uploads_dir=cfg.uploads_dir if cfg else state.data_dir / "uploads",
+                uploads_dir=uploads_dir,
                 fields=fields, note=note, uploads=uploads,
             )
 
         try:
-            _, template = state.manual_submission_target(instance_id, owner_id)
+            target = state.submission_edit_target if editing else state.manual_submission_target
+            _, template, *_ = target(instance_id, owner_id)
             if request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
                 async with request.form(max_files=20, max_fields=1) as form:
                     uploads = []

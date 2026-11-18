@@ -4,7 +4,7 @@
 1. 部门选项：后台配置（增/改名/删除），H5 登记页下拉共用；
 2. 激活一律走 H5 表单（姓名/手机号/部门）：名册内直接绑定，名册外落待归纳池（带三要素）；
 3. 对话文字激活彻底停用：未登记用户任何文本只回统一登记提示；
-4. 任务提交成功 → 按任务所属平台回推「【任务名】提交成功」，一次提交只推一条。
+4. 任务提交成功 → H5 返回结果，密信、企微均无机器人文本回执。
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def _submit_once(store: StateStore, template_id: str, *, fields: dict, notifier=
     return response.status_code, response.json()
 
 
-def test_submit_feedback_pushed_once_on_task_platform() -> None:
+def test_zdxlz_task_submit_returns_result_without_bot_reply() -> None:
     store = _store()
     try:
         role = store.create_role("密信任务组", actor="t", platform="zdxlz")
@@ -112,19 +112,17 @@ def test_submit_feedback_pushed_once_on_task_platform() -> None:
         z, w = FakeNotifier(), FakeNotifier()
         code, body = _submit_once(store, tpl_id, fields={"visit_count": 5}, notifier=z, notifiers={"zdxlz": z, "wecom": w})
         assert code == 200, body
-        assert len(z.sent_messages) == 1, "密信任务应回推到密信通道"
-        assert z.sent_messages[0].text == "【数据上报任务】提交成功"
-        assert w.sent_messages == [], "⛔ 企微通道不该收到密信任务的回推"
+        assert body['ok'] and not z.sent_messages and not w.sent_messages
 
         # 状态机已消耗令牌：再次提交被拒，不产生第二条回推
         code2, body2 = _submit_once(store, tpl_id, fields={"visit_count": 6}, notifier=z, notifiers={"zdxlz": z, "wecom": w})
         assert code2 == 400
-        assert len(z.sent_messages) == 1, "重复提交不得重复回推"
+        assert not z.sent_messages and not w.sent_messages
     finally:
         store.close()
 
 
-def test_submit_feedback_on_wecom_task_goes_wecom_only() -> None:
+def test_wecom_task_submit_returns_result_without_bot_reply() -> None:
     store = _store()
     try:
         role = store.create_role("企微任务组", actor="t", platform="wecom")
@@ -136,8 +134,7 @@ def test_submit_feedback_on_wecom_task_goes_wecom_only() -> None:
         z, w = FakeNotifier(), FakeNotifier()
         code, _body = _submit_once(store, tpl_id, fields={"visit_count": 3}, notifier=z, notifiers={"zdxlz": z, "wecom": w})
         assert code == 200
-        assert len(w.sent_messages) == 1 and w.sent_messages[0].receive_id == "wecom_uid_1"
-        assert z.sent_messages == []
+        assert not w.sent_messages and not z.sent_messages
     finally:
         store.close()
 

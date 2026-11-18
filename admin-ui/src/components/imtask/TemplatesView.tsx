@@ -137,6 +137,7 @@ function resolveUploadModules(tpl: TemplateItem): UploadH5Module[] {
 /* 上传任务（1. 密信提醒消息 + 2. H5 上传页面）手机预览组件              */
 /* ================================================================== */
 interface UploadH5PreviewProps {
+  isAdhoc: boolean;
   taskName: string;
   remindAt: string;
   deadline: string;
@@ -184,6 +185,7 @@ export const formatDeadlineRuleLabel = (
 };
 
 const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
+  isAdhoc,
   taskName,
   remindAt,
   deadline,
@@ -194,7 +196,8 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
   textLabel,
   textPlaceholder,
 }) => {
-  const [step, setStep] = useState<'im' | 'h5'>('h5');
+  const [previewStep, setStep] = useState<'im' | 'h5'>('h5');
+  const step = isAdhoc ? 'h5' : previewStep;
   /* 截止时间展示：统一规则样式（本月月底 17:00 / 本周日 17:00 / 今天 17:00 / 不限），
    与实发消息里后端解析出的具体时间戳互补——预览层按用户选择的规则展示。 */
   const deadlineText = deadline ? formatDeadlineRuleLabel(deadlineType, deadline) : '不限';
@@ -214,7 +217,7 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
           <Smartphone className="w-4 h-4 text-indigo-600" />
           <span className="text-xs font-bold tracking-tight text-slate-900">H5 上传任务实时预览</span>
         </div>
-        <div className="inline-flex rounded-xl bg-white p-0.5 border border-indigo-200/80 text-[11px]">
+        {!isAdhoc && <div className="inline-flex rounded-xl bg-white p-0.5 border border-indigo-200/80 text-[11px]">
           <button
             type="button"
             onClick={() => setStep('im')}
@@ -233,14 +236,14 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
           >
             2. H5上传页
           </button>
-        </div>
+        </div>}
       </div>
 
       {/* 手机屏幕容器 */}
       <div className="bg-slate-100 rounded-2xl overflow-hidden text-slate-800 border-2 border-indigo-200/90 shadow-inner min-h-[410px] flex flex-col">
         {/* 手机顶部状态栏 */}
         <div className="bg-white px-4 py-2.5 border-b border-slate-200 flex items-center justify-between text-[11px]">
-          <span className="font-mono font-bold text-slate-700">{remindAt || '16:30'}</span>
+          {!isAdhoc && <span className="font-mono font-bold text-slate-700">{remindAt || '16:30'}</span>}
           <span className="font-bold text-slate-900 truncate max-w-[180px]">
             {step === 'im' ? '办公软件 · 任务助手' : displayTitle}
           </span>
@@ -287,13 +290,13 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
             <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-1">
               <div className="flex items-center justify-between">
                 <span className="font-bold text-slate-900 text-xs">{displayTitle}</span>
-                <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
+                {!isAdhoc && <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
                   截止 {deadline ? deadlineText : '不限'}
-                </span>
+                </span>}
               </div>
               {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
               <div className="text-[11px] text-slate-500">
-                提交人：张三 · 周期：{new Date().toISOString().slice(0, 10)} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
+                提交人：张三{!isAdhoc && ` · 执行时间：${remindAt || '16:30'}`} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
               </div>
             </div>
 
@@ -857,11 +860,11 @@ export const TemplatesView: React.FC = () => {
       };
     } else {
       // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
-      if (hasDeadline && !deadlineTime.trim()) {
+      if (!isAdhoc && hasDeadline && !deadlineTime.trim()) {
         toast.warning('请填写截止时刻');
         return;
       }
-      if (!uploadRemindText.trim()) {
+      if (!isAdhoc && !uploadRemindText.trim()) {
         toast.warning('请填写发送给用户的提醒文本');
         return;
       }
@@ -881,7 +884,7 @@ export const TemplatesView: React.FC = () => {
           }
         }
       }
-      finalTextTpl = uploadRemindText.trim();
+      finalTextTpl = isAdhoc ? '' : uploadRemindText.trim();
       spec = {
         require_review: requireReview,
         upload_modules: uploadModules,
@@ -1213,9 +1216,9 @@ export const TemplatesView: React.FC = () => {
                           </span>
                         ) : tpl.is_adhoc ? (
                           /* 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式徽章 */
-                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-violet-50 text-violet-700 border-violet-200 text-xs font-semibold" title="无推送时刻/无截止，成员回复【菜单】自主获取链接">
+                          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-blue-50 text-blue-700 border-blue-200 text-xs font-semibold" title="成员在个人工作台自主上报">
                             <Smartphone className="w-3.5 h-3.5 shrink-0" />
-                            <span>不定期（菜单自选）</span>
+                            <span>自主上报</span>
                           </span>
                         ) : (
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border bg-blue-50 text-blue-700 border-blue-200 text-xs font-semibold">
@@ -1231,7 +1234,7 @@ export const TemplatesView: React.FC = () => {
                           /* 不定期任务无推送时刻（调度物理隔离） */
                           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-violet-50/80 text-violet-700 border border-violet-200/70 font-mono text-xs font-bold">
                             <Clock className="w-3.5 h-3.5 shrink-0" />
-                            <span>—（菜单自选）</span>
+                            <span>自主发起</span>
                           </span>
                         ) : (
                           <div className="space-y-1.5">
@@ -1472,7 +1475,7 @@ export const TemplatesView: React.FC = () => {
                               </button>
                             )}
                             {/* 2026-11-12 任务D：一键推送（上传任务专属；notice 按时刻自动发）。 */}
-                            {tpl.kind !== 'notice' && (
+                            {tpl.kind !== 'notice' && !tpl.is_adhoc && (
                               <button
                                 onClick={() => setPushConfirmTpl(tpl)}
                                 disabled={!tpl.enabled || busyId === tpl.id || pushingId === tpl.id}
@@ -1534,7 +1537,8 @@ export const TemplatesView: React.FC = () => {
                   <p className="text-[11px] text-slate-400">
                     {kind === 'notice'
                       ? '纯通知提醒模式：到点向角色成员发送文本或文件/图片通知'
-                      : '上传任务模式：发送提醒文本 + 自动附上专属 H5 链接（按所选字段/文本/图片/文件合成）'}
+                      : isAdhoc ? '成员可在个人工作台随时发起上报。'
+                        : '到达执行时间后，向接收成员发送提醒和专属 H5 提交链接。'}
                   </p>
                 </div>
               </div>
@@ -1661,11 +1665,12 @@ export const TemplatesView: React.FC = () => {
                         disabled={Boolean(editingTpl)}
                           onChange={(e) => {
                           setKind(e.target.value as 'notice' | 'upload');
+                          if (e.target.value === 'notice') setIsAdhoc(false);
                         }}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:opacity-65 disabled:cursor-not-allowed font-semibold"
                       >
                         <option value="notice">通知提醒</option>
-                        <option value="upload">上传任务（提醒文本 + H5链接上传）</option>
+                        <option value="upload">上传任务</option>
                       </select>
                     </div>
 
@@ -1675,7 +1680,7 @@ export const TemplatesView: React.FC = () => {
                         <label
                           className={`inline-flex items-start gap-2 rounded-xl border px-3 py-2 cursor-pointer transition-colors ${
                             isAdhoc
-                              ? 'bg-violet-50 border-violet-300'
+                              ? 'bg-blue-50 border-blue-300'
                               : 'bg-slate-50 border-slate-200 hover:border-slate-300'
                           }`}
                         >
@@ -1686,10 +1691,9 @@ export const TemplatesView: React.FC = () => {
                             className="w-4 h-4 mt-0.5 rounded text-violet-600 focus:ring-violet-500"
                           />
                           <span className="text-xs leading-5">
-                            <span className="font-bold text-slate-800">不定期任务（菜单自选）</span>
+                            <span className="font-bold text-slate-800">不定期任务（自主上报）</span>
                             <span className="text-slate-500 block">
-                              不定时推送催报：无推送时间、无截止时间，成员私聊回复【菜单】自主获取一次性填报链接，
-                              随到随报、提交后链接自动作废、可再次上报。勾选后「执行日 / 执行时间 / 截止配置」自动禁用。
+                              成员从个人工作台的「自主上报」进入，随时填报并可重复提交。
                             </span>
                           </span>
                         </label>
@@ -1698,13 +1702,12 @@ export const TemplatesView: React.FC = () => {
 
                     {/* 2026-11-02 用户口径：去掉「执行周期」概念 —— 管理员只选星期几，固定在每周选中的那几天触发 */}
                     {/* 2026-11-10 双模式：每周（周几）/ 每月（几号）；月底=31（调度自动适配小月/闰年） */}
-                    <div className={isAdhoc ? 'opacity-45 pointer-events-none select-none' : ''}>
+                    {!isAdhoc && <>
+                    <div>
                       <label className="font-semibold text-slate-700 flex items-center gap-1.5 mb-1">
                         <span>执行日</span>
                         <span className="text-[10px] text-slate-400 font-normal">
-                          {isAdhoc
-                            ? '不定期任务无执行日（不推送）'
-                            : execMode === 'weekly'
+                          {execMode === 'weekly'
                               ? '只在这些星期生成任务；没选的日子不提醒、不产生逾期'
                               : '只在每月选中的日期生成任务；选中 31 号时小月/闰月自动按当月最后一天执行'}
                         </span>
@@ -1810,9 +1813,9 @@ export const TemplatesView: React.FC = () => {
                     </div>
 
                     {/* 执行时间 & 截止时间（2026-10-28 重排版：时间字段并列一行 + 原生时间选择器） */}
-                    <div className={(kind === 'notice' ? 'sm:col-span-2 ' : '') + (isAdhoc ? 'opacity-45 pointer-events-none select-none' : '')}>
+                    <div className={kind === 'notice' ? 'sm:col-span-2' : ''}>
                       <label className="font-semibold text-slate-700 block mb-1">
-                        执行时间 {isAdhoc ? <span className="text-[10px] text-violet-600 font-normal">（不定期任务无推送时刻）</span> : <span className="text-rose-500">*</span>}
+                        执行时间 <span className="text-rose-500">*</span>
                       </label>
                       <input
                         type="time"
@@ -1824,9 +1827,9 @@ export const TemplatesView: React.FC = () => {
 
                     {/* 截止配置（2026-11-12 任务E1 重构：开关 + 类型单选 + 时刻） */}
                     {kind === 'upload' && (
-                      <div className={'sm:col-span-2 ' + (isAdhoc ? 'opacity-45 pointer-events-none select-none' : '')}>
+                      <div className="sm:col-span-2">
                         <label className="font-semibold text-slate-700 block mb-1.5">
-                          截止配置 <span className="text-[11px] font-normal text-slate-400">（不设截止 = 任务长期有效；不定期任务无截止概念）</span>
+                          截止配置 <span className="text-[11px] font-normal text-slate-400">（不设截止时任务长期有效）</span>
                         </label>
                         <div className="flex flex-wrap items-center gap-2">
                           <label className="inline-flex items-center gap-1.5 cursor-pointer select-none bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5">
@@ -1893,6 +1896,7 @@ export const TemplatesView: React.FC = () => {
                       </div>
                     )}
 
+                    </>}
                     {/* 立即启用自动调度（重排版：独占一行，与上方字段左对齐） */}
                     <div className="sm:col-span-2 pt-1">
                       <label className="inline-flex items-center gap-2 cursor-pointer select-none">
@@ -1902,7 +1906,7 @@ export const TemplatesView: React.FC = () => {
                           onChange={(e) => setEnabled(e.target.checked)}
                           className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500"
                         />
-                        <span className="font-semibold text-slate-800">立即启用自动调度</span>
+                        <span className="font-semibold text-slate-800">{isAdhoc ? '在个人工作台开放自主上报' : '立即启用自动调度'}</span>
                       </label>
                     </div>
                   </div>
@@ -2067,9 +2071,9 @@ export const TemplatesView: React.FC = () => {
                   {kind === 'upload' && (
                     <div className="space-y-4">
                       {/* 步骤1：发送给用户的提醒文本（系统自动附上 H5 链接） */}
-                      <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 space-y-2">
+                      {!isAdhoc && <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 space-y-2">
                         <label className="font-bold text-slate-800 flex items-center justify-between">
-                          <span>1. 发送给用户的提醒文本（自动附上专属 H5 链接） *</span>
+                          <span>发送给用户的提醒文本（自动附上专属 H5 链接） *</span>
                           <span className="text-[10px] font-semibold text-blue-600 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
                             自动追加 H5 链接
                           </span>
@@ -2081,12 +2085,12 @@ export const TemplatesView: React.FC = () => {
                           placeholder="请输入下发给用户的提醒文案，系统将在消息底部自动附上专属 H5 上传链接…"
                           className="w-full bg-white border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:border-blue-500 leading-relaxed"
                         />
-                      </div>
+                      </div>}
 
                       {/* 步骤2：选择 H5 链接中包含的上传组件（字段报数 / 文本 / 图片 / 文件） */}
                       <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 space-y-3">
                         <div className="font-bold text-slate-800">
-                          2. 选择 H5 页面需要员工上传的内容类型（可多选组合） *
+                          选择需要员工提交的内容类型（可多选） *
                         </div>
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                           {(['fields', 'text', 'image', 'file'] as UploadH5Module[]).map((mod) => {
@@ -2196,7 +2200,7 @@ export const TemplatesView: React.FC = () => {
                       <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/90 flex items-center justify-between">
                         <div className="font-bold text-slate-800 flex items-center gap-1.5">
                           <ShieldCheck className="w-4 h-4 text-blue-600" />
-                          <span>3. 上传后是否需要审核</span>
+                          <span>上传后是否需要审核</span>
                         </div>
                         <div className="inline-flex rounded-xl bg-white p-0.5 border border-slate-200">
                           <button
@@ -2231,6 +2235,7 @@ export const TemplatesView: React.FC = () => {
                 {kind === 'upload' && (
                   <div className="lg:col-span-5">
                     <UploadFlowPhonePreview
+                      isAdhoc={isAdhoc}
                       taskName={name}
                       remindAt={remindAt}
                       deadline={hasDeadline ? deadlineTime : ''}

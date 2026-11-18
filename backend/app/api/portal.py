@@ -26,17 +26,21 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
             if action == 'info':
                 return {'ok': True, 'can_create': bool(p.grants(ident)), 'todos': p.todos(ident),
                         'adhoc': state.list_adhoc_menu_items(ident['phone'], platform=ident['platform']),
-                        'adhoc_history': p.adhoc_history(ident)}
+                        'adhoc_history': p.submission_history(ident, adhoc_only=True, limit=10)}
             if action == 'open':
                 return p.task_link(ident, int(data.get('instance_id', 0)))
             if action == 'adhoc':
                 task_id = str(data.get('template_id') or '')
-                if task_id not in {t['template_id'] for t in state.list_adhoc_menu_items(ident['phone'], platform=ident['platform'])}:
-                    raise BizError(403, 'FORBIDDEN', '事项不可用')
-                issued = state.create_adhoc_instance_and_token(task_id, ident['phone'], platform=ident['platform'])
-                if not issued['ok']:
-                    raise BizError(429, 'COOLDOWN', issued['message'])
-                return {'ok': True, 'url': '/h5/task#t=' + issued['token']}
+                raw = state.issue_adhoc_report(task_id, ident['phone'], ident['platform'])
+                return {'ok': True, 'url': '/h5/task#t=' + raw}
+            if action == 'history':
+                offset = int(data.get('offset', 0))
+                if not 0 <= offset <= 2_147_483_647:
+                    raise ValueError
+                rows = p.submission_history(ident, offset=offset)
+                return {'ok': True, 'items': rows[:30], 'has_more': len(rows) > 30}
+            if action == 'history-open':
+                return p.submission_history_link(ident, int(data.get('instance_id', 0)))
             p.require_creator(ident)
             if action == 'recipients':
                 return {'ok': True, **await asyncio.to_thread(p.recipients, ident)}
@@ -84,7 +88,7 @@ def create_portal_admin_router(state):
     router, p = APIRouter(prefix='/api/admin'), PortalService(state)
 
     @router.api_route('/portal-grants/{phone}', methods=['GET', 'PUT'])
-    async def grant(phone: str, request: Request, platform: str = 'zdxlz'):
+    async def grant(phone: str, request: Request, platform: str = 'zdxlz', directory: bool = False, parent_id: str = ''):
         sess, err = require_session(request, state, check_csrf=request.method == 'PUT')
         if err is not None:
             return err
@@ -95,7 +99,9 @@ def create_portal_admin_router(state):
             if _is_super_admin(admin):
                 raise BizError(403, 'SUPER_ADMIN_READONLY', '请由成员所属分级管理员配置授权')
             if request.method == 'GET':
-                return {'ok': True, **await asyncio.to_thread(p.grant_options, platform, admin['id'], phone)}
+                if directory:
+                    return {'ok': True, **await asyncio.to_thread(p.grant_options, platform, admin['id'], phone, parent_id)}
+                return {'ok': True, **p.grant_info(platform, admin['id'], phone)}
             data = await request.json()
             if not isinstance(data, dict):
                 raise BizError(400, 'INVALID_BODY', '请求格式错误')

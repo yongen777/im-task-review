@@ -2,9 +2,9 @@
 """H5 任务提交与身份绑定接口（严格对齐规格书 §3.2、§3.7、§8、§9.8、R28~R40）。"""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import logging
 import os
 import re
 import threading
@@ -14,12 +14,12 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple
 
 try:
-    from fastapi import APIRouter, BackgroundTasks, Request
+    from fastapi import APIRouter, Request
     from starlette.datastructures import UploadFile
     from starlette.exceptions import HTTPException as StarletteHTTPException
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 except ImportError:  # pragma: no cover
-    APIRouter = BackgroundTasks = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
+    APIRouter = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
     FileResponse = None  # type: ignore[assignment]
 
 from ..h5log import H5_ACCESS_META
@@ -29,7 +29,6 @@ from ..state import (
     effective_h5_modules, submission_expired_message, task_attachment_limits, task_upload_max_mb,
 )
 
-logger = logging.getLogger(__name__)
 
 # 2026-10-28：补齐日常拍照格式——jpeg（Windows/相机常见）与 webp（微信转发常见）
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp", "bmp", "gif"}
@@ -296,12 +295,14 @@ def process_h5_bind(
 
 def _resolve_token_and_instance(
     state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+    *, allow_history: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
     token_str = (raw_token or "").strip()
     if not token_str:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "缺少 H5 访问令牌"})
     tok = state.get_h5_token(token_str)
-    if not tok or tok.get("purpose") != "submit":
+    purposes = {"submit", "adhoc_submit"} | ({"report_history"} if allow_history else set())
+    if not tok or tok.get("purpose") not in purposes:
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
     if on_instance_resolved is not None and tok.get("instance_id") is not None:
         on_instance_resolved(int(tok["instance_id"]))
@@ -322,6 +323,10 @@ def _resolve_token_and_instance(
     inst: Optional[Dict[str, Any]] = None
     if tok.get("instance_id") is not None:
         inst = state.get_instance(int(tok["instance_id"]))
+    elif tok["purpose"] == "adhoc_submit" and not tok["consumed"]:
+        draft = state.adhoc_report_draft(tok, state.get_template(tok["template_id"]))
+        if draft:
+            return tok, draft, None
     if inst is None and tok.get("template_id") and tok.get("period_key"):
         inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
     if inst is None or any(str(tok[key]) != str(inst[key]) for key in ("phone", "template_id", "period_key")):
@@ -354,11 +359,14 @@ def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, A
     return "本任务已提交完成，无需重复提交"
 
 
-def _completed_submission(state: StateStore, instance: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _completed_submission(state: StateStore, instance: Dict[str, Any], *, history=False) -> Optional[Dict[str, Any]]:
     """Expose saved values and attachment metadata for this instance only."""
-    if instance["status"] not in ("submitted", "approved"):
+    if not history and instance["status"] not in ("submitted", "approved"):
         return None
     saved = state.get_latest_valid_submission(instance["id"])
+    if history and instance["status"] not in ("submitted", "approved"):
+        records = state.list_submissions_for_instance(instance["id"])
+        saved = records[-1] if records else None
     if not saved:
         return None
     try:
@@ -377,12 +385,23 @@ def _completed_submission(state: StateStore, instance: Dict[str, Any]) -> Option
     return {
         "fields": saved.get("fields") or {}, "note": saved.get("note"),
         "submitted_at": saved["created_at"], "source": saved["source"], "attachments": attachments,
+        "revision": state.submission_revision(saved),
     }
 
 
 def _resolve_upload_target(
     state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+    *, editing=False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Tuple[int, Dict[str, Any]]]]:
+    if editing:
+        try:
+            token = state.get_h5_token(raw_token)
+            instance, template, _ = state.h5_edit_target(token)
+            if on_instance_resolved:
+                on_instance_resolved(instance["id"])
+            return {**instance, "period_key": state.h5_edit_upload_key(token)}, template, None
+        except BizError as exc:
+            return None, None, (exc.status_code, {"code": exc.code, "message": exc.message})
     tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
     if err:
         return None, None, err
@@ -403,9 +422,10 @@ def _resolve_upload_target(
 
 def _validate_upload_target_and_limits(
     state: StateStore, raw_token: str, filename: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
+    *, editing=False,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str, str, int, int, Optional[Tuple[int, Dict[str, Any]]]]:
     """校验任务状态和附件限制。"""
-    inst, tpl, err = _resolve_upload_target(state, raw_token, on_instance_resolved)
+    inst, tpl, err = _resolve_upload_target(state, raw_token, on_instance_resolved, editing=editing)
     if err:
         return None, None, "", "", 0, 0, err
 
@@ -471,34 +491,51 @@ def process_h5_task_info(
     *, state: StateStore, raw_token: str, on_instance_resolved: Optional[Callable[[int], None]] = None,
 ) -> Tuple[int, Dict[str, Any]]:
     """返回最新任务详情，已提交或已完成的实例仍可读取但禁止再次上传。"""
-    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved)
+    tok, inst, err = _resolve_token_and_instance(state, raw_token, on_instance_resolved, allow_history=True)
     if err:
         return err
     tpl = state.get_template(inst["template_id"], include_deleted=True)
+    history = tok["purpose"] == "report_history"
+    can_edit = False
+    if history:
+        try:
+            state.h5_edit_target(tok)
+            can_edit = True
+        except BizError:
+            pass
     # 2026-11-12 下午（四）：五类失效统一拦截「任务已关闭」（先于过期窗口判断）
-    close_reason = state.instance_close_reason(inst, tpl)
+    close_reason = state.instance_close_reason(inst, tpl) if not history else None
     if close_reason:
         return 403, {"code": "TASK_CLOSED", "message": close_reason}
 
     window_open, window_reason = _check_submission_window(state, inst, tok)
     completed = _completed_message(state, inst, tpl)
-    if completed:
+    if completed or history:
         window_open = False
-        window_reason = completed
+        window_reason = completed or "正在查看历史上报"
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
     if inst.get("status") == "rejected":
         inst["resubmit_deadline"] = calc_resubmit_deadline(inst["deadline_at"], inst.get("reviewed_at"))
+    adhoc = bool(tpl.get("is_adhoc") or inst["period_key"].startswith("adhoc-"))
+    submission = _completed_submission(state, inst, history=history)
+    if history and submission and not inst.get("submitted_at"):
+        inst["submitted_at"] = submission["submitted_at"]
     return 200, {
         "ok": True,
         "window_open": window_open,
         "window_reason": window_reason,
         "instance": inst,
-        "submission": _completed_submission(state, inst),
+        "readonly_history": history,
+        "can_edit": can_edit,
+        "submission": submission,
+        "published_at": None if adhoc or inst.get("submitted_at") else state.instance_published_at(inst["id"]),
         "template": {
             "template_id": tpl["template_id"],
             "name": tpl["name"],
             "kind": tpl["kind"],
+            "is_adhoc": adhoc,
+            "text_tpl": tpl.get("text_tpl") if tpl.get("portal_task") else "",
             "period": tpl["period"],
             "deadline": tpl["deadline"],
             # 2026-11-12 下午：统一截止规则样式（旧链接保存模板后顶部徽章随最新配置实时更新）；
@@ -526,10 +563,10 @@ def process_h5_task_info(
 
 
 def process_h5_task_upload(
-    *, state: StateStore, uploads_dir: Path, raw_token: str, filename: str, content_bytes: bytes
+    *, state: StateStore, uploads_dir: Path, raw_token: str, filename: str, content_bytes: bytes, editing=False,
 ) -> Tuple[int, Dict[str, Any]]:
     """§3.7 & §9.8 H5 附件上传（扩展名白名单 + 大小限制 + 魔数嗅探 MIME + 校验失败磁盘零残留）。"""
-    inst, tpl, orig_name, ext, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename)
+    inst, tpl, orig_name, ext, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, editing=editing)
     if err:
         return err
     assert inst is not None and tpl is not None
@@ -547,53 +584,6 @@ def process_h5_task_upload(
         "ok": True, "ref": rec["ref"], "file_name": rec["file_name"], "orig_name": rec["file_name"],
         "mime": rec["mime"], "size": rec["size"], "rel_path": rec["rel_path"],
     }
-
-
-def _push_submit_feedback(
-    *, state: StateStore, inst: Optional[Dict[str, Any]], submission_id: Any,
-    notifier: Optional[NotifierProtocol] = None,
-    notifiers: Optional[Dict[str, NotifierProtocol]] = None,
-) -> None:
-    """2026-11-03 用户口径：任务提交成功后给提交人回推一条「【任务名】提交成功」。
-
-    · 通道 = 任务所属办公软件（与调度投递同口径），不串到别的平台；
-    · 幂等：发送动作之前查重，同一 submission 只推一条；
-    · 发送/记账失败只记日志，绝不影响提交结果本身。
-    """
-    try:
-        if not inst:
-            return
-        tpl = state.get_template(str(inst.get("template_id") or "")) or {}
-        plats = state.role_platforms(list(tpl.get("role_ids") or []))
-        platform = tpl["platform"] if tpl.get("portal_task") else (plats.pop() if len(plats) == 1 else "")
-        nt = (notifiers or {}).get(platform) if (platform and notifiers) else notifier
-        if nt is None:
-            logger.warning("提交反馈未发送（无可用通道）instance=%s", inst.get("id"))
-            return
-        target = (
-            state.get_delivery_target(str(inst.get("phone") or ""), platform=platform)
-            if (platform and notifiers)
-            else state.get_delivery_target(str(inst.get("phone") or ""))
-        )
-        ext_id = str((target or {}).get("external_id") or "")
-        ext_type = str((target or {}).get("external_type") or "user").strip().lower() or "user"
-        if not ext_id:
-            logger.warning("提交反馈未发送（成员未激活绑定）instance=%s", inst.get("id"))
-            return
-        now_s = state.now_str()
-        idem = hashlib.sha1(f"submit_ack|{inst.get('id')}|{submission_id}".encode("utf-8")).hexdigest()
-        if state.has_sent_reminder(idem):
-            return
-        res = nt.send_text(ext_id, f"【{tpl.get('name') or '任务'}】提交成功", idem, receive_type=ext_type)
-        state.record_reminder_log(
-            template_id=str(inst.get("template_id") or ""), instance_id=int(inst["id"]),
-            phone=str(inst.get("phone") or ""), kind="submit_ack", planned_at=now_s,
-            attempted_at=now_s, sent_at=now_s if res.ok else None,
-            result="sent" if res.ok else "failed", retry=0,
-            error=None if res.ok else (res.error or "SEND_FAILED"), idem_key=idem,
-        )
-    except Exception as exc:  # noqa: BLE001 - 反馈回推绝不能把提交接口拖挂
-        logger.warning("提交反馈回推异常 instance=%s: %s", (inst or {}).get("id"), exc)
 
 
 def process_h5_task_submit(
@@ -740,11 +730,13 @@ def create_h5_router(
 
     @router.post("/api/h5/upload", include_in_schema=False)
     @router.post("/api/h5/task/upload")
+    @router.post("/api/h5/task/edit-upload")
     async def api_h5_task_upload(request: Request):
+        editing = request.url.path.endswith("/edit-upload")
         raw_token = _extract_token_from_request(request)
         if raw_token:
             # New pages send the token in a header so closed tasks are rejected before multipart parsing.
-            _, _, err = _resolve_upload_target(state, raw_token, track_instance(request))
+            _, _, err = _resolve_upload_target(state, raw_token, track_instance(request), editing=editing)
             if err:
                 return JSONResponse(status_code=err[0], content=err[1])
         try:
@@ -759,7 +751,7 @@ def create_h5_router(
                 ext = basename.rsplit(".", 1)[1].lower().strip() if "." in basename else ""
                 metadata["upload_ext"] = ext if re.fullmatch(r"[a-z0-9]{1,12}", ext) else "-"
                 metadata["upload_bytes"] = file.size
-                _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, track_instance(request))
+                _, _, _, _, max_mb, max_bytes, err = _validate_upload_target_and_limits(state, raw_token, filename, track_instance(request), editing=editing)
                 if err:
                     return JSONResponse(status_code=err[0], content=err[1])
 
@@ -773,7 +765,7 @@ def create_h5_router(
                     )
 
                 status_code, content = process_h5_task_upload(
-                    state=state, uploads_dir=uploads_dir, raw_token=raw_token, filename=filename, content_bytes=content_bytes
+                    state=state, uploads_dir=uploads_dir, raw_token=raw_token, filename=filename, content_bytes=content_bytes, editing=editing,
                 )
                 return JSONResponse(status_code=status_code, content=content)
         except StarletteHTTPException as exc:
@@ -781,18 +773,19 @@ def create_h5_router(
 
     @router.post("/api/h5/task/attachment")
     async def api_h5_task_attachment(request: Request):
-        _, instance, err = _resolve_token_and_instance(state, _extract_token_from_request(request), track_instance(request))
+        tok, instance, err = _resolve_token_and_instance(state, _extract_token_from_request(request), track_instance(request), allow_history=True)
         if err:
             return JSONResponse(status_code=err[0], content=err[1])
         template = state.get_template(instance["template_id"], include_deleted=True)
-        if state.instance_close_reason(instance, template):
+        history = tok["purpose"] == "report_history"
+        if not history and state.instance_close_reason(instance, template):
             return JSONResponse(status_code=403, content={"code": "TASK_CLOSED", "message": "任务已关闭"})
         try:
             data = await request.json()
         except ValueError:
             data = None
         ref = data.get("ref") if isinstance(data, dict) else None
-        saved = _completed_submission(state, instance)
+        saved = _completed_submission(state, instance, history=history)
         if saved and isinstance(ref, str) and any(item["ref"] == ref for item in saved["attachments"]):
             upload = state.get_upload_ref(ref)
             if upload:
@@ -803,9 +796,34 @@ def create_h5_router(
                                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
         return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "附件不存在"})
 
+    @router.post("/api/h5/task/save-edit")
+    async def api_h5_task_save_edit(request: Request):
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise ValueError
+            revision, fields, note = data.get("revision"), data.get("fields"), data.get("note")
+            retained, refs = data.get("retained_refs"), data.get("refs")
+            if (not isinstance(revision, str) or not isinstance(fields, dict) or not isinstance(note, str)
+                    or any(not isinstance(items, list) or len(items) > 20
+                           or any(not isinstance(item, str) for item in items) for items in (retained, refs))):
+                raise ValueError
+        except ValueError:
+            return JSONResponse(status_code=400, content={"code": "VALIDATION_FAILED", "message": "提交格式不正确"})
+        token = state.get_h5_token(_extract_token_from_request(request))
+        try:
+            if not token or token["purpose"] != "report_history" or not token["instance_id"]:
+                raise BizError(401, "TOKEN_INVALID", "请从工作台的已提交记录打开")
+            track_instance(request)(token["instance_id"])
+            return await asyncio.to_thread(state.edit_submission, token["instance_id"], None, "h5:" + token["phone"],
+                                           uploads_dir=uploads_dir, revision=revision, fields=fields, note=note,
+                                           retained_refs=retained, new_refs=refs, h5_token=token)
+        except BizError as exc:
+            return JSONResponse(status_code=exc.status_code, content={"code": exc.code, "message": exc.message})
+
     @router.post("/api/h5/submit", include_in_schema=False)
     @router.post("/api/h5/task/submit")
-    async def api_h5_task_submit(request: Request, background_tasks: BackgroundTasks):
+    async def api_h5_task_submit(request: Request):
         try:
             data = await request.json()
         except Exception:
@@ -816,11 +834,6 @@ def create_h5_router(
         status_code, content = process_h5_task_submit(
             state=state, raw_token=raw_token, data=data, on_instance_resolved=track_instance(request),
         )
-        if status_code == 200:
-            background_tasks.add_task(
-                _push_submit_feedback, state=state, inst=content.get("instance"), submission_id=content.get("submission_id"),
-                notifier=notifier, notifiers=notifiers,
-            )
-        return JSONResponse(status_code=status_code, content=content, background=background_tasks)
+        return JSONResponse(status_code=status_code, content=content)
 
     return router

@@ -3,7 +3,7 @@ import { AlertTriangle, Check, CheckCircle2, Clock, Download, Eye, ImagePlus, Pa
 import { api, plainError } from '../../lib/api';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
-import { TaskInstanceDetail, TaskInstanceItem } from '../../lib/types';
+import { SubmissionAttachment, TaskInstanceDetail, TaskInstanceItem } from '../../lib/types';
 
 export function getInstanceStatusMeta(inst: Pick<TaskInstanceItem, 'kind' | 'status' | 'need_review' | 'submitted_at'>): {
   label: string;
@@ -147,6 +147,9 @@ function slotReached(inst: TaskInstanceItem, hhmm: string): boolean {
 }
 
 export const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }> = ({ inst, className = '' }) => {
+  if (inst.kind !== 'notice' && inst.submitted_at) return <span title="完成时间">{inst.submitted_at}</span>;
+  if (inst.is_adhoc) return <span className="text-slate-400">—</span>;
+  if (inst.kind !== 'notice' && inst.published_at) return <span title="执行时间">{inst.published_at}</span>;
   const slots = instancePlanSlots(inst);
   if (slots.length === 0) return <span className="text-slate-400">—</span>;
   const pk = inst.period_key || '';
@@ -211,16 +214,19 @@ function ManualAttachmentPicker({ image, limit, files, onChange }: {
 }
 
 function ManualSubmissionForm({
-  detail, busy, onCancel, onConfirm,
+  detail, busy, onCancel, onConfirm, editing = false,
 }: {
   detail: TaskInstanceDetail;
   busy: boolean;
   onCancel: () => void;
   onConfirm: (body: FormData) => void;
+  editing?: boolean;
 }) {
   const modules = detail.instance.modules ?? [];
   const [images, setImages] = useState<File[]>([]);
   const [files, setFiles] = useState<File[]>([]);
+  const submission = editing ? detail.submission : undefined;
+  const [retained, setRetained] = useState<SubmissionAttachment[]>(() => submission?.attachments || []);
   const formRef = useRef<HTMLFormElement>(null);
   useEffect(() => { formRef.current?.scrollIntoView({ block: 'nearest' }); }, []);
   const resultLabel = detail.instance.need_review ? '已提交' : '已完成';
@@ -237,23 +243,47 @@ function ManualSubmissionForm({
       return value ? [[field.key, value]] : [];
     }));
     const body = new FormData();
-    body.set('payload', JSON.stringify({ fields: values, note: String(input.get('note') ?? '').trim() }));
+    body.set('payload', JSON.stringify({
+      fields: modules.includes('fields') ? values : undefined,
+      note: modules.includes('text') ? String(input.get('note') ?? '').trim() : undefined,
+      ...(editing ? { revision: submission?.revision, retained_refs: retained.map(item => item.ref) } : {}),
+    }));
     for (const file of [...images, ...files]) body.append('attachments', file);
     onConfirm(body);
+  };
+  const inputValue = (key: string) => {
+    const value = submission?.form_values?.[key];
+    return value === true ? '是' : value === false ? '否' : String(value ?? '');
+  };
+  const attachmentPicker = (image: boolean, added: File[], setAdded: (files: File[]) => void) => {
+    const existing = retained.filter(item => item.is_image === image);
+    const limit = (image ? detail.instance.attachment_limits?.image : detail.instance.attachment_limits?.file) ?? 1;
+    return <div className="space-y-2">
+      {existing.map(item => <div key={item.ref} className="flex items-center gap-2 rounded-lg bg-white px-2.5 py-2">
+        <a href={item.url} target="_blank" rel="noopener noreferrer" className="min-w-0 flex-1 truncate text-blue-700">{item.file_name}</a>
+        <button type="button" onClick={() => setRetained(current => current.filter(row => row.ref !== item.ref))}
+          aria-label={`移除 ${item.file_name}`} className="rounded p-1 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>
+      </div>)}
+      {(limit === 1 || existing.length < limit) && <ManualAttachmentPicker image={image} limit={Math.max(1, limit - existing.length)}
+        files={added} onChange={next => {
+          if (next.length && limit === 1) setRetained(current => current.filter(item => item.is_image !== image));
+          setAdded(next);
+        }} />}
+    </div>;
   };
 
   return (
     <form ref={formRef} onSubmit={handleSubmit} aria-labelledby="manual-submit-title" className="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-3">
       <div>
-        <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">标记{resultLabel}</h4>
-        <p className="mt-1 text-slate-600">所有内容均可选，可直接确认。标记后，员工原提交链接将作废。</p>
+        <h4 id="manual-submit-title" className="text-sm font-semibold text-slate-900">{editing ? '编辑提交内容' : `标记${resultLabel}`}</h4>
+        <p className="mt-1 text-slate-600">{editing ? '保存后，员工提交页和统计将同步显示更正后的内容。' : '所有内容均可选，可直接确认。标记后，员工原提交链接将作废。'}</p>
       </div>
       <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
         {fields.map((field) => (
           <label key={field.key} className="grid gap-1 font-medium text-slate-700">
             <span>{field.label}{field.unit ? `（${field.unit}）` : ''}</span>
             {field.type === 'select' || field.type === 'boolean' ? (
-              <select name={`field:${field.key}`} defaultValue="" className={inputClass}>
+              <select name={`field:${field.key}`} defaultValue={inputValue(field.key)} className={inputClass}>
                 <option value="">请选择</option>
                 {(field.type === 'boolean' ? ['是', '否'] : field.options)?.map((option) => <option key={option} value={option}>{option}</option>)}
               </select>
@@ -262,6 +292,7 @@ function ManualSubmissionForm({
                 name={`field:${field.key}`}
                 type={field.type === 'number' || field.type === 'date' ? field.type : 'text'}
                 step={field.type === 'number' ? 'any' : undefined}
+                defaultValue={inputValue(field.key)}
                 maxLength={field.type === 'text' ? field.max_len : undefined}
                 className={inputClass}
               />
@@ -271,22 +302,22 @@ function ManualSubmissionForm({
         {modules.includes('text') && (
           <label className="grid gap-1 font-medium text-slate-700 sm:col-span-2">
             <span>{spec?.text_label || '文字说明'}</span>
-            <textarea name="note" rows={2} maxLength={500} placeholder={spec?.text_placeholder} className={inputClass} />
+            <textarea name="note" rows={2} maxLength={500} defaultValue={submission?.note} placeholder={spec?.text_placeholder} className={inputClass} />
           </label>
         )}
         {modules.includes('image') && (
-          <ManualAttachmentPicker image limit={detail.instance.attachment_limits?.image ?? 1} files={images} onChange={setImages} />
+          attachmentPicker(true, images, setImages)
         )}
         {modules.includes('file') && (
-          <ManualAttachmentPicker image={false} limit={detail.instance.attachment_limits?.file ?? 1} files={files} onChange={setFiles} />
+          attachmentPicker(false, files, setFiles)
         )}
       </fieldset>
       <div className="flex justify-end gap-2">
         <button type="button" disabled={busy} onClick={onCancel} className="rounded-lg px-3 py-2 font-semibold text-slate-600 hover:bg-white disabled:opacity-50">
-          取消代交
+          {editing ? '取消编辑' : '取消代交'}
         </button>
         <button type="submit" disabled={busy} className="rounded-lg bg-blue-600 px-3 py-2 font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
-          {busy ? '正在标记…' : `确认标记为${resultLabel}`}
+          {busy ? '正在保存…' : editing ? '保存修改' : `确认标记为${resultLabel}`}
         </button>
       </div>
     </form>
@@ -334,6 +365,7 @@ export function InstanceDetailDialog({
   const [detailData, setDetailData] = useState<TaskInstanceDetail | null>(null);
   const [error, setError] = useState('');
   const [manualSubmissionOpen, setManualSubmissionOpen] = useState(false);
+  const [editSubmissionOpen, setEditSubmissionOpen] = useState(false);
   const [manualSubmissionBusy, setManualSubmissionBusy] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
@@ -349,11 +381,39 @@ export function InstanceDetailDialog({
     return () => { active = false; };
   }, [detailPath]);
 
+  useEffect(() => {
+    if (manualSubmissionOpen || editSubmissionOpen || manualSubmissionBusy || rejectOpen) return;
+    let active = true;
+    let refreshing = false;
+    const refresh = async () => {
+      if (document.hidden || refreshing) return;
+      refreshing = true;
+      try {
+        const result = await api.get<TaskInstanceDetail>(detailPath);
+        if (active) setDetailData(result);
+      } catch {
+        // Keep the visible record during a transient refresh failure.
+      } finally { refreshing = false; }
+    };
+    const timer = window.setInterval(refresh, 15000);
+    window.addEventListener('focus', refresh);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [detailPath, manualSubmissionOpen, editSubmissionOpen, manualSubmissionBusy, rejectOpen]);
+
   const canMarkSubmitted = !isSuperAdmin && me.role_level === 'sub_admin'
     && me.id != null && detailData?.instance.owner_id === me.id
     && detailData.instance.kind !== 'notice'
     && ['pending', 'overdue', 'rejected'].includes(detailData.instance.status);
-  const save = async (action: 'manual' | 'approve' | 'reject', body?: FormData) => {
+  const latestRecord = detailData?.submissions?.at(-1);
+  const canEditSubmission = !isSuperAdmin && me.role_level === 'sub_admin'
+    && me.id != null && detailData?.instance.owner_id === me.id
+    && detailData.instance.kind !== 'notice' && ['submitted', 'approved'].includes(detailData.instance.status)
+    && detailData.submission?.id === latestRecord?.id && Boolean(detailData.submission?.revision);
+  const save = async (action: 'manual' | 'edit' | 'approve' | 'reject', body?: FormData) => {
     if (!detailData || manualSubmissionBusy) return;
     const reason = rejectReason.trim();
     if (action === 'reject' && reason.length < 2) {
@@ -369,11 +429,15 @@ export function InstanceDetailDialog({
           ...detailData,
           instance: { ...detailData.instance, status: result.status, submitted_at: result.submitted_at, reject_reason: null },
         });
+      } else if (action === 'edit') {
+        await api.put(`${path}/submission`, body);
+        setEditSubmissionOpen(false);
       } else {
         await api.post(`${path}/review`, { action, reason });
       }
       const messages = {
         manual: detailData.instance.need_review ? '任务已提交，等待审核。' : '任务已标记为已完成。',
+        edit: '提交内容已更新。',
         approve: '审核已通过。', reject: '任务已驳回，系统将通知员工重交。',
       };
       toast.success(messages[action]);
@@ -492,7 +556,7 @@ export function InstanceDetailDialog({
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-400 mt-0.5">
-                  执行日期：{detailData.instance.period_key} · 接收人：
+                  {detailData.instance.is_adhoc ? '自主上报 · ' : ''}接收人：
                   {detailData.instance.member_name_snap} ({detailData.instance.phone}) ·{' '}
                   {roleLabel(detailData.instance)}
                 </p>
@@ -531,21 +595,13 @@ export function InstanceDetailDialog({
                   {detailData.instance.phone}
                 </div>
               </div>
-              <div>
-                <div className="text-[11px] text-slate-400">执行时间</div>
+              {(!detailData.instance.is_adhoc || detailData.instance.submitted_at) && <div>
+                <div className="text-[11px] text-slate-400">{detailData.instance.kind !== 'notice' && detailData.instance.submitted_at ? '完成时间' : '执行时间'}</div>
                 <div className="font-mono text-slate-700 mt-0.5">
                   <InstancePlanTime inst={detailData.instance} />
                 </div>
-              </div>
-              {detailData.instance.submitted_at && (
-                <div>
-                  <div className="text-[11px] text-slate-400">提交时间</div>
-                  <div className="font-mono text-slate-700 mt-0.5">
-                    {detailData.instance.submitted_at}
-                  </div>
-                </div>
-              )}
-              {detailData.instance.kind !== 'notice' && (
+              </div>}
+              {detailData.instance.kind !== 'notice' && !detailData.instance.is_adhoc && (
                 <div>
                   <div className="text-[11px] text-slate-400">截止时间</div>
                   <div className="font-mono text-slate-700 mt-0.5">
@@ -585,6 +641,8 @@ export function InstanceDetailDialog({
                     <Check className="h-3.5 w-3.5" /> 标记{detailData.instance.need_review ? '已提交' : '已完成'}
                   </button>
                 )}
+                {canEditSubmission && !editSubmissionOpen && <button type="button" onClick={() => setEditSubmissionOpen(true)}
+                  className="rounded-xl bg-blue-50 px-3 py-2 font-semibold text-blue-700 hover:bg-blue-100">编辑提交内容</button>}
               </div>
 
               {!detailData.submission ? (
@@ -753,6 +811,10 @@ export function InstanceDetailDialog({
               <ManualSubmissionForm detail={detailData} busy={manualSubmissionBusy}
                 onCancel={() => setManualSubmissionOpen(false)} onConfirm={(body) => void save('manual', body)} />
             )}
+            {canEditSubmission && editSubmissionOpen && (
+              <ManualSubmissionForm detail={detailData} editing busy={manualSubmissionBusy}
+                onCancel={() => setEditSubmissionOpen(false)} onConfirm={(body) => void save('edit', body)} />
+            )}
 
             {detailData.instance.kind !== 'notice' && !!detailData.submissions?.length && (
               <section className="space-y-2.5">
@@ -774,7 +836,7 @@ export function InstanceDetailDialog({
                               : '员工自交'}</td>
                             <td className="px-3 py-2">{status.label}</td>
                             <td className="px-3 py-2">{current ? <span className="text-slate-500">正在查看</span>
-                              : <button type="button" disabled={manualSubmissionBusy || manualSubmissionOpen}
+                              : <button type="button" disabled={manualSubmissionBusy || manualSubmissionOpen || editSubmissionOpen}
                                 onClick={() => setSelectedSubmissionId(record.id)} className="font-semibold text-blue-700 hover:underline disabled:opacity-50">查看</button>}</td>
                           </tr>
                         );

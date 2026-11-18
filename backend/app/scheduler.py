@@ -757,7 +757,8 @@ class Scheduler:
         if instance["status"] not in statuses[kind]:
             return False
         template = self.state.get_template(instance["template_id"])
-        return self.state.instance_close_reason(instance, template) is None
+        return bool(template and not template.get("is_adhoc")
+                    and self.state.instance_close_reason(instance, template) is None)
 
     def _record_delivery(self, task: Dict[str, Any], send_res: Optional[SendResult], stats: Dict[str, int]) -> bool:
         """主线程记账（worker 纯网络 IO，DB 全部回主线程串行写）。返回是否真的发出。"""
@@ -984,7 +985,7 @@ class Scheduler:
         # 2026-11-12 晚 · 不定期任务（菜单自选）：Pull 模式，与定时调度物理隔离——
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
-            raise BizError(400, "VALIDATION_FAILED", "不定期任务（菜单自选）不支持手动推送，成员通过【菜单】自主获取链接")
+            raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
         p_key = period_key(tpl["period"], cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）

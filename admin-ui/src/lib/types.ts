@@ -208,6 +208,8 @@ export interface TaskInstanceItem {
   kind: TemplateKind;
   period: TemplatePeriod;
   period_key: string;
+  is_adhoc?: boolean;
+  published_at?: string | null;
   role_id: string;
   role_ids?: string[];
   phone: string;
@@ -267,9 +269,10 @@ export interface SubmissionAttachment {
 
 export interface SubmissionData {
   id?: number;
+  revision?: string;
   instance_id?: number;
   kind?: TemplateKind;
-  form_values?: Record<string, string | number>;
+  form_values?: Record<string, string | number | boolean>;
   /** 带中文标签的字段明细（后端按模板 schema 映射好） */
   fields?: Array<{ key: string; label: string; value: string }>;
   note?: string;

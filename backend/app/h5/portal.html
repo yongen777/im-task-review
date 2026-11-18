@@ -36,6 +36,7 @@
     header div, main, nav { max-width: 800px; margin: auto; }
     header div { padding: 16px 16px 12px; }
     header small { color: var(--secondary); font-size: 13px; }
+    .intro { margin: 4px 0 0; color: var(--secondary); font-size: 14px; }
     h1 { font-size: 24px; margin: 4px 0 0; }
     h2 { font-size: 18px; margin: 0; }
     h3 { font-size: 17px; margin: 0; overflow-wrap: anywhere; }
@@ -74,25 +75,80 @@
     .preview::backdrop { background: #182530b3; }
     .preview img { display: block; width: 100%; max-height: 68vh; object-fit: contain; margin-top: 12px; }
     .hidden { display: none !important; }
-</style></head><body><header><div><small>德阳量密助手</small><h1>个人任务工作台</h1></div></header><nav aria-label="工作台页签"><button data-tab="todo" class="active">我的待办</button><button data-tab="adhoc">自主上报</button><button data-tab="create">创建任务</button></nav><main id="main" aria-live="polite">正在加载工作台…</main><div id="toast" class="toast hidden" role="status"></div>
+</style></head><body><header><div><small>德阳量密助手</small><h1>个人任务工作台</h1><p class="intro">查看待办、发起自主上报，或更正已提交的内容。</p></div></header><nav aria-label="工作台页签"><button data-tab="todo" class="active">我的待办</button><button data-tab="adhoc">自主上报</button><button data-tab="history">已提交</button><button data-tab="create">创建任务</button></nav><main id="main" aria-live="polite">正在加载工作台…</main><div id="toast" class="toast hidden" role="status"></div>
 <dialog class="preview" id="attachment-preview" aria-label="提交图片预览">
   <form method="dialog"><button class="secondary">关闭预览</button></form>
   <img alt="员工提交图片">
 </dialog>
 <script>
 'use strict';
-const token=new URLSearchParams(location.hash.slice(1)).get('t')||'',prefix=location.pathname.split('/h5/')[0];
+const params = new URLSearchParams(location.hash.slice(1));
+const token=params.get('t')||'',prefix=location.pathname.split('/h5/')[0];
 let toastTimer;
-let info=null,tab='todo',scope=null,busy=false,selected=new Set(),expired=false;
+let info=null,tab=['adhoc','history'].includes(params.get('tab')) ? params.get('tab') : 'todo',scope=null,busy=false,selected=new Set(),expired=false;
 const main=document.getElementById('main'),toastBox=document.getElementById('toast');
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(text){toastBox.textContent=text;toastBox.classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>toastBox.classList.add('hidden'),3500)}
 function expiry(){expired=true;const preview=document.getElementById('attachment-preview');if(preview.open)preview.close();main.innerHTML='<div class="card empty"><h2>链接已过期</h2><p>请回到聊天框向机器人发送任意消息，重新获取最新工作台入口。</p></div>'}
-async function api(action,data={},blob=false){const r=await fetch(prefix+'/api/h5/portal/'+action,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(data),cache:'no-store'});if(r.status===401){expiry();throw Error('链接已过期')}if(blob&&r.ok)return r.blob();const v=await r.json();if(!r.ok)throw Error(v.message||'请求失败');return v}
+async function api(action,data={},blob=false) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), action === 'recipients' ? 45000 : 20000);
+  try {
+    const r = await fetch(prefix+'/api/h5/portal/'+action,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},body:JSON.stringify(data),cache:'no-store',signal:controller.signal});
+    if (r.status===401) { expiry(); throw Error('链接已过期'); }
+    if (blob && r.ok) return await r.blob();
+    const v = await r.json(); if (!r.ok) throw Error(v.message || '请求失败');
+    return v;
+  } catch (error) {
+    if (controller.signal.aborted) throw Error('操作超时，请稍后重试');
+    throw error;
+  } finally { clearTimeout(timeout); }
+}
 async function refresh(render=true){try{info=await api('info');if(render)show()}catch(e){if(!expired){main.textContent='加载失败';toast(e.message)}}}
+const reportStatus = { submitted: '待审核', approved: '已完成', rejected: '已驳回', cancelled: '已取消', expired: '已过期' };
+function historyCards(items, showType) {
+  return items.map(row => '<article class="card task-card"><div><h3>' + esc(row.name) + '</h3>' +
+    '<p class="muted">' + (showType ? (row.is_adhoc ? '自主上报 · ' : '发布任务 · ') : '') +
+    esc(reportStatus[row.status] || row.status) + '</p><p class="muted">完成时间 ' + esc(row.submitted_at) +
+    '</p></div><button class="secondary" data-history="' + esc(row.id) + '">查看详情</button></article>').join('');
+}
+function bindHistory(root) {
+  root.querySelectorAll('[data-history]').forEach(button => {
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        const result = await api('history-open', { instance_id: Number(button.dataset.history) });
+        location.href = prefix + result.url + '&from=portal';
+      } catch (error) { toast(error.message); button.disabled = false; }
+    };
+  });
+}
+async function showHistory(offset = 0) {
+  const section = document.createElement('section');
+  section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div><p class="muted">正在读取提交记录…</p>';
+  main.replaceChildren(section);
+  try {
+    const result = await api('history', { offset });
+    if (!section.isConnected) return;
+    section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
+      (result.items.length ? historyCards(result.items, true) : '<div class="card empty">暂无提交记录</div>') +
+      (offset || result.has_more ? '<div class="row">' +
+        (offset ? '<button class="secondary" data-page="' + Math.max(0, offset - 30) + '">上一页</button>' : '') +
+        (result.has_more ? '<button class="secondary" data-page="' + (offset + 30) + '">下一页</button>' : '') + '</div>' : '');
+    bindHistory(section);
+    section.querySelectorAll('[data-page]').forEach(button => button.onclick = () => showHistory(Number(button.dataset.page)));
+  } catch (error) {
+    if (!section.isConnected) return;
+    section.innerHTML = '<div class="card empty"><p></p><button class="secondary">重试</button></div>';
+    section.querySelector('p').textContent = error.message;
+    section.querySelector('button').onclick = () => showHistory(offset);
+    toast(error.message);
+  }
+}
 function show() {
   if (expired || !info) return;
   if (tab === 'create') { creator(); return; }
+  if (tab === 'history') { showHistory(); return; }
   const todo = tab === 'todo';
   const rows = todo ? info.todos : info.adhoc;
   const focusKey = document.activeElement?.dataset.open;
@@ -110,11 +166,9 @@ function show() {
     }).join('') : '<div class="card empty">' +
       (todo ? '当前暂无待提交的任务事项' : '当前暂无可自主上报的任务事项') + '</div>');
   if (!todo && info.adhoc_history?.length) {
-    const statuses = { submitted: '待审核', approved: '已完成', rejected: '已驳回' };
     main.insertAdjacentHTML('beforeend', '<div class="row section-row"><h2>已上报记录</h2></div>' +
-      info.adhoc_history.map(record => '<article class="card"><div class="row"><h3>' + esc(record.name) +
-        '</h3><span class="muted">' + esc(statuses[record.status] || record.status) +
-        '</span></div><p class="muted">' + esc(record.submitted_at) + '</p></article>').join(''));
+      historyCards(info.adhoc_history, false));
+    bindHistory(main);
   }
   main.querySelectorAll('[data-open]').forEach((button, index) => {
     if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
@@ -123,7 +177,7 @@ function show() {
       try {
         const item = rows[index];
         const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: item.id } : { template_id: item.template_id });
-        location.href = prefix + result.url;
+        location.href = prefix + result.url + '&from=portal';
       } catch (error) {
         toast(error.message);
         button.disabled = false;
@@ -134,7 +188,8 @@ function show() {
 
 const tabs = document.querySelectorAll('[data-tab]');
 tabs.forEach(button => {
-  button.setAttribute('aria-pressed', String(button.classList.contains('active')));
+  button.classList.toggle('active', button.dataset.tab === tab);
+  button.setAttribute('aria-pressed', String(button.dataset.tab === tab));
   button.onclick = () => {
     if (expired || !info) return;
     if (button.dataset.tab === 'create' && !info.can_create) {
@@ -143,6 +198,8 @@ tabs.forEach(button => {
     }
     if (tab === button.dataset.tab) return;
     tab = button.dataset.tab;
+    params.set('tab', tab);
+    history.replaceState(null, '', '#' + params.toString());
     tabs.forEach(item => {
       item.classList.toggle('active', item === button);
       item.setAttribute('aria-pressed', String(item === button));
@@ -265,6 +322,7 @@ async function form() {
     <label class="field" for="description">任务要求</label>
     <textarea id="description" required maxlength="2000" placeholder="说明需要提交的文本和图片内容"></textarea>
     <div class="field-label">接收成员 <span class="muted" id="count" role="status">已选 0 人</span></div>
+    ${scope.directory_error ? `<p class="muted" role="status">${esc(scope.directory_error)}</p>` : ''}
     <div class="scope" id="scope"></div>
     <label class="field" for="mode">发布周期</label>
     <select id="mode"><option value="once">一次性 · 立即推送</option><option value="day">每日</option><option value="week">每周</option><option value="month">每月</option></select>
@@ -401,5 +459,5 @@ async function form() {
     }
   };
 }
-refresh();setInterval(()=>{if(document.hidden||expired)return;if(tab==='create'){if(document.getElementById('tasks'))stats();else refresh(false)}else refresh()},30000);window.addEventListener('pageshow',()=>{if(!expired&&tab!=='create')refresh()});
+refresh();setInterval(()=>{if(document.hidden||expired)return;if(tab==='create'){if(document.getElementById('tasks'))stats();else refresh(false)}else if(tab!=='history')refresh()},30000);window.addEventListener('pageshow',event=>{if(event.persisted&&!expired&&tab!=='create')refresh()});
 </script></body></html>

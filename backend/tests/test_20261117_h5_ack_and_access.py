@@ -77,11 +77,10 @@ def _http_server(app):
             assert not worker.is_alive()
 
 
-def test_submit_ack_slow_sender_returns_http_before_send_and_keeps_dedupe(tmp_path):
+def test_submit_returns_h5_feedback_and_never_calls_bot_sender(tmp_path):
     class SlowNotifier(FakeNotifier):
         def send_text(self, *args, **kwargs):
-            time.sleep(2)
-            return super().send_text(*args, **kwargs)
+            raise AssertionError('任务提交不得调用机器人')
 
     store = _store()
     notifier = SlowNotifier()
@@ -104,13 +103,8 @@ def test_submit_ack_slow_sender_returns_http_before_send_and_keeps_dedupe(tmp_pa
             for _ in range(3):
                 duplicate = client.post(path, json=payload)
                 assert (duplicate.status_code, duplicate.json()["code"]) == (400, "ALREADY_SUBMITTED")
-            deadline = time.monotonic() + 5
-            while not (logs := store.list_reminder_logs(instance_id=inst["id"])):
-                assert time.monotonic() < deadline, "后台回执未记录"
-                time.sleep(0.025)
-            assert len(notifier.sent_messages) == len(logs) == 1
-            assert (logs[0]["kind"], logs[0]["result"]) == ("submit_ack", "sent")
-            print(f"HTTP 200 {duration * 1000:.1f}ms；2s 下游回执 1 条；重复请求 3 次均拒绝")
+            assert response.json()['status'] == 'approved'
+            assert not store.list_reminder_logs(instance_id=inst["id"])
         lines = next(tmp_path.glob("h5_access-*.log")).read_text(encoding="utf-8").splitlines()
         success = next(line for line in lines if f"POST {path} | 200 |" in line)
         assert "SLOW" not in success and "inst=" in success, success

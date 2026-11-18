@@ -480,7 +480,7 @@ export const InstancesView: React.FC = () => {
                 <th className="py-3.5 px-3 whitespace-nowrap">任务类型</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">所属角色</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">执行人</th>
-                <th className="py-3.5 px-3 whitespace-nowrap">执行时间</th>
+                <th className="py-3.5 px-3 whitespace-nowrap">执行 / 完成时间</th>
                 <th className="py-3.5 px-3 whitespace-nowrap">当前状态</th>
                 <th className="py-3.5 px-4 text-right whitespace-nowrap">操作</th>
               </tr>

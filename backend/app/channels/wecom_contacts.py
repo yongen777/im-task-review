@@ -172,6 +172,17 @@ class WecomContacts:
         """组织树数据源是否可用（目前仅自建应用凭证形态；MCP 无部门树能力）。"""
         return bool(self.corpid and self.secret)
 
+    def org_directory(self) -> List[Dict[str, Any]]:
+        if not self.org_available():
+            return []
+        with self._department_lock:
+            departments = self._department_cache.get("directory")
+            if departments is None:
+                departments = self.client.department_list()
+                if departments:
+                    self._department_cache.set("directory", departments)
+        return departments or []
+
     def org_departments(self, parent_id: str = "") -> List[Dict[str, Any]]:
         """指定父部门下的子部门列表（含 has_children 计算）。
 
@@ -180,7 +191,7 @@ class WecomContacts:
         """
         if not self.org_available():
             return []
-        all_depts = self.client.department_list()
+        all_depts = self.org_directory()
         if not all_depts:
             return []
         pid = str(parent_id or "0").strip() or "0"
@@ -193,7 +204,7 @@ class WecomContacts:
         children = [d for d in all_depts if d["parent_id"] == pid]
         if not children:
             return []
-        ids = {d["dept_id"] for d in all_depts}
+        ids = {d["parent_id"] for d in all_depts}
         return [{"dept_id": d["dept_id"], "name": d["name"],
                  "has_children": d["dept_id"] in ids,
                  "user_count": 0}

@@ -207,20 +207,17 @@ def test_bot_rename_all_texts() -> None:
 
 # ═══════════════════ 三、H5 提交成功自动关窗（静态契约） ═══════════════════
 
-def test_task_html_success_autoclose_contract() -> None:
-    """H5 提交成功链路契约：绿色成功反馈 + 四条关窗路径 + 900ms 延迟 + 全屏兜底完成视图。"""
+def test_task_html_success_toast_and_detail_contract() -> None:
+    """H5 提交后保留页面，立即展示反馈和最新提交。"""
     src = (Path(__file__).resolve().parents[1] / "app" / "h5" / "task.html").read_text(encoding="utf-8")
     for marker in (
-        "submit-success-banner",
+        'id="feedback"',
         "提交成功",
-        "WeixinJSBridge.call(\"closeWindow\")",
-        "window.wx.closeWindow",
-        "window.history.back()",
-        "submit-done-mask",
-        "提交成功，可安全关闭页面",
-        "}, 900);",
+        'switchView(false, editing ? "saved" : "done")',
+        "renderSavedSubmission(data.submission",
     ):
-        assert marker in src, f"task.html 缺少自动关窗链路标记: {marker}"
+        assert marker in src
+    assert "WeixinJSBridge.call" not in src
 
 
 # ═══════════════════ 四、统计看板 · 实时名单接口 ═══════════════════
