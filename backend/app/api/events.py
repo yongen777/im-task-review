@@ -184,7 +184,7 @@ def handle_inbound_text(
                     return 200, {"ok": True, "bound": True, "duplicate": True}
             raw = portal.issue(bound_member["phone"], plat)
             link = f"{(base_url or '').rstrip('/')}/h5/portal#t={raw}"
-            send("【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：\n  点击进入：" + link, "portal")
+            send("【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：\n👉 点击进入：" + link, "portal")
             return 200, {"ok": True, "bound": True, "path": "portal"}
 
     # ── 2026-11-11 任务一（用户拍板）：私聊零落库，统一拦截引导 ──

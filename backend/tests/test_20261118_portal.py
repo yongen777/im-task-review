@@ -66,7 +66,7 @@ def test_all_texts_only_portal_and_callback_retry_once(portal, text):
             send=lambda message, tag: sent.append(message), platform='zdxlz', base_url='https://test/prefix', event_id='event-01')
         assert code == 200
     assert len(sent) == 1
-    assert sent[0].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：\n  点击进入：https://test/prefix/h5/portal#t=')
+    assert sent[0].startswith('【德阳量密助手】您好，请点击下方链接进入您的个人任务工作台：\n👉 点击进入：https://test/prefix/h5/portal#t=')
     assert '【菜单】' not in sent[0] and '【待办】' not in sent[0]
     assert s.conn.execute('SELECT COUNT(*) FROM h5_token WHERE purpose=?', ('portal',)).fetchone()[0] == 1
 

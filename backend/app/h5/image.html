@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>__IMAGE_TITLE__</title>
+  <style>
+    :root {
+      --blue: #15558a;
+      --ink: #182530;
+      --secondary: #485761;
+      --muted: #596876;
+      --paper: #fff;
+      --canvas: #f3f5f7;
+      --line: #d5dde4;
+      --selection: #edf4fa;
+      --panel: 12px;
+      --control: 8px;
+      font: 400 16px/1.55 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-variant-numeric: tabular-nums;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    h1, h2, h3, strong { font-weight: 600; }
+    button, input, select, textarea { font: inherit; color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .55; cursor: default; }
+    :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .btn, .primary, .secondary {
+      min-height: 44px; padding: 8px 16px; border: 1px solid transparent;
+      border-radius: var(--control); background: var(--blue); color: white; font-weight: 500;
+    }
+    .secondary { background: var(--paper); border-color: var(--line); color: var(--blue); }
+    .btn:active, .primary:active { background: #10436e; }
+    .secondary:active { background: var(--selection); }
+    .icon { width: 18px; height: 18px; flex: none; vertical-align: middle; }
+    .wrap { max-width: 960px; margin: auto; padding: 16px 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
+    .toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+    .image-panel { overflow: auto; background: var(--paper); border: 1px solid var(--line); border-radius: var(--panel); padding: 8px; }
+    img { display: block; width: 100%; max-width: 100%; height: auto; touch-action: pinch-zoom; cursor: zoom-in; }
+    img.is-zoomed { width: auto; max-width: none; cursor: zoom-out; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="toolbar"><button type="button" class="secondary" id="zoom" aria-controls="img">查看原图</button></div>
+    <div class="image-panel"><img id="img" src="__IMAGE_SRC__" alt="__IMAGE_TITLE__" loading="lazy"></div>
+  </main>
+  <script>
+    const image = document.getElementById('img');
+    const zoom = document.getElementById('zoom');
+    function toggleZoom() {
+      const enlarged = image.classList.toggle('is-zoomed');
+      zoom.textContent = enlarged ? '适应屏幕' : '查看原图';
+      if (!enlarged) image.parentElement.scrollLeft = 0;
+    }
+    zoom.addEventListener('click', toggleZoom);
+    image.addEventListener('click', toggleZoom);
+  </script>
+</body>
+</html>

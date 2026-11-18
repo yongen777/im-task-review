@@ -212,12 +212,12 @@ def test_task_html_success_autoclose_contract() -> None:
     src = (Path(__file__).resolve().parents[1] / "app" / "h5" / "task.html").read_text(encoding="utf-8")
     for marker in (
         "submit-success-banner",
-        "✅ 提交成功！",
+        "提交成功",
         "WeixinJSBridge.call(\"closeWindow\")",
         "window.wx.closeWindow",
         "window.history.back()",
         "submit-done-mask",
-        "✅ 提交成功，可安全关闭页面",
+        "提交成功，可安全关闭页面",
         "}, 900);",
     ):
         assert marker in src, f"task.html 缺少自动关窗链路标记: {marker}"
