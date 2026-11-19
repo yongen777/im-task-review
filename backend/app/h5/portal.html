@@ -1246,6 +1246,11 @@
         (rows.length ? rows.map(row => {
           const key = todo ? row.id : row.template_id;
           if (todo && row.receipt_phrase) {
+            if (row.receipt_mode === 'link') {
+              return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
+                '<div class="task-meta"><span class="tag tag-warn">待确认</span></div></div>' +
+                '<button type="button" class="primary" data-open="' + esc(key) + '" data-receipt>去查看确认</button></article>';
+            }
             return '<article class="card task-card receipt-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
               '<div class="task-meta"><span class="tag tag-warn">待回复</span></div>' +
               '<p class="receipt-note">请返回聊天框回复德阳量密助手<strong>「' + esc(row.receipt_phrase) +
@@ -1265,7 +1270,8 @@
           button.disabled = true;
           try {
             const key = button.dataset.open;
-            const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: Number(key) } : { template_id: key });
+            const action = button.hasAttribute('data-receipt') ? 'notice-open' : todo ? 'open' : 'adhoc';
+            const result = await api(action, todo ? { instance_id: Number(key) } : { template_id: key });
             location.href = prefix + result.url + '&from=portal';
           } catch (error) {
             toast(error.message);

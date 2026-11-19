@@ -49,7 +49,7 @@ SCHEMA_VERSION = 1
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
 BUSINESS_TABLES = (
     "scope", "role", "member", "delivery_target", "task_template",
-    "task_instance", "submission", "reminder_log", "upload_ref", "h5_token", "notice_asset",
+    "task_instance", "submission", "reminder_log", "upload_ref", "h5_token", "notice_asset", "notice_receipt_view",
     "admin_user", "admin_session", "admin_audit",
 )
 VERSION_TABLE = "schema_version"
@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS task_instance (
   late_submit   TINYINT      NOT NULL DEFAULT 0,
   receipt_phrase VARCHAR(80) DEFAULT NULL,
   receipt_platform VARCHAR(16) DEFAULT NULL,
+  receipt_mode VARCHAR(8) DEFAULT NULL,
   receipt_prompt_at VARCHAR(32) DEFAULT NULL,
   receipt_at VARCHAR(32) DEFAULT NULL,
   receipt_text TEXT,
@@ -194,6 +195,12 @@ CREATE TABLE IF NOT EXISTS task_instance (
   KEY ix_inst_status (status, deadline_at),
   KEY ix_inst_period (period_key),
   KEY ix_inst_receipt (phone, receipt_platform, receipt_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS notice_receipt_view (
+  instance_id INT NOT NULL,
+  content_json LONGTEXT NOT NULL,
+  PRIMARY KEY (instance_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS notice_asset (
@@ -723,7 +730,7 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
     for column, definition in (
         ("receipt_phrase", "VARCHAR(80) DEFAULT NULL"), ("receipt_platform", "VARCHAR(16) DEFAULT NULL"),
         ("receipt_prompt_at", "VARCHAR(32) DEFAULT NULL"), ("receipt_at", "VARCHAR(32) DEFAULT NULL"),
-        ("receipt_text", "TEXT"),
+        ("receipt_text", "TEXT"), ("receipt_mode", "VARCHAR(8) DEFAULT NULL"),
     ):
         if not proxy.execute("SHOW COLUMNS FROM task_instance LIKE ?", (column,)).fetchone():
             proxy.execute(f"ALTER TABLE task_instance ADD COLUMN {column} {definition}")

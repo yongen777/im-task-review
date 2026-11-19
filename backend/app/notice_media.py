@@ -17,12 +17,16 @@ def receipt_key(text: str) -> str:
                    if not c.isspace() and not unicodedata.category(c).startswith("P"))
 
 
-def receipt_phrase(template: dict) -> str | None:
+def notice_receipt_config(template: dict) -> tuple[str | None, str | None]:
     if template.get("kind") != "notice":
-        return None
+        return None, None
     spec = template.get("spec_json") or {}
     config = spec.get("notice_receipt") or {} if isinstance(spec, dict) else {}
-    return config.get("phrase") if isinstance(config, dict) and config.get("enabled") else None
+    if not isinstance(config, dict) or not config.get("enabled"):
+        return None, None
+    if config.get("mode") == "link":
+        return "link", config.get("button_label") or "我已知晓"
+    return "text", config.get("phrase") or "我已知晓"
 
 
 def _has_movie_boxes(source, size: int) -> bool:

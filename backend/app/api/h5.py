@@ -629,7 +629,9 @@ def create_h5_router(
     scheduler=None,
 ) -> APIRouter:
     router = APIRouter()
+    from .notice_receipts import create_notice_receipt_router
     from .portal import create_portal_router
+    router.include_router(create_notice_receipt_router(state))
     router.include_router(create_portal_router(state, scheduler=scheduler, uploads_dir=uploads_dir))
 
     def track_instance(request: Request) -> Callable[[int], None]:

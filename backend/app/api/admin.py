@@ -2834,7 +2834,7 @@ def create_admin_router(
     @router.get("/stats-panel/tasks")
     async def stats_panel_tasks(request: Request, platform: Optional[str] = None):
         """单任务选择器沿用模板的属主与平台范围。"""
-        from ..notice_media import receipt_phrase
+        from ..notice_media import notice_receipt_config
 
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
@@ -2848,7 +2848,7 @@ def create_admin_router(
             )
             items = []
             for t in res["items"]:
-                is_receipt = t["kind"] == "notice" and bool(receipt_phrase(t))
+                is_receipt = bool(notice_receipt_config(t)[0])
                 if t["kind"] == "notice" and not is_receipt:
                     continue
                 stats_period = state.stats_panel_period(t)

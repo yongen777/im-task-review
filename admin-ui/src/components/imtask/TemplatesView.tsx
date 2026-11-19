@@ -36,6 +36,7 @@ import {
   FormFieldSpec,
   NoticeContentFormat,
   NoticeMessageItem,
+  NoticeReceiptMode,
   TemplateItem,
   UploadH5Module,
   getTemplateRoleIds,
@@ -123,22 +124,30 @@ function formatManualDeadline(value?: string | null): string {
   return `${year}年${month}月${day}日 ${value.slice(11, 16)}`;
 }
 
-function NoticePhonePreview({ body, media, phrase }: { body: string; media: NoticeMessageItem[]; phrase: string }) {
-  const message = [body.trim(), phrase ? `收到请直接回复「${phrase}」确认` : ''].filter(Boolean).join('\n\n');
+function NoticePhonePreview({ body, media, label, mode }: {
+  body: string; media: NoticeMessageItem[]; label: string; mode: NoticeReceiptMode;
+}) {
+  const linkMode = label && mode === 'link';
+  const summary = body.trim().replace(/\s+/g, ' ');
+  const message = linkMode ? summary.slice(0, 100) + (summary.length > 100 ? '…' : '') : body.trim();
   return <aside aria-label="量子密信通知预览" className="rounded-2xl border border-slate-200 bg-slate-50 overflow-hidden">
     <h4 className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 text-sm font-semibold">
       <Smartphone className="size-4 text-blue-700" />量子密信通知预览
     </h4>
     <div className="space-y-3 p-4">
       {message && <p className="rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words">{message}</p>}
-      {media.map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+      {!linkMode && media.filter(item => item.format !== 'text').map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
         {item.format === 'image' && <img src={noticeAssetUrl(item)} alt={item.file_name || '通知图片'}
           className="max-h-44 w-full rounded-md object-contain" />}
         {item.format === 'video' && <video controls playsInline preload="metadata" src={noticeAssetUrl(item)}
           className="max-h-44 w-full rounded-md bg-black" />}
         <p className="mt-1">{NOTICE_LABELS[item.format]} · {item.file_name || item.file_caption}</p>
       </div>)}
-      {!message && !media.length && <p className="text-slate-500">添加通知内容后可预览。</p>}
+      {label && <p className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+        {linkMode ? <>请打开链接阅读完整通知，点击「{label}」确认。<br /><span className="text-blue-700">查看通知并确认</span></>
+          : <>以上为通知内容，查收后请直接回复「{label}」完成确认。</>}
+      </p>}
+      {!message && !media.length && !label && <p className="text-slate-500">添加通知内容后可预览。</p>}
     </div>
   </aside>;
 }
@@ -532,7 +541,9 @@ export const TemplatesView: React.FC = () => {
   const [noticeKinds, setNoticeKinds] = useState<NoticeContentFormat[]>(['text']);
   const [noticeText, setNoticeText] = useState(DEFAULT_NOTICE_TEXT);
   const [receiptEnabled, setReceiptEnabled] = useState(false);
+  const [receiptMode, setReceiptMode] = useState<NoticeReceiptMode>('link');
   const [receiptPhrase, setReceiptPhrase] = useState(DEFAULT_RECEIPT);
+  const [receiptButtonLabel, setReceiptButtonLabel] = useState(DEFAULT_RECEIPT);
   const [uploadingAssetId, setUploadingAssetId] = useState<string | null>(null);
 
   // 上传任务专用状态（提醒文本 + 选择 H5 上传项 [字段/文本/图片/文件] + 是否需要审核）
@@ -642,7 +653,9 @@ export const TemplatesView: React.FC = () => {
     setNoticeKinds(['text']);
     setNoticeText(DEFAULT_NOTICE_TEXT);
     setReceiptEnabled(false);
+    setReceiptMode('link');
     setReceiptPhrase(DEFAULT_RECEIPT);
+    setReceiptButtonLabel(DEFAULT_RECEIPT);
     setUploadRemindText(
       '请按时点击下方 H5 链接，完成今日上门走访户数报数及图片上传。',
     );
@@ -709,7 +722,9 @@ export const TemplatesView: React.FC = () => {
       setNoticeItems(items.filter(item => item.format !== 'text'));
       setNoticeKinds(NOTICE_KINDS.filter(key => key === 'text' ? Boolean(body) : items.some(item => item.format === key)));
       setReceiptEnabled(tpl.spec?.notice_receipt?.enabled === true);
+      setReceiptMode(tpl.spec?.notice_receipt?.mode || (tpl.spec?.notice_receipt?.enabled ? 'text' : 'link'));
       setReceiptPhrase(tpl.spec?.notice_receipt?.phrase || DEFAULT_RECEIPT);
+      setReceiptButtonLabel(tpl.spec?.notice_receipt?.button_label || DEFAULT_RECEIPT);
     } else {
       setUploadRemindText(tpl.text_tpl || '');
       setUploadModules(resolveUploadModules(tpl));
@@ -844,8 +859,8 @@ export const TemplatesView: React.FC = () => {
           return;
         }
       }
-      if (receiptEnabled && !receiptPhrase.trim()) {
-        toast.warning('请填写要求回复的话术');
+      if (receiptEnabled && !(receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim()) {
+        toast.warning(receiptMode === 'link' ? '请填写确认按钮文案' : '请填写要求回复的话术');
         return;
       }
       finalTextTpl = noticeKinds.includes('text') ? noticeText.trim() : '';
@@ -855,7 +870,8 @@ export const TemplatesView: React.FC = () => {
           ...(finalTextTpl ? [{ id: 'notice_text', format: 'text', text_content: finalTextTpl }] : []),
           ...activeNoticeItems,
         ],
-        notice_receipt: { enabled: receiptEnabled, phrase: receiptPhrase.trim() },
+        notice_receipt: { enabled: receiptEnabled, mode: receiptMode,
+          ...(receiptMode === 'link' ? { button_label: receiptButtonLabel.trim() } : { phrase: receiptPhrase.trim() }) },
       };
     } else {
       // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
@@ -1267,7 +1283,9 @@ export const TemplatesView: React.FC = () => {
                                 </div>
                               ))}
                               {tpl.spec?.notice_receipt?.enabled && <p className="text-xs text-slate-500">
-                                回执话术 · {tpl.spec.notice_receipt.phrase}
+                                {tpl.spec.notice_receipt.mode === 'link'
+                                  ? `H5 链接确认 · ${tpl.spec.notice_receipt.button_label || DEFAULT_RECEIPT}`
+                                  : `文本回复确认 · ${tpl.spec.notice_receipt.phrase || DEFAULT_RECEIPT}`}
                               </p>}
 
                               <button
@@ -1906,11 +1924,30 @@ export const TemplatesView: React.FC = () => {
                             onChange={event => setReceiptEnabled(event.target.checked)} />
                           需要成员回执确认
                         </label>
-                        {receiptEnabled && <label className="block space-y-2">
-                          <span>要求回复的话术</span>
-                          <input type="text" maxLength={80} value={receiptPhrase} onChange={event => setReceiptPhrase(event.target.value)}
-                            className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
-                        </label>}
+                        {receiptEnabled && <>
+                          <fieldset className="flex flex-wrap gap-x-5 gap-y-2">
+                            <legend className="mb-1 font-medium">回执方式</legend>
+                            <label className="flex items-center gap-2">
+                              <input type="radio" name="notice-receipt-mode" className="accent-blue-700" checked={receiptMode === 'link'}
+                                onChange={() => setReceiptMode('link')} /> H5 链接确认
+                            </label>
+                            <label className="flex items-center gap-2">
+                              <input type="radio" name="notice-receipt-mode" className="accent-blue-700" checked={receiptMode === 'text'}
+                                onChange={() => setReceiptMode('text')} /> 文本回复确认
+                            </label>
+                          </fieldset>
+                          {receiptMode === 'link'
+                            ? <label className="block space-y-2">
+                              <span>确认按钮文案</span>
+                              <input type="text" maxLength={80} value={receiptButtonLabel} onChange={event => setReceiptButtonLabel(event.target.value)}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
+                            </label>
+                            : <label className="block space-y-2">
+                              <span>要求回复的话术</span>
+                              <input type="text" maxLength={80} value={receiptPhrase} onChange={event => setReceiptPhrase(event.target.value)}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
+                            </label>}
+                        </>}
                       </div>
                     </div>
                   )}
@@ -2100,7 +2137,8 @@ export const TemplatesView: React.FC = () => {
                 {kind === 'notice' && platform === 'zdxlz' && (
                   <div className="lg:col-span-5"><NoticePhonePreview body={noticeKinds.includes('text') ? noticeText : ''}
                     media={noticeItems.filter(item => noticeKinds.includes(item.format))}
-                    phrase={receiptEnabled ? receiptPhrase.trim() : ''} /></div>
+                    mode={receiptMode}
+                    label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''} /></div>
                 )}
               </div>
 

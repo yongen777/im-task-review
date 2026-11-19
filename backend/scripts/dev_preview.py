@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,7 +32,8 @@ DEMO_DEPARTMENTS = {
     "preview-switch": ("交换维护组", "preview-network"),
     "preview-service": ("服务保障部", "preview-root"),
 }
-H5_FILES = {"portal": "portal.html", "task": "task.html", "image": "image.html"}
+H5_FILES = {"portal": "portal.html", "task": "task.html", "image": "image.html",
+            "notice-receipt": "notice-receipt.html"}
 
 
 def local_database():
@@ -114,7 +116,50 @@ def demo_files():
     return "机柜巡检照片.png", png.getvalue(), "交接明细.pdf", pdf.getvalue()
 
 
-def seed(store, password):
+def seed_notice_receipts(store, scheduler, owner, role_id, phone, image, pdf, run_id):
+    from app.notice_media import store_asset
+    from app.notice_receipts import issue_link
+
+    def asset(kind, name, content):
+        saved = store_asset(store, owner, kind, name, BytesIO(content), len(content))
+        return {"format": kind, "asset_id": saved["asset_id"]}
+
+    items = [asset("image", "机柜巡检照片.png", image), asset("file", "交接明细.pdf", pdf)]
+    if ffmpeg := shutil.which("ffmpeg"):
+        with tempfile.TemporaryDirectory(prefix="imtask-preview-video-") as directory:
+            path = Path(directory) / "巡检演示.mp4"
+            try:
+                subprocess.run([ffmpeg, "-v", "error", "-f", "lavfi", "-i",
+                                "color=c=0x244c6a:s=320x180:d=2", "-c:v", "libx264",
+                                "-movflags", "+faststart", str(path)], capture_output=True, check=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            else:
+                items.append(asset("video", path.name, path.read_bytes()))
+
+    def notice(title, body, config, media=()):
+        template = store.create_template({
+            "name": f"{title} · {run_id[:4]}", "kind": "notice", "period": "day", "is_manual": True,
+            "text_tpl": body, "role_ids": [role_id],
+            "spec": {"notice_receipt": {"enabled": True, **config}, "notice_items": list(media)},
+        }, owner_id=owner)
+        scheduler.push_now(template["template_id"])
+        return store.get_instance_by_key(template["template_id"], phone, "once")
+
+    long_body = "\n\n".join([
+        "请查阅本周机柜巡检工作安排。图文、视频与交接文件均可在本页查看。",
+        "一、核对机柜端口标签与交接明细，确认名称和位置一一对应。",
+        "二、查看巡检照片和演示片段。遇到异常时，请在交接明细中记录发现时间与设备位置。",
+        "三、完成值班信息核对后，向班组反馈未结事项。在页面底部点击按钮登记回执。",
+    ])
+    detailed = notice("机柜巡检通知", long_body, {"mode": "link", "button_label": "确认已读"}, items)
+    short = notice("晚班交接提示", "今晚交接按原计划进行。", {"mode": "link"})
+    notice("文本回执演示", "请回到聊天框完成确认。", {"mode": "text", "phrase": "预览已阅"})
+    return {"H5 通知确认 · 图文和附件": issue_link(store, detailed),
+            "H5 通知确认 · 单屏短文": issue_link(store, short)}
+
+
+def seed(store, password, scheduler):
     from app.api.h5 import prepare_task_upload, process_h5_task_upload, task_upload_limits
     from app.config import format_dt
     from app.portal import PortalService
@@ -258,6 +303,7 @@ def seed(store, password):
         "H5 填报 · 管理员代交": "/h5/task#t=" + delegated_token,
         "H5 填报 · 自主上报": "/h5/task#t=" + adhoc_open,
     }
+    routes.update(seed_notice_receipts(store, scheduler, owner, role_id, employee[0], image, pdf, run_id))
     return owner, routes
 
 
@@ -304,7 +350,7 @@ def make_app(store, scheduler, owner, open_key):
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         return page
 
-    for route in ("portal", "task"):
+    for route in ("portal", "task", "notice-receipt"):
         app.add_api_route("/h5/" + route, live_page(H5_FILES[route]), methods=["GET"])
     app.include_router(create_h5_router(store, store.data_dir / "uploads", notifier=scheduler.notifier,
                                         scheduler=scheduler))
@@ -388,7 +434,7 @@ def main():
     try:
         state.contacts = DemoDirectory()
         scheduler = Scheduler(state, backend, notifier=FakeNotifier())
-        owner, routes = seed(state, "Preview@" + secrets.token_hex(12))
+        owner, routes = seed(state, "Preview@" + secrets.token_hex(12), scheduler)
         key = secrets.token_urlsafe(24)
         urls = {label: backend + path for label, path in routes.items()}
         urls["PC admin (Vite HMR)"] = origin + "/"

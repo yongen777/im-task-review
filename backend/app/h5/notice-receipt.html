@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <title>通知确认</title>
+  <style>
+    :root { color-scheme: light; --bg: #f1f4f6; --surface: #fff; --ink: #182631; --muted: #50606e; --line: #dce3e9; --blue: #174c79; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; min-height: 100vh; min-height: 100dvh; display: flex; flex-direction: column; color: var(--ink); background: var(--bg); font: 15px/1.6 system-ui, "Microsoft YaHei", sans-serif; }
+    button, a { font: inherit; }
+    button { cursor: pointer; }
+    a { color: var(--blue); }
+    :focus-visible { outline: 2px solid #377fb5; outline-offset: 3px; }
+    main { width: min(100%, 660px); margin-inline: auto; padding: 20px 16px 24px; }
+    .card { margin: 0 0 12px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+    .heading { padding-top: 22px; padding-bottom: 20px; }
+    h1, h2, p { margin: 0; overflow-wrap: anywhere; }
+    h1 { font-size: clamp(22px, 5.3vw, 28px); line-height: 1.35; letter-spacing: -0.02em; }
+    h2 { font-size: 16px; margin-bottom: 12px; }
+    dl { margin: 12px 0 0; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+    dl div { display: flex; gap: 8px; flex-wrap: wrap; }
+    dd { margin: 0; }
+    #body { white-space: pre-wrap; line-height: 1.85; }
+    #back { min-height: 44px; border: 0; padding: 0 3px; margin: -10px 0 6px; background: none; color: var(--blue); }
+    .gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 140px), 1fr)); gap: 10px; }
+    .picture { width: 100%; padding: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); }
+    .picture img { display: block; width: 100%; height: auto; aspect-ratio: 4 / 3; object-fit: contain; }
+    .video + .video { padding-top: 15px; margin-top: 12px; border-top: 1px solid var(--line); }
+    video { display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 10px; background: #17202a; }
+    .media-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 8px; }
+    .media-row + .media-row { border-top: 1px solid var(--line); margin-top: 8px; }
+    .media-name { min-width: 0; overflow-wrap: anywhere; }
+    .size { display: block; color: var(--muted); font-size: 13px; }
+    .download { flex: none; display: inline-flex; align-items: center; min-height: 44px; }
+    #actions { position: sticky; bottom: 0; margin-top: auto; padding: 10px 16px max(12px, env(safe-area-inset-bottom)); background: var(--surface); border-top: 1px solid var(--line); }
+    .action-inner { width: min(100%, 628px); margin-inline: auto; }
+    #hint { text-align: center; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+    #hint:empty { display: none; }
+    #confirm { min-height: 48px; width: 100%; padding: 8px 14px; border: 0; border-radius: 10px; background: var(--blue); color: #fff; font-weight: 650; overflow-wrap: anywhere; }
+    #confirm:disabled { cursor: default; background: #e8edf1; color: #596773; }
+    #confirm[data-confirmed] { background: #e7f3eb; color: #24583a; }
+    #zoom { position: fixed; inset: 0; z-index: 2; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 12px; padding: max(12px, env(safe-area-inset-top)) 12px max(12px, env(safe-area-inset-bottom)); background: #121d27; color: #fff; }
+    #zoom button { justify-self: end; min-height: 44px; padding: 6px 12px; border: 1px solid #6b7984; border-radius: 8px; background: transparent; color: inherit; }
+    #zoom img { width: 100%; height: 100%; object-fit: contain; }
+  </style>
+</head>
+<body>
+  <main>
+    <button type="button" id="back" hidden>‹ 返回工作台</button>
+    <div class="card" id="loading" role="status">正在读取通知…</div>
+    <article id="notice" hidden>
+      <header class="card heading">
+        <h1 id="title"></h1>
+        <dl>
+          <div><dt>发布时间</dt><dd id="published"></dd></div>
+          <div><dt>送达时间</dt><dd id="delivered"></dd></div>
+        </dl>
+      </header>
+      <section class="card" id="body-card" aria-label="通知正文" hidden><p id="body"></p></section>
+      <div id="media"></div>
+    </article>
+    <div id="end" aria-hidden="true"></div>
+  </main>
+  <footer id="actions" hidden>
+    <div class="action-inner">
+      <p id="hint" role="status"></p>
+      <button type="button" id="confirm" disabled></button>
+    </div>
+  </footer>
+  <div id="zoom" role="dialog" aria-modal="true" aria-label="图片预览" hidden>
+    <button type="button" id="close-zoom">关闭预览</button>
+    <img alt="">
+  </div>
+  <script>
+    'use strict';
+    const $ = id => document.getElementById(id);
+    const params = new URLSearchParams(location.hash.slice(1));
+    const token = params.get('t') || '';
+    const api = location.pathname.split('/h5/')[0] + '/api/h5/notice-receipt';
+    const confirmButton = $('confirm');
+    const zoom = $('zoom');
+    let data, reachedEnd = false, previousFocus, confirming = false;
+    window.addEventListener('hashchange', () => location.reload());
+
+    function node(tag, text, className) {
+      const element = document.createElement(tag);
+      if (text) element.textContent = text;
+      if (className) element.className = className;
+      return element;
+    }
+
+    async function request(action) {
+      const response = await fetch(api + '/' + action, {
+        method: 'POST', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + token },
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.message || '通知暂不可用');
+      return result;
+    }
+
+    function mediaUrl(id, download = false) {
+      return api + '/media?token=' + encodeURIComponent(token) + '&id=' + id + (download ? '&download=1' : '');
+    }
+
+    function fileSize(size) {
+      if (size < 1024) return size + ' B';
+      if (size < 1048576) return (size / 1024).toFixed(1) + ' KB';
+      return (size / 1048576).toFixed(1) + ' MB';
+    }
+
+    function downloadRow(item, label) {
+      const row = node('div', '', 'media-row');
+      const name = node('div', '', 'media-name');
+      name.append(node('span', item.name), node('span', fileSize(item.size), 'size'));
+      const link = node('a', label, 'download');
+      link.href = mediaUrl(item.id, true);
+      link.download = item.name;
+      row.append(name, link);
+      return row;
+    }
+
+    function renderMedia(items) {
+      for (const [kind, title] of [['image', '图片'], ['video', '视频'], ['file', '文件附件']]) {
+        const entries = items.filter(item => item.kind === kind);
+        if (!entries.length) continue;
+        const section = node('section', '', 'card');
+        section.append(node('h2', title));
+        if (kind === 'image') {
+          const gallery = node('div', '', 'gallery');
+          for (const item of entries) {
+            const button = node('button', '', 'picture');
+            button.type = 'button';
+            button.setAttribute('aria-label', '放大预览 ' + item.name);
+            const image = node('img');
+            image.src = mediaUrl(item.id);
+            image.alt = item.name;
+            image.loading = 'lazy';
+            button.append(image);
+            button.onclick = () => {
+              previousFocus = button;
+              const target = zoom.querySelector('img');
+              target.src = image.src;
+              target.alt = item.name;
+              zoom.hidden = false;
+              $('close-zoom').focus();
+            };
+            gallery.append(button);
+          }
+          section.append(gallery);
+        } else if (kind === 'video') {
+          for (const item of entries) {
+            const entry = node('div', '', 'video');
+            const video = node('video');
+            video.controls = true;
+            video.playsInline = true;
+            video.preload = 'metadata';
+            video.src = mediaUrl(item.id);
+            video.setAttribute('aria-label', item.name);
+            entry.append(video, downloadRow(item, '下载原视频'));
+            section.append(entry);
+          }
+        } else {
+          for (const item of entries) section.append(downloadRow(item, '下载'));
+        }
+        $('media').append(section);
+      }
+    }
+
+    function closeZoom() {
+      zoom.hidden = true;
+      previousFocus?.focus();
+    }
+    $('close-zoom').onclick = closeZoom;
+    document.addEventListener('keydown', event => {
+      if (zoom.hidden) return;
+      if (event.key === 'Escape') closeZoom();
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        $('close-zoom').focus();
+      }
+    });
+    $('back').hidden = params.get('from') !== 'portal';
+    $('back').onclick = () => history.back();
+
+    function updateButton() {
+      if (!data) return;
+      if (data.confirmed_at) {
+        confirmButton.disabled = true;
+        confirmButton.dataset.confirmed = '';
+        confirmButton.textContent = '已确认 · ' + data.confirmed_at;
+        return;
+      }
+      confirmButton.textContent = confirming ? '正在确认…' : data.button_label;
+      reachedEnd ||= $('end').getBoundingClientRect().bottom <= $('actions').getBoundingClientRect().top + 2;
+      confirmButton.disabled = !data.confirmation_open || !reachedEnd || confirming;
+      $('hint').textContent = !data.confirmation_open ? '通知已停用，暂时无法确认' :
+        !reachedEnd ? '请滑动阅读到底部后确认' : '';
+    }
+
+    confirmButton.onclick = async () => {
+      if (confirmButton.disabled) return;
+      confirming = true;
+      updateButton();
+      try {
+        const result = await request('confirm');
+        data.confirmed_at = result.receipt_at;
+        $('hint').textContent = '确认成功';
+        updateButton();
+      } catch (error) {
+        confirming = false;
+        updateButton();
+        $('hint').textContent = error.message;
+      }
+    };
+
+    async function render() {
+      try {
+        data = await request('info');
+        document.title = data.title + ' · 通知确认';
+        $('title').textContent = data.title;
+        $('published').textContent = data.published_at;
+        $('delivered').textContent = data.delivered_at;
+        $('body').textContent = data.body;
+        $('body-card').hidden = !data.body;
+        renderMedia(data.media);
+        $('loading').hidden = true;
+        $('notice').hidden = false;
+        $('actions').hidden = false;
+        updateButton();
+        window.addEventListener('scroll', updateButton, { passive: true });
+        window.addEventListener('resize', updateButton);
+      } catch (error) {
+        $('loading').textContent = error.message;
+      }
+    }
+    render();
+  </script>
+</body>
+</html>

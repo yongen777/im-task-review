@@ -808,7 +808,7 @@ class Scheduler:
             with self.state.conn:
                 self.state.complete_claimed_reminder(task["claim_id"], **outcome)
                 if ok and task.get("receipt_prompt"):
-                    self.state.mark_receipt_prompt_sent(task["instance_id"], task["now_s"])
+                    self.state.mark_receipt_prompt_sent(task["instance_id"], task.get("receipt_sent_at") or task["now_s"])
         else:
             self.state.record_reminder_log(
                 template_id=task["template_id"], instance_id=task["instance_id"], phone=task["phone"],
@@ -857,7 +857,8 @@ class Scheduler:
             res = task["send_fn"](task["external_id"], task["msg_text"], task["idem_key"])
             if res and res.ok and task.get("receipt_prompt"):
                 try:
-                    self.state.mark_receipt_prompt_sent(task["instance_id"], task["now_s"])
+                    task["receipt_sent_at"] = self.state.now_str()
+                    self.state.mark_receipt_prompt_sent(task["instance_id"], task["receipt_sent_at"])
                 except Exception:  # noqa: BLE001
                     logger.exception("通知回执投递时间写入失败 instance=%s", task["instance_id"])
             return res
@@ -1153,7 +1154,7 @@ class Scheduler:
             template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=now, extra_vars=values,
         ).strip()
 
-    def _notice_images(self, tpl, period, seq, now_s, values):
+    def _notice_images(self, tpl, period, seq, now_s, values, *, require_available=False):
         """优先使用通知条目中的所有上传图片，再兼容旧字段和旧数据看板。"""
         from .notice_media import asset_path, get_asset
 
@@ -1185,6 +1186,8 @@ class Scheduler:
                 if (target.is_relative_to(root) and target.is_file()
                         and target.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")):
                     yield str(target), title, rel, rel == primary
+                elif require_available:
+                    yield None, title, rel, rel == primary
             return
 
         data_keys = tpl.get("data_keys") or []
@@ -1199,6 +1202,8 @@ class Scheduler:
                                       note=f"数据截至 {now_s} · 数据来源：人工填报")
         except Exception as exc:
             logger.warning("通知看板生成失败 template=%s: %s", tpl["template_id"], exc)
+            if require_available:
+                yield None, tpl.get("attach_image_name"), "dashboard", True
             return
         yield str(target), tpl.get("attach_image_name"), "dashboard", True
 
@@ -1231,10 +1236,12 @@ class Scheduler:
         send = getattr(notifier, "send_notice_attachment", None)
         return functools.partial(send, external_id, source, asset, idem, external_type) if callable(send) else None
 
-    def _notice_media_parts(self, tpl, period, seq, now_s, values):
+    def _notice_media_parts(self, tpl, period, seq, now_s, values, *, require_available=False):
         from .notice_media import asset_path, get_asset
 
-        for source, title, key, legacy in self._notice_images(tpl, period, seq, now_s, values):
+        for source, title, key, legacy in self._notice_images(
+            tpl, period, seq, now_s, values, require_available=require_available,
+        ):
             yield source, {"kind": "image", "file_name": title or "数据图片"}, key, legacy
 
         items = (tpl.get("spec_json") or {}).get("notice_items") or []
@@ -1313,7 +1320,7 @@ class Scheduler:
         return delivered
 
     def _deliver_notice_text_part(self, tpl, targets, period, seq, planned_str, now, stats, *,
-                                  values, once, receipt=False):
+                                  values, once, receipt=False, link_message=None):
         batch, batch_targets = [], []
         now_s = format_dt(now)
         kind = "notice_receipt" if receipt else "notice"
@@ -1340,10 +1347,18 @@ class Scheduler:
                     task = self._prepare_delivery(
                         template_id=tpl["template_id"], instance_id=instance_id, phone=inst["phone"],
                         external_id=external_id, kind=kind, planned_str=planned_str, delay_sec=0,
-                        idem_key=idem, msg_text_fn=lambda: message, cur_dt=now, now_s=now_s,
+                        idem_key=idem,
+                        msg_text_fn=functools.partial(link_message, inst) if link_message else lambda: message,
+                        cur_dt=now, now_s=now_s,
                         stats=stats, claim=True, once=once,
                     )
                     if task:
+                        if not task["msg_text"]:
+                            self.state.complete_claimed_reminder(
+                                task["claim_id"], sent_at=None, result="failed", error="NOTICE_VIEW_UNAVAILABLE",
+                            )
+                            stats["failed"] += 1
+                            continue
                         task["send_fn"] = functools.partial(notifier.send_text, receive_type=external_type)
                         task["receipt_prompt"] = receipt
                         batch.append(task)
@@ -1358,6 +1373,57 @@ class Scheduler:
                 targets.pop(target)
         return delivered
 
+    def _notice_link_message(self, tpl, period, seq, planned_str, now, values):
+        from mimetypes import guess_type
+        from .notice_receipts import issue_link, load_view, media_path, save_view
+
+        media = None
+        now_s = format_dt(now)
+        root = Path(self.state.data_dir).resolve()
+
+        def message(inst):
+            nonlocal media
+            if not self.public_base_url:
+                return ""
+            view = load_view(self.state, inst["id"])
+            if view is None:
+                if media is None:
+                    available = []
+                    for source, asset, _, _ in self._notice_media_parts(
+                        tpl, period, seq, now_s, values, require_available=True,
+                    ):
+                        if not source or not Path(source).is_relative_to(root):
+                            return ""
+                        relative = Path(source).relative_to(root).as_posix()
+                        path = media_path(self.state, relative)
+                        if path is None:
+                            return ""
+                        try:
+                            size = asset.get("size") or path.stat().st_size
+                        except OSError:
+                            return ""
+                        available.append({
+                            "kind": asset["kind"], "name": asset["file_name"], "relative": relative,
+                            "size": size,
+                            "mime": asset.get("mime") or guess_type(path.name)[0] or "application/octet-stream",
+                        })
+                    media = available
+                view = save_view(self.state, inst["id"], {
+                    "title": tpl["name"], "body": self._notice_body(tpl, inst, now, values),
+                    "published_at": planned_str, "media": media,
+                })
+            if not view:
+                return ""
+            summary = " ".join(view["body"].split())
+            if len(summary) > 100:
+                summary = summary[:100] + "…"
+            summary = summary or f"包含 {len(view['media'])} 个附件。"
+            link = self.public_base_url.rstrip("/") + issue_link(self.state, inst)
+            return (f"【德阳量密助手】您收到《{view['title']}》通知。\n{summary}\n\n"
+                    f"请打开链接阅读完整通知，点击「{inst['receipt_phrase']}」确认。\n{link}")
+
+        return message
+
     def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *, once=False):
         platform = self._template_platform(tpl)
         targets = {
@@ -1366,9 +1432,16 @@ class Scheduler:
             for channel, external_id, external_type, notifier in self._targets_for(inst["phone"], only_platform=platform)
             if external_id
         }
-        delivered = self._deliver_notice_text_part(
+        link_targets = {key: targets.pop(key) for key in list(targets) if targets[key][0].get("receipt_mode") == "link"}
+        delivered = set()
+        if link_targets:
+            delivered.update(self._deliver_notice_text_part(
+                tpl, link_targets, period, seq, planned_str, now, stats, values=values, once=once, receipt=True,
+                link_message=self._notice_link_message(tpl, period, seq, planned_str, now, values),
+            ))
+        delivered.update(self._deliver_notice_text_part(
             tpl, targets, period, seq, planned_str, now, stats, values=values, once=once,
-        )
+        ))
         now_s = format_dt(now)
         if targets:
             for part in self._notice_media_parts(tpl, period, seq, now_s, values):

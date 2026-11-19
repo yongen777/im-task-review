@@ -30,6 +30,8 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
                         'adhoc_history': p.submission_history(ident, adhoc_only=True, limit=10)}
             if action == 'open':
                 return p.task_link(ident, int(data.get('instance_id', 0)))
+            if action == 'notice-open':
+                return p.notice_receipt_link(ident, int(data.get('instance_id', 0)))
             if action == 'adhoc':
                 task_id = str(data.get('template_id') or '')
                 raw = state.issue_adhoc_report(task_id, ident['phone'], ident['platform'])

@@ -87,6 +87,7 @@ interface RowItem {
   submitted_at: string | null;
   receipt_at?: string | null;
   receipt_text?: string | null;
+  receipt_mode?: 'link' | 'text';
   content: SubmissionContent | null;
   late_submit?: boolean;
 }
@@ -566,7 +567,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                 <th className="w-[17%] px-3 py-3 font-medium">所属部门</th>
                 <th className="w-24 px-3 py-3 font-medium">状态</th>
                 <th className="w-36 px-3 py-3 font-medium">{isReceipt ? '回复时间' : '提交时间'}</th>
-                <th className="px-3 py-3 font-medium">{isReceipt ? '回复内容' : '上报内容'}</th>
+                <th className="px-3 py-3 font-medium">{isReceipt ? '回复内容 / 方式' : '上报内容'}</th>
                 {!isReceipt && <th className="w-28 px-4 py-3 text-right font-medium">操作</th>}
               </tr>
             </thead>
@@ -598,7 +599,10 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                       {(isReceipt ? row.receipt_at : row.submitted_at?.slice(5, task.is_adhoc ? 19 : 16)) || '—'}
                       {row.late_submit && <div className="mt-0.5 text-amber-700">迟交</div>}
                     </td>
-                    <td className="px-3 py-3">{isReceipt ? <span className="whitespace-pre-wrap break-words">{row.receipt_text || '—'}</span>
+                    <td className="px-3 py-3">{isReceipt ? <div>
+                      <div className="whitespace-pre-wrap break-words">{row.receipt_text || '—'}</div>
+                      <div className="mt-1 text-slate-500">{row.receipt_mode === 'link' ? 'H5 链接确认' : '文本回复确认'}</div>
+                    </div>
                       : <SubmissionPreview content={row.content} />}</td>
                     {!isReceipt && <td className="px-4 py-3 text-right">
                       <button type="button" disabled={instanceId == null} onClick={() => instanceId != null && setDetail({ instanceId, submissionId: row.submission_id })}

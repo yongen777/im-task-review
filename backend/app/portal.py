@@ -390,6 +390,16 @@ class PortalService:
                                     ttl_hours=calc_h5_token_ttl_hours(inst, self.s.now()))
         return {'ok': True, 'url': '/h5/task#t=' + raw}
 
+    def notice_receipt_link(self, ident, instance_id):
+        from .notice_receipts import issue_link
+
+        if not self.s.pending_notice_receipts(ident['phone'], ident['platform'], mode='link', instance_id=instance_id):
+            raise BizError(404, 'NOTICE_UNAVAILABLE', '通知已确认或暂不可用')
+        instance = self.s.get_instance(instance_id)
+        if not instance:
+            raise BizError(404, 'NOTICE_UNAVAILABLE', '通知暂不可用')
+        return {'ok': True, 'url': issue_link(self.s, instance)}
+
     def submission_history(self, ident, *, instance_id=None, adhoc_only=False, offset=0, limit=31):
         match, params = [], [ident['phone'], ident['platform'], f"adhoc-{ident['platform']}-%", ident['platform']]
         if instance_id is not None:

@@ -1366,6 +1366,7 @@ class StateStore:
                 f"DELETE FROM h5_token WHERE template_id IN ({tpl_sql})", (aid,)).rowcount or 0)
             detail["reminder_log"] = int(self.conn.execute(
                 f"DELETE FROM reminder_log WHERE template_id IN ({tpl_sql})", (aid,)).rowcount or 0)
+            self.conn.execute(f"DELETE FROM notice_receipt_view WHERE instance_id IN ({inst_sql})", (aid,))
             # 业务主数据
             detail["task_instance"] = int(self.conn.execute(
                 "DELETE FROM task_instance WHERE owner_id = ?", (aid,)).rowcount or 0)
@@ -2990,12 +2991,17 @@ class StateStore:
             receipt = _spec_payload["notice_receipt"]
             if not isinstance(receipt, dict) or not isinstance(receipt.get("enabled"), bool):
                 raise BizError(400, "INVALID_RECEIPT", "回执配置格式不正确")
-            phrase = receipt.get("phrase", "我已知晓")
-            if receipt["enabled"] and (not isinstance(phrase, str) or not 1 <= len(phrase.strip()) <= 80
-                                       or not receipt_key(phrase) or any(ord(c) < 32 for c in phrase)):
-                raise BizError(400, "INVALID_RECEIPT", "请输入 1–80 字的有效回执话术")
-            _spec_payload = {**_spec_payload, "notice_receipt": {"enabled": receipt["enabled"],
-                             "phrase": phrase.strip() if receipt["enabled"] else "我已知晓"}}
+            mode = receipt.get("mode", "text" if "phrase" in receipt else "link")
+            if mode not in ("link", "text"):
+                raise BizError(400, "INVALID_RECEIPT", "请选择有效的回执方式")
+            field = "button_label" if mode == "link" else "phrase"
+            label = receipt.get(field, "我已知晓")
+            if receipt["enabled"] and (not isinstance(label, str) or not 1 <= len(label.strip()) <= 80
+                                       or any(ord(c) < 32 for c in label)
+                                       or (mode == "text" and not receipt_key(label))):
+                raise BizError(400, "INVALID_RECEIPT", "请输入 1–80 字的有效回执文案")
+            _spec_payload = {**_spec_payload, "notice_receipt": {"enabled": receipt["enabled"], "mode": mode,
+                             field: label.strip() if receipt["enabled"] else "我已知晓"}}
         notice_items = _spec_payload.get("notice_items") if isinstance(_spec_payload, dict) else None
         notice_images = []
         notice_assets = []
@@ -3513,6 +3519,8 @@ class StateStore:
         # 2026-10-27 数据看板：调度器按 template_id 作为 source_key 读人工填报快照，一并清
         detail["data_snapshot"] = int(self.conn.execute(
             "DELETE FROM data_snapshot WHERE source_key = ?", (tid,)).rowcount or 0)
+        self.conn.execute("DELETE FROM notice_receipt_view WHERE instance_id IN "
+                          "(SELECT id FROM task_instance WHERE template_id=?)", (tid,))
         detail["task_instance"] = int(self.conn.execute(
             "DELETE FROM task_instance WHERE template_id = ?", (tid,)).rowcount or 0)
         detail["task_template"] = int(self.conn.execute(
@@ -3904,7 +3912,9 @@ class StateStore:
 
     def issue_h5_token(self, phone: str, template_id: str, period_key: str, instance_id: Optional[int], purpose: str = "submit", ttl_hours: int = H5_TOKEN_TTL_HOURS) -> str:
         now_dt = self.now()
-        created_at, expires_at = format_dt(now_dt), format_dt(now_dt + timedelta(hours=ttl_hours))
+        created_at = format_dt(now_dt)
+        expires_at = (NO_DEADLINE_SENTINEL if purpose == "notice_receipt"
+                      else format_dt(now_dt + timedelta(hours=ttl_hours)))
         with self.lock, self.conn:
             while True:
                 raw_token = secrets.token_urlsafe(24)
@@ -4818,9 +4828,9 @@ class StateStore:
                     members.append(_m)
         now_s = now_str or self.now_str()
         trigger = trigger_at or now_s
-        from .notice_media import receipt_phrase
+        from .notice_media import notice_receipt_config
 
-        phrase = receipt_phrase(tpl)
+        receipt_mode, phrase = notice_receipt_config(tpl)
         receipt_platform = tpl_plats[0] if phrase and len(tpl_plats) == 1 else None
         with self.lock, self.conn:
             # 2026-11-09：只有「本周期就是今天」时才按激活时刻切分。
@@ -4838,16 +4848,17 @@ class StateStore:
                     if _same_day(act_at, now_s) and _lt_time(trigger, act_at):
                         continue
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id, receipt_phrase, receipt_platform) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
                     (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s,
-                     int(tpl.get("owner_id") or 1), phrase, receipt_platform),
+                     int(tpl.get("owner_id") or 1), phrase, receipt_platform, receipt_mode),
                 )
             if tpl["kind"] == "notice":
                 self.conn.execute(
-                    "UPDATE task_instance SET receipt_phrase=?, receipt_platform=? "
+                    "UPDATE task_instance SET receipt_phrase=?, receipt_platform=?, receipt_mode=? "
                     "WHERE template_id=? AND period_key=? AND status='pending' AND receipt_prompt_at IS NULL "
-                    "AND (NOT (receipt_phrase <=> ?) OR NOT (receipt_platform <=> ?))",
-                    (phrase, receipt_platform, template_id, period_key, phrase, receipt_platform),
+                    "AND (NOT (receipt_phrase <=> ?) OR NOT (receipt_platform <=> ?) OR NOT (receipt_mode <=> ?))",
+                    (phrase, receipt_platform, receipt_mode, template_id, period_key,
+                     phrase, receipt_platform, receipt_mode),
                 )
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
 
@@ -4859,14 +4870,22 @@ class StateStore:
         self.conn.execute("UPDATE task_instance SET receipt_prompt_at=? WHERE id=? AND receipt_phrase IS NOT NULL "
                           "AND receipt_prompt_at IS NULL", (sent_at, instance_id))
 
-    def pending_notice_receipts(self, phone: str, platform: str) -> List[Dict[str, Any]]:
+    def pending_notice_receipts(self, phone: str, platform: str, *, mode=None, instance_id=None) -> List[Dict[str, Any]]:
+        filters, params = [], [phone, platform]
+        if mode is not None:
+            filters.append("AND COALESCE(i.receipt_mode, 'text')=? ")
+            params.append(mode)
+        if instance_id is not None:
+            filters.append("AND i.id=? ")
+            params.append(instance_id)
         rows = self.conn.execute(
-            "SELECT i.id, i.template_id, t.name AS template_name, i.receipt_phrase, i.receipt_prompt_at "
+            "SELECT i.id, i.template_id, t.name AS template_name, i.receipt_phrase, i.receipt_prompt_at, "
+            "COALESCE(i.receipt_mode, 'text') AS receipt_mode "
             "FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
             "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
             "AND i.receipt_at IS NULL AND i.receipt_phrase IS NOT NULL "
-            "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 ORDER BY i.id",
-            (phone, platform),
+            "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 " + "".join(filters) + "ORDER BY i.id",
+            tuple(params),
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -4880,11 +4899,12 @@ class StateStore:
             return []
         receipts = []
         with self.conn:
-            for row in self.pending_notice_receipts(phone, platform):
+            for row in self.pending_notice_receipts(phone, platform, mode="text"):
                 if receipt_key(row["receipt_phrase"]) != normalized:
                     continue
                 changed = self.conn.execute(
                     "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL "
+                    "AND COALESCE(receipt_mode, 'text')='text' "
                     "AND template_id IN (SELECT template_id FROM task_template WHERE template_id=? "
                     "AND kind='notice' AND enabled=1 AND deleted=0)",
                     (self.now_str(), text, row["id"], row["template_id"]),
@@ -5288,12 +5308,12 @@ class StateStore:
 
     def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
         """面板允许查看自己名下的上传任务和回执通知。"""
-        from .notice_media import receipt_phrase
+        from .notice_media import notice_receipt_config
 
         tpl = self.get_template((template_id or "").strip(), include_deleted=False)
         if not tpl:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
-        if tpl.get("kind") == "notice" and not receipt_phrase(tpl):
+        if tpl.get("kind") == "notice" and not notice_receipt_config(tpl)[0]:
             raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
         if int(tpl.get("owner_id") or 0) != int(owner_id):
             raise BizError(403, "FORBIDDEN_OWNER", "只能查看自己名下任务的统计数据")
@@ -5303,6 +5323,7 @@ class StateStore:
         per_sql, params = self._stats_period_where(period.strip(), alias="")
         return [dict(row) for row in self.conn.execute(
             "SELECT id, phone, name_snap, dept_snap, receipt_at, receipt_text, "
+            "COALESCE(receipt_mode, 'text') AS receipt_mode, "
             "CASE WHEN receipt_at IS NULL THEN 'pending' ELSE 'approved' END AS status, "
             "receipt_at AS submitted_at FROM task_instance "
             f"WHERE template_id = ? AND {per_sql} AND status != 'cancelled' AND receipt_phrase IS NOT NULL",
@@ -5673,7 +5694,7 @@ class StateStore:
                 "status": str(r["status"]), "submitted_at": r["submitted_at"],
                 "late_submit": bool(r.get("late_submit")),
                 "preview": self._stats_submission_preview(submitted), "content": submitted,
-                **({"receipt_at": r["receipt_at"], "receipt_text": r["receipt_text"]} if is_receipt else {}),
+                **({key: r[key] for key in ("receipt_at", "receipt_text", "receipt_mode")} if is_receipt else {}),
             })
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 

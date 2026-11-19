@@ -83,15 +83,16 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
         details = wb.active
         details.title = '回执明细'
         summary = wb.create_sheet('回执汇总')
-        details.append(['序号', '姓名', '手机号', '完整部门路径', '回执状态', '回复时间', '回复内容'])
+        details.append(['序号', '姓名', '手机号', '完整部门路径', '回执状态', '回复时间', '回复内容', '回执方式'])
         for index, row in enumerate(rows, start=1):
             details.append([index, _safe_text(row['name_snap']), _safe_text(row['phone']), _safe_text(row['dept_path']),
-                            '已回复' if row['receipt_at'] else '待回复', row['receipt_at'], _safe_text(row['receipt_text'])])
+                            '已回复' if row['receipt_at'] else '待回复', row['receipt_at'], _safe_text(row['receipt_text']),
+                            'H5 链接确认' if row.get('receipt_mode') == 'link' else '文本回复确认'])
         replied = sum(bool(row['receipt_at']) for row in rows)
         summary.append(['应回复', '已回复', '待回复', '回复率'])
         summary.append([len(rows), replied, len(rows) - replied, replied / len(rows) if rows else 0])
         summary['D2'].number_format = '0.0%'
-        for sheet, widths in ((details, [8, 18, 16, 42, 14, 23, 46]), (summary, [14, 14, 14, 14])):
+        for sheet, widths in ((details, [8, 18, 16, 42, 14, 23, 46, 18]), (summary, [14, 14, 14, 14])):
             sheet.freeze_panes = 'A2'
             for cell, width in zip(sheet[1], widths):
                 cell.font = Font(bold=True, color='183153')
