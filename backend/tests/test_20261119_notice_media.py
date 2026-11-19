@@ -183,22 +183,29 @@ class NativeNoticeTester(FakeNotifier):
     def __init__(self, fail_video=False):
         super().__init__(now_fn=lambda: NOW)
         self.native = []
+        self.order = []
         self.fail_video = fail_video
+
+    def send_text(self, receive_id, text, idem_key, **kwargs):
+        self.order.append(("text", text))
+        return super().send_text(receive_id, text, idem_key, **kwargs)
 
     def prepare_notice_attachment(self, source, asset):
         return asset
 
     def send_prepared_notice(self, receive_id, kind, asset, idem, receive_type):
+        self.order.append((kind, asset["file_name"]))
         self.native.append((kind, asset["file_name"], idem, receive_type))
         return SendResult(False, "failed", retryable=False, error="TEST_REJECTED" * 50) if self.fail_video and kind == "video" \
             else SendResult(True, "sent", 200)
 
 
-def make_template(owner, tpl, items, is_manual, text=""):
+def make_template(owner, tpl, items, is_manual, text="", receipt=False):
     response = owner.post("/api/admin/templates", json={
         "name": "媒体通知", "kind": "notice", "period": "day", "is_manual": is_manual,
         "role_ids": tpl["role_ids"], "text_tpl": text, "notice_times": [] if is_manual else ["10:00"],
-        "spec": {"notice_items": [{"format": item["kind"], "asset_id": item["asset_id"]} for item in items]},
+        "spec": {"notice_items": [{"format": item["kind"], "asset_id": item["asset_id"]} for item in items],
+                 "notice_receipt": {"enabled": receipt, "phrase": "好的"}},
     })
     assert response.status_code == 200, response.text
     return response.json()["template_id"]
@@ -207,6 +214,7 @@ def make_template(owner, tpl, items, is_manual, text=""):
 @pytest.mark.parametrize("is_manual", [False, True])
 def test_save_and_send_each_attachment_once_across_three_ticks(ctx, is_manual):
     store, scheduler, _, _, owner, create_owner, tpl, member = ctx
+    store.update_template(tpl["template_id"], {"enabled": False})
     images = io.BytesIO()
     Image.new("RGB", (12, 8), "blue").save(images, "PNG")
     asset_uploads = [
@@ -219,7 +227,7 @@ def test_save_and_send_each_attachment_once_across_three_ticks(ctx, is_manual):
     _, outsider = create_owner("other_notice_owner")
     assert outsider.get(f"/api/admin/notice-assets/{assets[0]['asset_id']}").status_code == 404
     assert owner.post("/api/admin/notice-assets/video", files={"file": ("bad.mp4", b"bad", "video/mp4")}).status_code == 400
-    template_id = make_template(owner, tpl, assets, is_manual)
+    template_id = make_template(owner, tpl, list(reversed(assets)), is_manual, text="通知正文", receipt=True)
     persisted = store.get_template(template_id)["spec_json"]["notice_items"]
     assert {item["asset_id"] for item in persisted} == {item["asset_id"] for item in assets}
     store.upsert_delivery_target(member["phone"], "mock-member", external_type="union_id",
@@ -232,23 +240,42 @@ def test_save_and_send_each_attachment_once_across_three_ticks(ctx, is_manual):
     else:
         for tick in range(3):
             scheduler.run_once(NOW + timedelta(seconds=tick * 30))
-    assert [(kind, name) for kind, name, _, _ in notifier.native] == [(item["kind"], item["file_name"]) for item in assets]
+    media_order = [(asset["kind"], asset["file_name"]) for group in ("image", "file", "video")
+                   for asset in reversed(assets) if asset["kind"] == group]
+    assert [(kind, name) for kind, name, _, _ in notifier.native] == media_order
+    assert notifier.order == [("text", "通知正文"), *media_order, (
+        "text", "【德阳量密助手】以上为《媒体通知》通知内容，查收后请直接回复「好的」即可完成确认登记。",
+    )]
+    period = "once" if is_manual else NOW.date().isoformat()
+    assert store.get_instance_by_key(template_id, member["phone"], period)["receipt_prompt_at"]
     assert len({idem for _, _, idem, _ in notifier.native}) == 6
     assert all(receive_type == "union_id" for _, _, _, receive_type in notifier.native)
     assert not any("/h5/notice-media" in message.text or "/h5/img/" in message.text for message in notifier.sent_messages)
 
 
-def test_definite_native_video_failure_gets_one_playback_and_download_link(ctx, movie):
+def test_missing_video_tools_get_one_playback_and_download_link_before_receipt(ctx, movie, monkeypatch):
     store, scheduler, _, _, owner, _, tpl, member = ctx
+    store.update_template(tpl["template_id"], {"enabled": False})
     movie_data = movie.read_bytes()
     asset = upload(owner, "video", "培训视频.mp4", movie_data, "video/mp4")
-    template_id = make_template(owner, tpl, [asset], False)
-    notifier = NativeNoticeTester(fail_video=True)
+    template_id = make_template(owner, tpl, [asset], False, receipt=True)
+    notifier = NativeNoticeTester()
+    channel, client = quantum_client(lambda _: pytest.fail("unexpected HTTP"), monkeypatch)
+    client.close()
+    monkeypatch.setattr(notifier, "prepare_notice_attachment", channel.prepare_notice_attachment)
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(subprocess, "run", missing)
     scheduler.notifiers = {"zdxlz": notifier}
     for tick in range(3):
         scheduler.run_once(NOW + timedelta(seconds=tick * 30))
     links = [message.text.splitlines()[-1] for message in notifier.sent_messages if "/h5/notice-media" in message.text]
-    assert len(notifier.native) == len(links) == 1
+    assert not notifier.native and len(links) == 1
+    assert len(notifier.order) == 2
+    assert "/h5/notice-media" in notifier.order[0][1]
+    assert "直接回复「好的」" in notifier.order[1][1]
     assert any(row["kind"] == "notice_vid_link" and row["result"] == "sent"
                for row in store.list_reminder_logs(template_id=template_id))
     url = urlsplit(links[0])
@@ -265,3 +292,56 @@ def test_definite_native_video_failure_gets_one_playback_and_download_link(ctx, 
     expired = store.issue_h5_token(member["phone"], template_id, asset["asset_id"], inst["id"],
                                    purpose="notice_asset", ttl_hours=-1)
     assert owner.get(url.path, params={"token": expired}).status_code == 401
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("ffprobe"),
+                                   subprocess.CalledProcessError(1, ["ffmpeg"]),
+                                   subprocess.TimeoutExpired(["ffprobe"], 20)])
+def test_video_preparation_returns_nonretryable_failure(error, monkeypatch):
+    def run(command, **kwargs):
+        if command[0] == "ffprobe" and isinstance(error, subprocess.CalledProcessError):
+            return SimpleNamespace(stdout=b'{"streams":[{"width":64,"height":32}],"format":{"duration":"1"}}')
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", run)
+    channel, client = quantum_client(lambda _: pytest.fail("unexpected HTTP"), monkeypatch)
+    with client:
+        result = channel.prepare_notice_attachment("video.mp4", {"kind": "video", "file_name": "video.mp4"})
+    assert isinstance(result, SendResult) and not result.ok and not result.retryable
+    assert type(error).__name__ in result.error
+
+
+def test_receipt_waits_for_preceding_media_to_finish_after_retry(ctx, monkeypatch):
+    store, scheduler, _, _, owner, _, tpl, member = ctx
+    store.update_template(tpl["template_id"], {"enabled": False})
+    document = upload(owner, "file", "说明.txt", b"details", "text/plain")
+    video = upload(owner, "video", "视频.mp4", fixture_video(), "video/mp4")
+    template_id = make_template(owner, tpl, [video, document], False, text="通知正文", receipt=True)
+    notifier = NativeNoticeTester()
+    original = notifier.send_prepared_notice
+    file_attempts = 0
+
+    def send(receive_id, kind, asset, idem, receive_type):
+        nonlocal file_attempts
+        assert store.acknowledge_notice_receipts(member["phone"], "zdxlz", "好的") == []
+        if kind == "file":
+            file_attempts += 1
+            if file_attempts == 1:
+                return SendResult(False, "failed", retryable=True, error="TEMPORARY")
+        return original(receive_id, kind, asset, idem, receive_type)
+
+    monkeypatch.setattr(notifier, "send_prepared_notice", send)
+    monkeypatch.setattr(scheduler, "RETRY_DELAYS", (30, 60, 90))
+    scheduler.notifiers = {"zdxlz": notifier}
+    scheduler.run_once(NOW)
+    assert notifier.order == [("text", "通知正文")]
+    period = NOW.date().isoformat()
+    assert store.get_instance_by_key(template_id, member["phone"], period)["receipt_prompt_at"] is None
+    for seconds in (30, 60, 90):
+        scheduler.run_once(NOW + timedelta(seconds=seconds))
+    assert file_attempts == 2
+    assert notifier.order == [
+        ("text", "通知正文"), ("file", "说明.txt"), ("video", "视频.mp4"),
+        ("text", "【德阳量密助手】以上为《媒体通知》通知内容，查收后请直接回复「好的」即可完成确认登记。"),
+    ]
+    assert store.get_instance_by_key(template_id, member["phone"], period)["receipt_prompt_at"]

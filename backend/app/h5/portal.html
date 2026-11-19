@@ -199,7 +199,7 @@
     }
     .tab-track {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 4px;
       padding: 4px;
       background: var(--track);
@@ -249,6 +249,22 @@
     }
     .task-info { min-width: 0; }
     .task-card p { margin: 6px 0 0; }
+    .receipt-card, .history-card { grid-template-columns: minmax(0, 1fr); }
+    .task-card .receipt-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: var(--control);
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 14px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+    .history-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    #home-history { margin-top: 24px; scroll-margin-top: 80px; }
+    @media (min-width: 480px) {
+      .history-card { grid-template-columns: minmax(0, 1fr) auto; }
+    }
 
     .muted {
       color: var(--muted);
@@ -982,89 +998,24 @@
     .pager button { flex: 1; }
 
     .history-filter {
+      display: flex;
+      align-items: center;
+      gap: 10px;
       background: var(--paper);
       border: 1px solid var(--line);
       border-radius: var(--panel);
-      padding: 12px;
+      padding: 10px 12px;
       margin-bottom: 12px;
-      box-shadow: 0 1px 2px rgba(24, 37, 48, 0.025);
-    }
-    .filter-presets {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 4px;
-      padding: 3px;
-      background: var(--track);
-      border-radius: 9px;
-    }
-    .filter-presets button {
-      min-height: 44px;
-      padding: 4px 2px;
-      border: 0;
-      border-radius: 7px;
-      background: transparent;
       color: var(--secondary);
       font-size: 13px;
-      font-weight: 500;
-      white-space: nowrap;
-      transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
     }
-    .filter-presets button.active {
-      background: var(--paper);
-      color: var(--blue);
-      font-weight: 600;
-      box-shadow: 0 1px 2px rgba(24, 37, 48, 0.08);
-    }
-    .filter-dates {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr);
-      align-items: center;
-      gap: 8px;
-      margin-top: 10px;
-    }
-    .filter-dates input[type="date"] {
-      display: block;
+    .history-filter input[type="date"] {
+      min-width: 0;
       max-width: 100%;
       min-height: 44px;
       padding: 8px 10px;
-      font-size: 13.5px;
-      -webkit-appearance: none;
-      appearance: none;
+      font-size: 14px;
     }
-    .filter-dates input[type="date"]::-webkit-date-and-time-value { text-align: start; }
-    .filter-sep {
-      justify-self: center;
-      font-size: 12.5px;
-      color: var(--muted);
-    }
-    @media (min-width: 520px) {
-      .filter-dates { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
-      .filter-dates input[type="date"] {
-        -webkit-appearance: auto;
-        appearance: auto;
-      }
-    }
-    .filter-foot {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      margin-top: 8px;
-      font-size: 12.5px;
-      color: var(--muted);
-    }
-    .filter-clear {
-      min-width: 44px;
-      min-height: 44px;
-      padding: 0 8px;
-      border: 0;
-      border-radius: 6px;
-      background: transparent;
-      color: var(--blue);
-      font-size: 12.5px;
-      font-weight: 500;
-    }
-    .filter-clear:hover { background: var(--blue-soft); }
 
     .hidden { display: none !important; }
   </style>
@@ -1093,7 +1044,6 @@
       <div class="tab-track">
         <button type="button" data-tab="todo" class="active">我的待办</button>
         <button type="button" data-tab="adhoc">自主上报</button>
-        <button type="button" data-tab="history">提交记录</button>
         <button type="button" data-tab="create">创建任务</button>
       </div>
     </nav>
@@ -1124,7 +1074,8 @@
     const params = new URLSearchParams(location.hash.slice(1));
     const token = params.get('t') || '', prefix = location.pathname.split('/h5/')[0];
     let toastTimer;
-    let info = null, tab = ['adhoc', 'history'].includes(params.get('tab')) ? params.get('tab') : 'todo', scope = null, busy = false, selected = new Set(), expired = false;
+    let jumpToHistory = params.get('tab') === 'history';
+    let info = null, tab = params.get('tab') === 'adhoc' ? 'adhoc' : 'todo', scope = null, busy = false, selected = new Set(), expired = false;
     const main = document.getElementById('main'), toastBox = document.getElementById('toast');
     const adminDialog = document.getElementById('admin-dialog'), adminBody = document.getElementById('admin-dialog-body');
     const esc = x => String(x ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1200,181 +1151,106 @@
         throw error;
       } finally { clearTimeout(timeout); }
     }
-    async function refresh(render = true) { try { info = await api('info'); if (adminDialog.open || adminDialog.classList.contains('fallback-open')) renderAdminBody(); if (render) show(); } catch (e) { if (!expired) { main.innerHTML = '<div class="card empty">加载失败</div>'; toast(e.message); } } }
+    async function refresh(render = true, preserveHistory = false) { try { info = await api('info'); if (adminDialog.open || adminDialog.classList.contains('fallback-open')) renderAdminBody(); if (render) show(preserveHistory); } catch (e) { if (!expired) { main.innerHTML = '<div class="card empty">加载失败</div>'; toast(e.message); } } }
     const reportStatus = { submitted: '待审核', approved: '已完成', rejected: '已驳回', cancelled: '已取消', expired: '已过期' };
     const reportTagClass = { submitted: 'tag-submitted', approved: 'tag-approved', rejected: 'tag-rejected', cancelled: 'tag-cancelled', expired: 'tag-expired' };
     function historyCards(items, showType) {
-      return items.map(row => '<article class="card task-card"><div class="task-info"><h3>' + esc(row.name) + '</h3>' +
+      return items.map(row => '<article class="card task-card history-card"><div class="task-info"><h3>' + esc(row.name) + '</h3>' +
         '<div class="task-meta"><span class="tag ' + (reportTagClass[row.status] || 'tag-pending') + '">' + esc(reportStatus[row.status] || row.status) + '</span>' +
         (showType ? '<span class="meta-dot" aria-hidden="true">·</span><span>' + (row.is_adhoc ? '自主上报' : '发布任务') + '</span>' : '') +
         '</div><p class="muted meta-time">完成时间 ' + esc(row.submitted_at) +
-        '</p></div><button type="button" class="secondary" data-history="' + esc(row.id) + '">查看详情</button></article>').join('');
+        '</p></div><div class="history-actions"><button type="button" class="secondary" data-history="' + esc(row.id) + '">查看详情</button>' +
+        (row.can_edit ? '<button type="button" class="primary" data-edit data-history="' + esc(row.id) + '">修改</button>' : '') +
+        '</div></article>').join('');
     }
     function bindHistory(root) {
       root.querySelectorAll('[data-history]').forEach(button => {
         button.onclick = async () => {
           button.disabled = true;
           try {
-            const result = await api('history-open', { instance_id: Number(button.dataset.history) });
+            const result = await api('history-open', { instance_id: Number(button.dataset.history), edit: button.hasAttribute('data-edit') });
             location.href = prefix + result.url + '&from=portal';
           } catch (error) { toast(error.message); button.disabled = false; }
         };
       });
     }
-    const historyFilter = { preset: 'all', start: '', end: '' };
     function shanghaiToday() {
       return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     }
-    function shiftYmd(ymd, deltaDays) {
-      const [y, m, d] = ymd.split('-').map(Number);
-      const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
-      return dt.toISOString().slice(0, 10);
-    }
-    function applyHistoryPreset(preset) {
-      historyFilter.preset = preset;
-      const today = shanghaiToday();
-      if (preset === 'today') {
-        historyFilter.start = today;
-        historyFilter.end = today;
-      } else if (preset === '7d') {
-        historyFilter.start = shiftYmd(today, -6);
-        historyFilter.end = today;
-      } else if (preset === 'month') {
-        historyFilter.start = today.slice(0, 8) + '01';
-        historyFilter.end = today;
-      } else {
-        historyFilter.start = '';
-        historyFilter.end = '';
-      }
-    }
-    function renderHistoryFilterBar(countText, showClear) {
-      const p = historyFilter.preset;
-      return '<div class="history-filter">' +
-        '<div class="filter-presets" role="group" aria-label="按时间快速筛选">' +
-        '<button type="button" data-preset="all" class="' + (p === 'all' ? 'active' : '') + '">全部</button>' +
-        '<button type="button" data-preset="today" class="' + (p === 'today' ? 'active' : '') + '">今天</button>' +
-        '<button type="button" data-preset="7d" class="' + (p === '7d' ? 'active' : '') + '">近7天</button>' +
-        '<button type="button" data-preset="month" class="' + (p === 'month' ? 'active' : '') + '">本月</button>' +
-        '</div>' +
-        '<div class="filter-dates">' +
-        '<input type="date" id="history-start" aria-label="开始日期" value="' + esc(historyFilter.start) + '">' +
-        '<span class="filter-sep" aria-hidden="true">至</span>' +
-        '<input type="date" id="history-end" aria-label="结束日期" value="' + esc(historyFilter.end) + '">' +
-        '</div>' +
-        (countText || showClear ? '<div class="filter-foot"><span>' + esc(countText) + '</span>' +
-          (showClear ? '<button type="button" class="filter-clear" data-reset-filter>清空筛选</button>' : '') + '</div>' : '') +
-        '</div>';
-    }
-    function bindHistoryFilter(section, maxPages) {
-      section.querySelectorAll('[data-preset]').forEach(btn => {
-        btn.onclick = () => {
-          applyHistoryPreset(btn.dataset.preset);
-          showHistory(0);
-        };
-      });
-      const startInp = section.querySelector('#history-start');
-      const endInp = section.querySelector('#history-end');
-      const onDateChange = () => {
-        historyFilter.preset = 'custom';
-        historyFilter.start = startInp.value;
-        historyFilter.end = endInp.value;
-        if (historyFilter.start && historyFilter.end && historyFilter.start > historyFilter.end) {
-          const tmp = historyFilter.start;
-          historyFilter.start = historyFilter.end;
-          historyFilter.end = tmp;
-        }
-        if (!historyFilter.start && !historyFilter.end) historyFilter.preset = 'all';
-        showHistory(0);
-      };
-      if (startInp) startInp.onchange = onDateChange;
-      if (endInp) endInp.onchange = onDateChange;
-      section.querySelectorAll('[data-reset-filter]').forEach(btn => {
-        btn.onclick = () => {
-          applyHistoryPreset('all');
-          showHistory(0);
-        };
-      });
-      const moreBtn = section.querySelector('[data-scan-more]');
-      if (moreBtn) {
-        moreBtn.onclick = () => showHistory(0, maxPages + 10);
-      }
-    }
-    async function showHistory(offset = 0, maxPages = 10) {
-      const hasFilter = Boolean(historyFilter.start || historyFilter.end);
+    let historyDate = shanghaiToday();
+
+    async function showHistory(offset = 0, previousItems = []) {
+      const date = historyDate;
       const section = document.createElement('section');
-      section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
-        renderHistoryFilterBar('', hasFilter) +
-        '<div class="card empty">正在读取提交记录…</div>';
-      main.replaceChildren(section);
-      bindHistoryFilter(section, maxPages);
+      section.id = 'home-history';
+      section.innerHTML = '<div class="row section-row"><h2>我的提交记录</h2></div>' +
+        '<label class="history-filter">日期 <input type="date" value="' + esc(date) +
+        '" max="' + esc(shanghaiToday()) + '"></label>' +
+        '<div data-history-results><div class="card empty">正在读取提交记录…</div></div>';
+      const input = section.querySelector('input');
+      input.onchange = () => {
+        historyDate = input.value || shanghaiToday();
+        showHistory();
+      };
+      const previous = document.getElementById('home-history');
+      if (previous) previous.replaceWith(section); else main.appendChild(section);
+      if (jumpToHistory) {
+        jumpToHistory = false;
+        section.scrollIntoView();
+      }
+      const results = section.querySelector('[data-history-results]');
+      const matched = [...previousItems];
+      let cursor = offset;
+      let hasMore = false;
       try {
-        if (!hasFilter) {
-          const result = await api('history', { offset });
-          if (!section.isConnected) return;
-          section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
-            renderHistoryFilterBar('', false) +
-            (result.items.length ? historyCards(result.items, true) : '<div class="card empty">暂无提交记录</div>') +
-            (offset || result.has_more ? '<div class="pager">' +
-              (offset ? '<button type="button" class="secondary" data-page="' + Math.max(0, offset - 30) + '">上一页</button>' : '') +
-              (result.has_more ? '<button type="button" class="secondary" data-page="' + (offset + 30) + '">下一页</button>' : '') + '</div>' : '');
-          bindHistory(section);
-          bindHistoryFilter(section, maxPages);
-          section.querySelectorAll('[data-page]').forEach(button => button.onclick = () => showHistory(Number(button.dataset.page)));
-          return;
-        }
-        const matched = [];
-        let cursor = 0;
-        let pages = 0;
-        let hasMore = false;
-        while (pages < maxPages) {
+        for (let page = 0; page < 10; page++) {
           const result = await api('history', { offset: cursor });
           if (!section.isConnected) return;
           const items = result.items || [];
-          for (const row of items) {
-            const day = String(row.submitted_at || '').slice(0, 10);
-            if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
-            if (historyFilter.start && day < historyFilter.start) continue;
-            if (historyFilter.end && day > historyFilter.end) continue;
-            matched.push(row);
-          }
-          pages++;
-          hasMore = Boolean(result.has_more);
-          const lastDay = items.length ? String(items[items.length - 1].submitted_at || '').slice(0, 10) : '';
-          if (!hasMore || !items.length || (historyFilter.start && /^\d{4}-\d{2}-\d{2}$/.test(lastDay) && lastDay < historyFilter.start)) {
-            hasMore = false;
-            break;
-          }
+          matched.push(...items.filter(row => String(row.submitted_at || '').slice(0, 10) === date));
+          const lastDay = String(items[items.length - 1]?.submitted_at || '').slice(0, 10);
+          hasMore = Boolean(result.has_more && lastDay && lastDay >= date);
           cursor += 30;
+          if (!hasMore) break;
         }
-        section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
-          renderHistoryFilterBar('共筛选出 ' + matched.length + ' 条记录', true) +
-          (matched.length ? historyCards(matched, true) : '<div class="card empty"><p>该时间范围内暂无提交记录</p><button type="button" class="secondary" data-reset-filter>查看全部记录</button></div>') +
-          (hasMore ? '<div class="pager"><button type="button" class="secondary" data-scan-more>继续加载更早记录</button></div>' : '');
-        bindHistory(section);
-        bindHistoryFilter(section, maxPages);
+        results.innerHTML = (matched.length ? historyCards(matched, true) : '<div class="card empty">' +
+          (hasMore ? '已加载的记录中暂无这一天的提交' : '这一天暂无提交记录') + '</div>') +
+          (hasMore ? '<div class="pager"><button type="button" class="secondary">继续查找记录</button></div>' : '');
+        bindHistory(results);
+        const more = results.querySelector('.pager button');
+        if (more) more.onclick = () => showHistory(cursor, matched);
       } catch (error) {
         if (!section.isConnected) return;
-        section.innerHTML = '<div class="row section-row"><h2>已提交任务</h2></div>' +
-          renderHistoryFilterBar('', hasFilter) +
-          '<div class="card empty"><p></p><button type="button" class="secondary">重试</button></div>';
-        section.querySelector('.empty p').textContent = error.message;
-        section.querySelector('.empty button').onclick = () => showHistory(offset, maxPages);
-        bindHistoryFilter(section, maxPages);
+        results.innerHTML = '<div class="card empty"><p></p><button type="button" class="secondary">重试</button></div>';
+        results.querySelector('.empty p').textContent = error.message;
+        results.querySelector('.empty button').onclick = () => showHistory(offset, previousItems);
         toast(error.message);
       }
     }
-    function show() {
+    function show(preserveHistory = false) {
       if (expired || !info) return;
       if (tab === 'create') { creator(); return; }
-      if (tab === 'history') { showHistory(); return; }
       const todo = tab === 'todo';
       const rows = todo ? info.todos : info.adhoc;
       const focusKey = document.activeElement?.dataset.open;
-      main.innerHTML =
-        '<div class="row section-row"><h2>' + (todo ? '当前可提交任务' : '自主上报事项') +
-        '</h2><span class="section-count">' + rows.length + ' 项</span></div>' +
+      let list = todo ? document.getElementById('home-todos') : null;
+      if (!list) {
+        list = document.createElement('section');
+        if (todo) list.id = 'home-todos';
+        main.replaceChildren(list);
+      }
+      list.innerHTML =
+        '<div class="row section-row"><h2>' + (todo ? '当前待办' : '自主上报事项') + '</h2>' +
+        (todo ? '<button type="button" class="secondary" data-jump-history>提交记录</button>' :
+          '<span class="section-count">' + rows.length + ' 项</span>') + '</div>' +
         (rows.length ? rows.map(row => {
           const key = todo ? row.id : row.template_id;
+          if (todo && row.receipt_phrase) {
+            return '<article class="card task-card receipt-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
+              '<div class="task-meta"><span class="tag tag-warn">待回复</span></div>' +
+              '<p class="receipt-note">请返回聊天框回复德阳量密助手<strong>「' + esc(row.receipt_phrase) +
+              '」</strong>完成确认</p></div></article>';
+          }
           const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
           const review = todo && row.status === 'rejected' ? '<div class="reject-note"><span class="tag tag-warn">待重交</span>' +
             (row.reject_reason ? '<span class="reject-reason">驳回原因：' + esc(row.reject_reason) + '</span>' : '') + '</div>' : '';
@@ -1382,14 +1258,14 @@
             '</h3>' + deadline + review + '</div><button type="button" class="primary" data-open="' + esc(key) + '">' +
             (todo ? '去完成' : '进入上报') + '</button></article>';
         }).join('') : '<div class="card empty">' +
-          (todo ? '当前暂无待提交的任务事项' : '当前暂无可自主上报的任务事项') + '</div>');
-      main.querySelectorAll('[data-open]').forEach((button, index) => {
+          (todo ? '当前暂无待办' : '当前暂无可自主上报的任务事项') + '</div>');
+      list.querySelectorAll('[data-open]').forEach(button => {
         if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
         button.onclick = async () => {
           button.disabled = true;
           try {
-            const item = rows[index];
-            const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: item.id } : { template_id: item.template_id });
+            const key = button.dataset.open;
+            const result = await api(todo ? 'open' : 'adhoc', todo ? { instance_id: Number(key) } : { template_id: key });
             location.href = prefix + result.url + '&from=portal';
           } catch (error) {
             toast(error.message);
@@ -1397,6 +1273,10 @@
           }
         };
       });
+      if (todo) {
+        list.querySelector('[data-jump-history]').onclick = () => document.getElementById('home-history')?.scrollIntoView();
+        if (!preserveHistory || !document.getElementById('home-history')) showHistory();
+      }
     }
 
     const tabs = document.querySelectorAll('[data-tab]');
@@ -2028,9 +1908,10 @@
       if (tab === 'create') {
         if (document.getElementById('tasks')) stats();
         else if (!document.getElementById('form')) refresh(false);
-      } else if (tab !== 'history') refresh();
+      } else refresh(true, true);
     }, 30000);
     window.addEventListener('pageshow', event => { if (event.persisted && !expired && tab !== 'create') refresh(); });
+    document.addEventListener('visibilitychange', () => { if (!document.hidden && !expired && tab === 'todo') refresh(true, true); });
   </script>
 </body>
 </html>

@@ -556,7 +556,7 @@ class ZdxlzChannel:
                    "mimeType": mime_type, "ext": ext.lstrip(".").lower(), "thumbnail": thumbnail}
         return self._send_media_message(receive_id, "video", content, idem_key, receive_type, "你收到一条视频")
 
-    def prepare_notice_attachment(self, file_path: str, asset: dict) -> dict:
+    def prepare_notice_attachment(self, file_path: str, asset: dict) -> dict | SendResult:
         kind = asset["kind"]
         name = asset["file_name"]
         if kind == "image":
@@ -566,6 +566,8 @@ class ZdxlzChannel:
             fields = {"width": width, "height": height, "alt_text": name}
         elif kind == "video":
             fields = self._prepare_video(file_path)
+            if isinstance(fields, SendResult):
+                return fields
         else:
             fields = {"file_name": name, "size": asset["size"]}
         mime = asset.get("mime") or self._MIME_BY_EXT.get(Path(file_path).suffix.lower()) or "application/octet-stream"
@@ -575,26 +577,30 @@ class ZdxlzChannel:
             fields["ext"] = Path(file_path).suffix.lstrip(".").lower()
         return fields
 
-    def _prepare_video(self, file_path: str) -> dict:
-        info = subprocess.run(
-            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", file_path],
-            capture_output=True, check=True, timeout=20,
-        )
-        info = json.loads(info.stdout)
-        stream = info["streams"][0]
-        duration = float(info["format"].get("duration") or stream["duration"])
-        width, height = int(stream["width"]), int(stream["height"])
-        if not (duration > 0 and width > 0 and height > 0):
-            raise ChannelError("VIDEO_METADATA_INVALID")
-        with tempfile.TemporaryDirectory(prefix="imtask_video_") as directory:
-            poster = str(Path(directory) / "thumbnail.jpg")
-            subprocess.run(
-                ["ffmpeg", "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-i", file_path,
-                 "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=480:-2", poster],
-                capture_output=True, check=True, timeout=30,
+    def _prepare_video(self, file_path: str) -> dict | SendResult:
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", file_path],
+                capture_output=True, check=True, timeout=20,
             )
-            thumbnail = self.upload_media(poster)
+            info = json.loads(probe.stdout)
+            stream = info["streams"][0]
+            duration = float(info.get("format", {}).get("duration") or stream["duration"])
+            width, height = int(stream["width"]), int(stream["height"])
+            if not (0 < duration < float("inf") and width > 0 and height > 0):
+                raise ValueError("Invalid video duration or dimensions")
+            with tempfile.TemporaryDirectory(prefix="imtask_video_") as directory:
+                poster = str(Path(directory) / "thumbnail.jpg")
+                subprocess.run(
+                    ["ffmpeg", "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-i", file_path,
+                     "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=480:-2", poster],
+                    capture_output=True, check=True, timeout=30,
+                )
+                thumbnail = self.upload_media(poster)
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError, KeyError, IndexError) as exc:
+            return SendResult(ok=False, result="failed", retryable=False,
+                              error=f"VIDEO_PREPARE_FAILED:{type(exc).__name__}:{exc}")
         return {"duration": max(1, round(duration)), "width": width, "height": height, "thumbnail": thumbnail}
 
     def send_prepared_notice(self, receive_id: str, kind: str, fields: dict, idem_key: str,

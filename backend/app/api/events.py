@@ -163,7 +163,7 @@ def handle_inbound_text(
     user_union_id: str = "",
     event_id: str = "",
 ) -> Tuple[int, Dict[str, Any]]:
-    """两通道统一入口：已注册成员仅发工作台入口，未注册保持零激活兜底。"""
+    """两通道统一入口：已注册成员可确认通知或获取工作台入口。"""
     bound_member = (
         state.touch_delivery_target_by_external_id(user_union_id, platform=platform or None)
         if user_union_id else None
@@ -184,7 +184,10 @@ def handle_inbound_text(
                         return 200, {"ok": True, "bound": True, "duplicate": True}
                 receipts = state.acknowledge_notice_receipts(bound_member["phone"], plat, msg_text)
             if receipts:
-                summary = f"已记录您的回执「{receipts[0]}」" if len(receipts) == 1 else f"已记录 {len(receipts)} 条通知回执。"
+                prefix = f"【德阳量密助手】已收到您的回执「{receipts[0]['receipt_phrase']}」，"
+                names = "".join(f"《{item['template_name']}》" for item in receipts)
+                summary = (f"{prefix}已完成{names}的确认登记。" if len(receipts) == 1
+                           else f"{prefix}已同步确认以下 {len(receipts)} 条通知：{names}")
                 send(summary, "notice_receipt")
                 return 200, {"ok": True, "bound": True, "path": "notice_receipt", "count": len(receipts)}
             raw = portal.issue(bound_member["phone"], plat)

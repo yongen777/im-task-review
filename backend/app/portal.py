@@ -378,10 +378,12 @@ class PortalService:
             if plat == ident['platform'] and effective_instance_deadline(inst) > self.s.now_str():
                 inst['template_name'] = t['name']
                 result.append(inst)
+        receipts = self.s.pending_notice_receipts(ident['phone'], ident['platform'])
+        result.extend(reversed(receipts))
         return result
 
     def task_link(self, ident, instance_id):
-        inst = next((i for i in self.todos(ident) if i['id'] == instance_id), None)
+        inst = next((i for i in self.todos(ident) if i['id'] == instance_id and not i.get('receipt_phrase')), None)
         if inst is None:
             raise BizError(403, 'TASK_UNAVAILABLE', '任务不在可提交窗口内')
         raw = self.s.issue_h5_token(inst['phone'], inst['template_id'], inst['period_key'], inst['id'],
@@ -397,27 +399,40 @@ class PortalService:
             match.append("AND i.period_key LIKE 'adhoc-%' ")
         rows = self.s.conn.execute(
             "SELECT COALESCE(t.name, JSON_UNQUOTE(JSON_EXTRACT(p.template_json,'$.name'))) AS name, "
-            "i.id, i.template_id, i.period_key, COALESCE(i.submitted_at, "
+            "i.id, i.phone, i.template_id, i.period_key, COALESCE(i.submitted_at, "
             "(SELECT MAX(latest.created_at) FROM submission latest WHERE latest.instance_id=i.id)) AS submitted_at, i.status, "
-            "(i.period_key LIKE 'adhoc-%') AS is_adhoc FROM task_instance i "
+            "(i.period_key LIKE 'adhoc-%') AS is_adhoc, "
+            "EXISTS (SELECT 1 FROM submission s WHERE s.instance_id=i.id AND s.status!='rejected') AS has_valid_submission "
+            "FROM task_instance i "
             "LEFT JOIN task_template t ON t.template_id=i.template_id LEFT JOIN portal_task p ON p.task_id=i.template_id "
             "WHERE i.phone=? AND EXISTS (SELECT 1 FROM submission s WHERE s.instance_id=i.id) "
+            "AND (p.task_id IS NOT NULL OR t.kind!='notice') "
             "AND (p.platform=? OR (t.template_id IS NOT NULL AND (i.period_key LIKE ? OR "
             "(i.period_key NOT REGEXP '^adhoc-(zdxlz|wecom)-' AND EXISTS "
             "(SELECT 1 FROM role r WHERE r.platform=? AND JSON_CONTAINS(t.role_ids,JSON_QUOTE(r.role_id))))))) "
             + ''.join(match) + "ORDER BY submitted_at DESC, i.id DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
         ).fetchall()
-        return [{**dict(row), 'can_edit': row['status'] in ('submitted', 'approved')} for row in rows]
+        records = []
+        for row in rows:
+            record = dict(row)
+            template = (self.s.get_template(row['template_id'])
+                        if record.pop('has_valid_submission') and row['status'] in ('submitted', 'approved') else None)
+            record['can_edit'] = self.s.h5_submission_editable(row, template)
+            record.pop('phone')
+            records.append(record)
+        return records
 
-    def submission_history_link(self, ident, instance_id):
+    def submission_history_link(self, ident, instance_id, *, edit=False):
         records = self.submission_history(ident, instance_id=instance_id, limit=1)
         if not records:
             raise BizError(404, 'NOT_FOUND', '上报记录不存在')
         report = records[0]
+        if edit and not report['can_edit']:
+            raise BizError(403, 'TASK_CLOSED', '这条提交已关闭编辑')
         raw = self.s.issue_h5_token(ident['phone'], report['template_id'], report['period_key'], report['id'],
                                     purpose='report_history', ttl_hours=1)
-        return {'ok': True, 'url': '/h5/task#t=' + raw}
+        return {'ok': True, 'url': '/h5/task#t=' + raw + ('&edit=1' if edit else '')}
 
     def tasks(self, ident=None, owner=None, platform=None):
         where, args = [], []

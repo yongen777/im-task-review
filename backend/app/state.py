@@ -4407,6 +4407,11 @@ class StateStore:
             raise BizError(404, "NOT_FOUND", "提交记录不存在")
         return instance, template, submission
 
+    def h5_submission_editable(self, instance, template) -> bool:
+        return bool(template and template["kind"] != "notice"
+                    and instance["status"] in ("submitted", "approved")
+                    and not self.instance_close_reason(instance, template))
+
     def h5_edit_target(self, token, *, for_update=False):
         if (not token or token['purpose'] != 'report_history' or not token['instance_id']
                 or token['expires_at'] < self.now_str()):
@@ -4417,7 +4422,7 @@ class StateStore:
         if not instance or any(token[key] != instance[key] for key in ('phone', 'template_id', 'period_key')):
             raise BizError(403, 'FORBIDDEN', '无法编辑这条提交')
         template = self.get_template(instance['template_id'])
-        if instance['status'] not in ('submitted', 'approved') or self.instance_close_reason(instance, template):
+        if not self.h5_submission_editable(instance, template):
             raise BizError(403, 'TASK_CLOSED', '这条提交已关闭编辑')
         submission = self.get_latest_valid_submission(instance['id'])
         if not submission:
@@ -4854,7 +4859,18 @@ class StateStore:
         self.conn.execute("UPDATE task_instance SET receipt_prompt_at=? WHERE id=? AND receipt_phrase IS NOT NULL "
                           "AND receipt_prompt_at IS NULL", (sent_at, instance_id))
 
-    def acknowledge_notice_receipts(self, phone: str, platform: str, text: str) -> List[str]:
+    def pending_notice_receipts(self, phone: str, platform: str) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT i.id, i.template_id, t.name AS template_name, i.receipt_phrase, i.receipt_prompt_at "
+            "FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
+            "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
+            "AND i.receipt_at IS NULL AND i.receipt_phrase IS NOT NULL "
+            "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 ORDER BY i.id",
+            (phone, platform),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_notice_receipts(self, phone: str, platform: str, text: str) -> List[Dict[str, Any]]:
         from .notice_media import receipt_key
 
         if len(text) > 4096:
@@ -4862,28 +4878,20 @@ class StateStore:
         normalized = receipt_key(text)
         if not normalized or len(normalized) > 160:
             return []
-        phrases = []
+        receipts = []
         with self.conn:
-            rows = self.conn.execute(
-                "SELECT i.* FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
-                "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
-                "AND i.receipt_at IS NULL AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 ORDER BY i.id",
-                (phone, platform),
-            ).fetchall()
-            for row in rows:
-                phrase = row["receipt_phrase"]
-                if receipt_key(phrase) != normalized:
-                    continue
-                template = self.get_template(row["template_id"])
-                if self.instance_close_reason(row, template):
+            for row in self.pending_notice_receipts(phone, platform):
+                if receipt_key(row["receipt_phrase"]) != normalized:
                     continue
                 changed = self.conn.execute(
-                    "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL",
-                    (self.now_str(), text, row["id"]),
+                    "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL "
+                    "AND template_id IN (SELECT template_id FROM task_template WHERE template_id=? "
+                    "AND kind='notice' AND enabled=1 AND deleted=0)",
+                    (self.now_str(), text, row["id"], row["template_id"]),
                 )
                 if changed.rowcount:
-                    phrases.append(phrase)
-        return phrases
+                    receipts.append(row)
+        return receipts
 
     def update_instance_status(self, instance_id: int, status: str) -> None:
         """2026-10-28 方案A：通知实例发送成功后标记为 sent（只在 pending 上生效，避免覆盖后续状态）。"""

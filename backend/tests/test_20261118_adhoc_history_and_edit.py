@@ -135,6 +135,13 @@ def test_adhoc_open_submit_and_history(ctx):
     assert action('history', {}).json()['items'][0]['submitted_at'] == inst['submitted_at']
     assert owner.get('/api/admin/instances', params={'template_id': tid, 'period_key': inst['submitted_at'][:10]}).json()['total'] == 1
     assert owner.post('/api/h5/task/info', json={'token': history}).json()['instance']['submitted_at'] == inst['submitted_at']
+    assert action('history', {}).json()['items'][0]['can_edit']
+    direct_edit = action('history-open', {'instance_id': inst['id'], 'edit': True})
+    assert direct_edit.status_code == 200 and direct_edit.json()['url'].endswith('&edit=1')
+    state.update_template(tid, {'enabled': False})
+    assert action('history', {}).json()['items'][0]['can_edit'] is False
+    assert action('history-open', {'instance_id': inst['id'], 'edit': True}).status_code == 403
+    assert action('history-open', {'instance_id': inst['id']}).status_code == 200
 
 
 def test_owner_replaces_submission_without_changing_status_or_completion(ctx):
