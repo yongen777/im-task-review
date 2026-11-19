@@ -133,38 +133,23 @@ function tplToMock(t: any): TemplateItem {
   dataKeysCache.set(t.template_id, t.data_keys || []);
   const spec: any = {};
   if ((t.kind || '') === 'notice') {
-    /* 2026-10-28 修复：以前这里凭空造一条「数据看板.png + 当日数据看板（到点自动生成并推送）」，
-       既不是真实上传的文件、也没有任何链接，纯假数据。现在只按真实配置还原：
-       文本项来自 spec_json（没有就退回 text_tpl），图片项只在真的上传过 attach_image_path 时才出现。 */
     const savedItems = Array.isArray(t.spec_json?.notice_items) ? t.spec_json.notice_items : [];
-    const textItems = savedItems.filter((it: any) => it && it.format === 'text');
-    spec.notice_items = textItems.length
-      ? textItems.map((it: any) => ({ id: it.id || 'n_text', format: 'text', text_content: it.text_content || '' }))
-      : [{ id: 'n_text', format: 'text', text_content: t.text_tpl || '' }];
-    /* 2026-10-29：file 项同样要从 spec_json 原样恢复 —— file_name 是上传时的**原始文件名**、
-       file_caption 是管理员填的描述。没填就留空，绝不再造「数据看板.png / 当日数据看板（…）」。
-       只有「存了 attach_image_path 但 spec 里没有 file 项」的老数据才兜底重建。 */
-    const fileItems = savedItems.filter((it: any) => it && it.format === 'file');
-    if (fileItems.length) {
-      fileItems.forEach((it: any, idx: number) => {
-        spec.notice_items.push({
-          id: it.id || `n_file_${idx + 1}`,
-          format: 'file',
-          file_name: it.file_name || (it.image_path ? String(it.image_path).split('/').pop() || '' : ''),
-          file_caption: it.file_caption || '',
-          file_size: it.file_size,
-          image_path: it.image_path || undefined,
-        });
-      });
-    } else if (t.attach_image_path) {
-      spec.notice_items.push({
-        id: 'n_file',
-        format: 'file',
-        file_name: String(t.attach_image_path).split('/').pop() || '',
-        file_caption: '',
-        image_path: t.attach_image_path,
-      });
+    const items = savedItems.filter((item: any) => item && ['text', 'image', 'file', 'video'].includes(item.format))
+      .map((item: any, index: number) => ({
+        ...item,
+        id: item.id || item.asset_id || `n_${index}`,
+        format: item.format === 'file' && item.image_path && !item.asset_id ? 'image' : item.format,
+        file_name: item.file_name || item.image_path?.split('/').pop(),
+      }));
+    if (!items.some((item: any) => item.format === 'text') && t.text_tpl) {
+      items.unshift({ id: 'n_text', format: 'text', text_content: t.text_tpl });
     }
+    if (t.attach_image_path && !items.some((item: any) => item.format === 'image')) {
+      items.push({ id: 'n_image', format: 'image', image_path: t.attach_image_path,
+        file_name: t.attach_image_path.split('/').pop(), file_caption: t.attach_image_name });
+    }
+    spec.notice_items = items;
+    spec.notice_receipt = t.spec_json?.notice_receipt;
   } else {
     /* 2026-10-28 修复：优先从 spec_json 恢复完整前端配置，fallback schema_json */
     if (t.spec_json && typeof t.spec_json === 'object') {
@@ -245,7 +230,7 @@ function tplFromMock(t: any, partial = false) {
     if (texts.length) text = texts.join('\n');
     /* 2026-10-28：数据图片提醒改为「上传图片 → 到点直接推图」，正文里不再拼任何说明文字
        （原来会把「当日数据看板（到点自动生成并推送）」这类描述写进消息）。 */
-    attach = t.spec.notice_items.some((x: any) => x.format === 'file' && !!x.image_path);
+    attach = t.spec.notice_items.some((x: any) => ['image', 'file'].includes(x.format) && !!x.image_path);
   }
   const roleIds = Array.isArray(t.role_ids) ? t.role_ids : t.role_id ? [t.role_id] : [];
   const out: Record<string, unknown> = {};
@@ -419,6 +404,9 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
   let rawPath = path;
   let queryText = '';
   const qi = path.indexOf('?');
+  if (path.startsWith('/api/admin/notice-assets/')) {
+    return rawFetch<T>(method, path, body);
+  }
   if (qi >= 0) {
     rawPath = path.slice(0, qi);
     queryText = path.slice(qi + 1);

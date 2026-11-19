@@ -132,7 +132,7 @@ def _extract_message_text(payload: Dict[str, Any]) -> str:
             for k in ("content", "text"):
                 v = item.get(k)
                 if isinstance(v, str) and v.strip():
-                    return v.strip()
+                    return v
         if isinstance(item, str):
             s = item.strip()
             if not s:
@@ -144,10 +144,10 @@ def _extract_message_text(payload: Dict[str, Any]) -> str:
                         for k in ("content", "text"):
                             v = parsed.get(k)
                             if isinstance(v, str) and v.strip():
-                                return v.strip()
+                                return v
                 except Exception:
                     pass
-            return s
+            return item
     return ""
 
 
@@ -176,12 +176,17 @@ def handle_inbound_text(
         plat = platform or state.platform
         if portal.members(plat, phone=bound_member["phone"]):
             incoming_id = event_id or getattr(send, "event_id", "")
-            if incoming_id:
-                key = hashlib.sha256(f"{plat}|{user_id}|{incoming_id}".encode()).hexdigest()
-                with state.conn:
+            with state.conn:
+                if incoming_id:
+                    key = hashlib.sha256(f"{plat}|{user_id}|{incoming_id}".encode()).hexdigest()
                     claimed = state.conn.execute("INSERT OR IGNORE INTO portal_event(event_key,created_at) VALUES(?,?)", (key, state.now_str())).rowcount
-                if not claimed:
-                    return 200, {"ok": True, "bound": True, "duplicate": True}
+                    if not claimed:
+                        return 200, {"ok": True, "bound": True, "duplicate": True}
+                receipts = state.acknowledge_notice_receipts(bound_member["phone"], plat, msg_text)
+            if receipts:
+                summary = f"已记录您的回执「{receipts[0]}」" if len(receipts) == 1 else f"已记录 {len(receipts)} 条通知回执。"
+                send(summary, "notice_receipt")
+                return 200, {"ok": True, "bound": True, "path": "notice_receipt", "count": len(receipts)}
             raw = portal.issue(bound_member["phone"], plat)
             link = f"{(base_url or '').rstrip('/')}/h5/portal#t={raw}"
             send("【德阳量密助手】您好，请点击下方链接进入个人任务工作台（含待办处理、自主上报、已交回看及授权建任务）："
@@ -296,7 +301,7 @@ def process_app_event(
             return 200, {"ok": True, "test": True, "message": "callback test acknowledged"}
         return 400, {"code": "VALIDATION_FAILED", "message": "事件缺失 userId"}
 
-    msg_text = _extract_message_text(event_payload).strip()
+    msg_text = _extract_message_text(event_payload)
     # 2026-11-10 方案A：官方事件同时带 userId 与 union_id（已绑定用户的 touch 命中要用 union_id）
     user_union_id = _extract_union_id(event_payload)
 

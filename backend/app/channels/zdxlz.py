@@ -6,6 +6,9 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
+import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -413,19 +416,31 @@ class ZdxlzChannel:
         except Exception:
             return 0, 0
 
-    def upload_media(self, file_path: str, category: int = 1) -> str:
+    @staticmethod
+    def _upload_data(resp, stage: str) -> dict:
+        if resp.status_code == 200:
+            try:
+                envelope = resp.json()
+            except ValueError:
+                envelope = None
+            if isinstance(envelope, dict):
+                code = envelope.get("code")
+                if envelope.get("success") is True or (not isinstance(code, bool) and code in (0, 200)):
+                    data = envelope.get("data")
+                    if isinstance(data, dict):
+                        return data
+        raise ChannelError(f"upload {stage} 失败: HTTP {resp.status_code} {resp.text[:300]}")
+
+    def upload_media(self, file_path: str, category: int = 1, *, filename: Optional[str] = None,
+                     mime_type: Optional[str] = None) -> str:
         """媒体三步分片上传，成功返回 fileKey（= 消息 content.fileId）。
 
         流程（官方《媒体文件上传与下载》）：
         1) POST /files/upload/init          -> parts[].uploadUrl（预签名）+ uploadId
-        2) PUT  uploadUrl（Content-Type 传真实 mime，⛔ 不带 Authorization）-> 响应头 ETag
+        2) PUT  uploadUrl（application/octet-stream）-> 响应头 ETag
         3) POST /files/upload/{uploadId}/complete -> data.fileKey
 
-        2026-10-29 修复：预签名 PUT 的 Content-Type 会被 S3 存成对象元数据，
-        下载时原样返回 ——之前写死 octet-stream，手机端图片组件因
-        Content-Type=application/octet-stream 无法识别而转圈重试。
-        现在与 init 的 mimeType 保持一致（_MIME_BY_EXT）。
-        注意：complete 提交的 etag 必须保留响应头中的引号。
+        init 和 complete 使用同一个原始文件 MD5，complete 保留 ETag 引号。
         """
         if not self.configured:
             raise ChannelError("消息通道未配置 (IMT_APP_ID / IMT_APP_SECRET 缺失)")
@@ -434,48 +449,60 @@ class ZdxlzChannel:
         if not path.is_file():
             raise ChannelError(f"上传文件不存在: {file_path}")
 
-        file_bytes = path.read_bytes()
-        file_size = len(file_bytes)
+        file_size = path.stat().st_size
+        if not file_size:
+            raise ChannelError("上传文件为空")
+        with path.open("rb") as source:
+            digest = hashlib.md5()
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        file_hash = digest.hexdigest()
         ext = path.suffix.lower()
-        mime = self._MIME_BY_EXT.get(ext, "application/octet-stream")
+        mime = (mime_type or self._MIME_BY_EXT.get(ext) or mimetypes.guess_type(path.name)[0]
+                or "application/octet-stream")
 
         token = self.get_access_token()
         base_headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"}
 
         # 1) 初始化上传（chunkSize 先传整文件大小，服务端返回实际采用的 chunkSize 与 parts）
         init_url = f"{self.config.api_base}/open-apis/v1/files/upload/init"
-        init_body = {"fileName": path.name, "fileSize": file_size, "mimeType": mime, "chunkSize": file_size, "category": int(category)}
+        init_body = {"fileName": filename or path.name, "fileSize": file_size, "mimeType": mime,
+                     "chunkSize": file_size, "category": int(category), "fileHash": file_hash}
         resp = self._client.post(init_url, headers={**base_headers}, json=init_body, timeout=60.0)
-        if resp.status_code != 200:
-            raise ChannelError(f"upload init 失败: HTTP {resp.status_code} {resp.text}")
-        init_data = (resp.json() or {}).get("data") or {}
+        init_data = self._upload_data(resp, "init")
+        if init_data.get("deduplicatedHit") is True and init_data.get("uploadComplete") is True:
+            file_key = str(init_data.get("fileKey") or "").strip()
+            if file_key:
+                return file_key
         parts = init_data.get("parts") or []
         upload_id = str(init_data.get("uploadId") or "").strip()
         if not upload_id or not parts:
             raise ChannelError(f"upload init 响应缺失 uploadId/parts: {resp.text}")
 
-        # 2) 按分片上传（预签名地址，Content-Type=真实 mime，不带开放平台 Authorization）
-        #    实测：S3 会把这个头存为对象元数据，下载 Content-Type 由此决定（A/B 实验已验证）。
-        completed: list = []
-        for part in parts:
-            part_no = int(part["partNumber"])
-            upload_url = str(part["uploadUrl"])
-            chunk_size = int(init_data.get("chunkSize") or 0) or file_size
-            start = (part_no - 1) * chunk_size
-            end = min(part_no * chunk_size, file_size)
-            chunk = file_bytes[start:end]
-            put_resp = self._client.put(
-                upload_url,
-                content=chunk,
-                headers={"Content-Type": mime},
-                timeout=120.0,
-            )
-            if put_resp.status_code not in (200, 201, 204):
-                raise ChannelError(f"分片 {part_no} 上传失败: HTTP {put_resp.status_code} {put_resp.text[:200]}")
-            etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
-            if not etag:
-                raise ChannelError(f"分片 {part_no} 上传成功但响应头缺失 ETag")
-            completed.append({"partNumber": part_no, "etag": etag, "size": len(chunk)})
+        chunk_size = int(init_data.get("chunkSize") or file_size)
+        if chunk_size <= 0:
+            raise ChannelError("upload init 响应包含无效 chunkSize")
+        completed = []
+        with path.open("rb") as source:
+            for part in parts:
+                part_no = int(part["partNumber"])
+                start = (part_no - 1) * chunk_size
+                if not 0 <= start < file_size:
+                    raise ChannelError("upload init 响应包含无效 partNumber")
+                source.seek(start)
+                chunk = source.read(min(chunk_size, file_size - start))
+                put_resp = self._client.put(
+                    str(part["uploadUrl"]),
+                    content=chunk,
+                    headers={"Content-Type": "application/octet-stream"},
+                    timeout=120.0,
+                )
+                if put_resp.status_code not in (200, 201, 204):
+                    raise ChannelError(f"分片 {part_no} 上传失败: HTTP {put_resp.status_code}")
+                etag = put_resp.headers.get("ETag") or put_resp.headers.get("etag")
+                if not etag:
+                    raise ChannelError(f"分片 {part_no} 上传成功但响应头缺失 ETag")
+                completed.append({"partNumber": part_no, "etag": etag, "size": len(chunk)})
 
         # 3) 完成上传（合并分片）
         complete_url = f"{self.config.api_base}/open-apis/v1/files/upload/{upload_id}/complete"
@@ -483,12 +510,10 @@ class ZdxlzChannel:
         resp3 = self._client.post(
             complete_url,
             headers={"Authorization": f"Bearer {token2}", "Content-Type": "application/json; charset=utf-8"},
-            json={"parts": completed, "fileHash": ""},
+            json={"parts": completed, "fileHash": file_hash},
             timeout=60.0,
         )
-        if resp3.status_code != 200:
-            raise ChannelError(f"upload complete 失败: HTTP {resp3.status_code} {resp3.text}")
-        data3 = (resp3.json() or {}).get("data") or {}
+        data3 = self._upload_data(resp3, "complete")
         file_key = str(data3.get("fileKey") or "").strip()
         if not file_key:
             raise ChannelError(f"upload complete 响应缺失 fileKey: {resp3.text}")
@@ -508,25 +533,79 @@ class ZdxlzChannel:
         file_name: Optional[str] = None,
         file_size: Optional[int] = None,
         file_ext: Optional[str] = None,
+        receive_type: str = "user",
     ) -> SendResult:
-        """发送单聊图片消息（官方《机器人消息发送和接收类型》image 消息）。
+        """按量子密信协议发送原生图片。保留旧调用方的可选参数。"""
+        if not width or not height:
+            return SendResult(False, "failed", None, False, False, error="IMAGE_SIZE_REQUIRED")
+        ext = (file_ext or mime_type.rsplit("/", 1)[-1]).strip().lstrip(".").lower()
+        content = {"fileId": file_key, "width": int(width), "height": int(height),
+                   "mimeType": "jpg" if ext == "jpeg" else ext, "altText": alt_text}
+        return self._send_media_message(receive_id, "image", content, idem_key, receive_type, push_content)
 
-        - content: {"fileId", "width", "height", "mimeType", "altText", "name", "size", "ext"}
-        - 成功判定与 send_text 一致（success==true || code==0 || code==200）
-        - HTTP 500（无会话）同样置 need_activate=True
+    def send_file(self, receive_id: str, file_key: str, *, file_name: str, size: int,
+                  mime_type: str, ext: str, idem_key: str, receive_type: str = "user") -> SendResult:
+        content = {"fileId": file_key, "fileName": file_name, "size": int(size),
+                   "mimeType": mime_type, "ext": ext.lstrip(".").lower()}
+        return self._send_media_message(receive_id, "file", content, idem_key, receive_type, file_name)
 
-        2026-10-29 实测修复（D/E/F 对照实验）：content 里显式携带的 name/size/ext
-        会被服务端原样透传给客户端，客户端凭 ext/size 识别图片；
-        只发 mimeType 时客户端收到 ext=""、size=0、name="fileId."，
-        手机端无法识别为图片（点击转圈），PC 端走「接收文件」下载流程。
-        因此 image 消息务必带全 name/size/ext 三个字段。
-        """
+    def send_video(self, receive_id: str, file_key: str, *, duration: int, width: int, height: int,
+                   mime_type: str, ext: str, thumbnail: str, idem_key: str,
+                   receive_type: str = "user") -> SendResult:
+        content = {"fileId": file_key, "duration": int(duration), "width": int(width), "height": int(height),
+                   "mimeType": mime_type, "ext": ext.lstrip(".").lower(), "thumbnail": thumbnail}
+        return self._send_media_message(receive_id, "video", content, idem_key, receive_type, "你收到一条视频")
+
+    def prepare_notice_attachment(self, file_path: str, asset: dict) -> dict:
+        kind = asset["kind"]
+        name = asset["file_name"]
+        if kind == "image":
+            width, height = self._read_image_size(file_path)
+            if not width or not height:
+                raise ChannelError("IMAGE_SIZE_REQUIRED")
+            fields = {"width": width, "height": height, "alt_text": name}
+        elif kind == "video":
+            fields = self._prepare_video(file_path)
+        else:
+            fields = {"file_name": name, "size": asset["size"]}
+        mime = asset.get("mime") or self._MIME_BY_EXT.get(Path(file_path).suffix.lower()) or "application/octet-stream"
+        fields["mime_type"] = mime.split(";", 1)[0]
+        fields["file_key"] = self.upload_media(file_path, filename=name, mime_type=fields["mime_type"])
+        if kind != "image":
+            fields["ext"] = Path(file_path).suffix.lstrip(".").lower()
+        return fields
+
+    def _prepare_video(self, file_path: str) -> dict:
+        info = subprocess.run(
+            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,duration:format=duration", "-of", "json", file_path],
+            capture_output=True, check=True, timeout=20,
+        )
+        info = json.loads(info.stdout)
+        stream = info["streams"][0]
+        duration = float(info["format"].get("duration") or stream["duration"])
+        width, height = int(stream["width"]), int(stream["height"])
+        if not (duration > 0 and width > 0 and height > 0):
+            raise ChannelError("VIDEO_METADATA_INVALID")
+        with tempfile.TemporaryDirectory(prefix="imtask_video_") as directory:
+            poster = str(Path(directory) / "thumbnail.jpg")
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-nostdin", "-protocol_whitelist", "file", "-i", file_path,
+                 "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=480:-2", poster],
+                capture_output=True, check=True, timeout=30,
+            )
+            thumbnail = self.upload_media(poster)
+        return {"duration": max(1, round(duration)), "width": width, "height": height, "thumbnail": thumbnail}
+
+    def send_prepared_notice(self, receive_id: str, kind: str, fields: dict, idem_key: str,
+                             receive_type: str) -> SendResult:
+        send = {"image": self.send_image, "file": self.send_file, "video": self.send_video}[kind]
+        return send(receive_id, **fields, idem_key=idem_key, receive_type=receive_type)
+
+    def _send_media_message(self, receive_id: str, kind: str, content: dict, idem_key: str,
+                            receive_type: str, push_content: str) -> SendResult:
         if not self.configured:
             return SendResult(False, "failed", None, False, False, error="CHANNEL_UNCONFIGURED")
-
-        if (not width) or (not height):
-            return SendResult(False, "failed", None, False, False, error="IMAGE_SIZE_REQUIRED (width/height 必填，可用 _read_image_size 读取)")
-
         for attempt in range(2):
             try:
                 token = self.get_access_token(force_refresh=(attempt > 0))
@@ -539,28 +618,15 @@ class ZdxlzChannel:
                 "X-Client-Id": self.config.app_id,
                 "Content-Type": "application/json; charset=utf-8",
             }
-            content: Dict[str, Any] = {
-                "fileId": str(file_key),
-                "width": int(width),
-                "height": int(height),
-                "mimeType": str(mime_type),
-                "altText": str(alt_text),
-            }
-            # D/E/F 实验结论：这三个字段是客户端识别图片的关键（服务端原样透传）。
-            # 未传时回退旧口径，保证兼容；生产链路 ZdxlzImageSender 总是会传齐。
-            if file_name is not None:
-                content["name"] = str(file_name)
-            if file_size is not None:
-                content["size"] = int(file_size)
-            if file_ext is not None and str(file_ext).strip():
-                content["ext"] = str(file_ext).strip().lstrip(".").lower()
             body = {
                 "receive_id": str(receive_id),
-                "msg_type": "image",
+                "msg_type": kind,
                 "content": json.dumps(content, ensure_ascii=False),
                 "push_content": str(push_content),
                 "idem_key": str(idem_key),
             }
+            if (receive_type or "user").strip().lower() == "union_id":
+                body["receive_type"] = "union_id"
 
             try:
                 resp = self._client.post(url, headers=headers, json=body)

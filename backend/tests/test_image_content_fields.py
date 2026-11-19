@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""2026-10-29 图片消息修复回归：content 必须带 name/size/ext（D/E/F 对照实验结论）。
-
-实验背景：机器人发的 image 消息，客户端收到 ext=""、size=0、name="<fileId>."，
-手机端无法识别为图片（点击转圈），PC 端走「接收文件」下载流程。
-实测（对照组 D/E/F，2026-10-29 11:33）：content 里显式携带的 name/size/ext
-被服务端原样透传给客户端；mimeType 无论何种格式都不影响这三个字段。
-"""
+"""量子密信原生图片回归，覆盖旧调用方式和官方消息内容结构。"""
 from __future__ import annotations
 
 import json
@@ -48,8 +42,8 @@ class _StubClient:
         return _StubResp()
 
 
-def test_image_content_includes_name_size_ext():
-    """带上 name/size/ext 时，content 必须完整透传这三个字段。"""
+def test_image_content_omits_legacy_metadata():
+    """旧调用方仍可传附件参数，消息体采用官方图片字段。"""
     stub = _StubClient()
     ch = ZdxlzChannel(_mk_cfg(), http_client=stub)
     res = ch.send_image(
@@ -64,15 +58,13 @@ def test_image_content_includes_name_size_ext():
     )
     assert res.ok is True
     content = json.loads(stub.last_json["content"])  # type: ignore[index]
-    assert content["fileId"] == "fk_123"
-    assert content["width"] == 650 and content["height"] == 434
-    assert content["name"] == "数据看板.jpg"
-    assert content["size"] == 36484
-    assert content["ext"] == "jpg"
+    assert content == {
+        "fileId": "fk_123", "width": 650, "height": 434, "mimeType": "jpg", "altText": "数据看板",
+    }
 
 
-def test_image_content_ext_normalized():
-    """ext 传 ".PNG" 这类脏值时归一成 "png"。"""
+def test_image_content_mime_type_normalizes_extension():
+    """历史调用方的 .PNG 后缀归一到消息的 mimeType。"""
     stub = _StubClient()
     ch = ZdxlzChannel(_mk_cfg(), http_client=stub)
     ch.send_image(
@@ -80,13 +72,14 @@ def test_image_content_ext_normalized():
         mime_type="image/png", file_name="a.png", file_size=100, file_ext=".PNG",
     )
     content = json.loads(stub.last_json["content"])  # type: ignore[index]
-    assert content["ext"] == "png"
+    assert content["mimeType"] == "png"
+    assert "ext" not in content
 
 
-def test_image_content_fallback_keeps_old_shape():
-    """不传可选字段时 content 保持旧结构（不新增空字段），确保兼容。"""
+def test_image_content_without_optional_attachment_metadata():
     stub = _StubClient()
     ch = ZdxlzChannel(_mk_cfg(), http_client=stub)
     ch.send_image("uid_x", "fk_123", width=650, height=434, mime_type="png")
     content = json.loads(stub.last_json["content"])  # type: ignore[index]
     assert set(content.keys()) == {"fileId", "width", "height", "mimeType", "altText"}
+    assert content["mimeType"] == "png"

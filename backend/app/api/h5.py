@@ -648,6 +648,45 @@ def create_h5_router(
     async def h5_bind_page():
         return HTMLResponse(content=load_h5_html("bind.html"))
 
+    @router.get("/h5/notice-media")
+    async def h5_notice_media(token: str = "", raw: bool = False, download: bool = False):
+        from html import escape
+        from ..notice_media import asset_path, get_asset
+
+        headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+                   "Referrer-Policy": "no-referrer"}
+        tok = state.get_h5_token(token) if re.fullmatch(r"[A-Za-z0-9_-]{32}", token) else None
+        if not tok or tok["purpose"] != "notice_asset" or tok["consumed"] or tok["expires_at"] <= state.now_str():
+            return HTMLResponse("附件链接无效或已过期", status_code=401, headers=headers)
+        instance = state.get_instance(tok["instance_id"]) if tok["instance_id"] else None
+        tpl = state.get_template(tok["template_id"])
+        asset = get_asset(state, tok["period_key"])
+        if (not instance or not tpl or instance["phone"] != tok["phone"]
+                or instance["template_id"] != tpl["template_id"] or tpl["kind"] != "notice"
+                or not asset or asset["owner_id"] != tpl["owner_id"]
+                or state.instance_close_reason(instance, tpl)):
+            return HTMLResponse("附件不可用", status_code=404, headers=headers)
+        path = asset_path(state, asset)
+        if path is None:
+            return HTMLResponse("附件不可用", status_code=404, headers=headers)
+        if download or raw or asset["kind"] != "video":
+            inline = not download and (raw and asset["kind"] == "video" or asset["kind"] == "image")
+            return FileResponse(path, filename=asset["file_name"], media_type=asset["mime"],
+                                content_disposition_type="inline" if inline else "attachment", headers=headers)
+        title = escape(asset["file_name"])
+        return HTMLResponse(
+            f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{title}</title>
+<style>body{{margin:0;background:#f3f5f7;color:#192630;font:16px system-ui,sans-serif}}
+main{{box-sizing:border-box;max-width:640px;margin:auto;padding:16px 16px max(20px,env(safe-area-inset-bottom))}}
+h1{{font-size:18px;overflow-wrap:anywhere}}video{{display:block;width:100%;background:#111;border-radius:8px}}
+a{{display:inline-flex;align-items:center;min-height:44px;margin-top:12px;color:#15558a}}</style>
+<main><h1>{title}</h1><video controls playsinline preload="metadata" src="?token={token}&amp;raw=1"></video>
+<a href="?token={token}&amp;download=1">下载原视频文件</a></main></html>""",
+            headers={**headers, "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; media-src 'self'"},
+        )
+
     # 2026-11-03：H5 登记表单的部门下拉选项（后台管理员配置，公开只读）
     @router.get("/api/h5/departments")
     async def api_h5_departments():

@@ -23,6 +23,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ..channel_config import (
     CHANNEL_SCHEMA,
@@ -533,7 +534,8 @@ def _query_instances(
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
             f"t.notice_times AS template_notice_times, "
             f"(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id=i.id AND l.result='sent' "
-            f"AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','portal')) AS published_at, "
+            f"AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
+            f"'notice_file_link','notice_video','notice_vid_link','portal')) AS published_at, "
             # 2026-11-04 多管理员分级：超管全局查看时需要看到「创建人」
             f"u.username AS owner_username, u.display_name AS owner_display_name "
             # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），
@@ -1244,6 +1246,69 @@ def create_admin_router(
         if not path.exists() or not path.is_file():
             return error_response(404, "NOT_FOUND", "素材不存在")
         return FileResponse(str(path))
+
+    @router.post("/notice-assets/{kind}")
+    async def upload_notice_asset(kind: str, request: Request):
+        from ..notice_media import LIMITS, store_asset
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        if _is_super_admin(admin):
+            return error_response(403, "SUPER_ADMIN_READONLY", "仅分级管理员可以上传通知素材")
+        if kind not in LIMITS:
+            return error_response(400, "INVALID_ASSET_KIND", "请选择图片、文件或视频")
+        max_body = LIMITS[kind] + 65536
+        size_error = "附件超过该类型的大小上限"
+
+        async def bounded_body():
+            received = 0
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > max_body:
+                    raise MultiPartException(size_error)
+                yield chunk
+
+        if not request.headers.get("content-type", "").lower().startswith("multipart/form-data"):
+            return error_response(400, "FILE_REQUIRED", "请选择要上传的附件")
+        try:
+            length = int(request.headers.get("content-length") or 0)
+            if length > max_body:
+                raise BizError(413, "FILE_SIZE_REJECTED", size_error)
+            parser = MultiPartParser(request.headers, bounded_body(), max_files=1, max_fields=0)
+            form = await parser.parse()
+            try:
+                upload = form.get("file")
+                if not isinstance(upload, UploadFile):
+                    raise BizError(400, "FILE_REQUIRED", "请选择要上传的附件")
+                asset = await asyncio.to_thread(store_asset, state, int(admin["id"]), kind,
+                                               upload.filename or "", upload.file, upload.size or 0)
+            finally:
+                await form.close()
+        except MultiPartException as exc:
+            if exc.message == size_error:
+                return error_response(413, "FILE_SIZE_REJECTED", size_error)
+            return error_response(400, "FILE_REQUIRED", "请逐个上传有效的附件")
+        except BizError as exc:
+            return biz_error_response(exc)
+        return {"ok": True, **asset}
+
+    @router.get("/notice-assets/{asset_id}")
+    async def preview_notice_asset(asset_id: str, request: Request):
+        from ..notice_media import asset_path, get_asset
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        asset = get_asset(state, asset_id)
+        if not asset or (not _is_super_admin(admin) and asset["owner_id"] != admin["id"]):
+            return error_response(404, "NOT_FOUND", "附件不存在")
+        path = asset_path(state, asset)
+        if path is None:
+            return error_response(404, "NOT_FOUND", "附件不存在")
+        return FileResponse(path, filename=asset["file_name"], media_type=asset["mime"],
+                            content_disposition_type="inline" if asset["kind"] != "file" else "attachment",
+                            headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
 
     @router.post("/templates/{template_id}/preview")
     async def preview_template(template_id: str, request: Request):
@@ -2731,11 +2796,9 @@ def create_admin_router(
 
     @router.get("/stats-panel/tasks")
     async def stats_panel_tasks(request: Request, platform: Optional[str] = None):
-        """任务选择器数据：当前分级管理员名下的上传任务（kind != 'notice'）。
+        """单任务选择器沿用模板的属主与平台范围。"""
+        from ..notice_media import receipt_phrase
 
-        ⛔ 严禁出现「全部任务」——面板单任务独占；平台参数沿用模板列表口径
-        （zdxlz/wecom 隔离由 state.list_templates 的角色平台 EXISTS 过滤完成）。
-        """
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
@@ -2748,12 +2811,14 @@ def create_admin_router(
             )
             items = []
             for t in res["items"]:
-                if str(t.get("kind") or "") == "notice":
+                is_receipt = t["kind"] == "notice" and bool(receipt_phrase(t))
+                if t["kind"] == "notice" and not is_receipt:
                     continue
                 stats_period = state.stats_panel_period(t)
                 items.append({
                     "template_id": t["template_id"], "name": t["name"],
                     "kind": t.get("kind"), "period": t.get("period"),
+                    "is_receipt": is_receipt,
                     "statistics_period": stats_period,
                     "current_period_key": "once" if t.get("is_manual") else period_key(stats_period, state.now()),
                     "is_manual": bool(t.get("is_manual")),

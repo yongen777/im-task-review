@@ -15,6 +15,7 @@ import { getInstanceStatusMeta, InstanceDetailDialog } from './InstanceDetailDia
 const PAGE_SIZE = 50;
 const periodLabel = { day: '日期', week: '周', month: '月份' };
 const statusLabels = { all: '全部', done: '已完成', pending: '待提交', overdue: '已逾期', rejected: '已驳回' };
+const receiptLabels = { all: '应回复', done: '已回复', pending: '待回复' };
 type PeriodMode = keyof typeof periodLabel;
 type StatusTab = keyof typeof statusLabels;
 type DetailTarget = { instanceId: number; submissionId?: number };
@@ -33,6 +34,7 @@ interface PanelTask {
   exec_dom_days?: number[] | null;
   is_adhoc: boolean;
   is_manual?: boolean;
+  is_receipt?: boolean;
   need_review: boolean;
 }
 
@@ -83,6 +85,8 @@ interface RowItem {
   status?: TaskInstanceItem['status'];
   instance_status?: TaskInstanceItem['status'];
   submitted_at: string | null;
+  receipt_at?: string | null;
+  receipt_text?: string | null;
   content: SubmissionContent | null;
   late_submit?: boolean;
 }
@@ -232,10 +236,10 @@ function StatisticsCatalog({ platform, focusId, focusVersion, storageKey, onTask
   if (!task) {
     return (
       <div className="space-y-4">
-        <AdminScopeHeader title="任务数据统计" description="查看上报进度和提交内容" />
+        <AdminScopeHeader title="任务数据统计" description="查看任务上报及通知回执" />
         <div className={panelClass + ' px-5 py-12 text-center text-sm text-slate-600'} role={catalog.error ? 'alert' : 'status'}>
           <BarChart3 className="mx-auto mb-3 h-8 w-8 text-slate-400" />
-          {catalog.error || (catalog.loading ? '正在加载任务…' : '当前平台暂无上传任务')}
+          {catalog.error || (catalog.loading ? '正在加载任务…' : '当前平台暂无可统计任务')}
           {catalog.error && <button type="button" className={secondaryButton + ' ml-3'} onClick={() => setRevision((n) => n + 1)}>重试</button>}
         </div>
       </div>
@@ -249,6 +253,8 @@ function StatisticsCatalog({ platform, focusId, focusVersion, storageKey, onTask
 function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   task: PanelTask; tasks: PanelTask[]; onTaskChange: (id: string) => void; onRefreshTasks: () => void;
 }) {
+  const isReceipt = task.is_receipt;
+  const tabs = isReceipt ? receiptLabels : statusLabels;
   const toast = useToast();
   const [chosenPeriod, setChosenPeriod] = useState<string>();
   const periodKey = chosenPeriod ?? task.current_period_key;
@@ -390,7 +396,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
     <div className="space-y-4">
       <AdminScopeHeader title="任务数据统计"
         description={<>
-          按任务、周期和部门查看上报进度、核对提交内容并导出明细。
+          {isReceipt ? '按周期和部门查看通知回执并导出明细。' : '按任务、周期和部门查看上报进度、核对提交内容并导出明细。'}
           {lastUpdated && <span className="ml-2 whitespace-nowrap text-slate-500">更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}</span>}
         </>}
         actions={<>
@@ -445,26 +451,27 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
       {overviewData?.mode === 'periodic' && (
         <>
           <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-            <KpiCard label="应参与人数" value={overviewData.kpis.total} />
-            <KpiCard label="已完成人数" value={overviewData.kpis.done} color="text-emerald-700"
-              hint={task.need_review ? '待审核 ' + overviewData.kpis.pending_review + ' · 审核通过 ' + overviewData.kpis.approved : undefined} />
-            <KpiCard label="未完成人数" value={overviewData.kpis.not_done} color="text-amber-700"
-              hint={'待提交 ' + overviewData.kpis.pending + ' · 逾期 ' + overviewData.kpis.overdue + ' · 驳回 ' + overviewData.kpis.rejected} />
-            <KpiCard label="完成率" value={overviewData.kpis.total ? overviewData.kpis.rate + '%' : '—'} color="text-blue-700"
+            <KpiCard label={isReceipt ? '应回复' : '应参与人数'} value={overviewData.kpis.total} />
+            <KpiCard label={isReceipt ? '已回复' : '已完成人数'} value={overviewData.kpis.done} color="text-emerald-700"
+              hint={!isReceipt && task.need_review ? '待审核 ' + overviewData.kpis.pending_review + ' · 审核通过 ' + overviewData.kpis.approved : undefined} />
+            <KpiCard label={isReceipt ? '待回复' : '未完成人数'} value={overviewData.kpis.not_done} color="text-amber-700"
+              hint={isReceipt ? undefined : '待提交 ' + overviewData.kpis.pending + ' · 逾期 ' + overviewData.kpis.overdue + ' · 驳回 ' + overviewData.kpis.rejected} />
+            <KpiCard label={isReceipt ? '回复率' : '完成率'} value={overviewData.kpis.total ? overviewData.kpis.rate + '%' : '—'} color="text-blue-700"
               hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: overviewData.kpis.rate + '%' }} /></div>} />
           </div>
 
           {deptChildren.length > 0 && (
             <section className={panelClass + ' overflow-hidden'} aria-labelledby="department-progress-title">
               <div className="flex flex-wrap items-baseline justify-between gap-2 px-5 py-4">
-                <h3 id="department-progress-title" className="text-base font-bold text-slate-900">部门完成情况</h3>
-                <span className="text-xs text-slate-500">按完成率从高到低 · 点击部门查看明细</span>
+                <h3 id="department-progress-title" className="text-base font-bold text-slate-900">{isReceipt ? '部门回复情况' : '部门完成情况'}</h3>
+                <span className="text-xs text-slate-500">按{isReceipt ? '回复率' : '完成率'}从高到低 · 点击部门查看明细</span>
               </div>
               <div className="max-h-[26rem] overflow-auto">
                 <table className="w-full min-w-[560px] table-fixed text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-left text-xs text-slate-600">
-                    <tr><th className="w-[26%] px-5 py-2.5">部门</th><th className="px-4 py-2.5">完成率</th>
-                      <th className="w-[19%] px-4 py-2.5 text-right">已提交 / 应提交</th><th className="w-[15%] px-5 py-2.5 text-right">未提交</th></tr>
+                    <tr><th className="w-[26%] px-5 py-2.5">部门</th><th className="px-4 py-2.5">{isReceipt ? '回复率' : '完成率'}</th>
+                      <th className="w-[19%] px-4 py-2.5 text-right">{isReceipt ? '已回复 / 应回复' : '已提交 / 应提交'}</th>
+                      <th className="w-[15%] px-5 py-2.5 text-right">{isReceipt ? '待回复' : '未提交'}</th></tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {deptChildren.map((node) => (
@@ -523,7 +530,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
       <section className={panelClass + ' overflow-hidden'} aria-busy={roster.loading || searching}>
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
           <div className="flex items-center gap-2">
-            <h3 className="text-sm font-semibold text-slate-900">{task.is_adhoc ? '上报明细' : '员工明细'}</h3>
+            <h3 className="text-sm font-semibold text-slate-900">{isReceipt ? '回执明细' : task.is_adhoc ? '上报明细' : '员工明细'}</h3>
             {list && !searching && <span className="text-xs tabular-nums text-slate-500">{list.total} {task.is_adhoc ? '条' : '人'}</span>}
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -534,7 +541,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
               {search && <button type="button" aria-label="清除搜索" onClick={() => setSearch('')}
                 className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
             </div>
-            {!task.is_adhoc && (
+            {!task.is_adhoc && !isReceipt && (
               <button type="button" onClick={() => void copyTodoList()} className={secondaryButton} disabled={copying || !overviewData}>
                 <Copy className="h-3.5 w-3.5" /> {copying ? '正在复制…' : '一键复制未交名单'}
               </button>
@@ -543,10 +550,10 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
         </div>
         {!task.is_adhoc && (
           <div className="flex flex-wrap gap-1.5 border-b border-slate-100 px-4 py-2.5">
-            {(Object.keys(statusLabels) as StatusTab[]).map((tab) => (
+            {(Object.keys(tabs) as (keyof typeof tabs)[]).map((tab) => (
               <button type="button" key={tab} aria-pressed={tab === status} onClick={() => { setStatus(tab); setFilter((current) => ({ ...current, page: 1 })); }}
                 className={'rounded-lg px-2.5 py-1.5 text-xs font-medium ' + (tab === status ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50')}>
-                {statusLabels[tab]}
+                {tabs[tab]}
               </button>
             ))}
           </div>
@@ -558,19 +565,22 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                 <th className="w-28 px-4 py-3 font-medium">成员</th>
                 <th className="w-[17%] px-3 py-3 font-medium">所属部门</th>
                 <th className="w-24 px-3 py-3 font-medium">状态</th>
-                <th className="w-32 px-3 py-3 font-medium">提交时间</th>
-                <th className="px-3 py-3 font-medium">上报内容</th>
-                <th className="w-28 px-4 py-3 text-right font-medium">操作</th>
+                <th className="w-36 px-3 py-3 font-medium">{isReceipt ? '回复时间' : '提交时间'}</th>
+                <th className="px-3 py-3 font-medium">{isReceipt ? '回复内容' : '上报内容'}</th>
+                {!isReceipt && <th className="w-28 px-4 py-3 text-right font-medium">操作</th>}
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {(!list?.items.length || searching) ? (
-                <tr><td colSpan={6} className="px-4 py-10 text-center text-slate-500">
+                <tr><td colSpan={isReceipt ? 5 : 6} className="px-4 py-10 text-center text-slate-500">
                   {searching || roster.loading ? '正在加载明细…' : roster.error ? '明细加载失败' : filter.query ? '没有匹配的记录' : '当前范围暂无记录'}
                 </td></tr>
               ) : list.items.map((row) => {
                 const instanceId = row.instance_id ?? row.id;
-                const meta = getInstanceStatusMeta({
+                const meta = isReceipt
+                  ? (row.receipt_at ? { label: '已回复', className: 'border-emerald-200 text-emerald-700' }
+                    : { label: '待回复', className: 'border-slate-200 text-slate-600' })
+                  : getInstanceStatusMeta({
                   status: row.status ?? row.instance_status ?? 'pending',
                   kind: task.kind, need_review: task.need_review, submitted_at: row.submitted_at,
                 });
@@ -585,16 +595,17 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                     </td>
                     <td className="px-3 py-3"><span className={'inline-flex whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[11px] font-semibold ' + meta.className}>{meta.label}</span></td>
                     <td className="px-3 py-3 tabular-nums text-slate-600">
-                      {row.submitted_at?.slice(5, task.is_adhoc ? 19 : 16) || '—'}
+                      {(isReceipt ? row.receipt_at : row.submitted_at?.slice(5, task.is_adhoc ? 19 : 16)) || '—'}
                       {row.late_submit && <div className="mt-0.5 text-amber-700">迟交</div>}
                     </td>
-                    <td className="px-3 py-3"><SubmissionPreview content={row.content} /></td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-3 py-3">{isReceipt ? <span className="whitespace-pre-wrap break-words">{row.receipt_text || '—'}</span>
+                      : <SubmissionPreview content={row.content} />}</td>
+                    {!isReceipt && <td className="px-4 py-3 text-right">
                       <button type="button" disabled={instanceId == null} onClick={() => instanceId != null && setDetail({ instanceId, submissionId: row.submission_id })}
                         className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50">
                         <Eye className="h-3.5 w-3.5" /> 查看详情
                       </button>
-                    </td>
+                    </td>}
                   </tr>
                 );
               })}

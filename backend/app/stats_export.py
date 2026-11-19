@@ -78,6 +78,29 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
     from openpyxl.utils import get_column_letter
 
     rows = bundle['rows']
+    if bundle.get('is_receipt'):
+        wb = Workbook()
+        details = wb.active
+        details.title = '回执明细'
+        summary = wb.create_sheet('回执汇总')
+        details.append(['序号', '姓名', '手机号', '完整部门路径', '回执状态', '回复时间', '回复内容'])
+        for index, row in enumerate(rows, start=1):
+            details.append([index, _safe_text(row['name_snap']), _safe_text(row['phone']), _safe_text(row['dept_path']),
+                            '已回复' if row['receipt_at'] else '待回复', row['receipt_at'], _safe_text(row['receipt_text'])])
+        replied = sum(bool(row['receipt_at']) for row in rows)
+        summary.append(['应回复', '已回复', '待回复', '回复率'])
+        summary.append([len(rows), replied, len(rows) - replied, replied / len(rows) if rows else 0])
+        summary['D2'].number_format = '0.0%'
+        for sheet, widths in ((details, [8, 18, 16, 42, 14, 23, 46]), (summary, [14, 14, 14, 14])):
+            sheet.freeze_panes = 'A2'
+            for cell, width in zip(sheet[1], widths):
+                cell.font = Font(bold=True, color='183153')
+                cell.fill = PatternFill('solid', fgColor='E8F0FE')
+                sheet.column_dimensions[cell.column_letter].width = width
+        details.auto_filter.ref = details.dimensions
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
     fields = bundle['content_fields']
     has_note = bundle['has_note_col']
     images_by_row = [[upload for upload in row['uploads'] if str(upload['mime']).startswith('image/')] for row in rows]

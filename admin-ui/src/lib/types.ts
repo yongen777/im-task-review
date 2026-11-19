@@ -46,11 +46,12 @@ export interface FormFieldSpec {
   options?: string[];
 }
 
-export type NoticeContentFormat = 'text' | 'file';
+export type NoticeContentFormat = 'text' | 'image' | 'file' | 'video';
 
 export interface NoticeMessageItem {
   id: string;
-  format: NoticeContentFormat; // 'text' 文本 | 'file' 文件（含图片）
+  format: NoticeContentFormat;
+  asset_id?: string;
   text_content?: string;
   file_name?: string;
   file_url?: string;
@@ -67,6 +68,7 @@ export type UploadH5Module = 'fields' | 'text' | 'image' | 'file';
 export interface TemplateSpec {
   // 纯通知提醒配置
   notice_items?: NoticeMessageItem[];
+  notice_receipt?: { enabled: boolean; phrase: string };
   // 统一上传任务配置（下发提醒文本 + 专属 H5 链接 + 上传完成反馈）
   upload_modules?: UploadH5Module[]; // 选择 H5 链接包含的上传项：字段(报数)、文本、图片、文件
   fields?: FormFieldSpec[]; // 报数字段配置

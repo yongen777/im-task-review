@@ -3,8 +3,7 @@
 
 1. 回调回复必须走**来源平台**的通道（`main._channel_notifier`）——
    实锤：密信回调回复被发给企微 bot（errcode=93006 invalid chatid），用户侧“完全不回话”；
-2. 量子密信永远不发原生图片（10-29 实测口径：手机端点不开），直接走 H5 链接，
-   不再靠 send_image 签名不匹配的 TypeError 兜底（08:15 日志实锤）；
+2. 量子密信通知兼容未提供原生素材适配器的旧通道；
 3. 移出分组 → 未完成任务实例一并清掉（带"另一角色保留/已完成历史不删"边界）。
    （绑定名册比对与"移除=彻底删绑定"2026-11-03 下午已迁至 test_activation_model.py）
 """
@@ -62,15 +61,15 @@ def test_channel_notifier_picks_source_platform() -> None:
     assert _channel_notifier(None, "wecom", fb) is fb
 
 
-# ── 2. 密信附图永远走链接 ──────────────────────────────────────────
+# ── 2. 旧密信通道缺少素材适配器时的兜底 ────────────────────────────
 class _ZdxlzLikeNotifier(FakeNotifier):
     """模拟密信通道：有 send_image 但签名与调度器不兼容——一旦被调用立即报错。"""
 
     def send_image(self, *args, **kwargs):  # noqa: ANN001, ANN002
-        raise AssertionError("量子密信通道不允许尝试原生图片（应直接走 H5 链接）")
+        raise AssertionError("旧方法签名不能用素材路径直接调用")
 
 
-def test_zdxlz_attach_image_goes_link_not_native() -> None:
+def test_zdxlz_legacy_notifier_without_attachment_adapter_uses_link() -> None:
     store = _store()
     try:
         role = store.create_role("密信图组", actor="t", platform="zdxlz")["role_id"]

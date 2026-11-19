@@ -1413,7 +1413,7 @@ class StateStore:
             if str(dst["role_level"] or "") == self.SUPER_ADMIN:
                 raise BizError(400, "VALIDATION_FAILED", "业务数据不能转移到超级管理员名下（超管名下保持为空）")
             moved: Dict[str, int] = {}
-            for tbl in ("role", "member", "task_template", "task_instance"):
+            for tbl in ("role", "member", "task_template", "task_instance", "notice_asset"):
                 cur = self.conn.execute(
                     f"UPDATE {tbl} SET owner_id = ? WHERE owner_id = ?", (tid, fid))
                 moved[tbl] = int(cur.rowcount or 0)
@@ -1430,7 +1430,7 @@ class StateStore:
             if not self.conn.execute("SELECT 1 FROM admin_user WHERE id = ?", (int(owner_id),)).fetchone():
                 raise BizError(404, "NOT_FOUND", "目标管理员账号不存在")
             moved: Dict[str, int] = {}
-            for tbl in ("role", "member", "task_template", "task_instance"):
+            for tbl in ("role", "member", "task_template", "task_instance", "notice_asset"):
                 cur = self.conn.execute(f"UPDATE {tbl} SET owner_id = ? WHERE owner_id != ?", (int(owner_id), int(owner_id)))
                 moved[tbl] = int(cur.rowcount or 0)
             self._insert_audit_unlocked(actor, "admin.account.transfer_owner", "admin_user", str(int(owner_id)),
@@ -2884,7 +2884,8 @@ class StateStore:
             "created_by": d["created_by"], "created_at": d["created_at"], "updated_at": d["updated_at"],
         }
 
-    def _validate_and_normalize_template_unlocked(self, payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _validate_and_normalize_template_unlocked(self, payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None,
+                                                 *, owner_id: Optional[int] = None) -> Dict[str, Any]:
         if existing is not None:
             if "is_manual" in payload and payload["is_manual"] != existing.get("is_manual", False):
                 raise BizError(400, "MODE_IMMUTABLE", "任务创建后不可切换立即推送模式")
@@ -2983,11 +2984,34 @@ class StateStore:
                 raise BizError(400, "INVALID_DEADLINE", "请输入有效的截止日期和时刻") from None
             if manual_deadline != (existing or {}).get("manual_deadline_at") and manual_deadline <= self.now_str():
                 raise BizError(400, "INVALID_DEADLINE", "截止时间必须晚于当前时间")
+        from .notice_media import get_asset, receipt_key
+
+        if kind == "notice" and isinstance(_spec_payload, dict) and "notice_receipt" in _spec_payload:
+            receipt = _spec_payload["notice_receipt"]
+            if not isinstance(receipt, dict) or not isinstance(receipt.get("enabled"), bool):
+                raise BizError(400, "INVALID_RECEIPT", "回执配置格式不正确")
+            phrase = receipt.get("phrase", "我已知晓")
+            if receipt["enabled"] and (not isinstance(phrase, str) or not 1 <= len(phrase.strip()) <= 80
+                                       or not receipt_key(phrase) or any(ord(c) < 32 for c in phrase)):
+                raise BizError(400, "INVALID_RECEIPT", "请输入 1–80 字的有效回执话术")
+            _spec_payload = {**_spec_payload, "notice_receipt": {"enabled": receipt["enabled"],
+                             "phrase": phrase.strip() if receipt["enabled"] else "我已知晓"}}
         notice_items = _spec_payload.get("notice_items") if isinstance(_spec_payload, dict) else None
         notice_images = []
+        notice_assets = []
         if kind == "notice" and isinstance(notice_items, list):
             for item in notice_items:
-                if not isinstance(item, dict) or item.get("format") != "file" or not item.get("image_path"):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("asset_id"):
+                    asset = get_asset(self, str(item["asset_id"]))
+                    owner = owner_id if owner_id is not None else (existing or {}).get("owner_id")
+                    if not asset or asset["owner_id"] != owner or asset["kind"] != item.get("format"):
+                        raise BizError(400, "INVALID_NOTICE_ASSET", "通知附件不可用，或不属于当前模板的管理员")
+                    item.pop("image_path", None)
+                    item.update({"file_name": asset["file_name"], "file_size": asset["size"], "file_mime": asset["mime"]})
+                    notice_assets.append(asset["asset_id"])
+                if item.get("format") not in ("image", "file") or not item.get("image_path"):
                     continue
                 path = str(item["image_path"]).strip()
                 root = (self.data_dir / "notice_attach").resolve()
@@ -2999,7 +3023,7 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "通知类模板不支持自主上报")
         if is_adhoc:
             text_tpl = ""
-        elif not text_tpl and not (kind == "notice" and (notice_images or merged.get("attach_image_path"))):
+        elif not text_tpl and not (kind == "notice" and (notice_assets or notice_images or merged.get("attach_image_path"))):
             raise BizError(400, "VALIDATION_FAILED", "提醒文案 text_tpl 不能为空")
 
         if kind == "notice" or is_manual:
@@ -3300,7 +3324,7 @@ class StateStore:
     def create_template(self, payload: Dict[str, Any], actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
-            norm = self._validate_and_normalize_template_unlocked(payload, existing=None)
+            norm = self._validate_and_normalize_template_unlocked(payload, existing=None, owner_id=owner_id)
             template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
             self.conn.execute(
                 "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, is_adhoc, is_manual, manual_deadline_at, deleted, created_by, created_at, updated_at, owner_id) "
@@ -4782,6 +4806,10 @@ class StateStore:
                     members.append(_m)
         now_s = now_str or self.now_str()
         trigger = trigger_at or now_s
+        from .notice_media import receipt_phrase
+
+        phrase = receipt_phrase(tpl)
+        receipt_platform = tpl_plats[0] if phrase and len(tpl_plats) == 1 else None
         with self.lock, self.conn:
             # 2026-11-09：只有「本周期就是今天」时才按激活时刻切分。
             # period_key 是历史日期（补跑）或跨天周期时不做这个过滤 ——
@@ -4798,14 +4826,57 @@ class StateStore:
                     if _same_day(act_at, now_s) and _lt_time(trigger, act_at):
                         continue
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-                    (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s, int(tpl.get("owner_id") or 1)),
+                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id, receipt_phrase, receipt_platform) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+                    (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s,
+                     int(tpl.get("owner_id") or 1), phrase, receipt_platform),
+                )
+            if tpl["kind"] == "notice":
+                self.conn.execute(
+                    "UPDATE task_instance SET receipt_phrase=?, receipt_platform=? "
+                    "WHERE template_id=? AND period_key=? AND status='pending' AND receipt_prompt_at IS NULL "
+                    "AND (NOT (receipt_phrase <=> ?) OR NOT (receipt_platform <=> ?))",
+                    (phrase, receipt_platform, template_id, period_key, phrase, receipt_platform),
                 )
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
 
     def list_instances_for_period(self, template_id: str, period_key: str) -> List[Dict[str, Any]]:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
+
+    def mark_receipt_prompt_sent(self, instance_id: int, sent_at: str) -> None:
+        self.conn.execute("UPDATE task_instance SET receipt_prompt_at=? WHERE id=? AND receipt_phrase IS NOT NULL "
+                          "AND receipt_prompt_at IS NULL", (sent_at, instance_id))
+
+    def acknowledge_notice_receipts(self, phone: str, platform: str, text: str) -> List[str]:
+        from .notice_media import receipt_key
+
+        if len(text) > 4096:
+            return []
+        normalized = receipt_key(text)
+        if not normalized or len(normalized) > 160:
+            return []
+        phrases = []
+        with self.conn:
+            rows = self.conn.execute(
+                "SELECT i.* FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
+                "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
+                "AND i.receipt_at IS NULL AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 ORDER BY i.id",
+                (phone, platform),
+            ).fetchall()
+            for row in rows:
+                phrase = row["receipt_phrase"]
+                if receipt_key(phrase) != normalized:
+                    continue
+                template = self.get_template(row["template_id"])
+                if self.instance_close_reason(row, template):
+                    continue
+                changed = self.conn.execute(
+                    "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL",
+                    (self.now_str(), text, row["id"]),
+                )
+                if changed.rowcount:
+                    phrases.append(phrase)
+        return phrases
 
     def update_instance_status(self, instance_id: int, status: str) -> None:
         """2026-10-28 方案A：通知实例发送成功后标记为 sent（只在 pending 上生效，避免覆盖后续状态）。"""
@@ -4827,7 +4898,8 @@ class StateStore:
     def instance_published_at(self, instance_id: int) -> Optional[str]:
         row = self.conn.execute(
             "SELECT MIN(sent_at) AS published_at FROM reminder_log WHERE instance_id=? AND result='sent' "
-            "AND kind IN ('remind','manual_push','notice','notice_img','notice_img_link','portal')", (instance_id,),
+            "AND kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
+            "'notice_file_link','notice_video','notice_vid_link','portal')", (instance_id,),
         ).fetchone()
         return row["published_at"] if row else None
 
@@ -5200,20 +5272,27 @@ class StateStore:
         return "week" if 0 < len(weekdays) < 7 else "day"
 
     def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
-        """面板模板定位 + 归属校验（404 / 非上传任务 / 跨属主 403）。
+        """面板允许查看自己名下的上传任务和回执通知。"""
+        from .notice_media import receipt_phrase
 
-        面板只对分级管理员开放（admin 层再拦超管）；这里保证：
-        · 模板存在且未删除；· kind != 'notice'（通知类无「参与/完成」语义）；
-        · owner_id 严格等于当前分级管理员（跨属主一律 403，不含同名巧合）。
-        """
         tpl = self.get_template((template_id or "").strip(), include_deleted=False)
         if not tpl:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
-        if str(tpl.get("kind") or "") == "notice":
+        if tpl.get("kind") == "notice" and not receipt_phrase(tpl):
             raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
         if int(tpl.get("owner_id") or 0) != int(owner_id):
             raise BizError(403, "FORBIDDEN_OWNER", "只能查看自己名下任务的统计数据")
         return tpl
+
+    def _stats_receipt_rows(self, template_id: str, period: str) -> List[Dict[str, Any]]:
+        per_sql, params = self._stats_period_where(period.strip(), alias="")
+        return [dict(row) for row in self.conn.execute(
+            "SELECT id, phone, name_snap, dept_snap, receipt_at, receipt_text, "
+            "CASE WHEN receipt_at IS NULL THEN 'pending' ELSE 'approved' END AS status, "
+            "receipt_at AS submitted_at FROM task_instance "
+            f"WHERE template_id = ? AND {per_sql} AND status != 'cancelled' AND receipt_phrase IS NOT NULL",
+            (template_id, *params),
+        ).fetchall()]
 
     @staticmethod
     def _stats_like_escape(text: str) -> str:
@@ -5383,6 +5462,7 @@ class StateStore:
             "need_review": bool(tpl.get("need_review")),
             "modules": effective_h5_modules(tpl),
             "schema_fields": [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")],
+            "is_receipt": tpl["kind"] == "notice",
         }
 
         if tpl_meta["is_adhoc"]:
@@ -5435,7 +5515,7 @@ class StateStore:
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
         per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
-        rows = self.conn.execute(
+        rows = self._stats_receipt_rows(tpl["template_id"], period_key) if tpl_meta["is_receipt"] else self.conn.execute(
             "SELECT id, phone, name_snap, dept_snap, status, submitted_at, deadline_at "
             f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
             (tpl["template_id"], *per_params)).fetchall()
@@ -5488,6 +5568,8 @@ class StateStore:
                 "rejected": by_status.get("rejected", 0),
                 "overdue": by_status.get("overdue", 0) + by_status.get("expired", 0),
                 "by_status": {k: v for k, v in by_status.items()},
+                **({"expected_replies": total, "replied": done, "pending_replies": not_done, "reply_rate": rate}
+                   if tpl_meta["is_receipt"] else {}),
             },
             "dept_stats": dept_stats,
         }
@@ -5502,7 +5584,8 @@ class StateStore:
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         sel = str(dept_path or "").strip().strip("/")
         per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
-        rows = [dict(r) for r in self.conn.execute(
+        is_receipt = tpl["kind"] == "notice"
+        rows = self._stats_receipt_rows(tpl["template_id"], period_key) if is_receipt else [dict(r) for r in self.conn.execute(
             "SELECT id, phone, name_snap, dept_snap, status, submitted_at, late_submit "
             f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
             (tpl["template_id"], *per_params)).fetchall()]
@@ -5556,7 +5639,7 @@ class StateStore:
         # 当前页代表实例的最近一次提交（内容预览用；不翻全库）
         previews: Dict[int, Dict[str, Any]] = {}
         ids = [int(r["id"]) for r in page_rows]
-        if ids:
+        if ids and not is_receipt:
             ph = ",".join("?" for _ in ids)
             subs = self.conn.execute(
                 f"SELECT instance_id, fields_json, note, refs_json, file_ref FROM submission "
@@ -5575,6 +5658,7 @@ class StateStore:
                 "status": str(r["status"]), "submitted_at": r["submitted_at"],
                 "late_submit": bool(r.get("late_submit")),
                 "preview": self._stats_submission_preview(submitted), "content": submitted,
+                **({"receipt_at": r["receipt_at"], "receipt_text": r["receipt_text"]} if is_receipt else {}),
             })
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 
@@ -5683,6 +5767,16 @@ class StateStore:
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         dept_map = self._stats_member_dept_map(role_ids)
         sel = str(dept_path or "").strip().strip("/")
+        if tpl["kind"] == "notice":
+            if not (period_key or "").strip():
+                raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
+            persons = self._stats_dedup_persons(self._stats_receipt_rows(tpl["template_id"], period_key))
+            rows = []
+            for row in persons:
+                path = self._stats_phone_path(row["phone"], dept_map)
+                if not sel or path == sel or path.startswith(sel + "/"):
+                    rows.append({**row, "dept_path": path})
+            return {"template": tpl, "is_receipt": True, "rows": rows}
         modules = effective_h5_modules(tpl)
         schema_fields = [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")]
         content_fields = [f for f in schema_fields if str(f.get("type") or "").lower() not in ("file", "image")]

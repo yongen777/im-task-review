@@ -96,14 +96,25 @@ function describeTemplateSchedule(tpl: TemplateItem): string {
   return label.startsWith('周') ? `每周 ${label}` : label;
 }
 
-function createDefaultNoticeItems(): NoticeMessageItem[] {
-  return [
-    {
-      id: `ni_${Date.now()}_1`,
-      format: 'text',
-      text_content: '一、文字提醒：\n请按时完成本时段重点工作安排与点检。',
-    },
-  ];
+const NOTICE_KINDS: NoticeContentFormat[] = ['text', 'image', 'file', 'video'];
+const NOTICE_LABELS: Record<NoticeContentFormat, string> = { text: '文本', image: '图片', file: '文件', video: '视频' };
+const NOTICE_UPLOADS = {
+  image: { accept: '.png,.jpg,.jpeg,.webp', max: 9 },
+  file: { accept: '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.zip', max: 64 },
+  video: { accept: '.mp4,.mov,.m4v', max: 100 },
+};
+type NoticeAttachmentKind = keyof typeof NOTICE_UPLOADS;
+const DEFAULT_RECEIPT = '我已知晓';
+const DEFAULT_NOTICE_TEXT = '请按时完成本时段重点工作安排与点检。';
+
+function noticeAssetUrl(item: NoticeMessageItem): string | undefined {
+  if (item.asset_id) return `/api/admin/notice-assets/${encodeURIComponent(item.asset_id)}`;
+  if (item.image_path) return `/api/admin/template-assets/${encodeURIComponent(item.image_path.split('/').pop() || '')}`;
+}
+
+function noticeAssetSize(bytes?: number) {
+  if (!bytes) return '';
+  return bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 function formatManualDeadline(value?: string | null): string {
@@ -112,23 +123,22 @@ function formatManualDeadline(value?: string | null): string {
   return `${year}年${month}月${day}日 ${value.slice(11, 16)}`;
 }
 
-function NoticePhonePreview({ items }: { items: NoticeMessageItem[] }) {
-  const body = summarizeNoticeItemsToText(items).replace(/\\r\\n|\\n/g, '\n');
-  const images = items.filter(item => item.format === 'file' && item.image_path);
+function NoticePhonePreview({ body, media, phrase }: { body: string; media: NoticeMessageItem[]; phrase: string }) {
+  const message = [body.trim(), phrase ? `收到请直接回复「${phrase}」确认` : ''].filter(Boolean).join('\n\n');
   return <aside aria-label="量子密信通知预览" className="rounded-2xl border border-slate-200 bg-slate-50 overflow-hidden">
     <h4 className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 text-sm font-semibold">
       <Smartphone className="size-4 text-blue-700" />量子密信通知预览
     </h4>
     <div className="space-y-3 p-4">
-      {body && <p className="rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words">{body}</p>}
-      {images.map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
-        <p>{item.file_caption?.trim() || '数据图片'}（点击查看）：</p>
-        <a className="text-blue-700 break-all hover:underline" target="_blank" rel="noreferrer"
-           href={`/api/admin/template-assets/${encodeURIComponent(item.image_path!.split('/').pop() || '')}`}>
-          打开图片预览
-        </a>
+      {message && <p className="rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words">{message}</p>}
+      {media.map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+        {item.format === 'image' && <img src={noticeAssetUrl(item)} alt={item.file_name || '通知图片'}
+          className="max-h-44 w-full rounded-md object-contain" />}
+        {item.format === 'video' && <video controls playsInline preload="metadata" src={noticeAssetUrl(item)}
+          className="max-h-44 w-full rounded-md bg-black" />}
+        <p className="mt-1">{NOTICE_LABELS[item.format]} · {item.file_name || item.file_caption}</p>
       </div>)}
-      {!body && !images.length && <p className="text-slate-500">添加文本或图片后可预览。</p>}
+      {!message && !media.length && <p className="text-slate-500">添加通知内容后可预览。</p>}
     </div>
   </aside>;
 }
@@ -517,7 +527,11 @@ export const TemplatesView: React.FC = () => {
   const [enabled, setEnabled] = useState(true);
 
   // 纯通知提醒专用状态
-  const [noticeItems, setNoticeItems] = useState<NoticeMessageItem[]>(createDefaultNoticeItems);
+  const [noticeItems, setNoticeItems] = useState<NoticeMessageItem[]>([]);
+  const [noticeKinds, setNoticeKinds] = useState<NoticeContentFormat[]>(['text']);
+  const [noticeText, setNoticeText] = useState(DEFAULT_NOTICE_TEXT);
+  const [receiptEnabled, setReceiptEnabled] = useState(false);
+  const [receiptPhrase, setReceiptPhrase] = useState(DEFAULT_RECEIPT);
   const [uploadingAssetId, setUploadingAssetId] = useState<string | null>(null);
 
   // 上传任务专用状态（提醒文本 + 选择 H5 上传项 [字段/文本/图片/文件] + 是否需要审核）
@@ -620,7 +634,11 @@ export const TemplatesView: React.FC = () => {
     setDeadlineType('same_day');
     setDeadlineTime('18:00');
     setRequireReview(true);
-    setNoticeItems(createDefaultNoticeItems());
+    setNoticeItems([]);
+    setNoticeKinds(['text']);
+    setNoticeText(DEFAULT_NOTICE_TEXT);
+    setReceiptEnabled(false);
+    setReceiptPhrase(DEFAULT_RECEIPT);
     setUploadRemindText(
       '请按时点击下方 H5 链接，完成今日上门走访户数报数及图片上传。',
     );
@@ -674,28 +692,20 @@ export const TemplatesView: React.FC = () => {
     setEnabled(tpl.enabled);
 
     if (tpl.kind === 'notice') {
-      if (Array.isArray(tpl.spec?.notice_items) && tpl.spec.notice_items.length > 0) {
-        const items = tpl.spec.notice_items.map((item) => ({ ...item }));
-        /* 2026-10-29 H5.5：老模板可能只有顶层 attach_image_name（或只有 spec 里的 file_caption），
-           两处都回填到 file 项的 file_caption，保证编辑框能显示已存的图片名称 */
-        const savedName = String(tpl.attach_image_name ?? '').trim();
-        if (savedName) {
-          for (const it of items) {
-            if (it.format === 'file' && !String(it.file_caption ?? '').trim()) {
-              it.file_caption = savedName;
-            }
-          }
-        }
-        setNoticeItems(items);
-      } else {
-        setNoticeItems([
-          {
-            id: `ni_${tpl.id}_1`,
-            format: 'text',
-            text_content: tpl.text_tpl || '',
-          },
-        ]);
+      const items = (tpl.spec?.notice_items || []).map(item => ({
+        ...item,
+        format: item.format === 'file' && item.image_path && !item.asset_id ? 'image' as const : item.format,
+      }));
+      if (tpl.attach_image_path && !items.some(item => item.format === 'image')) {
+        items.push({ id: 'legacy_image', format: 'image', image_path: tpl.attach_image_path,
+          file_name: tpl.attach_image_name || tpl.attach_image_path.split('/').pop() });
       }
+      const body = summarizeNoticeItemsToText(items) || tpl.text_tpl || '';
+      setNoticeText(body.replace(/\\r\\n|\\n/g, '\n'));
+      setNoticeItems(items.filter(item => item.format !== 'text'));
+      setNoticeKinds(NOTICE_KINDS.filter(key => key === 'text' ? Boolean(body) : items.some(item => item.format === key)));
+      setReceiptEnabled(tpl.spec?.notice_receipt?.enabled === true);
+      setReceiptPhrase(tpl.spec?.notice_receipt?.phrase || DEFAULT_RECEIPT);
     } else {
       setUploadRemindText(tpl.text_tpl || '');
       setUploadModules(resolveUploadModules(tpl));
@@ -722,65 +732,29 @@ export const TemplatesView: React.FC = () => {
     );
   };
 
-  // 添加一条同时下发的提醒子任务
-  const addNoticeItem = (defaultFormat: NoticeContentFormat = 'text') => {
-    setNoticeItems((prev) => [
-      ...prev,
-      {
-        id: `ni_${Date.now()}_${prev.length + 1}`,
-        format: defaultFormat,
-        text_content: defaultFormat === 'text' ? '' : undefined,
-        file_name: defaultFormat === 'file' ? '' : undefined,
-        file_caption: defaultFormat === 'file' ? '' : undefined,
-      },
-    ]);
-  };
-
-  const updateNoticeItem = (idx: number, patch: Partial<NoticeMessageItem>) => {
-    setNoticeItems((prev) => prev.map((item, i) => (i === idx ? { ...item, ...patch } : item)));
-  };
-
-  const removeNoticeItem = (idx: number) => {
-    setNoticeItems((prev) => prev.filter((_, i) => i !== idx));
-  };
-
-  const handleNoticeImageUpload = async (itemId: string, files: File[]) => {
+  const handleNoticeUpload = async (assetKind: NoticeAttachmentKind, files: File[]) => {
     if (!files.length || uploadingAssetId !== null) return;
-    if (files.some(file => !/\.(png|jpg|jpeg|webp)$/i.test(file.name))) {
-      toast.warning('仅支持 PNG、JPG、JPEG、WebP 图片', '文件类型不支持');
+    const { max } = NOTICE_UPLOADS[assetKind];
+    if (files.some(file => !file.size || file.size > max * 1024 ** 2)) {
+      toast.warning(`每个${NOTICE_LABELS[assetKind]}必须非空且不超过 ${max} MB`);
       return;
     }
-    if (files.some(file => file.size > 9 * 1024 * 1024)) {
-      toast.warning('每张图片不能超过 9MB，请压缩后再上传', '图片过大');
-      return;
-    }
-    setUploadingAssetId(itemId);
+    setUploadingAssetId(assetKind);
     const uploaded: NoticeMessageItem[] = [];
     try {
       for (const file of files) {
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(String(reader.result || ''));
-          reader.onerror = () => reject(new Error('读取本地文件失败'));
-          reader.readAsDataURL(file);
-        });
-        const res = await api.post<{ path: string; file_name: string; size: number }>(
-          '/api/admin/template-assets', { filename: file.name, content_base64: dataUrl },
+        const body = new FormData();
+        body.append('file', file);
+        const res = await api.post<{ asset_id: string; file_name: string; file_size: number; file_mime: string }>(
+          `/api/admin/notice-assets/${assetKind}`, body,
         );
-        const fileName = res.file_name || file.name;
-        uploaded.push({ id: res.path, format: 'file', image_path: res.path, file_name: fileName,
-          file_size: res.size || file.size, file_mime: file.type, file_caption: fileName.replace(/\.[^.]+$/, '') || fileName });
+        uploaded.push({ ...res, id: res.asset_id, format: assetKind });
       }
-      toast.success(`已上传 ${uploaded.length} 张图片`, '图片已就绪');
+      toast.success(`已上传 ${uploaded.length} 个附件`);
     } catch (err) {
-      toast.error(err instanceof Error ? plainError(err.message) : '图片上传失败');
+      toast.error(err instanceof Error ? plainError(err.message) : '附件上传失败');
     } finally {
-      if (uploaded.length) {
-        const [first, ...rest] = uploaded;
-        setNoticeItems(previous => previous.flatMap(item => item.id === itemId
-          ? [{ ...first, id: item.id, file_caption: item.file_caption || first.file_caption }, ...rest]
-          : [item]));
-      }
+      if (uploaded.length) setNoticeItems(previous => [...previous, ...uploaded]);
       setUploadingAssetId(null);
     }
   };
@@ -847,46 +821,37 @@ export const TemplatesView: React.FC = () => {
       return;
     }
 
+    const activeNoticeItems = noticeItems.filter(item => noticeKinds.includes(item.format));
     let finalTextTpl = '';
     let spec: Record<string, any> = {};
 
     if (kind === 'notice') {
-      if (noticeItems.length === 0) {
-        toast.warning('请至少保留 1 条提醒内容');
+      if (!noticeKinds.length) {
+        toast.warning('请选择至少一种通知内容');
         return;
       }
-      for (let i = 0; i < noticeItems.length; i++) {
-        const item = noticeItems[i];
-        if (item.format === 'text' && !item.text_content?.trim()) {
-          toast.warning(`请填写第 ${i + 1} 条文本提醒内容`);
-          return;
-        }
-        if (item.format === 'file' && !item.image_path) {
-          toast.warning(
-            `第 ${i + 1} 条勾选了「数据图片提醒」，请先上传要推送的图片`,
-            '缺少提醒图片',
-          );
-          return;
-        }
-        /* 2026-10-29：图片名称是**必填**——没有名称，H5 图文页就没有标题可显示。
-           只在保存时用弹窗提醒（不写死在界面上的红字提示）。 */
-        if (item.format === 'file' && item.image_path && !item.file_caption?.trim()) {
-          toast.warning(
-            `第 ${i + 1} 条已上传图片，请填写「图片名称（描述）」`,
-            '缺少图片名称',
-          );
+      if (noticeKinds.includes('text') && !noticeText.trim()) {
+        toast.warning('请填写通知正文');
+        return;
+      }
+      for (const assetKind of noticeKinds.filter(key => key !== 'text')) {
+        if (!activeNoticeItems.some(item => item.format === assetKind && (item.asset_id || item.image_path))) {
+          toast.warning(`请至少上传一个${NOTICE_LABELS[assetKind]}附件`);
           return;
         }
       }
-      finalTextTpl = summarizeNoticeItemsToText(noticeItems);
+      if (receiptEnabled && !receiptPhrase.trim()) {
+        toast.warning('请填写要求回复的话术');
+        return;
+      }
+      finalTextTpl = noticeKinds.includes('text') ? noticeText.trim() : '';
       spec = {
         require_review: false,
-        notice_items: noticeItems.map((ni) => ({
-          ...ni,
-          text_content: ni.text_content?.trim(),
-          file_name: ni.file_name?.trim(),
-          file_caption: ni.file_caption?.trim(),
-        })),
+        notice_items: [
+          ...(finalTextTpl ? [{ id: 'notice_text', format: 'text', text_content: finalTextTpl }] : []),
+          ...activeNoticeItems,
+        ],
+        notice_receipt: { enabled: receiptEnabled, phrase: receiptPhrase.trim() },
       };
     } else {
       // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
@@ -932,12 +897,9 @@ export const TemplatesView: React.FC = () => {
       };
     }
 
-    /* 通知类：取第一条已上传的「数据图片提醒」图片，作为到点直接推送的附件 */
-    const noticeImagePath =
-      noticeItems.find((ni) => ni.format === 'file' && ni.image_path)?.image_path || '';
-    /* 2026-10-29 H5.5：图片名称（描述）——发送直链文案与 H5 页标题用 */
-    const noticeImageName =
-      noticeItems.find((ni) => ni.format === 'file' && ni.image_path)?.file_caption?.trim() || '';
+    const legacyImage = activeNoticeItems.find(item => item.format === 'image' && item.image_path);
+    const noticeImagePath = legacyImage?.image_path || '';
+    const noticeImageName = legacyImage?.file_caption?.trim() || '';
 
     setSaving(true);
     try {
@@ -1287,95 +1249,18 @@ export const TemplatesView: React.FC = () => {
                         {isNotice ? (
                           items.length > 0 ? (
                             <div className="space-y-2">
-                              {items.map((ni, idx) => (
-                                <div
-                                  key={ni.id || idx}
-                                  className="bg-slate-50/90 border border-slate-200/80 rounded-xl px-3.5 py-2.5 text-xs"
-                                >
-                                  <div className="flex items-start gap-2.5">
-                                    <span
-                                      className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border whitespace-nowrap shrink-0 mt-0.5 ${
-                                        ni.format === 'file'
-                                          ? 'bg-indigo-50 text-indigo-700 border-indigo-200'
-                                          : 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                                      }`}
-                                    >
-                                      {ni.format === 'file' ? '文件/图片' : '文本'}
-                                    </span>
-
-                                    <div className="min-w-0 flex-1">
-                                      {ni.format === 'text' ? (
-                                        <div
-                                          className={`text-slate-700 leading-relaxed ${
-                                            isExpanded ? 'whitespace-pre-line' : 'line-clamp-2'
-                                          }`}
-                                        >
-                                          {ni.text_content}
-                                        </div>
-                                      ) : ni.image_path ? (
-                                        <div className="space-y-2">
-                                          {/* 文件/附件标题胶囊 */}
-                                          <div className="flex flex-wrap items-center gap-2">
-                                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-slate-200 rounded-lg text-[11px] font-semibold text-slate-700 shadow-2xs">
-                                              <ImageIcon className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
-                                              <span className="truncate max-w-[280px]">
-                                                {ni.file_name || '0815_支局1+1155核心指标完成率与沉淀商机通报.png'}
-                                              </span>
-                                            </span>
-                                            <a
-                                              href={`/api/admin/template-assets/${encodeURIComponent(
-                                                String(ni.image_path).split('/').pop() || '',
-                                              )}`}
-                                              target="_blank"
-                                              rel="noopener noreferrer"
-                                              className="text-[11px] text-blue-600 hover:text-blue-700 inline-flex items-center gap-1 font-medium hover:underline"
-                                            >
-                                              <ExternalLink className="w-3 h-3" />
-                                              <span>查看原图</span>
-                                            </a>
-                                          </div>
-
-                                          {/* 预览缩略图与文字说明上下/图文分栏 */}
-                                          <div className="flex flex-col sm:flex-row items-start gap-3">
-                                            <a
-                                              href={`/api/admin/template-assets/${encodeURIComponent(
-                                                String(ni.image_path).split('/').pop() || '',
-                                              )}`}
-                                              target="_blank"
-                                              rel="noopener noreferrer"
-                                              className="relative group rounded-xl overflow-hidden border border-slate-200 hover:border-indigo-400 shrink-0 shadow-2xs transition-all block bg-slate-900"
-                                              title="点击查看高清图表"
-                                            >
-                                              <img
-                                                src={`/api/admin/template-assets/${encodeURIComponent(
-                                                  String(ni.image_path).split('/').pop() || '',
-                                                )}`}
-                                                alt={ni.file_name || '数据通报图'}
-                                                className="w-36 h-20 object-cover group-hover:scale-105 transition-transform"
-                                              />
-                                              <div className="absolute inset-0 bg-slate-900/30 group-hover:bg-transparent transition-colors flex items-center justify-center">
-                                                <span className="opacity-0 group-hover:opacity-100 bg-black/70 text-white text-[10px] px-2 py-0.5 rounded backdrop-blur-xs transition-opacity font-medium">
-                                                  放大
-                                                </span>
-                                              </div>
-                                            </a>
-
-                                            {ni.file_caption ? (
-                                              <div className="flex-1 min-w-0 bg-white border border-slate-200/80 rounded-xl p-2.5 text-xs text-slate-700 leading-relaxed whitespace-pre-line">
-                                                {ni.file_caption}
-                                              </div>
-                                            ) : null}
-                                          </div>
-                                        </div>
-                                      ) : (
-                                        <div className="text-[11px] text-rose-600 font-semibold">
-                                          未上传图片（编辑模板后可上传）
-                                        </div>
-                                      )}
-                                    </div>
-                                  </div>
+                              {items.map((item, index) => (
+                                <div key={item.id || index} className="flex gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
+                                  <span className="shrink-0 font-semibold text-slate-600">{NOTICE_LABELS[item.format]}</span>
+                                  {item.format === 'text' ? <span className={isExpanded ? 'whitespace-pre-line' : 'line-clamp-2'}>
+                                    {item.text_content}
+                                  </span> : <a href={noticeAssetUrl(item)} target="_blank" rel="noreferrer"
+                                    className="min-w-0 truncate text-blue-700 hover:underline">{item.file_name || item.file_caption}</a>}
                                 </div>
                               ))}
+                              {tpl.spec?.notice_receipt?.enabled && <p className="text-xs text-slate-500">
+                                回执话术 · {tpl.spec.notice_receipt.phrase}
+                              </p>}
 
                               <button
                                 type="button"
@@ -1497,9 +1382,7 @@ export const TemplatesView: React.FC = () => {
                           </span>
                         ) : (
                           <div className="inline-flex items-center justify-end gap-2">
-                            {/* 2026-11-16 任务数据统计面板：上传任务行内「统计」入口（分级管理员专属；
-                                通知类无「参与/完成」语义，不显示；点击跳统计页并自动选中该任务） */}
-                            {tpl.kind !== 'notice' && (
+                            {(tpl.kind !== 'notice' || tpl.spec?.notice_receipt?.enabled) && (
                               <button
                                 onClick={() => setStatsFocus(String(tpl.id))}
                                 title="查看该任务的数据统计（进度 / 部门对比 / 明细 / Excel 导出）"
@@ -1968,157 +1851,56 @@ export const TemplatesView: React.FC = () => {
 
                   {/* ==================== 分支 A：纯通知提醒配置 ==================== */}
                   {kind === 'notice' && (
-                    <div className="space-y-3 pt-1">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <label className="font-bold text-slate-800 flex items-center gap-1.5">
-                          <Layers className="w-4 h-4 text-blue-600" />
-                          <span>提醒内容</span>
-                          <span className="text-rose-500">*</span>
-                        </label>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => addNoticeItem('text')}
-                            className="px-2.5 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 font-semibold text-[11px] inline-flex items-center gap-1 cursor-pointer"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>新增文本提醒</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => addNoticeItem('file')}
-                            className="px-2.5 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-semibold text-[11px] inline-flex items-center gap-1 cursor-pointer"
-                          >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>新增图片提醒</span>
-                          </button>
+                    <div className="space-y-4 pt-1">
+                      <fieldset className="space-y-2">
+                        <legend className="font-bold text-slate-800">推送内容 <span className="text-rose-500">*</span></legend>
+                        <div className="flex flex-wrap gap-2">
+                          {NOTICE_KINDS.map(key => <label key={key}
+                            className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-3 py-2">
+                            <input type="checkbox" className="accent-blue-700" checked={noticeKinds.includes(key)}
+                              onChange={event => setNoticeKinds(current => event.target.checked
+                                ? [...current, key] : current.filter(value => value !== key))} />
+                            {NOTICE_LABELS[key]}
+                          </label>)}
                         </div>
-                      </div>
-
-                      <div className="space-y-3">
-                        {noticeItems.map((item, idx) => (
-                          <div
-                            key={item.id || idx}
-                            className="p-3.5 rounded-2xl bg-slate-50/90 border border-slate-200/90 space-y-3"
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200/70 pb-2.5">
-                              <div className="flex items-center gap-2">
-                                <span className="px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200 font-bold text-[11px]">
-                                  第 {idx + 1} 次提醒
-                                </span>
-                                <div className="inline-flex rounded-xl bg-white p-0.5 border border-slate-200">
-                                  <button
-                                    type="button"
-                                    onClick={() => updateNoticeItem(idx, { format: 'text' })}
-                                    className={`px-3 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-all ${
-                                      item.format === 'text'
-                                        ? 'bg-blue-600 text-white shadow-2xs'
-                                        : 'text-slate-600 hover:text-slate-900'
-                                    }`}
-                                  >
-                                    <FileText className="w-3 h-3" />
-                                    <span>文本</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => updateNoticeItem(idx, { format: 'file' })}
-                                    className={`px-3 py-1 rounded-lg text-[11px] font-semibold inline-flex items-center gap-1 cursor-pointer transition-all ${
-                                      item.format === 'file'
-                                        ? 'bg-indigo-600 text-white shadow-2xs'
-                                        : 'text-slate-600 hover:text-slate-900'
-                                    }`}
-                                  >
-                                    <ImageIcon className="w-3 h-3" />
-                                    <span>图片</span>
-                                  </button>
-                                </div>
-                              </div>
-
-                              {noticeItems.length > 1 && (
-                                <button
-                                  type="button"
-                                  onClick={() => removeNoticeItem(idx)}
-                                  className="px-2 py-1 rounded-lg text-rose-600 hover:bg-rose-50 font-medium text-[11px] inline-flex items-center gap-1 cursor-pointer"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                  <span>移除</span>
-                                </button>
-                              )}
-                            </div>
-
-                            {item.format === 'text' ? (
-                              <textarea
-                                rows={4}
-                                value={item.text_content || ''}
-                                onChange={(e) =>
-                                  updateNoticeItem(idx, { text_content: e.target.value })
-                                }
-                                placeholder="请输入提醒事项......"
-                                className="w-full bg-white border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:border-blue-500 leading-relaxed"
-                              />
-                            ) : (
-                              <div className="space-y-2.5">
-                                {/* 2026-10-28：数据图片提醒只需要一张图，到点直接推图，不再填名称/描述 */}
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <label
-                                    className={`px-3.5 py-2 rounded-xl font-semibold text-[11px] inline-flex items-center justify-center gap-1.5 shrink-0 ${
-                                      uploadingAssetId === item.id
-                                        ? 'bg-slate-300 text-white cursor-wait'
-                                        : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
-                                    }`}
-                                  >
-                                    <Upload className="w-3.5 h-3.5" />
-                                    <span>{uploadingAssetId === item.id ? '上传中…' : item.image_path ? '替换图片' : '选择图片（可多选）'}</span>
-                                    <input
-                                      type="file"
-                                      accept="image/png,image/jpeg,image/webp"
-                                      multiple
-                                      className="hidden"
-                                      disabled={uploadingAssetId !== null}
-                                      onChange={(e) => {
-                                        void handleNoticeImageUpload(item.id, Array.from(e.target.files || []));
-                                        e.currentTarget.value = '';
-                                      }}
-                                    />
-                                  </label>
-                                  {item.image_path ? (
-                                    <span className="inline-flex items-center gap-1 text-indigo-700 font-medium text-[11px]">
-                                      <Paperclip className="w-3.5 h-3.5 shrink-0" />
-                                      <span className="truncate max-w-[220px]">{item.file_name || item.image_path}</span>
-                                      <button
-                                        type="button"
-                                        onClick={() => updateNoticeItem(idx, { image_path: undefined, file_name: undefined, file_size: undefined })}
-                                        className="text-rose-600 hover:bg-rose-50 rounded px-1 cursor-pointer"
-                                      >
-                                        移除
-                                      </button>
-                                    </span>
-                                  ) : (
-                                    <span className="text-rose-600 text-[11px] font-semibold">未上传图片 —— 保存前必须先上传</span>
-                                  )}
-                                </div>
-                                <div className="text-[11px] text-slate-500 leading-relaxed">
-                                  {platform === 'zdxlz' ? '量子密信会逐张发送图片查看链接。' : '企业微信会逐张发送图片消息。'}
-                                </div>
-                                {item.image_path ? (
-                                  <div className="space-y-1.5">
-                                    <label className="block text-[11px] font-semibold text-slate-600">
-                                      图片名称（描述）
-                                      <span className="text-rose-600 ml-0.5">*</span>
-                                    </label>
-                                    <input
-                                      type="text"
-                                      value={item.file_caption || ''}
-                                      onChange={(e) => updateNoticeItem(idx, { file_caption: e.target.value })}
-                                      placeholder="如：上午上门情况统计图"
-                                      className="w-full bg-white border border-slate-200 rounded-xl px-2.5 py-2 text-slate-800 outline-none focus:border-blue-500 text-sm"
-                                    />
-                                  </div>
-                                ) : null}
-                              </div>
-                            )}
-                          </div>
-                        ))}
+                      </fieldset>
+                      {noticeKinds.includes('text') && <label className="block space-y-2 font-semibold">
+                        <span>通知正文</span>
+                        <textarea rows={4} value={noticeText} onChange={event => setNoticeText(event.target.value)}
+                          className="w-full rounded-xl border border-slate-200 bg-white p-3 font-normal outline-none focus:border-blue-500" />
+                      </label>}
+                      {(Object.keys(NOTICE_UPLOADS) as NoticeAttachmentKind[]).filter(key => noticeKinds.includes(key)).map(key =>
+                        <fieldset key={key} className="space-y-2 rounded-xl border border-slate-200 p-3">
+                          <legend className="px-1 font-semibold">{NOTICE_LABELS[key]}附件</legend>
+                          <input type="file" accept={NOTICE_UPLOADS[key].accept} multiple disabled={uploadingAssetId !== null}
+                            aria-label={`选择${NOTICE_LABELS[key]}（可多选）`}
+                            className="block w-full cursor-pointer rounded-md text-xs file:mr-3 file:cursor-pointer file:border-0 file:bg-blue-50 file:px-3 file:py-2 file:text-blue-700"
+                            onChange={event => {
+                              void handleNoticeUpload(key, Array.from(event.target.files || []));
+                              event.currentTarget.value = '';
+                            }} />
+                          <p className="text-xs text-slate-500">{uploadingAssetId === key ? '上传中…' : `可多选并追加，每个最多 ${NOTICE_UPLOADS[key].max} MB`}</p>
+                          {noticeItems.filter(item => item.format === key).map(item =>
+                            <div key={item.id} className="flex items-center gap-2 rounded-lg bg-slate-50 px-2 py-1 text-xs">
+                              <a href={noticeAssetUrl(item)} target="_blank" rel="noreferrer"
+                                className="min-w-0 flex-1 truncate text-blue-700 hover:underline" title={item.file_name}>{item.file_name}</a>
+                              <span className="shrink-0 tabular-nums text-slate-500">{noticeAssetSize(item.file_size)}</span>
+                              <button type="button" onClick={() => setNoticeItems(previous => previous.filter(value => value.id !== item.id))}
+                                aria-label={`移除 ${item.file_name || NOTICE_LABELS[key]}`}
+                                className="cursor-pointer px-2 py-1.5 text-rose-700 hover:bg-rose-50">移除</button>
+                            </div>)}
+                        </fieldset>)}
+                      <div className="space-y-3 rounded-xl border border-slate-200 p-3">
+                        <label className="flex cursor-pointer items-center gap-2 font-semibold">
+                          <input type="checkbox" className="accent-blue-700" checked={receiptEnabled}
+                            onChange={event => setReceiptEnabled(event.target.checked)} />
+                          需要成员回执确认
+                        </label>
+                        {receiptEnabled && <label className="block space-y-2">
+                          <span>要求回复的话术</span>
+                          <input type="text" maxLength={80} value={receiptPhrase} onChange={event => setReceiptPhrase(event.target.value)}
+                            className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
+                        </label>}
                       </div>
                     </div>
                   )}
@@ -2306,7 +2088,9 @@ export const TemplatesView: React.FC = () => {
                   </div>
                 )}
                 {kind === 'notice' && platform === 'zdxlz' && (
-                  <div className="lg:col-span-5"><NoticePhonePreview items={noticeItems} /></div>
+                  <div className="lg:col-span-5"><NoticePhonePreview body={noticeKinds.includes('text') ? noticeText : ''}
+                    media={noticeItems.filter(item => noticeKinds.includes(item.format))}
+                    phrase={receiptEnabled ? receiptPhrase.trim() : ''} /></div>
                 )}
               </div>
 

@@ -26,6 +26,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -298,6 +299,9 @@ class AibotBridge:
         return frame if isinstance(frame, dict) else {}
 
     async def _upload_image_async(self, data: bytes, filename: str) -> Tuple[Optional[str], str]:
+        return await self._upload_media_async(data, filename, "image")
+
+    async def _upload_media_async(self, data: bytes, filename: str, kind: str) -> Tuple[Optional[str], str]:
         total = len(data)
         chunks = max(1, math.ceil(total / self.UPLOAD_CHUNK_SIZE))
         if chunks > 100:
@@ -306,7 +310,7 @@ class AibotBridge:
         init = await self._cmd(
             "aibot_upload_media_init",
             {
-                "type": "image",
+                "type": kind,
                 "filename": filename,
                 "total_size": total,
                 "total_chunks": chunks,
@@ -412,6 +416,25 @@ class AibotBridge:
             logger.warning("上传图片失败 %s: %s", file_path, err)
         return media_id
 
+    def _send_media_frame(self, chatid: str, body: dict, timeout: float) -> Tuple[Optional[int], str]:
+        try:
+            frame = self._run_sync(self._client.send_message(chatid, body), timeout)
+        except Exception as exc:  # noqa: BLE001
+            # 官方 SDK 把通道返回的非零 errcode 变成 RuntimeError。
+            match = re.match(r"Reply ack error: errcode=(-?\d+), errmsg=(.*)", str(exc), re.DOTALL)
+            if match and int(match[1]):
+                return int(match[1]), match[2]
+            return None, str(exc)
+        headers = frame.get("headers") if isinstance(frame, dict) else None
+        try:
+            if isinstance(frame, dict) and (
+                frame.get("errcode") is not None or isinstance(headers, dict) and headers.get("errcode") is not None
+            ):
+                return self._frame_error(frame)
+        except (TypeError, ValueError):
+            pass
+        return None, "NO_ACK"
+
     def send_image(self, chatid: str, file_path: str, *, timeout: float = 60.0) -> SendResult:
         """发一条真正的图片消息：先三步上传拿 media_id，再 msgtype=image 发出去。
 
@@ -432,14 +455,9 @@ class AibotBridge:
                 # 上传失败按可重试处理：可能是长连接抖动或频率限制（30 次/分钟）
                 return SendResult(ok=False, result="failed", retryable=True, error="UPLOAD_FAILED")
             body["image"]["media_id"] = media_id
-            try:
-                frame = self._run_sync(self._client.send_message(target, body), timeout)
-            except (asyncio.TimeoutError, FutureTimeoutError):
-                return SendResult(ok=False, result="failed", retryable=True, error="SEND_TIMEOUT")
-            except Exception as exc:  # noqa: BLE001
-                return SendResult(ok=False, result="failed", retryable=True, error="EXCEPTION: %s" % exc)
-
-            errcode, errmsg = self._frame_error(frame if isinstance(frame, dict) else {})
+            errcode, errmsg = self._send_media_frame(target, body, timeout)
+            if errcode is None:
+                return SendResult(ok=False, result="pending", retryable=True, error=f"SEND_UNCONFIRMED:{errmsg}")
             if errcode == 0:
                 return SendResult(ok=True, result="sent", status_code=200)
             # 用的是缓存、且被判失效（media_id 过期/被清理）：丢掉缓存重传一次
@@ -449,6 +467,39 @@ class AibotBridge:
                 continue
             return SendResult(ok=False, result="failed", status_code=200,
                               retryable=False, error="%s: %s" % (errcode, errmsg))
+        return SendResult(ok=False, result="failed", retryable=False, error="SEND_FAILED")
+
+    def send_notice_attachment(self, chatid: str, file_path: str, asset: dict, *, timeout: float = 120.0) -> SendResult:
+        kind, filename = asset["kind"], asset["file_name"]
+        if not self._transport_ready():
+            return SendResult(ok=False, result="failed", retryable=True, error="NOT_CONNECTED")
+        if os.path.getsize(file_path) > 100 * self.UPLOAD_CHUNK_SIZE:
+            return SendResult(ok=False, result="failed", retryable=False, error="MEDIA_TOO_LARGE")
+        for attempt in range(2):
+            cached = self._cache_get(file_path)
+            media_id = cached
+            if not media_id:
+                try:
+                    with open(file_path, "rb") as source:
+                        data = source.read()
+                    media_id, error = self._run_sync(self._upload_media_async(data, filename, kind), timeout)
+                except Exception as exc:  # noqa: BLE001
+                    return SendResult(ok=False, result="failed", retryable=False, error=f"UPLOAD_FAILED:{exc}")
+                if not media_id:
+                    return SendResult(ok=False, result="failed", retryable=False, error=error)
+                self._cache_put(file_path, media_id)
+            content = {"media_id": media_id}
+            if kind == "video":
+                content["title"] = filename
+            code, message = self._send_media_frame(chatid, {"msgtype": kind, kind: content}, timeout)
+            if code is None:
+                return SendResult(ok=False, result="pending", retryable=True, error=f"SEND_UNCONFIRMED:{message}")
+            if not code:
+                return SendResult(ok=True, result="sent", status_code=200)
+            if attempt == 0 and cached:
+                self._cache_drop(file_path)
+                continue
+            return SendResult(ok=False, result="failed", retryable=False, error=f"{code}: {message}")
         return SendResult(ok=False, result="failed", retryable=False, error="SEND_FAILED")
 
 
@@ -498,3 +549,8 @@ class WecomAibotNotifier:
 
     def close(self) -> None:
         self.bridge.stop()
+
+    def send_notice_attachment(
+        self, receive_id: str, file_path: str, asset: dict, idem_key: str, receive_type: str = "user",
+    ) -> SendResult:
+        return self.bridge.send_notice_attachment(receive_id, file_path, asset)

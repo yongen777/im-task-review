@@ -49,7 +49,7 @@ SCHEMA_VERSION = 1
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
 BUSINESS_TABLES = (
     "scope", "role", "member", "delivery_target", "task_template",
-    "task_instance", "submission", "reminder_log", "upload_ref", "h5_token",
+    "task_instance", "submission", "reminder_log", "upload_ref", "h5_token", "notice_asset",
     "admin_user", "admin_session", "admin_audit",
 )
 VERSION_TABLE = "schema_version"
@@ -179,6 +179,11 @@ CREATE TABLE IF NOT EXISTS task_instance (
   reject_reason VARCHAR(512) DEFAULT NULL,
   reject_count  INT          NOT NULL DEFAULT 0,
   late_submit   TINYINT      NOT NULL DEFAULT 0,
+  receipt_phrase VARCHAR(80) DEFAULT NULL,
+  receipt_platform VARCHAR(16) DEFAULT NULL,
+  receipt_prompt_at VARCHAR(32) DEFAULT NULL,
+  receipt_at VARCHAR(32) DEFAULT NULL,
+  receipt_text TEXT,
   resubmit_req_at       VARCHAR(32) DEFAULT NULL,
   resubmit_status       VARCHAR(16) DEFAULT NULL,
   resubmit_decided_by   VARCHAR(64) DEFAULT NULL,
@@ -187,7 +192,20 @@ CREATE TABLE IF NOT EXISTS task_instance (
   PRIMARY KEY (id),
   UNIQUE KEY uk_inst_tpl_phone_period (template_id(64), phone, period_key),
   KEY ix_inst_status (status, deadline_at),
-  KEY ix_inst_period (period_key)
+  KEY ix_inst_period (period_key),
+  KEY ix_inst_receipt (phone, receipt_platform, receipt_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS notice_asset (
+  asset_id CHAR(32) NOT NULL PRIMARY KEY,
+  owner_id INT NOT NULL,
+  kind VARCHAR(12) NOT NULL,
+  storage_name VARCHAR(64) NOT NULL,
+  file_name VARCHAR(255) NOT NULL,
+  mime VARCHAR(128) NOT NULL,
+  size INT NOT NULL,
+  created_at VARCHAR(32) NOT NULL,
+  KEY ix_notice_asset_owner (owner_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS submission (
@@ -702,6 +720,15 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         proxy.execute("ALTER TABLE task_template ADD COLUMN is_manual TINYINT NOT NULL DEFAULT 0")
     if not proxy.execute("SHOW COLUMNS FROM task_template LIKE 'manual_deadline_at'").fetchone():
         proxy.execute("ALTER TABLE task_template ADD COLUMN manual_deadline_at VARCHAR(32) DEFAULT NULL")
+    for column, definition in (
+        ("receipt_phrase", "VARCHAR(80) DEFAULT NULL"), ("receipt_platform", "VARCHAR(16) DEFAULT NULL"),
+        ("receipt_prompt_at", "VARCHAR(32) DEFAULT NULL"), ("receipt_at", "VARCHAR(32) DEFAULT NULL"),
+        ("receipt_text", "TEXT"),
+    ):
+        if not proxy.execute("SHOW COLUMNS FROM task_instance LIKE ?", (column,)).fetchone():
+            proxy.execute(f"ALTER TABLE task_instance ADD COLUMN {column} {definition}")
+    if not proxy.execute("SHOW INDEX FROM task_instance WHERE Key_name='ix_inst_receipt'").fetchone():
+        proxy.execute("ALTER TABLE task_instance ADD INDEX ix_inst_receipt (phone, receipt_platform, receipt_at)")
 
     if not proxy.execute("SHOW INDEX FROM reminder_log WHERE Key_name='ix_rem_instance_sent'").fetchone():
         proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")
