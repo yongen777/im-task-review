@@ -97,6 +97,30 @@ interface ResultList {
   items: RowItem[];
 }
 
+/* 2026-11-19 需求一：推送批次（period_key 维度聚合） */
+interface BatchItem {
+  period_key: string;
+  instance_count: number;
+  alive_count: number;
+  first_created_at: string;
+}
+
+function shortStamp(value: string): string {
+  return value ? value.slice(5, 16) : '';
+}
+
+function batchOptionLabel(item: BatchItem): string {
+  if (item.period_key === 'once') {
+    return `首次推送（${shortStamp(item.first_created_at)} · ${item.alive_count} 人）`;
+  }
+  const stem = item.period_key.split('#')[1] ?? '';
+  if (/^\d{14}/.test(stem)) {
+    const stamp = `${stem.slice(4, 6)}-${stem.slice(6, 8)} ${stem.slice(8, 10)}:${stem.slice(10, 12)}`;
+    return `${stamp} 重推批次（${item.alive_count} 人）`;
+  }
+  return `主批次（${item.alive_count} 人）`;
+}
+
 function execCycleText(task: PanelTask): string {
   if (task.is_adhoc) return '不定期';
   const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
@@ -151,6 +175,10 @@ function makeTree(nodes: TreeNode[]): DeptTreeNode[] {
 function usePanelQuery<T>(url: string, revision: number) {
   const [result, setResult] = useState<{ url: string; revision: number; data?: T; error?: string } | null>(null);
   useEffect(() => {
+    if (!url) {
+      setResult(null);
+      return;
+    }
     let active = true;
     api.get<T>(url).then(
       (data) => { if (active) setResult({ url, revision, data }); },
@@ -258,7 +286,8 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const tabs = isReceipt ? receiptLabels : statusLabels;
   const toast = useToast();
   const [chosenPeriod, setChosenPeriod] = useState<string>();
-  const periodKey = chosenPeriod ?? task.current_period_key;
+  const [chosenBatch, setChosenBatch] = useState<string>();
+  const canonicalKey = chosenPeriod ?? task.current_period_key;
   const [deptPath, setDeptPath] = useState('');
   const [deptOpen, setDeptOpen] = useState(false);
   const [status, setStatus] = useState<StatusTab>('all');
@@ -283,8 +312,29 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   }, [query, searching]);
 
   const base = new URLSearchParams({ template_id: task.template_id, dept_path: deptPath });
+  /* 2026-11-19 需求一：先取批次清单，再决定本次统计看哪一批 */
+  const batchesQuery = usePanelQuery<{ items: BatchItem[] }>(
+    task.is_adhoc ? '' : '/api/admin/stats-panel/batches?template_id=' + encodeURIComponent(task.template_id),
+    revision,
+  );
+  const manualBatches = useMemo(() => (batchesQuery.data?.items ?? [])
+    .filter((item) => item.period_key === 'once' || item.period_key.startsWith('once#'))
+    .sort((a, b) => (a.first_created_at < b.first_created_at ? 1 : a.first_created_at > b.first_created_at ? -1 : 0)),
+  [batchesQuery.data]);
+  const periodicBatches = useMemo(() => (batchesQuery.data?.items ?? [])
+    .filter((item) => item.period_key === canonicalKey || item.period_key.startsWith(canonicalKey + '#')),
+  [batchesQuery.data, canonicalKey]);
+  const periodKey = task.is_manual
+    ? (chosenBatch ?? manualBatches[0]?.period_key ?? task.current_period_key)
+    : (chosenBatch ?? canonicalKey);
   const scope = new URLSearchParams(base);
   scope.set('period_key', periodKey);
+  /* 复制未交名单等文案里用可读批次名，别把 once#20261119… 这类内部键甩给用户 */
+  const periodTitle = useMemo(() => {
+    if (!periodKey.includes('#')) return periodKey;
+    const hit = (batchesQuery.data?.items ?? []).find((item) => item.period_key === periodKey);
+    return hit ? batchOptionLabel(hit) : periodKey;
+  }, [periodKey, batchesQuery.data]);
   const overview = usePanelQuery<Overview>('/api/admin/stats-panel/overview?' + scope, revision);
   const listParams = new URLSearchParams(task.is_adhoc ? base : scope);
   if (task.is_adhoc) listParams.set('date', periodKey);
@@ -335,7 +385,13 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   function selectPeriod(key: string) {
     if (!key) return;
     setChosenPeriod(key);
+    setChosenBatch(undefined); // 换周期 → 子批次选择重置
     selectDept(deptPath);
+  }
+
+  function selectBatch(key: string) {
+    setChosenBatch(key || undefined);
+    setFilter((current) => ({ ...current, page: 1 }));
   }
 
   function refresh() {
@@ -383,7 +439,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
         return;
       }
       const lines = rows.map((row) => [row.name, row.phone, row.dept_path].join('\t'));
-      if (await copyText(['【未交名单】' + task.name + ' · ' + periodKey, ...lines].join('\n'))) {
+      if (await copyText(['【未交名单】' + task.name + ' · ' + periodTitle, ...lines].join('\n'))) {
         toast.success('已复制 ' + lines.length + ' 名未交人员。');
       } else toast.error('复制失败，请重试。');
     } catch (err) {
@@ -421,13 +477,20 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
         </label>
         <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
           {task.is_manual ? '推送批次' : periodLabel[task.statistics_period]}
-          {task.is_manual ? <span className={fieldClass}>一次性推送</span> : task.statistics_period === 'week' ? (
-            <select className={fieldClass} value={periodKey} onChange={(e) => selectPeriod(e.target.value)}>
+          {task.is_manual ? (manualBatches.length > 1 ? (
+            /* 2026-11-19 需求一：同一模板当天多次推送 → 按批次查看 */
+            <select className={fieldClass} value={periodKey} onChange={(e) => selectBatch(e.target.value)}>
+              {manualBatches.map((item) => (
+                <option key={item.period_key} value={item.period_key}>{batchOptionLabel(item)}</option>
+              ))}
+            </select>
+          ) : <span className={fieldClass}>一次性推送</span>) : task.statistics_period === 'week' ? (
+            <select className={fieldClass} value={canonicalKey} onChange={(e) => selectPeriod(e.target.value)}>
               {weekOptions(task.current_period_key).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
             </select>
           ) : (
             <input className={fieldClass} type={task.statistics_period === 'month' ? 'month' : 'date'}
-              value={periodKey} onChange={(e) => selectPeriod(e.target.value)} />
+              value={canonicalKey} onChange={(e) => selectPeriod(e.target.value)} />
           )}
         </label>
         <div className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
@@ -446,6 +509,17 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           </div>
           {deptPath && <span className="truncate font-normal text-slate-500" title={deptPath}>{deptPath.split('/').join(' / ')}</span>}
         </div>
+        {!task.is_manual && !task.is_adhoc && periodicBatches.length > 1 && (
+          /* 2026-11-19 需求一：周期任务的重推子批次（默认选主批次 = 当日 canonical） */
+          <label className="grid min-w-0 max-w-xs gap-1.5 text-xs font-medium text-slate-600 md:col-span-3">
+            推送批次
+            <select className={fieldClass} value={periodKey} onChange={(e) => selectBatch(e.target.value)}>
+              {periodicBatches.map((item) => (
+                <option key={item.period_key} value={item.period_key}>{batchOptionLabel(item)}</option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
 
       {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}

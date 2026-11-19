@@ -457,21 +457,32 @@ def test_d_push_now_double_send_with_scheduled_and_same_second_dedupe() -> None:
 
 
 def test_d_push_now_cooldown_window_429() -> None:
-    """软护栏：同模板 2 分钟内重复推送 → 429 PUSH_COOLDOWN；满 2 分钟放行。"""
+    """软护栏：同模板 2 分钟内重复推送 → 先回 needs_confirm（预检不占 marker），
+    确认后撞 429 PUSH_COOLDOWN；满 2 分钟放行并新建批次（2026-11-19 需求一）。"""
     store, app, sa, sub, sched, ntf, tpl_id = _d_setup()
     try:
         CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 0)
         r1 = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
         assert r1.status_code == 200, r1.text
+        assert r1.json()["queued"] is True and r1.json()["new_batch"] is False
 
         CLOCK["now"] = datetime(2026, 11, 12, 10, 1, 59)  # 119s < 120s
         r2 = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
-        assert r2.status_code == 429 and r2.json()["code"] == "PUSH_COOLDOWN", (r2.status_code, r2.text)
+        assert r2.status_code == 200 and r2.json()["needs_confirm"] is True, (r2.status_code, r2.text)
+        assert r2.json()["target_count"] == 2 and r2.json()["canonical_period_key"] == "2026-11-12"
+        r2b = sub.post(f"/api/admin/templates/{tpl_id}/push-now?confirmed=1")
+        assert r2b.status_code == 429 and r2b.json()["code"] == "PUSH_COOLDOWN", (r2b.status_code, r2b.text)
 
         CLOCK["now"] = datetime(2026, 11, 12, 10, 2, 1)  # 121s ≥ 120s 放行
         r3 = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
-        assert r3.status_code == 200, r3.text
-        # 429 那次被护栏挡住：消息总数 = 首次 2 + 放行后 2
+        assert r3.status_code == 200 and r3.json()["needs_confirm"] is True, (r3.status_code, r3.text)
+        r3b = sub.post(f"/api/admin/templates/{tpl_id}/push-now?confirmed=1")
+        assert r3b.status_code == 200, r3b.text
+        body = r3b.json()
+        assert body["new_batch"] is True and body["instance_count"] == 2, body
+        assert body["period_key"] == "2026-11-12#20261112100201", body
+        assert body["cancelled"] == 2, body
+        # 429 那次被护栏挡住：消息总数 = 首批 2 + 新批次 2
         assert len(ntf.sent_messages) == 4, len(ntf.sent_messages)
     finally:
         store.close()

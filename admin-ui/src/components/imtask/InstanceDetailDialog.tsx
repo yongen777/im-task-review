@@ -335,9 +335,13 @@ export function useInstanceRoleLabel() {
 
   /* 2026-10-30 用户反馈：详情里角色一直显示成固定的「业务角色」。
      根因是详情接口没带 role_id（已补），同时这里的兜底也不该编一个假名字 ——
-     多角色逐个查名，查不到就显示「—」，让人一眼看出是角色被删了而不是"叫业务角色"。 */
+     多角色逐个查名，查不到就显示「—」，让人一眼看出是角色被删了而不是"叫业务角色"。
+     2026-11-19 需求二：实例上固化的 role_name_snapshot **优先**（历史实例不随模板
+     改绑角色漂移）；没有快照（老数据 / portal_task）才回退到按当前 role_ids 查名。 */
   return useCallback(
-    (inst: { role_id?: string; role_ids?: string[] }) => {
+    (inst: { role_id?: string; role_ids?: string[]; role_name_snapshot?: string | null }) => {
+      const snapshot = (inst.role_name_snapshot || '').trim();
+      if (snapshot) return snapshot;
       const ids = (
         Array.isArray(inst.role_ids) && inst.role_ids.length
           ? inst.role_ids

@@ -42,6 +42,10 @@ def read_target(state, raw):
     if (not instance or instance["receipt_mode"] != "link" or not instance["receipt_prompt_at"]
             or any(instance[key] != token[key] for key in ("phone", "template_id", "period_key"))):
         raise BizError(404, "NOTICE_UNAVAILABLE", "通知已关闭或尚未送达")
+    # 2026-11-19 需求三：重推新批次会把旧批次未回执的实例置 cancelled，
+    # 旧链接必须直接失效（否则用户还能打开并确认一批已经作废的通知）。
+    if str(instance.get("status") or "") == "cancelled":
+        raise BizError(404, "NOTICE_UNAVAILABLE", "通知已关闭或尚未送达")
     template = state.get_template(instance["template_id"])
     view = load_view(state, instance["id"]) if template and template["kind"] == "notice" else None
     if view is None:
@@ -54,12 +58,19 @@ def confirm(state, instance_id):
         state.conn.execute(
             "UPDATE task_instance SET receipt_at=?,receipt_text=receipt_phrase "
             "WHERE id=? AND receipt_mode='link' AND receipt_at IS NULL AND receipt_prompt_at IS NOT NULL "
+            "AND status IN ('pending','sent') "
             "AND template_id IN (SELECT template_id FROM task_template WHERE kind='notice' AND enabled=1 AND deleted=0)",
             (state.now_str(), instance_id),
         )
-        row = state.conn.execute("SELECT receipt_at FROM task_instance WHERE id=? FOR UPDATE",
+        # 2026-11-19 需求三：上面 WHERE 里加了 status 过滤 —— 已取消（cancelled）的实例
+        # 写不进回执，这里按「实例是否已作废」明确回 404（其余场景保持原有 403 文案）。
+        row = state.conn.execute("SELECT receipt_at, status FROM task_instance WHERE id=? FOR UPDATE",
                                  (instance_id,)).fetchone()
-        if not row or not row["receipt_at"]:
+        if not row:
+            raise BizError(403, "NOTICE_CLOSED", "通知已停用，暂时无法确认")
+        if str(row["status"] or "") == "cancelled" and not row["receipt_at"]:
+            raise BizError(404, "NOTICE_UNAVAILABLE", "通知已关闭或尚未送达")
+        if not row["receipt_at"]:
             raise BizError(403, "NOTICE_CLOSED", "通知已停用，暂时无法确认")
         return row["receipt_at"]
 

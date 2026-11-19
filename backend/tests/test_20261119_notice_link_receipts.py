@@ -57,7 +57,10 @@ def test_link_notice_media_auth_and_receipt_lifecycle(ctx, movie, manual):
             scheduler.push_now(template_id)
         else:
             scheduler.run_once(NOW + timedelta(seconds=tick * 30))
-    assert len(notifier.sent_messages) == 2
+    # 2026-11-19 需求四（link 模式完整投递）：每人 = 1 正文 + 3 媒体（FakeNotifier 无原生
+    # 附件能力 → 走 H5 链接兜底，每附件 1 条文本）+ 1 条确认链接 = 5 条，两人共 10 条；
+    # 重复 tick 命中幂等键，不会追加（所以 3 轮后仍是 10）。
+    assert len(notifier.sent_messages) == 10
     links = {message.receive_id: message for message in notifier.sent_messages}
     assert links["second-union"].receive_type == "union_id"
     tokens = {receiver: message.text.splitlines()[-1].partition("#t=")[2] for receiver, message in links.items()}

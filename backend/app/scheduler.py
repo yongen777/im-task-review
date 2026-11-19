@@ -123,6 +123,15 @@ def period_key(period_or_dt: Union[str, DateLike], dt_or_period: Optional[Union[
 calc_period_key = period_key
 
 
+def batch_period_key(canonical: str, dt: datetime) -> str:
+    """2026-11-19 需求一：重推批次键 = `{canonical}#{YYYYMMDDHHMMSS}`。
+
+    长度上限 29（日键 10 + '#' + 14 = 25）< VARCHAR(64)；`#` 不参与 LIKE 通配，
+    因此批次统计与主批次天然互不串味（日期分支已在 admin._instance_filter_sql 显式处理）。
+    """
+    return f"{str(canonical).strip()}#{dt.strftime('%Y%m%d%H%M%S')}"
+
+
 def effective_month_dom(year: int, month: int, anchor_dom: int) -> int:
     """R48：计算月度任务在指定年月的实际触发日（1~31，当月无此日取月末）。"""
     if not (1 <= int(anchor_dom) <= 31):
@@ -1018,13 +1027,19 @@ class Scheduler:
         return self.push_now_deliver(template_id, prep, actor=actor)
 
     def push_now_prepare(self, template_id: str, actor: str = "system",  # noqa: ARG002
-                         now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+                         now_dt: Optional[datetime] = None,
+                         reprocess: bool = False) -> Dict[str, Any]:
         """2026-11-13 修复一：一键推送·准备段（校验 + 当期实例生成，**不发送任何消息**）。
 
         返回 {template_id, pushed_at, period_key, deadline_at, instance_count}：
           · pushed_at = 时间基线，也是幂等键种子——deliver 必须用它保持时间一致；
           · 幂等键语义不变：同一个 prep 重放只会命中既有幂等记录，绝不二次发送。
         本段只做毫秒~秒级 DB 操作，供 API 请求内安全执行（asyncio.to_thread）。
+
+        2026-11-19 需求一（同日多次推送）：reprocess=True 时 p_key 改写成批次键
+        `{canonical}#YYYYMMDDHHMMSS`（同秒碰撞追加 -2/-3），建完新实例后把旧批次
+        未完成实例置 cancelled。**默认 reprocess=False 的行为与历史逐字节一致**
+        （调度级 push_now / run_once 定时链一行不动）。
         """
         cur_dt = now_dt or self.now()
         if cur_dt.tzinfo is None:
@@ -1041,6 +1056,8 @@ class Scheduler:
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
         p_key = "once" if manual else period_key(tpl["period"], cur_dt)
+        if reprocess:
+            p_key = self._next_batch_period_key(template_id, p_key, cur_dt)
         deadline_at = calc_instance_deadline(tpl, cur_dt)
         if tpl["kind"] == "notice":
             deadline_at = format_dt(cur_dt + timedelta(hours=24))
@@ -1050,10 +1067,24 @@ class Scheduler:
         instances = self.state.ensure_template_instances(
             tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
         )
+        cancelled = 0
+        if reprocess:
+            # 2026-11-19 需求三：新批次建好后取消旧批次的未完成实例（防 H5 待办刷屏）
+            cancelled = self.state.cancel_stale_instances_for_new_batch(tpl["template_id"], p_key)
         return {
             "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
             "deadline_at": deadline_at, "instance_count": len(instances),
+            "new_batch": bool(reprocess), "cancelled": cancelled,
         }
+
+    def _next_batch_period_key(self, template_id: str, canonical: str, cur_dt: datetime) -> str:
+        """批次键同秒碰撞兜底：`…#HHMMSS` 已存在实例则追加 -2 / -3（while 该键已有实例）。"""
+        base = batch_period_key(canonical, cur_dt)
+        candidate, seq = base, 1
+        while self.state.list_instances_for_period(template_id, candidate):
+            seq += 1
+            candidate = f"{base}-{seq}"
+        return candidate
 
     def push_now_deliver(self, template_id: str, prep: Dict[str, Any],
                          actor: str = "system") -> Dict[str, int]:  # noqa: ARG002
@@ -1074,12 +1105,13 @@ class Scheduler:
         manual = tpl.get("is_manual", False)
         if tpl["kind"] == "notice" and not manual:
             raise BizError(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
-        if (manual and p_key != "once") or tpl.get("is_adhoc"):
+        # 2026-11-19 需求一：手动模板的 period_key 除 'once' 外还允许重推批次键 once#…
+        if (manual and p_key != "once" and not p_key.startswith("once#")) or tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "任务的推送配置已变更")
         instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
 
         if tpl["kind"] == "notice":
-            return self._push_manual_notice(tpl, instances, cur_dt)
+            return self._push_manual_notice(tpl, instances, cur_dt, p_key)
 
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         push_seq: Dict[str, int] = {}
@@ -1425,6 +1457,14 @@ class Scheduler:
         return message
 
     def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *, once=False):
+        """通知投递主链：正文 → 媒体 → 收尾（文本回执短语 / H5 确认链接）。
+
+        2026-11-19 需求四（link 模式完整投递）：**所有接收人（含 receipt_mode='link'）
+        都先收正文与全部附件**，最后才按模式分流收尾：
+          · text 模式 → 追加「回复短语即可确认」提示（原逻辑）；
+          · link 模式 → 追加 1 条 H5 确认链接（正文摘要 + 完整通知入口）。
+        与后台预览（NoticePhonePreview）的渲染顺序一一对应，做到所见即所得。
+        """
         platform = self._template_platform(tpl)
         targets = {
             (int(inst["id"]), channel): (inst, external_id, external_type, notifier)
@@ -1432,16 +1472,12 @@ class Scheduler:
             for channel, external_id, external_type, notifier in self._targets_for(inst["phone"], only_platform=platform)
             if external_id
         }
-        link_targets = {key: targets.pop(key) for key in list(targets) if targets[key][0].get("receipt_mode") == "link"}
         delivered = set()
-        if link_targets:
-            delivered.update(self._deliver_notice_text_part(
-                tpl, link_targets, period, seq, planned_str, now, stats, values=values, once=once, receipt=True,
-                link_message=self._notice_link_message(tpl, period, seq, planned_str, now, values),
-            ))
+        # ① 正文：发给全部 targets（正文为空时 _deliver_notice_text_part 内自然跳过）
         delivered.update(self._deliver_notice_text_part(
             tpl, targets, period, seq, planned_str, now, stats, values=values, once=once,
         ))
+        # ② 媒体：图片 → 文件 → 视频（原生优先 + H5 链接兜底，顺序不动）
         now_s = format_dt(now)
         if targets:
             for part in self._notice_media_parts(tpl, period, seq, now_s, values):
@@ -1450,20 +1486,33 @@ class Scheduler:
                 ))
                 if not targets:
                     break
-        delivered.update(self._deliver_notice_text_part(
-            tpl, targets, period, seq, planned_str, now, stats, values=values, once=once, receipt=True,
-        ))
+        # ③ 收尾分流（互斥）：link 模式单独一条 H5 确认链接，text 模式回执短语提示
+        if targets:
+            link_targets = {key: val for key, val in targets.items()
+                            if val[0].get("receipt_mode") == "link"}
+            text_targets = {key: val for key, val in targets.items() if key not in link_targets}
+            if link_targets:
+                delivered.update(self._deliver_notice_text_part(
+                    tpl, link_targets, period, seq, planned_str, now, stats, values=values,
+                    once=once, receipt=True,
+                    link_message=self._notice_link_message(tpl, period, seq, planned_str, now, values),
+                ))
+            if text_targets:
+                delivered.update(self._deliver_notice_text_part(
+                    tpl, text_targets, period, seq, planned_str, now, stats, values=values,
+                    once=once, receipt=True,
+                ))
         for instance_id in delivered:
             self.state.update_instance_status(instance_id, "sent")
         return len(delivered)
 
-    def _push_manual_notice(self, tpl, instances, now):
+    def _push_manual_notice(self, tpl, instances, now, period: str = "once"):
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         instances = [inst for inst in instances if inst["status"] in ("pending", "sent")
                      and self.state.instance_close_reason(inst, tpl) is None]
         values = self.state.get_data_snapshot_values(tpl["template_id"], period_key(tpl["period"], now)) if tpl.get("data_keys") else {}
         stats["pushed_instances"] = self._deliver_notice(
-            tpl, instances, "once", 1, format_dt(now), now, values, stats, once=True,
+            tpl, instances, period, 1, format_dt(now), now, values, stats, once=True,
         )
         return stats
 

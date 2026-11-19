@@ -29,7 +29,12 @@ def test_create_and_push_reuses_manual_delivery_and_deduplicates_request(ctx, ki
         scheduler.run_once(store.now() + timedelta(seconds=seconds))
     assert len([message for message in notifier.sent_messages if "只发送这条创建提醒" in message.text]) == 1
     assert [inst["phone"] for inst in store.list_instances_for_period(tid, "once")] == [member["phone"]]
-    assert owner.post(f"/api/admin/templates/{tid}/push-now", json={}).status_code == 429
+    # 2026-11-19 需求一：已推送过 → 先回 needs_confirm（预检不占冷却 marker）；
+    # 真的确认重推时才撞上「创建即推送」留下的 2 分钟冷却。
+    confirm = owner.post(f"/api/admin/templates/{tid}/push-now", json={})
+    assert confirm.status_code == 200 and confirm.json()["needs_confirm"] is True, confirm.text
+    blocked = owner.post(f"/api/admin/templates/{tid}/push-now?confirmed=1", json={})
+    assert blocked.status_code == 429 and blocked.json()["code"] == "PUSH_COOLDOWN", blocked.text
     assert owner.delete(f"/api/admin/templates/{tid}").status_code == 200
     assert owner.post("/api/admin/templates", json=payload).status_code == 409
     assert store.get_template(tid) is None

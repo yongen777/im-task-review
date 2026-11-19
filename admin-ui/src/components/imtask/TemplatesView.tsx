@@ -128,15 +128,16 @@ function NoticePhonePreview({ body, media, label, mode }: {
   body: string; media: NoticeMessageItem[]; label: string; mode: NoticeReceiptMode;
 }) {
   const linkMode = label && mode === 'link';
-  const summary = body.trim().replace(/\s+/g, ' ');
-  const message = linkMode ? summary.slice(0, 100) + (summary.length > 100 ? '…' : '') : body.trim();
+  /* 2026-11-19 需求四（所见即所得）：link 模式同样先发正文与全部附件，
+     最后才追加一条确认链接。预览不再截断正文、不再隐藏媒体气泡。 */
+  const message = body.trim();
   return <aside aria-label="量子密信通知预览" className="rounded-2xl border border-slate-200 bg-slate-50 overflow-hidden">
     <h4 className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 text-sm font-semibold">
       <Smartphone className="size-4 text-blue-700" />量子密信通知预览
     </h4>
     <div className="space-y-3 p-4">
       {message && <p className="rounded-xl border border-slate-200 bg-white p-3 whitespace-pre-wrap break-words">{message}</p>}
-      {!linkMode && media.filter(item => item.format !== 'text').map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+      {media.filter(item => item.format !== 'text').map(item => <div key={item.id} className="rounded-xl border border-slate-200 bg-white p-3 break-words">
         {item.format === 'image' && <img src={noticeAssetUrl(item)} alt={item.file_name || '通知图片'}
           className="max-h-44 w-full rounded-md object-contain" />}
         {item.format === 'video' && <video controls playsInline preload="metadata" src={noticeAssetUrl(item)}
@@ -507,6 +508,8 @@ export const TemplatesView: React.FC = () => {
   const [deleteConfirmTpl, setDeleteConfirmTpl] = useState<TemplateItem | null>(null);
   const [pushingId, setPushingId] = useState<number | null>(null);
   const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
+  /* 2026-11-19 需求一：本周期已推送过时的二次确认（新建批次并重推） */
+  const [repushConfirm, setRepushConfirm] = useState<{ tpl: TemplateItem; targetCount: number } | null>(null);
 
   // 弹窗表单状态（任务类型简化为两大类：'notice' 纯通知提醒 | 'upload' 上传任务）
   const [name, setName] = useState('');
@@ -1038,11 +1041,22 @@ export const TemplatesView: React.FC = () => {
     try {
       const res = await api.post<{
         queued?: boolean;
+        needs_confirm?: boolean;
+        target_count?: number;
+        new_batch?: boolean;
+        cancelled?: number;
         instance_count?: number;
         pushed_at?: string;
         deadline_at?: string;
         stats?: { sent?: number; pushed_instances?: number };
       }>(`/api/admin/templates/${target.id}/push-now`);
+      if (res?.needs_confirm) {
+        /* 2026-11-19 需求一：本周期已推送过 → 关掉首次确认框，改问「是否新建一批」。
+           预检不写冷却 marker，用户取消也不影响后续操作。 */
+        setPushConfirmTpl(null);
+        setRepushConfirm({ tpl: target, targetCount: res.target_count ?? 0 });
+        return;
+      }
       if (res?.queued) {
         toast.success(
           `当期已生成 ${res.instance_count ?? 0} 条任务实例，提醒消息已在后台逐条投递` +
@@ -1060,6 +1074,41 @@ export const TemplatesView: React.FC = () => {
     } catch (err) {
       // 429 冷却（2 分钟内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
       toast.error(err instanceof Error ? plainError(err.message) : '推送未成功');
+    } finally {
+      setPushingId(null);
+    }
+  };
+
+  /* 2026-11-19 需求一：第二次确认 —— 新建批次并向当前角色重推一遍 */
+  const handleConfirmRepush = async () => {
+    if (!repushConfirm) return;
+    const target = repushConfirm.tpl;
+    setPushingId(target.id);
+    try {
+      const res = await api.post<{
+        queued?: boolean;
+        new_batch?: boolean;
+        cancelled?: number;
+        instance_count?: number;
+        period_key?: string;
+        stats?: { sent?: number; pushed_instances?: number };
+      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1`);
+      if (res?.queued) {
+        toast.success(
+          `已新建一批实例（${res.instance_count ?? 0} 条），取消旧的未完成实例 ${res.cancelled ?? 0} 条；` +
+            `消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。`,
+          '重推已启动',
+        );
+      } else {
+        const stats = res?.stats || {};
+        toast.success(
+          `已重推 ${stats.pushed_instances ?? 0} 名成员（发送成功 ${stats.sent ?? 0} 条）。`,
+          '重推完成',
+        );
+      }
+      setRepushConfirm(null);
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '重推未成功');
     } finally {
       setPushingId(null);
     }
@@ -2233,6 +2282,43 @@ export const TemplatesView: React.FC = () => {
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
               >
                 {pushingId === pushConfirmTpl.id ? '推送中…' : '确认推送'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 2026-11-19 需求一：本周期已推送过 → 二次确认是否新建一批再推一次 */}
+      {repushConfirm && (
+        <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <h3 className="font-bold text-slate-900 text-base">本周期已推送过，仍需再推一次？</h3>
+              <button
+                onClick={() => setRepushConfirm(null)}
+                className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              该任务本周期已推送过，确认向当前角色（{repushConfirm.targetCount} 人）新建一批实例并再次推送吗？
+              <br />
+              （旧的未完成/未回执实例将自动取消，已完成/已回执的不受影响）
+            </p>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => setRepushConfirm(null)}
+                className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-xs cursor-pointer"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleConfirmRepush}
+                disabled={pushingId === repushConfirm.tpl.id}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
+              >
+                {pushingId === repushConfirm.tpl.id ? '重推中…' : '新建批次并重推'}
               </button>
             </div>
           </div>

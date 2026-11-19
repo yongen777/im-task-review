@@ -218,6 +218,8 @@ export interface TaskInstanceItem {
   published_at?: string | null;
   role_id: string;
   role_ids?: string[];
+  /* 2026-11-19 需求二：实例创建时刻的角色名快照（模板改绑角色后历史实例不漂移） */
+  role_name_snapshot?: string | null;
   phone: string;
   member_name_snap: string;
   dept_snap?: string;

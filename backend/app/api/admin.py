@@ -424,11 +424,15 @@ def _instance_filter_sql(
     if period_key and period_key.strip():
         key = period_key.strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
-            where.append("(i.period_key=? OR (t.is_manual=1 AND i.period_key='once' AND LEFT(i.created_at,10)=?) "
+            # 2026-11-19 需求一：日期视图同时覆盖「当日重推批次」（period_key 形如 2026-11-19#…）
+            # 与手动模板的 once#… 批次；否则按日期筛实例会漏掉重推出的那一批。
+            where.append("(i.period_key=? OR i.period_key LIKE ? "
+                         "OR (t.is_manual=1 AND (i.period_key='once' OR i.period_key LIKE 'once#%') "
+                         "AND LEFT(i.created_at,10)=?) "
                          "OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
                          "OR (i.submitted_at IS NULL AND EXISTS (SELECT 1 FROM submission s "
                          "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
-            params.extend((key, key, key, key))
+            params.extend((key, key + "#%", key, key, key))
         else:
             where.append("i.period_key=?")
             params.append(key)
@@ -1368,7 +1372,8 @@ def create_admin_router(
     # 权限：仅分级管理员；超管 SUPER_ADMIN_READONLY 不放行（路径不在写白名单，middleware 先拦，
     # 这里再拦一层防御）；模板归属由 middleware 的 /templates/{id} 路径归属校验兜住。
     @router.post("/templates/{template_id}/push-now")
-    async def push_template_now(template_id: str, request: Request, background_tasks: BackgroundTasks):
+    async def push_template_now(template_id: str, request: Request, background_tasks: BackgroundTasks,
+                               confirmed: bool = False):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1380,9 +1385,11 @@ def create_admin_router(
                 403, "SUPER_ADMIN_READONLY",
                 "请由创建该模板的分级管理员推送",
             )
-        return await _queue_template_push(template_id, request, background_tasks, sess["username"])
+        return await _queue_template_push(template_id, request, background_tasks, sess["username"],
+                                         confirmed=confirmed)
 
-    async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks, actor: str):
+    async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks,
+                                  actor: str, confirmed: bool = False):
         # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
         _tpl = state.get_template(template_id, include_deleted=False)
         if not _tpl or _tpl.get("deleted"):
@@ -1393,6 +1400,24 @@ def create_admin_router(
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         if _tpl.get("is_adhoc"):
             return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
+
+        # 2026-11-19 需求一：本周期/历史上已推送过 → 先回一次「要不要新建批次」。
+        # ⚠ 预检只读：不写冷却 marker、不建实例、不发消息；前端确认后带 ?confirmed=1 再来。
+        # portal_task（授权成员发布任务）没有批次语义，保持旧行为。
+        reprocess = False
+        if not _tpl.get("portal_task"):
+            canonical = "once" if _tpl.get("is_manual") else period_key(_tpl["period"], state.now())
+            try:
+                info = state.manual_push_repush_info(template_id, canonical)
+            except BizError as exc:
+                return biz_error_response(exc)
+            if info["pushed_before"] and not confirmed:
+                return {
+                    "ok": True, "needs_confirm": True,
+                    "target_count": info["target_count"],
+                    "canonical_period_key": info["canonical_key"],
+                }
+            reprocess = bool(info["pushed_before"] and confirmed)
 
         # 软护栏：同模板 2 分钟内拒绝重复推送（防手抖）；通过即记 marker 占位
         try:
@@ -1416,7 +1441,7 @@ def create_admin_router(
         # 投递期间 H5 提交、后台查询、调度器 tick 全部不受影响。
         try:
             prep = await asyncio.to_thread(
-                scheduler.push_now_prepare, template_id, actor=actor)
+                scheduler.push_now_prepare, template_id, actor=actor, reprocess=reprocess)
         except BizError as exc:
             return biz_error_response(exc)
         except Exception:  # noqa: BLE001
@@ -1442,7 +1467,10 @@ def create_admin_router(
                 return
             state.write_audit(
                 username=actor, action="template.push_now", target_type="task_template",
-                target_id=template_id, detail={"pushed_at": guard["attempted_at"], "stats": stats},
+                target_id=template_id,
+                detail={"pushed_at": guard["attempted_at"], "stats": stats,
+                        "new_batch": prep.get("new_batch", False),
+                        "cancelled": prep.get("cancelled", 0)},
             )
 
         background_tasks.add_task(_bg_deliver)
@@ -1451,12 +1479,16 @@ def create_admin_router(
             username=actor, action="template.push_now", target_type="task_template",
             target_id=template_id,
             detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
-                    "period_key": prep["period_key"], "instance_count": prep["instance_count"]},
+                    "period_key": prep["period_key"], "instance_count": prep["instance_count"],
+                    "new_batch": prep.get("new_batch", False),
+                    "cancelled": prep.get("cancelled", 0)},
         )
         return {
             "ok": True, "queued": True, "pushed_at": guard["attempted_at"],
             "period_key": prep["period_key"], "deadline_at": prep["deadline_at"],
             "instance_count": prep["instance_count"],
+            "new_batch": bool(prep.get("new_batch", False)),
+            "cancelled": int(prep.get("cancelled", 0) or 0),
         }
 
     # ==================================================================
@@ -2981,6 +3013,24 @@ def create_admin_router(
                 "Cache-Control": "no-store",
             },
         )
+
+    @router.get("/stats-panel/batches")
+    async def stats_panel_batches(request: Request, template_id: str):
+        """2026-11-19 需求一：该模板的全部推送批次（period_key 维度聚合）。
+
+        属主校验复用 stats_panel_guard_template（上传任务与回执通知放行，
+        非回执通知本就 404 —— 与面板其它端点同口径）。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        try:
+            admin = _require_stats_panel_admin(sess)
+            state.stats_panel_guard_template(template_id, int(admin.get("id") or 0))
+            return {"ok": True, "items": state.list_push_batches(template_id)}
+        except BizError as exc:
+            return biz_error_response(exc)
 
 
     # ==================================================================

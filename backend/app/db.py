@@ -43,7 +43,9 @@ _READ_ONLY_RE = re.compile(r"^\s*(SELECT|SHOW|DESCRIBE|DESC|EXPLAIN|WITH)\b", re
 def _is_read_only(sql: str) -> bool:
     return bool(_READ_ONLY_RE.match(sql or ""))
 
-SCHEMA_VERSION = 1
+# 2（2026-11-19）：task_instance 增加 role_name_snapshot（历史实例的角色名快照，
+# 模板改绑角色后不再随当前 role_ids 漂移）。
+SCHEMA_VERSION = 2
 
 # §16 P6 台账约定：10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit)
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
@@ -169,6 +171,7 @@ CREATE TABLE IF NOT EXISTS task_instance (
   name_snap     VARCHAR(128) NOT NULL,
   dept_snap     VARCHAR(200),
   period_key    VARCHAR(64)  NOT NULL,
+  role_name_snapshot VARCHAR(200) DEFAULT NULL,
   status        VARCHAR(16)  NOT NULL,
   deadline_at   VARCHAR(32)  NOT NULL,
   owner_id      INT          NOT NULL DEFAULT 1,
@@ -731,6 +734,7 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         ("receipt_phrase", "VARCHAR(80) DEFAULT NULL"), ("receipt_platform", "VARCHAR(16) DEFAULT NULL"),
         ("receipt_prompt_at", "VARCHAR(32) DEFAULT NULL"), ("receipt_at", "VARCHAR(32) DEFAULT NULL"),
         ("receipt_text", "TEXT"), ("receipt_mode", "VARCHAR(8) DEFAULT NULL"),
+        ("role_name_snapshot", "VARCHAR(200) DEFAULT NULL"),
     ):
         if not proxy.execute("SHOW COLUMNS FROM task_instance LIKE ?", (column,)).fetchone():
             proxy.execute(f"ALTER TABLE task_instance ADD COLUMN {column} {definition}")

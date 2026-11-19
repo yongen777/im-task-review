@@ -4737,9 +4737,20 @@ class StateStore:
             owner_table, owner_key = ("portal_task", "task_id") if str(template_id).startswith("pt_") else ("task_template", "template_id")
             tpl_owner = self.conn.execute(f"SELECT owner_id FROM {owner_table} WHERE {owner_key} = ?", (template_id,)).fetchone()
             owner_val = int(tpl_owner["owner_id"]) if tpl_owner else 1
+            # 2026-11-19 需求二：只建一条实例（补建/单点）时同样固化角色名快照；
+            # portal_task（授权成员发布任务）没有角色概念 → 保持 NULL。
+            role_names = None
+            if owner_table == "task_template":
+                raw = self.conn.execute(
+                    "SELECT role_ids FROM task_template WHERE template_id = ?", (template_id,)).fetchone()
+                if raw is not None:
+                    try:
+                        role_names = self._role_names_snapshot(json.loads(str(dict(raw).get("role_ids") or "[]")) or [])
+                    except (TypeError, ValueError):
+                        role_names = None
             cur = self.conn.execute(
-                "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
-                (template_id, phone, name_snap, dept_snap, period_key, deadline_at, now_s, owner_val),
+                "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, role_name_snapshot, status, deadline_at, created_at, owner_id) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (template_id, phone, name_snap, dept_snap, period_key, role_names, deadline_at, now_s, owner_val),
             )
             created = cur.rowcount > 0
             # INSERT IGNORE 可能等待另一事务提交；当前读避免 RR 快照看不到刚提交的唯一键行。
@@ -4789,6 +4800,39 @@ class StateStore:
             return True
         return bool(plats & self._owner_allowed_platforms(int(tpl.get("owner_id") or 1)))
 
+    def template_deliverable_members(self, tpl: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """模板可投递成员（按模板角色平台逐平台取已激活成员，跨平台按手机号去重）。
+
+        2026-11-19：从 ensure_template_instances 抽出，供「重推预检」计算当前角色人数
+        （needs_confirm 响应里的 target_count）复用同一口径，避免两处取数漂移。
+        """
+        roles = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
+        if not roles:
+            return []
+        tpl_plats = sorted(self.role_platforms(roles)) or [None]
+        members: List[Dict[str, Any]] = []
+        for _p in tpl_plats:
+            for _m in self.get_dedup_enabled_members_for_roles(roles, only_activated=True, platform=_p):
+                if not any(x["phone"] == _m["phone"] for x in members):
+                    members.append(_m)
+        return members
+
+    def _role_names_snapshot(self, role_ids: Optional[List[str]]) -> Optional[str]:
+        """角色名快照：按 role_ids 顺序取 role.name 拼成「甲、乙」，空则 None。
+
+        2026-11-19 需求二：实例固化创建时刻的角色名，模板后续改绑角色时历史实例
+        不再跟着漂移（列表/详情/导出都按快照渲染）。
+        """
+        roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
+        if not roles:
+            return None
+        ph = ",".join("?" for _ in roles)
+        rows = self.conn.execute(
+            f"SELECT role_id, name FROM role WHERE role_id IN ({ph})", tuple(roles)).fetchall()
+        names = {str(r["role_id"]): str(r["name"] or "").strip() for r in rows}
+        joined = "、".join(names[r] for r in roles if names.get(r))
+        return joined[:200] or None
+
     def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str,
                                   now_str: Optional[str] = None,
                                   trigger_at: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -4807,7 +4851,9 @@ class StateStore:
         """
         tpl = self.get_template(template_id, include_deleted=False)
         # 2026-10-28 方案A：notice 也建实例（pending → sent），不再在这里拦掉
-        if not tpl or not tpl["enabled"] or not tpl["role_ids"] or (tpl.get("is_manual") and period_key != "once"):
+        # 2026-11-19：手动模板的「重推批次键」形如 once#20261119160230，同样按手动口径放行。
+        manual_period_ok = period_key == "once" or str(period_key).startswith("once#")
+        if not tpl or not tpl["enabled"] or not tpl["role_ids"] or (tpl.get("is_manual") and not manual_period_ok):
             return []
         # 2026-11-06 纵深防御（workbuddy）：模板所属管理员被停用 → 也不生成实例。
         # 此前只在 list_active_templates 拦（真实调度链只经那里，业务上不漏发），
@@ -4822,19 +4868,16 @@ class StateStore:
         # 否则在密信通道下给企微模板建实例时，企微绑定的人会被判成未激活。
         # 2026-11-09：激活判定用**模板所属角色平台**，不是当前通道。
         # 跨平台模板 → 各平台分别取已激活成员，按手机号去重（任一平台已激活即可）。
+        # 2026-11-19：取数抽到 template_deliverable_members（与重推预检同一口径）。
         tpl_plats = sorted(self.role_platforms(tpl.get("role_ids") or [])) or [None]
-        members: List[Dict[str, Any]] = []
-        for _p in tpl_plats:
-            for _m in self.get_dedup_enabled_members_for_roles(
-                    tpl["role_ids"], only_activated=True, platform=_p):
-                if not any(x["phone"] == _m["phone"] for x in members):
-                    members.append(_m)
+        members = self.template_deliverable_members(tpl)
         now_s = now_str or self.now_str()
         trigger = trigger_at or now_s
         from .notice_media import notice_receipt_config
 
         receipt_mode, phrase = notice_receipt_config(tpl)
         receipt_platform = tpl_plats[0] if phrase and len(tpl_plats) == 1 else None
+        role_names = self._role_names_snapshot(tpl.get("role_ids"))
         with self.lock, self.conn:
             # 2026-11-09：只有「本周期就是今天」时才按激活时刻切分。
             # period_key 是历史日期（补跑）或跨天周期时不做这个过滤 ——
@@ -4851,8 +4894,8 @@ class StateStore:
                     if _same_day(act_at, now_s) and _lt_time(trigger, act_at):
                         continue
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
-                    (template_id, m["phone"], m["name"], m["dept"], period_key, deadline_at, now_s,
+                    "INSERT OR IGNORE INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, role_name_snapshot, status, deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    (template_id, m["phone"], m["name"], m["dept"], period_key, role_names, deadline_at, now_s,
                      int(tpl.get("owner_id") or 1), phrase, receipt_platform, receipt_mode),
                 )
             if tpl["kind"] == "notice":
@@ -4868,6 +4911,75 @@ class StateStore:
     def list_instances_for_period(self, template_id: str, period_key: str) -> List[Dict[str, Any]]:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
+
+    # ── 2026-11-19 需求一：同日多次手动推送（新批次） ──────────────────
+    def manual_push_repush_info(self, template_id: str, canonical_key: str) -> Dict[str, Any]:
+        """预检：该模板本周期（或历史上）是否已推送过实例。
+
+        canonical_key 由调用方按模板口径算好传入（manual='once'、periodic=当期键）——
+        `period_key()` 在 scheduler 里，state 反向 import 会成环，故不做隐式推导。
+        重推批次键形如 `{canonical}#YYYYMMDDHHMMSS`，用 `#` 前缀匹配判「推过」。
+        """
+        clean = (template_id or "").strip()
+        tpl = self.get_template(clean, include_deleted=False)
+        if not tpl:
+            raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
+        canonical = (canonical_key or "").strip() or "once"
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM task_instance WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) LIMIT 1",
+                (clean, canonical, canonical + "#%"),
+            ).fetchone()
+        return {
+            "pushed_before": row is not None,
+            "canonical_key": canonical,
+            "target_count": len(self.template_deliverable_members(tpl)),
+        }
+
+    def list_push_batches(self, template_id: str) -> List[Dict[str, Any]]:
+        """按 period_key 聚合的推送批次（统计面板「推送批次」下拉与既有批次对账用）。
+
+        alive_count = 未被取消的实例数（重推会把旧批次未完成实例置 cancelled）。
+        """
+        clean = (template_id or "").strip()
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT period_key, COUNT(1) AS instance_count, "
+                "SUM(CASE WHEN status <> 'cancelled' THEN 1 ELSE 0 END) AS alive_count, "
+                "MIN(created_at) AS first_created_at "
+                "FROM task_instance WHERE template_id = ? GROUP BY period_key "
+                "ORDER BY MIN(created_at) ASC, period_key ASC",
+                (clean,),
+            ).fetchall()
+        return [
+            {
+                "period_key": str(r["period_key"] or ""),
+                "instance_count": int(r["instance_count"] or 0),
+                "alive_count": int(r["alive_count"] or 0),
+                "first_created_at": str(r["first_created_at"] or ""),
+            }
+            for r in rows
+        ]
+
+    def cancel_stale_instances_for_new_batch(self, template_id: str, keep_period_key: str) -> int:
+        """手动重推建新批次后调用：同模板旧批次的未完成实例置 cancelled（防 H5 待办刷屏）。
+
+        notice：status IN ('pending','sent') 且 receipt_at IS NULL（未回执/未送达）；
+        非 notice：status IN ('pending','rejected')（待提交 / 被驳回待重交）。
+        已完成（submitted/approved）、已回执、已 cancelled/expired 的历史批次一律不动。
+        """
+        clean = (template_id or "").strip()
+        tpl = self.get_template(clean, include_deleted=False)
+        is_notice = bool(tpl and tpl.get("kind") == "notice")
+        cond = ("status IN ('pending', 'sent') AND receipt_at IS NULL"
+                if is_notice else "status IN ('pending', 'rejected')")
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                f"UPDATE task_instance SET status = 'cancelled' "
+                f"WHERE template_id = ? AND period_key <> ? AND {cond}",
+                (clean, (keep_period_key or "").strip()),
+            )
+            return int(cur.rowcount or 0)
 
     def mark_receipt_prompt_sent(self, instance_id: int, sent_at: str) -> None:
         self.conn.execute("UPDATE task_instance SET receipt_prompt_at=? WHERE id=? AND receipt_phrase IS NOT NULL "
@@ -4887,6 +4999,9 @@ class StateStore:
             "FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
             "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
             "AND i.receipt_at IS NULL AND i.receipt_phrase IS NOT NULL "
+            # 2026-11-19 需求三：重推新批次会把旧批次的未回执实例置 cancelled，
+            # 必须在这里排除，否则旧批次会一直挂在 H5 待办里刷屏。
+            "AND i.status IN ('pending', 'sent') "
             "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 " + "".join(filters) + "ORDER BY i.id",
             tuple(params),
         ).fetchall()
@@ -5346,6 +5461,10 @@ class StateStore:
         月 'YYYY-MM' → 月键 + 'YYYY-MM-' 前缀（兼容按日推送/月推送两种实例）。
         """
         pk = (period_key or "").strip()
+        # 2026-11-19 需求一：重推批次键 `{canonical}#YYYYMMDDHHMMSS` 精确匹配本批次
+        # （`#` 不参与 LIKE 通配，绝不与主批次互串）。
+        if "#" in pk:
+            return {"keys": [pk], "like": ""}
         if pk == "once":
             return {"keys": [pk], "like": ""}
         if re.match(r"^\d{4}-\d{2}-\d{2}$", pk):
@@ -5418,31 +5537,59 @@ class StateStore:
         op = "NOT IN" if unassigned else "IN"
         return f"i.phone {op} ({ph})", phones
 
-    def _stats_member_dept_map(self, role_ids: List[str]) -> Dict[str, str]:
+    def _stats_member_dept_map(self, role_ids: List[str], *, owner_id: Optional[int] = None,
+                               phones: Optional[Iterable[str]] = None) -> Dict[str, str]:
         """模板角色名册 → {手机号: 完整部门路径}。
 
         同一手机号在多个角色出现时，按模板 role_ids 的顺序优先（先配的角色优先），
         保证任务→成员的部门归属稳定可复现；名册行不按 enabled 过滤（统计看的是
         实例/名册的真实部门，停用成员的历史实例同样要能归到部门）。
+
+        2026-11-19 需求五（历史成员部门兜底）：模板改绑角色后，原角色成员不在当前
+        role_ids 里，只按角色查会全部塌成「未分配部门」。故对 `phones`（该周期实例里
+        实际出现的手机号）中未命中或部门为空的，按同管理员（owner_id）名册兜底取
+        最新非空 dept_path —— 明细、导出、部门下钻共用同一份兜底结果，口径一致。
         """
         roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
         out: Dict[str, tuple[int, str]] = {}
-        if not roles:
-            return {}
-        order = {r: idx for idx, r in enumerate(roles)}
-        ph = ",".join("?" for _ in roles)
-        rows = self.conn.execute(
-            f"SELECT role_id, phone, dept_path FROM member WHERE role_id IN ({ph})",
-            tuple(roles)).fetchall()
-        for r in rows:
-            phone = str(r["phone"] or "").strip()
-            if not phone:
-                continue
-            path = "/".join(seg.strip() for seg in str(r["dept_path"] or "").split("/") if seg.strip())
-            cur = out.get(phone)
-            cand_prio = order.get(str(r["role_id"]), 999)
-            if cur is None or cand_prio < cur[0]:
-                out[phone] = (cand_prio, path)
+        if roles:
+            order = {r: idx for idx, r in enumerate(roles)}
+            ph = ",".join("?" for _ in roles)
+            rows = self.conn.execute(
+                f"SELECT role_id, phone, dept_path FROM member WHERE role_id IN ({ph})",
+                tuple(roles)).fetchall()
+            for r in rows:
+                phone = str(r["phone"] or "").strip()
+                if not phone:
+                    continue
+                path = "/".join(seg.strip() for seg in str(r["dept_path"] or "").split("/") if seg.strip())
+                cur = out.get(phone)
+                cand_prio = order.get(str(r["role_id"]), 999)
+                if cur is None or cand_prio < cur[0]:
+                    out[phone] = (cand_prio, path)
+        # 2026-11-19 需求五：历史实例兜底（同管理员名册里按手机号取最新非空 dept_path）
+        missing: List[str] = []
+        for raw_phone in (phones or []):
+            phone = str(raw_phone or "").strip()
+            if phone and not (out.get(phone, (0, ""))[1]) and phone not in missing:
+                missing.append(phone)
+        if missing and owner_id is not None:
+            for start in range(0, len(missing), 900):
+                chunk = missing[start:start + 900]
+                ph = ",".join("?" for _ in chunk)
+                rows = self.conn.execute(
+                    f"SELECT phone, dept_path FROM member "
+                    f"WHERE owner_id = ? AND phone IN ({ph}) "
+                    f"AND dept_path IS NOT NULL AND TRIM(dept_path) <> '' "
+                    f"ORDER BY directory_checked_at DESC, id DESC",
+                    (int(owner_id), *chunk)).fetchall()
+                for r in rows:
+                    phone = str(r["phone"] or "").strip()
+                    if out.get(phone, (0, ""))[1]:
+                        continue
+                    path = "/".join(seg.strip() for seg in str(r["dept_path"] or "").split("/") if seg.strip())
+                    if path:
+                        out[phone] = (998, path)  # 兜底优先级低于任何当前角色命中
         return {phone: path for phone, (_, path) in out.items()}
 
     @classmethod
@@ -5560,6 +5707,10 @@ class StateStore:
             (tpl["template_id"], *per_params)).fetchall()
         # 周/月聚合视角：同人多实例去重成一人一行（日视图唯一键保证恒等）
         persons = self._stats_dedup_persons([dict(r) for r in rows])
+        # 2026-11-19 需求五：用「本期实例里实际出现的手机号」做部门兜底，
+        # 模板改绑角色后原角色成员不再变成「未分配部门」。
+        dept_map = self._stats_member_dept_map(
+            role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in persons])
         covered_paths = {str(r["phone"]): self._stats_phone_path(str(r["phone"]), dept_map) for r in persons}
         tree = self._stats_dept_tree(covered_paths)
         # KPI（部门子树过滤；按去重后的人计）
@@ -5652,7 +5803,8 @@ class StateStore:
                 return False
             return True
 
-        dept_map = self._stats_member_dept_map(role_ids)
+        dept_map = self._stats_member_dept_map(
+            role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in rows])
         persons = self._stats_dedup_persons(rows)
         scoped: List[Dict[str, Any]] = []
         for r in persons:
@@ -5804,12 +5956,15 @@ class StateStore:
         """按任务、周期和部门范围装配完整明细及提交附件。"""
         tpl = self.stats_panel_guard_template(template_id, owner_id)
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
-        dept_map = self._stats_member_dept_map(role_ids)
+        dept_map = self._stats_member_dept_map(role_ids, owner_id=owner_id)
         sel = str(dept_path or "").strip().strip("/")
         if tpl["kind"] == "notice":
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
             persons = self._stats_dedup_persons(self._stats_receipt_rows(tpl["template_id"], period_key))
+            # 2026-11-19 需求五：导出与明细/下钻共用同一份兜底后的 dept_map
+            dept_map = self._stats_member_dept_map(
+                role_ids, owner_id=owner_id, phones=[str(row["phone"]) for row in persons])
             rows = []
             for row in persons:
                 path = self._stats_phone_path(row["phone"], dept_map)
@@ -5832,6 +5987,8 @@ class StateStore:
                 "FROM submission s JOIN task_instance i ON i.id = s.instance_id "
                 "WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at DESC, s.id DESC",
                 tuple(params)).fetchall()
+            dept_map = self._stats_member_dept_map(
+                role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in rows])
             out_rows: List[Dict[str, Any]] = []
             for r in rows:
                 phone = str(r["phone"])
@@ -5848,8 +6005,16 @@ class StateStore:
         else:
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-            ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
             per_sql, per_params = self._stats_period_where(period_key.strip())
+            # 2026-11-19 需求五：先取本期实际出现的手机号做部门兜底，再按部门筛选，
+            # 保证「日历改了绑定角色」的历史成员不会被部门下钻筛掉。
+            covered = self.conn.execute(
+                f"SELECT DISTINCT i.phone FROM task_instance i "
+                f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled'",
+                (tpl["template_id"], *per_params)).fetchall()
+            dept_map = self._stats_member_dept_map(
+                role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in covered])
+            ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
             where = ["i.template_id = ?", per_sql, "i.status != 'cancelled'"]
             params: List[Any] = [tpl["template_id"], *per_params]
             if ex_sql:
