@@ -311,6 +311,8 @@ function tplFromMock(t: any, partial = false) {
   out.is_adhoc = !isNotice && !!t.is_adhoc;
   out.is_manual = !!t.is_manual;
   out.manual_deadline_at = t.manual_deadline_at || null;
+  if (t.push_on_create !== undefined) out.push_on_create = t.push_on_create;
+  if (t.request_id !== undefined) out.request_id = t.request_id;
   out.period = t.period || 'day';
   out.attach_image = attach;
   out.attach_image_path = t.attach_image_path || null;

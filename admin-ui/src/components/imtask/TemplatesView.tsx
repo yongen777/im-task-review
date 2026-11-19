@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   Plus,
   Edit3,
@@ -496,7 +496,6 @@ export const TemplatesView: React.FC = () => {
   const [editingTpl, setEditingTpl] = useState<TemplateItem | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [deleteConfirmTpl, setDeleteConfirmTpl] = useState<TemplateItem | null>(null);
-  /* 2026-11-12 任务D：一键推送（创建者分级管理员专属测试按钮；超管只读不显示） */
   const [pushingId, setPushingId] = useState<number | null>(null);
   const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
 
@@ -504,6 +503,8 @@ export const TemplatesView: React.FC = () => {
   const [name, setName] = useState('');
   const [kind, setKind] = useState<'notice' | 'upload'>('notice');
   const [isManual, setIsManual] = useState(false);
+  const [pushOnCreate, setPushOnCreate] = useState(false);
+  const createRequestId = useRef('');
   const [manualDeadline, setManualDeadline] = useState('');
   const hasPreview = kind === 'upload' || platform === 'zdxlz';
   /* 2026-10-29 执行日：1=周一…7=周日；全选七天等价于「每天」（保存时传 null）。
@@ -623,6 +624,9 @@ export const TemplatesView: React.FC = () => {
     setKind(defaultKind);
     setIsAdhoc(false);
     setIsManual(false);
+    setPushOnCreate(false);
+    createRequestId.current = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+      byte => byte.toString(16).padStart(2, '0')).join('');
     setManualDeadline('');
     setExecWeekdays([1, 2, 3, 4, 5, 6, 7]);
     setExecMode('weekly');
@@ -948,7 +952,7 @@ export const TemplatesView: React.FC = () => {
           '编辑已保存',
         );
       } else {
-        await api.post('/api/admin/templates', {
+        const res = await api.post<{ replayed?: boolean; push?: { queued: boolean; message?: string; instance_count?: number } }>('/api/admin/templates', {
           name: name.trim(),
           kind: kind === 'notice' ? 'notice' : 'upload',
           period: 'day',
@@ -963,7 +967,8 @@ export const TemplatesView: React.FC = () => {
           deadline_time: finalDeadlineTime,
           text_tpl: finalTextTpl,
           spec,
-          enabled,
+          enabled: isManual || enabled,
+          ...(isManual ? { push_on_create: pushOnCreate, request_id: createRequestId.current } : {}),
           /* 2026-11-02：不再有周期概念，选哪几天就每周那几天触发；七天全选等价「每天」存 null */
           exec_weekdays: isAdhoc || isManual || execWeekdays.length === 7 ? null : execWeekdays,
           exec_dom_days: !isAdhoc && !isManual && execMode === 'monthly' ? execDomDays : [],
@@ -972,12 +977,19 @@ export const TemplatesView: React.FC = () => {
             ? { attach_image: Boolean(noticeImagePath), attach_image_path: noticeImagePath || null, attach_image_name: noticeImageName || null }
             : {}),
         });
-        await refreshTemplates();
         setModalOpen(false);
-        toast.success(
-          `已成功创建新模板「${name.trim()}」（已关联 ${roleIds.length} 个业务角色）。`,
-          '新建模板成功',
-        );
+        if (res.replayed && isManual && pushOnCreate) {
+          toast.success('此创建请求已处理，请在提醒日志核对推送状态。', '模板已保存');
+        } else if (res.push?.queued && res.push.instance_count) {
+          toast.success(`推送已受理，涉及 ${res.push.instance_count} 条任务实例。请在提醒日志查看结果。`, '已创建并提交推送');
+        } else if (res.push?.queued) {
+          toast.warning('暂无符合资格的成员。', '模板已保存');
+        } else if (res.push) {
+          toast.warning(res.push.message || '推送未启动，可在任务列表重新推送。', '模板已保存');
+        } else {
+          toast.success(`已创建模板「${name.trim()}」。`, '新建模板成功');
+        }
+        await refreshTemplates().catch(() => toast.warning('模板列表刷新失败，可刷新页面查看。'));
       }
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '保存模板未成功');
@@ -1003,10 +1015,6 @@ export const TemplatesView: React.FC = () => {
     }
   };
 
-  /* 2026-11-12 任务D：一键推送确认动作——立即向当前「待提交」成员各发一条提醒
-     （与当期定时提醒互不影响、内容同版式；服务端另有 2 分钟冷却防手抖 + 审计）。
-     2026-11-13 修复一：2600 人推送改为「请求内建实例 + 后台投递」——接口立即返回 queued，
-     不再同步等待 108 秒（避免浏览器/网关超时与事件循环冻结）。 */
   const handleConfirmPush = async () => {
     if (!pushConfirmTpl) return;
     const target = pushConfirmTpl;
@@ -1023,13 +1031,13 @@ export const TemplatesView: React.FC = () => {
         toast.success(
           `当期已生成 ${res.instance_count ?? 0} 条任务实例，提醒消息已在后台逐条投递` +
             `（2600 人约需 2 分钟）。发送结果可在「提醒日志 / 任务实例」页核对。`,
-          '一键推送已启动',
+          '推送已启动',
         );
       } else {
         const stats = res?.stats || {};
         toast.success(
           `已向 ${stats.pushed_instances ?? 0} 名待提交成员推送提醒（发送成功 ${stats.sent ?? 0} 条）。`,
-          '一键推送完成',
+          '推送完成',
         );
       }
       setPushConfirmTpl(null);
@@ -1392,7 +1400,6 @@ export const TemplatesView: React.FC = () => {
                                 <span>统计</span>
                               </button>
                             )}
-                            {/* 2026-11-12 任务D：一键推送（上传任务专属；notice 按时刻自动发）。 */}
                             {(tpl.is_manual || (tpl.kind !== 'notice' && !tpl.is_adhoc)) && (
                               <button
                                 onClick={() => setPushConfirmTpl(tpl)}
@@ -1405,7 +1412,7 @@ export const TemplatesView: React.FC = () => {
                                 className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-semibold text-xs inline-flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0 disabled:opacity-50 disabled:cursor-not-allowed"
                               >
                                 <Send className="w-3.5 h-3.5 shrink-0" />
-                                <span>{pushingId === tpl.id ? '推送中…' : tpl.is_manual ? '一键推送' : '推送'}</span>
+                                <span>{pushingId === tpl.id ? '推送中…' : '推送'}</span>
                               </button>
                             )}
                             <button
@@ -1453,9 +1460,9 @@ export const TemplatesView: React.FC = () => {
                     {editingTpl ? `编辑任务模板 · ${editingTpl.name}` : '新建任务模板'}
                   </h3>
                   <p className="text-[11px] text-slate-400">
-                    {isManual ? '保存后在任务模板列表点击「一键推送」。'
+                    {isManual ? '可在任务模板列表随时点击「推送」。'
                       : kind === 'notice'
-                      ? '到达执行时间后，向角色成员发送文本或图片提醒。'
+                      ? '到达执行时间后，向角色成员发送通知。'
                       : isAdhoc ? '成员可在个人工作台随时发起上报。'
                         : '到达执行时间后，向接收成员发送提醒和专属 H5 提交链接。'}
                   </p>
@@ -1599,6 +1606,7 @@ export const TemplatesView: React.FC = () => {
                         onChange={(event) => {
                           setIsManual(event.target.value === 'manual');
                           if (event.target.value === 'manual') setIsAdhoc(false);
+                          else setPushOnCreate(false);
                         }}
                         className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-slate-800 disabled:opacity-70">
                         <option value="scheduled">定时推送</option>
@@ -1835,17 +1843,19 @@ export const TemplatesView: React.FC = () => {
                           className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 font-mono text-slate-800" />
                       </label>
                     )}
-                    {/* 立即启用自动调度（重排版：独占一行，与上方字段左对齐） */}
                     <div className="sm:col-span-2 pt-1">
                       <label className="inline-flex items-center gap-2 cursor-pointer select-none">
                         <input
                           type="checkbox"
-                          checked={enabled}
-                          onChange={(e) => setEnabled(e.target.checked)}
+                          checked={isManual && !editingTpl ? pushOnCreate : enabled}
+                          onChange={(e) => isManual && !editingTpl
+                            ? setPushOnCreate(e.target.checked) : setEnabled(e.target.checked)}
                           className="w-4 h-4 rounded text-blue-600 focus:ring-blue-500"
                         />
-                        <span className="font-semibold text-slate-800">{isAdhoc ? '在个人工作台开放自主上报' : isManual ? '启用一键推送' : '立即启用自动调度'}</span>
+                        <span className="font-semibold text-slate-800">{isAdhoc ? '在个人工作台开放自主上报'
+                          : isManual ? (editingTpl ? '启用模板' : '创建后立即推送') : '立即启用自动调度'}</span>
                       </label>
+                      {isManual && !editingTpl && <p className="mt-1 text-slate-500">关闭时只保存，可稍后在任务模板列表推送。</p>}
                     </div>
                   </div>
 
@@ -2107,7 +2117,7 @@ export const TemplatesView: React.FC = () => {
                   disabled={saving || uploadingAssetId !== null}
                   className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
                 >
-                  {saving ? '正在保存…' : editingTpl ? '保存修改' : '确认创建'}
+                  {saving ? '正在保存…' : editingTpl ? '保存修改' : isManual && pushOnCreate ? '创建并推送' : '确认创建'}
                 </button>
               </div>
             </form>
@@ -2151,7 +2161,6 @@ export const TemplatesView: React.FC = () => {
         </div>
       )}
 
-      {/* 一键推送确认弹窗（2026-11-12 任务D：测试用按钮，管理员自行判断场景） */}
       {pushConfirmTpl && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">

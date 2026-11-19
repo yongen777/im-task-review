@@ -12,15 +12,71 @@ from test_20261118_portal import portal, publish
 
 
 @pytest.mark.parametrize("kind", ["form", "notice"])
+def test_create_and_push_reuses_manual_delivery_and_deduplicates_request(ctx, kind):
+    store, scheduler, notifier, _, owner, _, original, member = ctx
+    payload = {"name": "创建后立即推送", "kind": kind, "period": "day", "is_manual": True,
+               "role_ids": original["role_ids"], "text_tpl": "只发送这条创建提醒",
+               "push_on_create": True, "request_id": "432a97d5021c4e61a8438deadf65a46c"}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda _: owner.post("/api/admin/templates", json=payload), range(2)))
+    assert all(response.status_code == 200 for response in responses), [response.text for response in responses]
+    bodies = [response.json() for response in responses]
+    assert len({body["template_id"] for body in bodies}) == 1
+    [accepted] = [body["push"] for body in bodies if not body.get("replayed")]
+    assert accepted["queued"] and accepted["instance_count"] == 1
+    tid = bodies[0]["template_id"]
+    for seconds in (0, 30, 60):
+        scheduler.run_once(store.now() + timedelta(seconds=seconds))
+    assert len([message for message in notifier.sent_messages if "只发送这条创建提醒" in message.text]) == 1
+    assert [inst["phone"] for inst in store.list_instances_for_period(tid, "once")] == [member["phone"]]
+    assert owner.post(f"/api/admin/templates/{tid}/push-now", json={}).status_code == 429
+    assert owner.delete(f"/api/admin/templates/{tid}").status_code == 200
+    assert owner.post("/api/admin/templates", json=payload).status_code == 409
+    assert store.get_template(tid) is None
+
+
+def test_create_and_push_keeps_saved_template_if_scheduler_is_unavailable(ctx):
+    store, _, notifier, _, owner, _, original, _ = ctx
+    owner.app.state.scheduler = None
+    response = owner.post("/api/admin/templates", json={
+        "name": "调度不可用时保存", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": original["role_ids"], "text_tpl": "等待管理员推送", "push_on_create": True,
+        "request_id": "652acde5021c4e61a8438deadf65a46c",
+    })
+    assert response.status_code == 200, response.text
+    response_data = response.json()
+    assert response_data["push"]["queued"] is False and response_data["push"]["code"] == "PUSH_UNAVAILABLE"
+    assert store.get_template(response_data["template_id"])["enabled"]
+    assert not notifier.sent_messages
+
+
+@pytest.mark.parametrize("overrides", [{"is_manual": False}, {"enabled": False}, {"request_id": "bad"}])
+def test_create_and_push_rejects_invalid_configuration_before_saving(ctx, overrides):
+    store, _, notifier, _, owner, _, original, _ = ctx
+    count = store.conn.execute("SELECT COUNT(*) FROM task_template").fetchone()[0]
+    response = owner.post("/api/admin/templates", json={
+        "name": "不可直接推送", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": original["role_ids"], "text_tpl": "本条不会发送", "push_on_create": True,
+        "request_id": "a18fcde5021c4e61a8438deadf65a46c",
+        **overrides,
+    })
+    assert response.status_code == 400, response.text
+    assert store.conn.execute("SELECT COUNT(*) FROM task_template").fetchone()[0] == count
+    assert not notifier.sent_messages
+
+
+@pytest.mark.parametrize("kind", ["form", "notice"])
 def test_immediate_template_only_pushes_once_per_recipient(ctx, kind):
     store, scheduler, notifier, _, owner, _, original, member = ctx
     payload = {"name": "仅立即推送", "kind": kind, "period": "day", "is_manual": True,
-               "role_ids": original["role_ids"], "text_tpl": "请核对本次任务"}
+               "role_ids": original["role_ids"], "text_tpl": "请核对本次任务", "push_on_create": False,
+               "request_id": "00a184f05c3b409b891271ba8b850ec8"}
     response = owner.post("/api/admin/templates", json=payload)
     assert response.status_code == 200, response.text
     template = response.json()["template"]
     tid = template["template_id"]
-    assert template["is_manual"] and not template["remind_at"] and not template["notice_times"]
+    assert template["is_manual"] and template["enabled"] and not template["remind_at"] and not template["notice_times"]
+    assert "push" not in response.json()
     assert not template["exec_weekdays"] and not template["exec_dom_days"]
 
     now = store.now()

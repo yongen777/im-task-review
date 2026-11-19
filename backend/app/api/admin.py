@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from pymysql.err import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
@@ -1122,7 +1123,7 @@ def create_admin_router(
         return {"ok": True, "total": res["total"], "items": res["items"]}
 
     @router.post("/templates")
-    async def create_template(request: Request):
+    async def create_template(request: Request, background_tasks: BackgroundTasks):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1133,11 +1134,45 @@ def create_admin_router(
         _scope_err = _check_template_role_scope(state, _admin, body)
         if _scope_err is not None:
             return _scope_err
+        push_on_create = body.get("push_on_create", False)
+        request_id = body.get("request_id")
+        if not isinstance(push_on_create, bool):
+            return error_response(400, "INVALID_PUSH_ON_CREATE", "创建后立即推送须为布尔值")
+        if push_on_create:
+            if _is_super_admin(_admin):
+                return error_response(403, "SUPER_ADMIN_READONLY", "请由分级管理员推送")
+            if body.get("is_manual") is not True or body.get("enabled", True) is not True or body.get("is_adhoc"):
+                return error_response(400, "INVALID_PUSH_ON_CREATE", "仅启用的立即推送模板可在创建时推送")
+        if (request_id is not None or push_on_create) and (
+            not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id)
+        ):
+            return error_response(400, "INVALID_REQUEST_ID", "创建请求编号无效，请重新打开新建窗口")
+        owner_id = int(_admin.get("id") or 0)
+        template_id = ("t_" + uuid.uuid5(uuid.NAMESPACE_URL, f"imtask:template:{owner_id}:{request_id}").hex[:16]
+                       if request_id else None)
+
+        def replay():
+            saved = state.get_template(template_id) if template_id else None
+            if saved and saved["owner_id"] == owner_id:
+                return {"ok": True, "template_id": template_id, "template": saved, "replayed": True}
+            return None
+
+        if previous := replay():
+            return previous
         try:
-            tpl = state.create_template(body, actor=sess["username"], owner_id=int(_admin.get("id") or 0))
+            tpl = state.create_template(body, actor=sess["username"], owner_id=owner_id, template_id=template_id)
         except BizError as exc:
             return biz_error_response(exc)
-        return {"ok": True, "template_id": tpl["template_id"], "template": tpl}
+        except IntegrityError as exc:
+            if template_id and exc.args[0] == 1062 and (previous := replay()):
+                return previous
+            raise
+        result = {"ok": True, "template_id": tpl["template_id"], "template": tpl}
+        if push_on_create:
+            queued = await _queue_template_push(tpl["template_id"], request, background_tasks, sess["username"])
+            result["push"] = ({"queued": False, **json.loads(queued.body)}
+                              if isinstance(queued, JSONResponse) else queued)
+        return result
 
     @router.get("/templates/{template_id}")
     async def get_template(template_id: str, request: Request):
@@ -1343,9 +1378,11 @@ def create_admin_router(
         if _is_super_admin(_admin):
             return error_response(
                 403, "SUPER_ADMIN_READONLY",
-                "一键推送属于业务操作；超级管理员只读，请由创建该模板的分级管理员自行推送",
+                "请由创建该模板的分级管理员推送",
             )
+        return await _queue_template_push(template_id, request, background_tasks, sess["username"])
 
+    async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks, actor: str):
         # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
         _tpl = state.get_template(template_id, include_deleted=False)
         if not _tpl or _tpl.get("deleted"):
@@ -1359,14 +1396,14 @@ def create_admin_router(
 
         # 软护栏：同模板 2 分钟内拒绝重复推送（防手抖）；通过即记 marker 占位
         try:
-            guard = state.check_manual_push_cooldown(template_id, actor=sess["username"])
+            guard = state.check_manual_push_cooldown(template_id, actor=actor)
         except BizError as exc:
             return biz_error_response(exc)
 
         scheduler = getattr(request.app.state, "scheduler", None)
         if scheduler is None or not callable(getattr(scheduler, "push_now", None)):
             state.record_reminder_log(
-                template_id=template_id, instance_id=None, phone=sess["username"],
+                template_id=template_id, instance_id=None, phone=actor,
                 kind="manual_push", planned_at=guard["attempted_at"], attempted_at=guard["attempted_at"],
                 sent_at=None, result="failed", error="SCHEDULER_UNAVAILABLE", retry=0,
                 idem_key=f"push_unavailable|{template_id}|{guard['attempted_at']}",
@@ -1379,7 +1416,7 @@ def create_admin_router(
         # 投递期间 H5 提交、后台查询、调度器 tick 全部不受影响。
         try:
             prep = await asyncio.to_thread(
-                scheduler.push_now_prepare, template_id, actor=sess["username"])
+                scheduler.push_now_prepare, template_id, actor=actor)
         except BizError as exc:
             return biz_error_response(exc)
         except Exception:  # noqa: BLE001
@@ -1389,12 +1426,12 @@ def create_admin_router(
         def _bg_deliver() -> None:
             """后台投递（线程池执行，事件循环零阻塞）；成功/异常都留痕，绝不向响应传播。"""
             try:
-                stats = scheduler.push_now_deliver(template_id, prep, actor=sess["username"])
+                stats = scheduler.push_now_deliver(template_id, prep, actor=actor)
             except Exception as exc:  # noqa: BLE001 - 后台任务异常只留痕，不炸进程
                 logger.exception("push_now 后台投递异常 template=%s", template_id)
                 try:
                     state.record_reminder_log(
-                        template_id=template_id, instance_id=None, phone=sess["username"],
+                        template_id=template_id, instance_id=None, phone=actor,
                         kind="manual_push", planned_at=guard["attempted_at"],
                         attempted_at=guard["attempted_at"], sent_at=None, result="failed",
                         error=f"BACKGROUND_PUSH_FAILED:{str(exc)[:100]}", retry=0,
@@ -1404,14 +1441,14 @@ def create_admin_router(
                     logger.exception("push_now 后台失败留痕异常 template=%s", template_id)
                 return
             state.write_audit(
-                username=sess["username"], action="template.push_now", target_type="task_template",
+                username=actor, action="template.push_now", target_type="task_template",
                 target_id=template_id, detail={"pushed_at": guard["attempted_at"], "stats": stats},
             )
 
         background_tasks.add_task(_bg_deliver)
         # 受理审计（与完成审计同 action；detail.phase='dispatch' 区分，完成后另有一条带 stats）
         state.write_audit(
-            username=sess["username"], action="template.push_now", target_type="task_template",
+            username=actor, action="template.push_now", target_type="task_template",
             target_id=template_id,
             detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
                     "period_key": prep["period_key"], "instance_count": prep["instance_count"]},

@@ -3321,11 +3321,18 @@ class StateStore:
             "spec_json": json.dumps(_spec_payload, ensure_ascii=False) if _spec_payload not in (None, "") else None,
         }
 
-    def create_template(self, payload: Dict[str, Any], actor: str = "system", owner_id: int = 1) -> Dict[str, Any]:
+    def create_template(self, payload: Dict[str, Any], actor: str = "system", owner_id: int = 1, *,
+                        template_id: Optional[str] = None) -> Dict[str, Any]:
         now_s = self.now_str()
         with self.lock, self.conn:
             norm = self._validate_and_normalize_template_unlocked(payload, existing=None, owner_id=owner_id)
-            template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
+            if template_id is None:
+                template_id = self._generate_unique_id_unlocked("task_template", "template_id", "t_")
+            elif self.conn.execute(
+                "SELECT 1 FROM admin_audit WHERE target_type='task_template' AND target_id=? "
+                "AND action='template.purge' LIMIT 1", (template_id,),
+            ).fetchone():
+                raise BizError(409, "TEMPLATE_REQUEST_EXPIRED", "此创建请求对应的模板已删除，请重新打开新建窗口")
             self.conn.execute(
                 "INSERT INTO task_template(template_id, name, kind, role_ids, schema_json, allow_note, text_tpl, remind_at, notice_times, deadline, period, anchor_weekday, anchor_dom, deadline_offset, has_deadline, deadline_type, deadline_time, need_review, max_file_mb, attach_image, attach_image_path, attach_image_name, exec_weekdays, exec_dom_days, data_keys, spec_json, enabled, is_adhoc, is_manual, manual_deadline_at, deleted, created_by, created_at, updated_at, owner_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
