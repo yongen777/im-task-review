@@ -1009,13 +1009,48 @@
       color: var(--secondary);
       font-size: 13px;
     }
-    .history-filter input[type="date"] {
+    .history-filter > span { white-space: nowrap; }
+    .history-date-trigger {
+      flex: 1;
       min-width: 0;
-      max-width: 100%;
-      min-height: 44px;
-      padding: 8px 10px;
+      justify-content: space-between;
       font-size: 14px;
+      font-variant-numeric: tabular-nums;
     }
+    .history-date-trigger .chev { transform: rotate(90deg); }
+    .calendar-options {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .calendar-options select { min-height: 44px; }
+    .calendar-grid {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 3px;
+      text-align: center;
+    }
+    .calendar-week { margin-bottom: 5px; color: var(--muted); font-size: 12px; }
+    .calendar-day {
+      min-height: 42px;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--ink);
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    .calendar-day:hover:not(:disabled) { background: var(--blue-soft); color: var(--blue); }
+    .calendar-day[aria-current="date"] { border-color: var(--blue-line); }
+    .calendar-day[aria-pressed="true"] {
+      background: var(--blue);
+      color: #fff;
+      font-weight: 600;
+    }
+    .calendar-day:disabled { color: var(--muted); opacity: 0.43; cursor: default; }
+    #calendar-today { margin-top: 10px; width: 100%; }
 
     .hidden { display: none !important; }
   </style>
@@ -1066,6 +1101,21 @@
     </div>
     <p class="admin-dialog-desc">有问题就找管理员。以下为管理您当前账号的全部管理员，请选择需要联系的人员：</p>
     <div class="admin-dialog-body" id="admin-dialog-body"></div>
+  </dialog>
+  <dialog class="preview" id="history-calendar" aria-labelledby="calendar-title">
+    <div class="preview-head">
+      <span class="preview-title" id="calendar-title">选择提交日期</span>
+      <button type="button" class="secondary" id="calendar-close">关闭</button>
+    </div>
+    <div class="calendar-options">
+      <select id="calendar-year" aria-label="年份"></select>
+      <select id="calendar-month" aria-label="月份"></select>
+    </div>
+    <div class="calendar-grid calendar-week" aria-hidden="true">
+      <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+    </div>
+    <div class="calendar-grid" id="calendar-days"></div>
+    <button type="button" class="secondary" id="calendar-today">回到今天</button>
   </dialog>
   <script>
     'use strict';
@@ -1131,7 +1181,7 @@
     document.getElementById('attachment-preview').addEventListener('click', event => {
       if (event.target === event.currentTarget) event.currentTarget.close();
     });
-    function expiry() { expired = true; const preview = document.getElementById('attachment-preview'); if (preview.open) preview.close(); closeAdminDialog(); main.innerHTML = '<div class="card empty"><h2>链接已过期</h2><p>请回到聊天框向机器人发送任意消息，重新获取最新工作台入口。</p></div>'; }
+    function expiry() { expired = true; const preview = document.getElementById('attachment-preview'); if (preview.open) preview.close(); closeAdminDialog(); closeHistoryCalendar(); main.innerHTML = '<div class="card empty"><h2>链接已过期</h2><p>请回到聊天框向机器人发送任意消息，重新获取最新工作台入口。</p></div>'; }
     async function api(action, data = {}, attachment = false) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), action === 'recipients' ? 45000 : 20000);
@@ -1178,20 +1228,87 @@
       return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     }
     let historyDate = shanghaiToday();
+    const historyCalendar = document.getElementById('history-calendar');
+    const calendarYear = document.getElementById('calendar-year');
+    const calendarMonth = document.getElementById('calendar-month');
+    const calendarDays = document.getElementById('calendar-days');
+
+    function displayHistoryDate(date) {
+      const [year, month, day] = date.split('-').map(Number);
+      return year + '年' + month + '月' + day + '日';
+    }
+
+    function renderCalendar(wantedMonth) {
+      const today = shanghaiToday();
+      const [currentYear, currentMonth] = today.split('-').map(Number);
+      const year = Number(calendarYear.value);
+      const maxMonth = year === currentYear ? currentMonth : 12;
+      const month = Math.min(wantedMonth, maxMonth);
+      calendarMonth.innerHTML = Array.from({ length: maxMonth }, (_, index) =>
+        '<option value="' + (index + 1) + '">' + (index + 1) + '月</option>').join('');
+      calendarMonth.value = String(month);
+      const firstWeekday = (new Date(Date.UTC(year, month - 1, 1)).getUTCDay() + 6) % 7;
+      const length = new Date(Date.UTC(year, month, 0)).getUTCDate();
+      const prefix = year + '-' + String(month).padStart(2, '0') + '-';
+      calendarDays.innerHTML = '<span aria-hidden="true"></span>'.repeat(firstWeekday) +
+        Array.from({ length }, (_, index) => {
+          const day = index + 1;
+          const date = prefix + String(day).padStart(2, '0');
+          return '<button type="button" class="calendar-day" data-day="' + date +
+            '" aria-label="' + displayHistoryDate(date) + '" aria-pressed="' + (date === historyDate) + '"' +
+            (date === today ? ' aria-current="date"' : '') + (date > today ? ' disabled' : '') + '>' + day + '</button>';
+        }).join('');
+    }
+
+    function openHistoryCalendar() {
+      const latestYear = Number(shanghaiToday().slice(0, 4));
+      const [selectedYear, selectedMonth] = historyDate.split('-').map(Number);
+      calendarYear.innerHTML = Array.from({ length: latestYear - 1899 }, (_, index) => {
+        const year = latestYear - index;
+        return '<option value="' + year + '">' + year + '年</option>';
+      }).join('');
+      calendarYear.value = String(selectedYear);
+      renderCalendar(selectedMonth);
+      if (typeof historyCalendar.showModal === 'function') {
+        if (!historyCalendar.open) historyCalendar.showModal();
+      } else {
+        historyCalendar.classList.add('fallback-open');
+      }
+    }
+
+    function closeHistoryCalendar() {
+      if (historyCalendar.open && typeof historyCalendar.close === 'function') historyCalendar.close();
+      historyCalendar.classList.remove('fallback-open');
+    }
+
+    function chooseHistoryDate(date) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '') || date > shanghaiToday()) return;
+      closeHistoryCalendar();
+      historyDate = date;
+      showHistory();
+      main.querySelector('[data-history-date]')?.focus({ preventScroll: true });
+    }
+
+    calendarYear.onchange = () => renderCalendar(Number(calendarMonth.value));
+    calendarMonth.onchange = () => renderCalendar(Number(calendarMonth.value));
+    calendarDays.onclick = event => {
+      const button = event.target.closest('button[data-day]');
+      if (button && !button.disabled) chooseHistoryDate(button.dataset.day);
+    };
+    document.getElementById('calendar-close').onclick = closeHistoryCalendar;
+    document.getElementById('calendar-today').onclick = () => chooseHistoryDate(shanghaiToday());
+    historyCalendar.addEventListener('click', event => { if (event.target === historyCalendar) closeHistoryCalendar(); });
 
     async function showHistory(offset = 0, previousItems = []) {
       const date = historyDate;
       const section = document.createElement('section');
       section.id = 'home-history';
       section.innerHTML = '<div class="row section-row"><h2>我的提交记录</h2></div>' +
-        '<label class="history-filter">日期 <input type="date" value="' + esc(date) +
-        '" max="' + esc(shanghaiToday()) + '"></label>' +
+        '<div class="history-filter"><span>日期</span><button type="button" class="secondary history-date-trigger" ' +
+        'data-history-date aria-haspopup="dialog"><span>' + displayHistoryDate(date) + '</span>' + CHEVRON_SVG +
+        '</button></div>' +
         '<div data-history-results><div class="card empty">正在读取提交记录…</div></div>';
-      const input = section.querySelector('input');
-      input.onchange = () => {
-        historyDate = input.value || shanghaiToday();
-        showHistory();
-      };
+      section.querySelector('[data-history-date]').onclick = openHistoryCalendar;
       const previous = document.getElementById('home-history');
       if (previous) previous.replaceWith(section); else main.appendChild(section);
       if (jumpToHistory) {
@@ -1241,7 +1358,7 @@
       }
       list.innerHTML =
         '<div class="row section-row"><h2>' + (todo ? '当前待办' : '自主上报事项') + '</h2>' +
-        (todo ? '<button type="button" class="secondary" data-jump-history>提交记录</button>' :
+        (todo ? '' :
           '<span class="section-count">' + rows.length + ' 项</span>') + '</div>' +
         (rows.length ? rows.map(row => {
           const key = todo ? row.id : row.template_id;
@@ -1280,7 +1397,6 @@
         };
       });
       if (todo) {
-        list.querySelector('[data-jump-history]').onclick = () => document.getElementById('home-history')?.scrollIntoView();
         if (!preserveHistory || !document.getElementById('home-history')) showHistory();
       }
     }

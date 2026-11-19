@@ -2306,8 +2306,9 @@ class StateStore:
 
         2026-11-13 用户口径（2600 人真实导入前，严格实名 + 原子性）：
         ④ 行数上限 5000（IMPORT_ROW_LIMIT，超出直接拒绝，不再有 500 行限制）；
-        ⑤ 格式校验全过后，用官方通讯录**逐行严格核验**（手机号存在 + 姓名一致，
-           16 线程并发 + TTL 缓存）；**按传入顺序**扫，第一处错误立即中断，整批 0 写入；
+        ⑤ 格式校验全过后，先查同平台已激活名册，再查官方通讯录（16 线程并发 + TTL 缓存）。
+           未填姓名时采用核验到的姓名，已填姓名时核对姓名一致性。
+           **按传入顺序**扫，第一处错误立即中断，整批 0 写入；
         ⑥ 全部 100% 通过才在同一事务内一次性入册并激活（前面通过的行也绝不提前写库）；
         ⑦ 查询失败（网络/凭证/权限）按「查询失败」中断，绝不当作「不存在」；
         ⑧ 核验结果复用给激活（pre_resolved），每个手机号只打一次通讯录接口。
@@ -2379,9 +2380,6 @@ class StateStore:
                 if not is_valid_phone(phone):
                     invalid.append({"row": row_num, "phone": phone, "reason": "手机号格式不正确"})
                     continue
-                if not name:
-                    invalid.append({"row": row_num, "phone": phone, "reason": "姓名不能为空"})
-                    continue
                 # 2026-11-04 用户口径：CSV 里的部门若「部门管理」里没有，**不拦截**——
                 # 自动把该部门建进部门选项（成员表 dept 仍存文本快照），
                 # 这样 H5 登记页/成员表单的下拉立刻能选到，不会出现"名册里有、下拉里没有"的死锁。
@@ -2441,16 +2439,20 @@ class StateStore:
                     if profile:
                         status, user = "ok", profile
                     elif lookup is None:
-                        continue
+                        if name:
+                            continue
+                        status, user = "error", None
                     else:
                         status, user = lookup.get(phone, ("error", None))
                     if status != "ok":
                         reason = "官方通讯录查询失败，请稍后重试"
                     elif user is None:
                         reason = f"{phone} 不存在，请确定手机号是否正确"
-                    elif require_directory and not (user.get("name") and (user.get("union_id") or user.get("external_id"))):
+                    elif (require_directory or not name) and not (
+                        str(user.get("name") or "").strip() and (user.get("union_id") or user.get("external_id"))
+                    ):
                         reason = "官方通讯录返回的成员档案不完整，请稍后重试"
-                    elif user.get("name") is not None and clean_name_for_match(user["name"]) != clean_name_for_match(name):
+                    elif name and user.get("name") is not None and clean_name_for_match(user["name"]) != clean_name_for_match(name):
                         reason = f"{name}（{phone}）姓名不正确"
                     else:
                         if not profile:
@@ -2463,8 +2465,9 @@ class StateStore:
                     break
         resolved = {**local, **verified}
         to_insert = [
-            (row_no, phone, name, (str(resolved[phone].get("department") or "").strip() or None)
-             if phone in resolved else dept)
+            (row_no, phone, name or str(resolved[phone].get("name") or "").strip(),
+             str(resolved[phone].get("department") or "").strip() or None)
+            if phone in resolved else (row_no, phone, name, dept)
             for row_no, phone, name, dept in to_insert
         ]
         global_profile_updates = [upd for upd in global_profile_updates if upd["phone"] not in resolved]

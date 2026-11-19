@@ -28,13 +28,8 @@ import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 
 /**
- * 2026-11-12 A1：把 CSV 文本解析成后端要的 csv_rows（数组）——只收「姓名,手机号」两列。
- * · 列序自动识别：首格命中 11 位手机号（1[3-9] 开头，与后端 is_valid_phone 同口径）
- *   → 按 (手机号,姓名) 读；否则按 (姓名,手机号) 读。
- * · 出现第 3 个非空列 → 该行进 errors（本地拦截，不提交后端）。
- * · 部门不再手填（2026-11-11 拍板）：CSV 行 dept 恒传空，导入后由官方通讯录反查自动回填
- *   member.dept / dept_path（后端 import_role_members + _auto_activate_imported 已就绪）。
- * · 空行忽略；# 开头为注释；首行是「姓名/手机号」表头时自动跳过。
+ * 手机号必填，姓名选填。支持单列手机号和两列自动识别，姓名与部门由后台核验。
+ * 跳过空行和注释，首条数据前可带表头。
  */
 function parseCsvRows(csvText: string): {
   rows: Array<{ row: number; phone: string; name: string; dept: string }>;
@@ -44,31 +39,29 @@ function parseCsvRows(csvText: string): {
   const errors: Array<{ row: number; phone: string; reason: string }> = [];
   const phoneCellRe = /^1[3-9]\d{9}$/;
   const lines = (csvText || '').split(/\r?\n/);
-  lines.forEach((raw, idx) => {
+  let firstRecord = true;
+  lines.forEach((raw) => {
     const line = raw.trim();
     if (!line || line.startsWith('#')) return;
-    const cells = line.split(/[,，\t]/).map((c) => c.trim());
+    const cells = line.split(/[,，\t]/).map((cell) => cell.trim().replace(/^"(.*)"$/, '$1').trim());
     const nonEmpty = cells.filter((c) => c !== '');
     const rowNo = rows.length + errors.length + 1;
-    // 跳过表头：首行格子全是「姓名/手机号」类字样且不含任何手机号数据
-    if (
-      idx === 0 &&
-      nonEmpty.length > 0 &&
-      nonEmpty.every((c) => /姓名|手机号|name|phone/i.test(c)) &&
-      !nonEmpty.some((c) => phoneCellRe.test(c))
-    ) {
-      return;
-    }
-    // 2026-11-12 A1：出现第 3 个非空列 → 拒绝该行（部门由官方通讯录反查回填，不再手填）
-    if (nonEmpty.length > 2) {
+    const header = firstRecord && nonEmpty.length > 0 &&
+      nonEmpty.every((c) => /^(?:姓名|成员姓名|员工姓名|手机号|手机号码|name|phone)$/i.test(c));
+    firstRecord = false;
+    if (cells.slice(2).some(Boolean)) {
       errors.push({
         row: rowNo,
         phone: '',
-        reason: '仅需姓名与手机号两列，请删除多余列（部门无需填写，导入后由官方通讯录自动匹配回填）',
+        reason: '手机号必填，姓名选填，请删除额外列。部门由通讯录自动回填。',
       });
       return;
     }
-    // 两列自动识别列序：首格命中 11 位手机号 → (手机号,姓名)，否则 (姓名,手机号)
+    if (header || !nonEmpty.length) return;
+    if (nonEmpty.length === 1) {
+      rows.push({ row: rowNo, phone: nonEmpty[0], name: '', dept: '' });
+      return;
+    }
     let phone: string;
     let name: string;
     if (phoneCellRe.test(cells[0] || '')) {
@@ -291,14 +284,13 @@ export const RolesMembersView: React.FC = () => {
   const [assigningRoles, setAssigningRoles] = useState(false);
   const [memberRoleIds, setMemberRoleIds] = useState<string[]>([]);
 
-  // CSV 批量导入弹窗（手机号,姓名,部门）
+  // CSV 批量导入弹窗
   const [importModalOpen, setImportModalOpen] = useState(false);
   // 2026-11-11 任务二：组织架构选择器弹窗
   const [orgPickerOpen, setOrgPickerOpen] = useState(false);
   // 2026-11-09：导入被拦截时列出全部错误行（等用户修复后再导）
   const [importErrors, setImportErrors] = useState<Array<{ row: number; phone: string; reason: string }>>([]);
-  // 2026-11-12 A1：两列「姓名,手机号」（列序自动识别）；部门走通讯录反查，不再出现在 CSV 里
-  const [csvText, setCsvText] = useState('姓名,手机号\n张三,13900000000');
+  const [csvText, setCsvText] = useState('');
   const [importing, setImporting] = useState(false);
 
   // 跨管理员全局搜索已激活成员弹窗（若其他管理员已激活该成员，直接复用免二次激活）
@@ -813,7 +805,6 @@ export const RolesMembersView: React.FC = () => {
     try {
       // 2026-11-09：后端接口收的是 csv_rows（数组），原来这里传 csv_text → 协议不匹配、功能实际不可用。
       // 现在本地把 CSV 文本解析成行数组再提交。
-      // 2026-11-12 A1：两列「姓名,手机号」自动识别列序；第 3 列等本地错误直接拦截，不提交后端。
       const { rows, errors } = parseCsvRows(csvText);
       // 2026-11-13：行数上限与后端 IMPORT_ROW_LIMIT=5000 对齐——超限本地直接拦截，不发大请求
       if (rows.length > 5000) {
@@ -830,6 +821,10 @@ export const RolesMembersView: React.FC = () => {
           `导入未执行：${errors.length} 行有问题，已全部列出（本次一行都没有写入）。请修复后重新导入。`,
           '导入被拦截',
         );
+        return;
+      }
+      if (!rows.length) {
+        toast.warning('请填写至少一条带手机号的成员记录');
         return;
       }
       const res = await api.post<{
@@ -1123,8 +1118,6 @@ export const RolesMembersView: React.FC = () => {
                       <ShieldCheck className="w-3.5 h-3.5" />
                       <span>全局搜索已激活成员</span>
                     </button>
-                    {/* 2026-11-12 A1：CSV 批量导入恢复（两列「姓名,手机号」自动识别列序；
-                        部门由官方通讯录反查回填，不再手填） */}
                     <button
                       type="button"
                       onClick={() => {
@@ -1132,7 +1125,7 @@ export const RolesMembersView: React.FC = () => {
                         setImportModalOpen(true);
                       }}
                       className="px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-                      title="每行「姓名,手机号」两列（列序自动识别）；部门由官方通讯录自动匹配回填"
+                      title="手机号必填，姓名选填。核验后自动回填姓名和部门。"
                     >
                       <Upload className="w-3.5 h-3.5" />
                       <span>CSV 批量导入</span>
@@ -1748,8 +1741,7 @@ export const RolesMembersView: React.FC = () => {
         </div>
       )}
 
-      {/* 2026-11-12 A1：CSV 批量导入弹窗（仅「姓名,手机号」两列，列序自动识别；
-          部门由官方通讯录反查自动回填，不再手填） */}
+      {/* CSV 批量导入，姓名与部门可由通讯录回填。 */}
       {importModalOpen && currentRole && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -1759,7 +1751,7 @@ export const RolesMembersView: React.FC = () => {
                   批量导入成员至「{currentRole.role_name}」
                 </h3>
                 <p className="text-[11px] text-slate-400">
-                  每行一条记录，仅需「姓名,手机号」两列（列序自动识别）；部门无需填写，导入后由官方通讯录自动匹配回填；已激活手机号自动免二次激活
+                  每行一条记录。可只填手机号，也可填写「姓名,手机号」或「手机号,姓名」。姓名留空时自动补全，填写姓名时会核对一致性。部门自动回填。
                 </p>
               </div>
               <button
@@ -1774,7 +1766,7 @@ export const RolesMembersView: React.FC = () => {
                 rows={6}
                 value={csvText}
                 onChange={(e) => setCsvText(e.target.value)}
-                placeholder={'姓名,手机号\n张三,13900000000\n13900000001,李四（列序颠倒也能识别）'}
+                placeholder={'手机号\n13900000000\n13900000001'}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 font-mono text-xs text-slate-800 outline-none focus:bg-white focus:border-blue-500 leading-relaxed"
               />
               {/* 2026-11-09：导入被拦截 → 列出全部错误行（不关窗，等用户修复后再导） */}

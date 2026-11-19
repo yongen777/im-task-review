@@ -242,12 +242,10 @@ class TestStage2A(unittest.TestCase):
         self.assertEqual((diff["ok"], diff["dry_run"]), (True, True))
         self.assertEqual(diff["will_add"], 0, diff)          # 2026-11-09 新口径：整批拒绝 → will_add 归零
         self.assertEqual(diff["already_exists"], 2, diff)     # 张三（名册已有）+ 李四重复（批次内重复）
-        self.assertEqual(len(diff["invalid"]), 5, diff)       # 与名册重复 + 手机号格式 + 姓名空 + 批次内重复 + None 行
-        # 2026-11-09：invalid 列表的**顺序变了**（新增的「与名册重复」检测在收集阶段，
-        # 排在格式错误之前）→ 按**行号**取断言，不依赖下标顺序。
+        # 姓名可留空。其余行存在格式错误时，整批在通讯录核验前被拦截。
         _by_row = {x["row"]: x for x in diff["invalid"]}
+        self.assertEqual(set(_by_row), {1, 4, 6, 7}, diff)
         self.assertEqual((_by_row[4]["phone"], _by_row[4]["reason"]), ("12345", "手机号格式不正确"))
-        self.assertEqual((_by_row[5]["row"], _by_row[7]["row"]), (5, 7))
         self.assertTrue(any(x["row"] == 1 and "重复" in x["reason"] for x in diff["invalid"]), diff["invalid"])
         self.assertEqual(self.store.list_role_members(rid)["total"], 1)
 
