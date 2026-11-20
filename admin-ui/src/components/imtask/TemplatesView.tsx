@@ -124,12 +124,16 @@ function formatManualDeadline(value?: string | null): string {
   return `${year}年${month}月${day}日 ${value.slice(11, 16)}`;
 }
 
-function NoticePhonePreview({ body, media, label, mode }: {
-  body: string; media: NoticeMessageItem[]; label: string; mode: NoticeReceiptMode;
+function NoticePhonePreview({ body, media, label, mode, guide, title }: {
+  body: string; media: NoticeMessageItem[]; label: string; mode: NoticeReceiptMode; guide?: string; title?: string;
 }) {
   const linkMode = label && mode === 'link';
   /* 2026-11-19 需求四（所见即所得）：link 模式同样先发正文与全部附件，
-     最后才追加一条确认链接。预览不再截断正文、不再隐藏媒体气泡。 */
+     最后才追加一条确认链接。预览不再截断正文、不再隐藏媒体气泡。
+     2026-11-20 需求 A/B：链接气泡改为与实发消息逐字一致的三行标准文本
+     （头部 + 引导语 + 链接行），media 气泡只展示媒体本体（不发文件名）。 */
+  const guideLine = (guide || '').trim() || `请打开链接阅读完整通知，点击「${label || '我已知晓'}」确认。`;
+  const heading = `【德阳量密助手】您收到《${(title || '').trim() || '通知'}》通知。`;
   const message = body.trim();
   return <aside aria-label="量子密信通知预览" className="rounded-2xl border border-slate-200 bg-slate-50 overflow-hidden">
     <h4 className="flex items-center gap-2 border-b border-slate-200 bg-white px-4 py-3 text-sm font-semibold">
@@ -142,11 +146,14 @@ function NoticePhonePreview({ body, media, label, mode }: {
           className="max-h-44 w-full rounded-md object-contain" />}
         {item.format === 'video' && <video controls playsInline preload="metadata" src={noticeAssetUrl(item)}
           className="max-h-44 w-full rounded-md bg-black" />}
-        <p className="mt-1">{NOTICE_LABELS[item.format]} · {item.file_name || item.file_caption}</p>
       </div>)}
-      {label && <p className="rounded-xl border border-slate-200 bg-white p-3 break-words">
-        {linkMode ? <>请打开链接阅读完整通知，点击「{label}」确认。<br /><span className="text-blue-700">查看通知并确认</span></>
-          : <>以上为通知内容，查收后请直接回复「{label}」完成确认。</>}
+      {linkMode && <p className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+        {heading}<br />
+        {guideLine}<br />
+        <span className="text-blue-700 break-all">http://…/h5/notice-receipt#t=…</span>
+      </p>}
+      {label && !linkMode && <p className="rounded-xl border border-slate-200 bg-white p-3 break-words">
+        以上为通知内容，查收后请直接回复「{label}」完成确认。
       </p>}
       {!message && !media.length && !label && <p className="text-slate-500">添加通知内容后可预览。</p>}
     </div>
@@ -280,202 +287,217 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
         </div>}
       </div>
 
-      {/* 手机屏幕容器 */}
-      <div className="bg-slate-100 rounded-2xl overflow-hidden text-slate-800 border-2 border-indigo-200/90 shadow-inner min-h-[410px] flex flex-col">
-        {/* 手机顶部状态栏 */}
-        <div className="bg-white px-4 py-2.5 border-b border-slate-200 flex items-center justify-between text-[11px]">
-          {!isAdhoc && <span className="font-mono font-bold text-slate-700">{isManual ? '立即推送' : (remindAt || '16:30')}</span>}
-          <span className="font-bold text-slate-900 truncate max-w-[180px]">
-            {step === 'im' ? '办公软件 · 任务助手' : displayTitle}
-          </span>
-          <span className="text-[10px] text-blue-600 font-semibold">H5 专属通道</span>
-        </div>
-
-        {/* 步骤1：办公软件聊天界面收到提醒文本 + H5链接 */}
-        {step === 'im' && (
-          <div className="p-4 flex-1 flex flex-col justify-between space-y-4 bg-slate-100">
-            <div className="space-y-3">
-              <div className="text-center">
-                <span className="px-2 py-0.5 rounded bg-slate-200/80 text-slate-500 text-[10px] font-mono">
-                  执行时间 {remindAt || '16:30'}
-                </span>
-              </div>
-
-              <div className="flex items-start gap-2.5">
-                <div className="bg-white rounded-2xl rounded-tl-xs p-3.5 shadow-xs border border-slate-200/80 max-w-[92%]">
-                  {/* 2026-10-28：预览按实际推送的纯文本渲染（密信不支持富文本卡片/超链接），
-                      与实际发送内容一字不差，避免「预览一套、实发一套」。 */}
-                  <div className="text-xs text-slate-800 whitespace-pre-line leading-relaxed">
-                    {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：${deadline ? deadlineText : '不限'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
+      {/* 手机屏幕容器（2026-11-20 需求 B-3：H5 步骤与 task.html 真实页面同视觉基准——
+          --blue #15558a / --canvas #f4f6f8 / --line #e2e8ee / 白卡 12px 圆角 / 顶栏 3px 主色条） */}
+      <div className="bg-[#f4f6f8] rounded-2xl overflow-hidden text-slate-800 border-2 border-[#c7d9ea] shadow-inner min-h-[410px] flex flex-col">
+        {step === 'im' ? (
+          <>
+            {/* 步骤1 顶部：办公软件标题行 */}
+            <div className="bg-white px-4 py-2.5 border-b border-[#e2e8ee] flex items-center justify-between text-[11px]">
+              <span className="font-mono font-bold text-slate-700">{isManual ? '立即推送' : (remindAt || '16:30')}</span>
+              <span className="font-bold text-slate-900">办公软件 · 任务助手</span>
+              <span className="text-[10px] text-[#15558a] font-semibold">H5 专属通道</span>
+            </div>
+            <div className="p-4 flex-1 flex flex-col justify-between space-y-4 bg-slate-100">
+              <div className="space-y-3">
+                <div className="text-center">
+                  <span className="px-2 py-0.5 rounded bg-slate-200/80 text-slate-500 text-[10px] font-mono">
+                    执行时间 {remindAt || '16:30'}
+                  </span>
+                </div>
+                <div className="flex items-start gap-2.5">
+                  <div className="bg-white rounded-2xl rounded-tl-xs p-3.5 shadow-xs border border-slate-200/80 max-w-[92%]">
+                    <div className="text-xs text-slate-800 whitespace-pre-line leading-relaxed">
+                      {`【任务提醒】${displayTitle}\n${displayRemindText}\n\n截止时间：${deadline ? deadlineText : '不限'}\n提交入口（点击链接打开上传任务）：\n${linkPreviewUrl}`}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-
-            <div className="text-center pt-2">
-              <button
-                type="button"
-                onClick={() => setStep('h5')}
-                className="px-3.5 py-1.5 rounded-xl bg-blue-600 text-white text-[11px] font-semibold cursor-pointer shadow-xs"
-              >
-                查看 H5 上传页效果 →
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* 步骤2：H5 上传页面（根据勾选的 字段/文本/图片/文件 动态合成） */}
-        {step === 'h5' && (
-          <div className="p-3.5 flex-1 overflow-y-auto space-y-3 bg-slate-50">
-            {/* H5 顶部任务说明卡片 */}
-            <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-1">
-              <div className="flex items-center justify-between">
-                <span className="font-bold text-slate-900 text-xs">{displayTitle}</span>
-                {!isAdhoc && <span className="text-[10px] font-mono text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
-                  截止 {deadline ? deadlineText : '不限'}
-                </span>}
-              </div>
-              {/* 2026-10-28：按业务方要求，这里不放提醒正文，改为「提交人 · 周期 · 状态」 */}
-              <div className="text-[11px] text-slate-500">
-                提交人：张三{!isAdhoc && !isManual && ` · 执行时间：${remindAt || '16:30'}`} · 状态：<span className="text-slate-700 font-semibold">待上传</span>
+              <div className="text-center pt-2">
+                <button
+                  type="button"
+                  onClick={() => setStep('h5')}
+                  className="px-3.5 py-1.5 rounded-xl bg-blue-600 text-white text-[11px] font-semibold cursor-pointer shadow-xs"
+                >
+                  查看 H5 上传页效果 →
+                </button>
               </div>
             </div>
+          </>
+        ) : (
+          <>
+            {/* 步骤2 顶部：task.html 的 topbar（白底 + 3px 主色条 + 品牌/副标） */}
+            <div className="bg-white px-4 py-2.5 shadow-xs flex items-center justify-between" style={{ borderTop: '3px solid #15558a', borderBottom: '1px solid #e2e8ee' }}>
+              <span className="text-[13px] font-semibold text-[#182530] tracking-tight">德阳量密助手</span>
+              <span className="text-xs text-[#60707d]">任务填报</span>
+            </div>
 
-            {modules.length === 0 ? (
-              <div className="p-6 text-center text-xs text-slate-400 bg-white rounded-xl border border-dashed border-slate-200">
-                请在左侧勾选至少一种 H5 上传组件（字段 / 文本 / 图片 / 文件）
+            <div className="p-4 flex-1 overflow-y-auto space-y-3 bg-[#f4f6f8]">
+              {/* H5 任务头卡（.task-head：白卡 + 19px 标题 + 截止徽章 + 提交人行 + 状态徽章） */}
+              <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs">
+                <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2 mb-2.5">
+                  <h3 className="text-[19px] leading-[1.35] font-semibold text-[#182530] tracking-tight flex-1">{displayTitle}</h3>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium text-[#15558a] bg-[#eef4fa] border border-[#c7d9ea] whitespace-nowrap">
+                    截止 {deadline ? deadlineText : '不限'}
+                  </span>
+                </div>
+                <p className="text-[14px] leading-[1.6] text-[#495966] whitespace-pre-line">{isAdhoc ? '' : displayRemindText}</p>
+                <div className="flex flex-wrap items-center justify-between gap-2 mt-3.5 pt-3 border-t border-[#e2e8ee] text-[12.5px] text-[#60707d]">
+                  <span>提交人：张三{!isAdhoc && !isManual && ` · 执行时间：${remindAt || '16:30'}`}</span>
+                  <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium text-[#15558a] bg-[#eef4fa] border border-[#c7d9ea]">待上传</span>
+                </div>
               </div>
-            ) : (
-              <div className="space-y-2.5">
-                {/* 模块 A：字段（报数类型） */}
-                {modules.includes('fields') && (
-                  <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-2">
-                    <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                      <Hash className="w-3.5 h-3.5 text-blue-600" />
-                      <span>数据报数填报</span>
+
+              {modules.length === 0 ? (
+                <div className="p-6 text-center text-xs text-slate-400 bg-white rounded-xl border border-dashed border-slate-200">
+                  请在左侧勾选至少一种 H5 上传组件（字段 / 文本 / 图片 / 文件）
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {/* 模块 A：字段（报数类型）—— H5 block 视觉 */}
+                  {modules.includes('fields') && (
+                    <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2.5">
+                      <div className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
+                        <Hash className="w-[18px] h-[18px] text-[#15558a]" />
+                        <span>数据报数填报</span>
+                      </div>
+                      <div className="space-y-2.5">
+                        {(fields.length > 0
+                          ? fields
+                          : [
+                              {
+                                key: 'visit_count',
+                                label: '今日累计上门户数',
+                                type: 'number' as const,
+                                required: true,
+                              },
+                              {
+                                key: 'intent_orders',
+                                label: '新增商机意向单数',
+                                type: 'number' as const,
+                                required: true,
+                              },
+                            ]
+                        ).map((f, i) => (
+                          <div key={i} className="space-y-1">
+                            <label className="text-[13px] font-medium text-[#495966] flex items-center justify-between">
+                              <span>
+                                {f.label || `报数项 #${i + 1}`}
+                                {f.required && <span className="text-rose-500 ml-0.5">*</span>}
+                              </span>
+                              <span className="text-[11px] text-[#60707d]">
+                                {f.type === 'number' ? '数值报数' : f.type === 'boolean' ? '是／否' : f.type === 'select' ? '下拉选择' : '文本'}
+                              </span>
+                            </label>
+                            {f.type === 'select' || f.type === 'boolean' ? (
+                              <select className="w-full bg-[#f7f9fb] border border-[#e2e8ee] rounded-lg px-2.5 py-2 text-[13px] text-[#182530]">
+                                {(f.type === 'boolean' ? ['是', '否'] : f.options || []).map(
+                                  (opt, idx) => (
+                                    <option key={idx}>{opt}</option>
+                                  ),
+                                )}
+                              </select>
+                            ) : (
+                              <input
+                                type={f.type === 'number' ? 'number' : 'text'}
+                                readOnly
+                                placeholder={
+                                  f.type === 'number' ? '请输入具体数值（如：18）' : '请输入内容'
+                                }
+                                className="w-full bg-[#f7f9fb] border border-[#e2e8ee] rounded-lg px-2.5 py-2 text-[13px] text-[#182530] placeholder:text-[#8a95a1]"
+                              />
+                            )}
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                    <div className="space-y-2">
-                      {(fields.length > 0
-                        ? fields
-                        : [
-                            {
-                              key: 'visit_count',
-                              label: '今日累计上门户数',
-                              type: 'number' as const,
-                              required: true,
-                            },
-                            {
-                              key: 'intent_orders',
-                              label: '新增商机意向单数',
-                              type: 'number' as const,
-                              required: true,
-                            },
-                          ]
-                      ).map((f, i) => (
-                        <div key={i} className="space-y-1">
-                          <label className="text-[11px] font-medium text-slate-700 flex items-center justify-between">
-                            <span>
-                              {f.label || `报数项 #${i + 1}`}
-                              {f.required && <span className="text-rose-500 ml-0.5">*</span>}
-                            </span>
-                            <span className="text-[10px] text-slate-400">
-                              {f.type === 'number' ? '数值报数' : f.type === 'boolean' ? '是／否' : f.type === 'select' ? '下拉选择' : '文本'}
-                            </span>
-                          </label>
-                          {f.type === 'select' || f.type === 'boolean' ? (
-                            <select className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-700">
-                              {(f.type === 'boolean' ? ['是', '否'] : f.options || []).map(
-                                (opt, idx) => (
-                                  <option key={idx}>{opt}</option>
-                                ),
-                              )}
-                            </select>
-                          ) : (
-                            <input
-                              type={f.type === 'number' ? 'number' : 'text'}
-                              readOnly
-                              placeholder={
-                                f.type === 'number' ? '请输入具体数值（如：18）' : '请输入内容'
-                              }
-                              className="w-full bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 text-[11px] text-slate-700"
-                            />
-                          )}
+                  )}
+
+                  {/* 模块 B：文本反馈 */}
+                  {modules.includes('text') && (
+                    <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2">
+                      <div className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
+                        <AlignLeft className="w-[18px] h-[18px] text-[#15558a]" />
+                        <span>{textLabel.trim() || '文字情况反馈'}</span>
+                      </div>
+                      <textarea
+                        rows={2}
+                        readOnly
+                        placeholder={
+                          textPlaceholder.trim() || '请输入今日重点执行情况、未破零帮扶进度或补充说明…'
+                        }
+                        className="w-full bg-[#f7f9fb] border border-[#e2e8ee] rounded-lg p-2.5 text-[13px] text-[#182530] placeholder:text-[#8a95a1] resize-none"
+                      />
+                    </div>
+                  )}
+
+                  {/* 模块 C：图片上传 */}
+                  {modules.includes('image') && (
+                    <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
+                          <ImageIcon className="w-[18px] h-[18px] text-[#15558a]" />
+                          <span>图片上传</span>
+                        </span>
+                        <span className="text-[11px] text-[#60707d]">JPG / PNG / WEBP</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        <div className="h-[68px] w-full rounded-lg border-2 border-dashed border-[#c7d9ea] bg-[#eef4fa] flex flex-col items-center justify-center text-center gap-1 text-[#15558a]">
+                          <ImageIcon className="w-4 h-4 shrink-0" />
+                          <span className="text-[10px] font-medium leading-none whitespace-nowrap">+ 点击选择图片</span>
                         </div>
-                      ))}
+                        <div className="h-[68px] rounded-lg bg-[#f7f9fb] border border-[#e2e8ee] flex items-center justify-center text-[10px] text-[#8a95a1]">
+                          示例晒图1.jpg
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
 
-                {/* 模块 B：文本反馈 */}
-                {modules.includes('text') && (
-                  <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-1.5">
-                    <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                      <AlignLeft className="w-3.5 h-3.5 text-emerald-600" />
-                      <span>{textLabel.trim() || '文字情况反馈'}</span>
+                  {/* 模块 D：文件上传 */}
+                  {modules.includes('file') && (
+                    <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
+                          <Paperclip className="w-[18px] h-[18px] text-[#15558a]" />
+                          <span>文件上传</span>
+                        </span>
+                        <span className="text-[11px] text-[#60707d]">Excel / PDF / Word</span>
+                      </div>
+                      <div className="p-2.5 rounded-lg border-2 border-dashed border-[#c7d9ea] bg-[#eef4fa] flex items-center justify-center gap-1.5 text-[#15558a] text-[13px] font-medium">
+                        <Upload className="w-4 h-4" />
+                        <span>点击选择文档并上传</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 备注说明（选填）——H5 noteField 块 */}
+                  <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2">
+                    <div className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
+                      <AlignLeft className="w-[18px] h-[18px] text-[#15558a]" />
+                      <span>备注说明（选填）</span>
                     </div>
                     <textarea
                       rows={2}
                       readOnly
-                      placeholder={
-                        textPlaceholder.trim() || '请输入今日重点执行情况、未破零帮扶进度或补充说明…'
-                      }
-                      className="w-full bg-slate-50 border border-slate-200 rounded-lg p-2 text-[11px] text-slate-600 resize-none"
+                      placeholder="请输入补充说明"
+                      className="w-full bg-[#f7f9fb] border border-[#e2e8ee] rounded-lg p-2.5 text-[13px] text-[#182530] placeholder:text-[#8a95a1] resize-none"
                     />
                   </div>
-                )}
+                </div>
+              )}
+            </div>
 
-                {/* 模块 C：图片上传 */}
-                {modules.includes('image') && (
-                  <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                        <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
-                        <span>图片上传</span>
-                      </span>
-                      <span className="text-[10px] text-slate-400">JPG / PNG / WEBP</span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2">
-                      <div className="h-16 w-full rounded-lg border-2 border-dashed border-indigo-200 bg-indigo-50/50 flex flex-col items-center justify-center text-center gap-1 text-indigo-600">
-                        <ImageIcon className="w-4 h-4 shrink-0" />
-                        <span className="text-[10px] font-medium leading-none whitespace-nowrap">+ 点击选择图片</span>
-                      </div>
-                      <div className="h-16 rounded-lg bg-slate-100 border border-slate-200 flex items-center justify-center text-[10px] text-slate-400">
-                        示例晒图1.jpg
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* 模块 D：文件上传 */}
-                {modules.includes('file') && (
-                  <div className="bg-white p-3 rounded-xl border border-slate-200/90 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="flex items-center gap-1.5 text-xs font-bold text-slate-800">
-                        <Paperclip className="w-3.5 h-3.5 text-violet-600" />
-                        <span>文件上传</span>
-                      </span>
-                      <span className="text-[10px] text-slate-400">Excel / PDF / Word</span>
-                    </div>
-                    <div className="p-2.5 rounded-lg border border-dashed border-violet-200 bg-violet-50/40 flex items-center justify-center gap-1.5 text-violet-700 text-[11px] font-medium">
-                      <Upload className="w-3.5 h-3.5" />
-                      <span>点击选择文档并上传</span>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* H5 底部提交按钮 */}
-            <div className="pt-1">
+            {/* H5 底部提交按钮（task-actions：贴底白条 + 深蓝主按钮） */}
+            <div className="bg-white px-4 py-3 border-t border-[#e2e8ee]">
               <button
                 type="button"
-                className="w-full py-2.5 rounded-xl bg-blue-600 text-white font-bold text-xs shadow-sm flex items-center justify-center gap-1.5 cursor-default"
+                className="w-full h-11 rounded-lg bg-[#15558a] text-white font-medium text-sm flex items-center justify-center gap-1.5 cursor-default"
               >
-                <Send className="w-3.5 h-3.5" />
-                <span>提交上传</span>
+                <Send className="w-4 h-4" />
+                <span>提交任务</span>
               </button>
             </div>
-          </div>
+          </>
         )}
       </div>
     </div>
@@ -547,6 +569,8 @@ export const TemplatesView: React.FC = () => {
   const [receiptMode, setReceiptMode] = useState<NoticeReceiptMode>('link');
   const [receiptPhrase, setReceiptPhrase] = useState(DEFAULT_RECEIPT);
   const [receiptButtonLabel, setReceiptButtonLabel] = useState(DEFAULT_RECEIPT);
+  /* 2026-11-20 需求 A：link 模式选填「链接引导语」——确认链接消息第二行的自定义提示语 */
+  const [receiptGuideText, setReceiptGuideText] = useState('');
   const [uploadingAssetId, setUploadingAssetId] = useState<string | null>(null);
 
   // 上传任务专用状态（提醒文本 + 选择 H5 上传项 [字段/文本/图片/文件] + 是否需要审核）
@@ -728,6 +752,7 @@ export const TemplatesView: React.FC = () => {
       setReceiptMode(tpl.spec?.notice_receipt?.mode || (tpl.spec?.notice_receipt?.enabled ? 'text' : 'link'));
       setReceiptPhrase(tpl.spec?.notice_receipt?.phrase || DEFAULT_RECEIPT);
       setReceiptButtonLabel(tpl.spec?.notice_receipt?.button_label || DEFAULT_RECEIPT);
+      setReceiptGuideText(tpl.spec?.notice_receipt?.receipt_guide_text || '');
     } else {
       setUploadRemindText(tpl.text_tpl || '');
       setUploadModules(resolveUploadModules(tpl));
@@ -874,7 +899,9 @@ export const TemplatesView: React.FC = () => {
           ...activeNoticeItems,
         ],
         notice_receipt: { enabled: receiptEnabled, mode: receiptMode,
-          ...(receiptMode === 'link' ? { button_label: receiptButtonLabel.trim() } : { phrase: receiptPhrase.trim() }) },
+          ...(receiptMode === 'link'
+            ? { button_label: receiptButtonLabel.trim(), ...(receiptGuideText.trim() ? { receipt_guide_text: receiptGuideText.trim() } : {}) }
+            : { phrase: receiptPhrase.trim() }) },
       };
     } else {
       // 统一上传任务校验（2026-11-12 任务E1：截止配置改为 开关+类型+时刻）
@@ -1044,7 +1071,7 @@ export const TemplatesView: React.FC = () => {
         needs_confirm?: boolean;
         target_count?: number;
         new_batch?: boolean;
-        cancelled?: number;
+        synced_completed?: number;
         instance_count?: number;
         pushed_at?: string;
         deadline_at?: string;
@@ -1072,7 +1099,7 @@ export const TemplatesView: React.FC = () => {
       }
       setPushConfirmTpl(null);
     } catch (err) {
-      // 429 冷却（2 分钟内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
+      // 429 冷却（3 秒内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
       toast.error(err instanceof Error ? plainError(err.message) : '推送未成功');
     } finally {
       setPushingId(null);
@@ -1088,15 +1115,15 @@ export const TemplatesView: React.FC = () => {
       const res = await api.post<{
         queued?: boolean;
         new_batch?: boolean;
-        cancelled?: number;
+        synced_completed?: number;
         instance_count?: number;
         period_key?: string;
         stats?: { sent?: number; pushed_instances?: number };
       }>(`/api/admin/templates/${target.id}/push-now?confirmed=1`);
       if (res?.queued) {
         toast.success(
-          `已新建一批实例（${res.instance_count ?? 0} 条），取消旧的未完成实例 ${res.cancelled ?? 0} 条；` +
-            `消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。`,
+          `已按归属周期再推 ${res.instance_count ?? 0} 条实例（已同步本周期完成状态 ${res.synced_completed ?? 0} 条，` +
+            `已完成/已截止成员收到只读回顾链接）；消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。`,
           '重推已启动',
         );
       } else {
@@ -1986,11 +2013,19 @@ export const TemplatesView: React.FC = () => {
                             </label>
                           </fieldset>
                           {receiptMode === 'link'
-                            ? <label className="block space-y-2">
-                              <span>确认按钮文案</span>
-                              <input type="text" maxLength={80} value={receiptButtonLabel} onChange={event => setReceiptButtonLabel(event.target.value)}
-                                className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
-                            </label>
+                            ? <>
+                              <label className="block space-y-2">
+                                <span>确认按钮文案</span>
+                                <input type="text" maxLength={80} value={receiptButtonLabel} onChange={event => setReceiptButtonLabel(event.target.value)}
+                                  className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
+                              </label>
+                              <label className="block space-y-2">
+                                <span>链接引导语（选填）</span>
+                                <input type="text" maxLength={120} value={receiptGuideText} onChange={event => setReceiptGuideText(event.target.value)}
+                                  placeholder="留空默认：请打开链接阅读完整通知，点击「我已知晓」确认。"
+                                  className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none focus:border-blue-500" />
+                              </label>
+                            </>
                             : <label className="block space-y-2">
                               <span>要求回复的话术</span>
                               <input type="text" maxLength={80} value={receiptPhrase} onChange={event => setReceiptPhrase(event.target.value)}
@@ -2187,7 +2222,9 @@ export const TemplatesView: React.FC = () => {
                   <div className="lg:col-span-5"><NoticePhonePreview body={noticeKinds.includes('text') ? noticeText : ''}
                     media={noticeItems.filter(item => noticeKinds.includes(item.format))}
                     mode={receiptMode}
-                    label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''} /></div>
+                    label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''}
+                    guide={receiptEnabled && receiptMode === 'link' ? receiptGuideText : ''}
+                    title={name} /></div>
                 )}
               </div>
 
@@ -2288,7 +2325,7 @@ export const TemplatesView: React.FC = () => {
         </div>
       )}
 
-      {/* 2026-11-19 需求一：本周期已推送过 → 二次确认是否新建一批再推一次 */}
+      {/* 2026-11-20 切期改造：本周期已推送过 → 二次确认是否按归属周期再推一次（全员照推） */}
       {repushConfirm && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -2302,9 +2339,10 @@ export const TemplatesView: React.FC = () => {
               </button>
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              该任务本周期已推送过，确认向当前角色（{repushConfirm.targetCount} 人）新建一批实例并再次推送吗？
+              将向当前角色（{repushConfirm.targetCount} 人）再次推送本周期任务；
               <br />
-              （旧的未完成/未回执实例将自动取消，已完成/已回执的不受影响）
+              （已完成/已回执与已过截止的成员照常收到消息，但链接只读回顾、不会再回到待办；
+              未完成成员正常提交；待办与统计按本周期自动去重）
             </p>
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -2318,7 +2356,7 @@ export const TemplatesView: React.FC = () => {
                 disabled={pushingId === repushConfirm.tpl.id}
                 className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
               >
-                {pushingId === repushConfirm.tpl.id ? '重推中…' : '新建批次并重推'}
+                {pushingId === repushConfirm.tpl.id ? '重推中…' : '确认重推'}
               </button>
             </div>
           </div>

@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, Iterable, List, Optional, Tuple
 
-from .config import NowFn, default_now, format_dt, parse_dt
+from .config import NowFn, canonical_part, default_now, format_dt, parse_dt
 from .db import Database, IntegrityError
 
 logger = logging.getLogger(__name__)
@@ -3003,8 +3003,17 @@ class StateStore:
                                        or any(ord(c) < 32 for c in label)
                                        or (mode == "text" and not receipt_key(label))):
                 raise BizError(400, "INVALID_RECEIPT", "请输入 1–80 字的有效回执文案")
-            _spec_payload = {**_spec_payload, "notice_receipt": {"enabled": receipt["enabled"], "mode": mode,
-                             field: label.strip() if receipt["enabled"] else "我已知晓"}}
+            # 2026-11-20 需求 A：链接引导语（选填，仅 link 模式）——自定义确认链接消息的
+            # 第二行提示语；留空回退默认「请打开链接阅读完整通知，点击「…」确认。」
+            guide = receipt.get("receipt_guide_text")
+            if guide is not None and (not isinstance(guide, str) or len(guide) > 120
+                                      or any(ord(c) < 32 for c in guide)):
+                raise BizError(400, "INVALID_RECEIPT", "链接引导语必须是不超过 120 字的纯文本")
+            receipt_out = {"enabled": receipt["enabled"], "mode": mode,
+                           field: label.strip() if receipt["enabled"] else "我已知晓"}
+            if mode == "link" and isinstance(guide, str) and guide.strip():
+                receipt_out["receipt_guide_text"] = guide.strip()
+            _spec_payload = {**_spec_payload, "notice_receipt": receipt_out}
         notice_items = _spec_payload.get("notice_items") if isinstance(_spec_payload, dict) else None
         notice_images = []
         notice_assets = []
@@ -4276,6 +4285,10 @@ class StateStore:
         · rejected 也算未完成（驳回重交窗口内仍可交）；
         · 「未截止」：deadline_at > now（哨兵天然恒真）；
           rejected 用重交截止判定（超过重交截止的按 advance 会转 expired，双保险）。
+
+        2026-11-20 切期改造：按「模板 + 归属周期」去重——同周期不论定时/手动推了
+        多少批，只展示最新一条（与 H5 工作台 todos 同口径）。预取 limit×4 缓冲
+        （重推批次会占行数），去重后再截取 limit。
         """
         clean_phone = (phone or "").strip()
         if not clean_phone:
@@ -4288,6 +4301,7 @@ class StateStore:
             plat_sql = ("AND EXISTS (SELECT 1 FROM role r WHERE r.platform = ? "
                         "AND instr(t.role_ids, r.role_id) > 0) ")
             params.append(plat)
+        want = max(1, int(limit))
         with self.lock:
             rows = self.conn.execute(
                 "SELECT i.*, t.name AS template_name, t.kind AS template_kind "
@@ -4298,10 +4312,18 @@ class StateStore:
                 "AND i.period_key NOT LIKE 'adhoc-%' "
                 + plat_sql +
                 "ORDER BY i.deadline_at ASC, i.id ASC LIMIT ?",
-                tuple(params + [max(1, int(limit))]),
+                tuple(params + [want * 4]),
             ).fetchall()
-        out: List[Dict[str, Any]] = []
+        pick: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for r in rows:
+            d = dict(r)
+            key = (str(d["template_id"]), canonical_part(str(d["period_key"])))
+            cur = pick.get(key)
+            if cur is None or int(d["id"]) > int(cur["id"]):
+                pick[key] = d
+        ordered = sorted(pick.values(), key=lambda d: (d["deadline_at"], int(d["id"])))[:want]
+        out: List[Dict[str, Any]] = []
+        for r in ordered:
             d = dict(r)
             d["kind"] = d.pop("template_kind", None) or "form"
             deadline_at = effective_instance_deadline(d)
@@ -4688,6 +4710,14 @@ class StateStore:
                 "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL WHERE id = ?",
                 (new_status, now_s, late_submit, int(inst["id"])),
             )
+            # 2026-11-20 切期改造二-3（双向同步）：本周期内该成员名下其余未完成实例
+            # （定时推的 #1 / 手动重推的 #2 …）同步为完成态并共享展示本条提交内容
+            # （提交行不动，只读回看走 latest_family_submission）。
+            self.sync_family_completion(
+                inst["template_id"], inst["phone"], inst["period_key"],
+                status=new_status, submitted_at=now_s, late_submit=late_submit,
+                skip_instance_id=int(inst["id"]),
+            )
 
         if draft and on_instance_resolved is not None:
             on_instance_resolved(inst["id"])
@@ -4718,6 +4748,17 @@ class StateStore:
                 self.conn.execute("UPDATE task_instance SET status = 'approved', reviewed_at = ?, reviewer = ? WHERE id = ?", (now_s, reviewer, int(instance_id)))
                 if latest_sub:
                     self.conn.execute("UPDATE submission SET status = 'approved' WHERE id = ?", (int(latest_sub["id"]),))
+                # 2026-11-20 切期改造二-3：审核通过的完成态同步到同归属周期
+                # 其余 submitted 副本（保持三端口径一致）。
+                _fam = self.conn.execute(
+                    "SELECT template_id, phone, period_key, submitted_at, late_submit FROM task_instance WHERE id = ?",
+                    (int(instance_id),)).fetchone()
+                if _fam is not None:
+                    self.sync_family_completion(
+                        _fam["template_id"], _fam["phone"], _fam["period_key"],
+                        status="approved", submitted_at=_fam["submitted_at"], late_submit=_fam["late_submit"],
+                        skip_instance_id=int(instance_id),
+                    )
             else:
                 self.conn.execute(
                     "UPDATE task_instance SET status = 'rejected', reviewed_at = ?, reviewer = ?, reject_reason = ?, reject_count = reject_count + 1 WHERE id = ?",
@@ -4937,23 +4978,23 @@ class StateStore:
         }
 
     def list_push_batches(self, template_id: str) -> List[Dict[str, Any]]:
-        """按 period_key 聚合的推送批次（统计面板「推送批次」下拉与既有批次对账用）。
-
-        alive_count = 未被取消的实例数（重推会把旧批次未完成实例置 cancelled）。
+        """按**归属周期**聚合的推送批次（2026-11-20 切期改造：重推不再取消旧批次，
+        面板默认按「整个归属周期」汇总，批次清单退化为周期清单——每个归属周期一行，
+        instance_count = 该周期全部实例数（含重推批次），alive_count = 未取消数）。
         """
         clean = (template_id or "").strip()
         with self.lock:
             rows = self.conn.execute(
-                "SELECT period_key, COUNT(1) AS instance_count, "
+                "SELECT SUBSTRING_INDEX(period_key, '#', 1) AS canonical_key, COUNT(1) AS instance_count, "
                 "SUM(CASE WHEN status <> 'cancelled' THEN 1 ELSE 0 END) AS alive_count, "
                 "MIN(created_at) AS first_created_at "
-                "FROM task_instance WHERE template_id = ? GROUP BY period_key "
-                "ORDER BY MIN(created_at) ASC, period_key ASC",
+                "FROM task_instance WHERE template_id = ? GROUP BY canonical_key "
+                "ORDER BY MIN(created_at) ASC, canonical_key ASC",
                 (clean,),
             ).fetchall()
         return [
             {
-                "period_key": str(r["period_key"] or ""),
+                "period_key": str(r["canonical_key"] or ""),
                 "instance_count": int(r["instance_count"] or 0),
                 "alive_count": int(r["alive_count"] or 0),
                 "first_created_at": str(r["first_created_at"] or ""),
@@ -4961,25 +5002,209 @@ class StateStore:
             for r in rows
         ]
 
-    def cancel_stale_instances_for_new_batch(self, template_id: str, keep_period_key: str) -> int:
-        """手动重推建新批次后调用：同模板旧批次的未完成实例置 cancelled（防 H5 待办刷屏）。
+    def period_has_alive_instances(self, template_id: str, period_key: str) -> bool:
+        """该 period_key（canonical 或批次键）下是否还有未取消实例。
 
-        notice：status IN ('pending','sent') 且 receipt_at IS NULL（未回执/未送达）；
-        非 notice：status IN ('pending','rejected')（待提交 / 被驳回待重交）。
-        已完成（submitted/approved）、已回执、已 cancelled/expired 的历史批次一律不动。
+        2026-11-20 切期改造：手动重推确认时用它判断「canonical 主批次是否复活」——
+        主批次仍存活 → 另起新批次；已整批取消（成员变动/历史停用）→ 直接复活 canonical。
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM task_instance WHERE template_id = ? AND period_key = ? "
+                "AND status <> 'cancelled' LIMIT 1",
+                ((template_id or "").strip(), (period_key or "").strip()),
+            ).fetchone()
+        return row is not None
+
+    def revive_cancelled_batch_rows(self, template_id: str, period_key: str, deadline_at: str) -> int:
+        """复活 canonical 主批次中被取消的实例行（仅限**当前仍在名册内**的成员）。
+
+        背景：INSERT OR IGNORE 撞唯一键 (template, phone, period_key) 会被静默吞掉——
+        主批次曾有实例又被整批取消时，不先复活则重推对这些成员永远静默失效。
+        仅 reset 到 pending 并刷新截止；已完成（submitted/approved）与已回执的
+        历史行不受影响（它们本来就不是 cancelled）。
         """
         clean = (template_id or "").strip()
         tpl = self.get_template(clean, include_deleted=False)
-        is_notice = bool(tpl and tpl.get("kind") == "notice")
-        cond = ("status IN ('pending', 'sent') AND receipt_at IS NULL"
-                if is_notice else "status IN ('pending', 'rejected')")
+        if not tpl:
+            return 0
+        members = self.template_deliverable_members(tpl)
+        phones = [str(m["phone"]).strip() for m in members if str(m.get("phone") or "").strip()]
+        if not phones:
+            return 0
+        revived = 0
         with self.lock, self.conn:
-            cur = self.conn.execute(
-                f"UPDATE task_instance SET status = 'cancelled' "
-                f"WHERE template_id = ? AND period_key <> ? AND {cond}",
-                (clean, (keep_period_key or "").strip()),
-            )
+            for start in range(0, len(phones), 900):
+                chunk = phones[start:start + 900]
+                ph = ",".join("?" for _ in chunk)
+                cur = self.conn.execute(
+                    f"UPDATE task_instance SET status = 'pending', deadline_at = ?, "
+                    f"reject_reason = NULL, reviewer = NULL, reviewed_at = NULL "
+                    f"WHERE template_id = ? AND period_key = ? AND status = 'cancelled' "
+                    f"AND phone IN ({ph})",
+                    (deadline_at, clean, (period_key or "").strip(), *chunk),
+                )
+                revived += int(cur.rowcount or 0)
+        return revived
+
+    def sync_batch_completion(self, template_id: str, batch_period_key: str) -> int:
+        """同周期「已完成/已回执」状态同步到本批次未完成实例（2026-11-20 切期改造）。
+
+        手动重推全员照推后，把每个成员在本归属周期（canonical + 全部 #批次）内的
+        完成态（form: submitted/approved；notice: receipt_at 回执）立即回填到本批次的
+        pending/overdue/rejected 实例上——闭口展示、待办去重、统计去重共用该状态。
+        取源规则：同手机号取**最新一个完成实例**（MAX(id)，与 _stats_dedup_persons
+        的代表实例口径一致）。
+        """
+        clean = (template_id or "").strip()
+        pk = (batch_period_key or "").strip()
+        if not clean or not pk:
+            return 0
+        canon = canonical_part(pk)
+        tpl = self.get_template(clean, include_deleted=False)
+        is_notice = bool(tpl and tpl.get("kind") == "notice")
+        with self.lock, self.conn:
+            if is_notice:
+                cur = self.conn.execute(
+                    "UPDATE task_instance cur "
+                    "JOIN (SELECT phone, MAX(id) AS src_id FROM task_instance "
+                    "      WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) "
+                    "      AND status IN ('pending','sent') AND receipt_at IS NOT NULL "
+                    "      GROUP BY phone) pick ON pick.phone = cur.phone "
+                    "JOIN task_instance src ON src.id = pick.src_id "
+                    "SET cur.receipt_at = src.receipt_at, cur.receipt_text = src.receipt_text "
+                    "WHERE cur.template_id = ? AND cur.period_key = ? "
+                    "AND cur.status IN ('pending','sent') AND cur.receipt_at IS NULL",
+                    (clean, canon, canon + "#%", clean, pk),
+                )
+            else:
+                cur = self.conn.execute(
+                    "UPDATE task_instance cur "
+                    "JOIN (SELECT phone, MAX(id) AS src_id FROM task_instance "
+                    "      WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) "
+                    "      AND status IN ('submitted','approved') "
+                    "      GROUP BY phone) pick ON pick.phone = cur.phone "
+                    "JOIN task_instance src ON src.id = pick.src_id "
+                    "SET cur.status = src.status, cur.submitted_at = src.submitted_at, "
+                    "cur.late_submit = src.late_submit, cur.reject_reason = NULL "
+                    "WHERE cur.template_id = ? AND cur.period_key = ? "
+                    "AND cur.status IN ('pending','overdue','rejected')",
+                    (clean, canon, canon + "#%", clean, pk),
+                )
             return int(cur.rowcount or 0)
+
+    def sync_family_completion(self, template_id: str, phone: str, period_key: str, *,
+                               status: Optional[str] = None, submitted_at: Optional[str] = None,
+                               late_submit: Optional[int] = None,
+                               receipt_at: Optional[str] = None, receipt_text: Optional[str] = None,
+                               skip_instance_id: Optional[int] = None) -> int:
+        """某成员在某实例上完成/回执后，把完成态同步到**同归属周期其余未完成实例**。
+
+        2026-11-20 切期改造二-3（双向同步）：同一归属周期内不论通过哪一条实例完成
+        （定时推的 #1 还是手动重推的 #2），周期内该成员名下全部实例都同步为完成态，
+        H5 待办按周期去重后只留一条、统计只算一人次。驳回（rejected）**不**扩散
+        ——驳回是个别实例的审核动作，留在那条实例上走重交窗口。
+        """
+        clean_phone = (phone or "").strip()
+        if not clean_phone:
+            return 0
+        canon = canonical_part(period_key)
+        is_receipt_sync = receipt_at is not None
+        params: List[Any] = []
+        if is_receipt_sync:
+            # receipt_text 缺省（link 链接确认）→ 回退各自行自己的回执短语
+            # （与 confirm() 本体 `receipt_text=receipt_phrase` 同口径）。
+            set_sql = "receipt_at = ?, receipt_text = COALESCE(?, receipt_phrase)"
+            params.extend([receipt_at, receipt_text])
+        else:
+            if not status or status not in ("submitted", "approved"):
+                return 0
+            set_sql = "status = ?, submitted_at = ?, late_submit = ?"
+            params.extend([status, submitted_at, int(late_submit or 0)])
+        params.extend([(template_id or "").strip(), clean_phone, canon, canon + "#%"])
+        extra = ""
+        if skip_instance_id is not None:
+            extra = " AND id <> ?"
+            params.append(int(skip_instance_id))
+        # form 分支的可达状态集：submit 同步不碰已通过（approved）行；approve 同步
+        # 允许把同周期 submitted 副本升为 approved（同义升级，不降级不覆盖 finished 行）。
+        status_set = ("('pending','overdue','rejected','submitted')" if status == "approved"
+                      else "('pending','overdue','rejected')")
+        with self.lock, self.conn:
+            if is_receipt_sync:
+                cur = self.conn.execute(
+                    f"UPDATE task_instance SET {set_sql} "
+                    f"WHERE template_id = ? AND phone = ? AND (period_key = ? OR period_key LIKE ?) "
+                    f"AND status IN ('pending','sent') AND receipt_at IS NULL{extra}",
+                    tuple(params),
+                )
+            else:
+                cur = self.conn.execute(
+                    f"UPDATE task_instance SET {set_sql}, reject_reason = NULL "
+                    f"WHERE template_id = ? AND phone = ? AND (period_key = ? OR period_key LIKE ?) "
+                    f"AND status IN {status_set}{extra}",
+                    tuple(params),
+                )
+            return int(cur.rowcount or 0)
+
+    def latest_family_submission(self, template_id: str, phone: str, period_key: str,
+                                 *, exclude_instance_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """同模板 + 同手机号 + **同归属周期**（含全部重推批次）内最近一次有效提交。
+
+        2026-11-20 切期改造：手动重推的「已完成闭口副本」实例本身没有提交行，
+        H5 只读回看 / 统计明细内容按该函数回查周期内原提交（get_latest_valid_submission
+        的周期家族版；有效期口径同源：status != 'rejected'）。
+        """
+        clean_phone = (phone or "").strip()
+        if not clean_phone:
+            return None
+        canon = canonical_part(period_key)
+        extra, extra_params = "", []
+        if exclude_instance_id is not None:
+            extra = " AND i.id <> ?"
+            extra_params.append(int(exclude_instance_id))
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT s.* FROM submission s JOIN task_instance i ON i.id = s.instance_id "
+                "WHERE i.template_id = ? AND i.phone = ? "
+                "AND (i.period_key = ? OR i.period_key LIKE ?) AND s.status != 'rejected'"
+                + extra + " ORDER BY s.id DESC LIMIT 1",
+                ((template_id or "").strip(), clean_phone, canon, canon + "#%", *extra_params),
+            ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["fields"] = json.loads(d["fields_json"]) if d.get("fields_json") else None
+        return d
+
+    def latest_family_submissions(self, template_id: str, phones: List[str], period_key: str) -> Dict[str, Dict[str, Any]]:
+        """批量版 latest_family_submission：{手机号: 周期内最近一次有效提交}。
+
+        2026-11-20 切期改造：统计明细/导出的代表实例可能是「同步完成的闭口副本」
+        （无自身提交行），用本函数按（模板 + 归属周期 + 手机号集合）一次回查整页
+        的原提交内容（同口径：status != 'rejected'，取最新一条）。
+        """
+        clean_phones = [str(p or "").strip() for p in phones if str(p or "").strip()]
+        if not clean_phones:
+            return {}
+        canon = canonical_part(period_key)
+        out: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(clean_phones), 900):
+            chunk = clean_phones[start:start + 900]
+            ph = ",".join("?" for _ in chunk)
+            rows = self.conn.execute(
+                "SELECT s.*, i.phone AS member_phone FROM submission s "
+                "JOIN task_instance i ON i.id = s.instance_id "
+                f"WHERE i.template_id = ? AND i.phone IN ({ph}) "
+                "AND (i.period_key = ? OR i.period_key LIKE ?) AND s.status != 'rejected' "
+                "ORDER BY s.id ASC",
+                ((template_id or "").strip(), *chunk, canon, canon + "#%"),
+            ).fetchall()
+            for r in rows:
+                d = dict(r)
+                d["fields"] = json.loads(d["fields_json"]) if d.get("fields_json") else None
+                out[str(d.pop("member_phone") or "")] = d
+        return out
 
     def mark_receipt_prompt_sent(self, instance_id: int, sent_at: str) -> None:
         self.conn.execute("UPDATE task_instance SET receipt_prompt_at=? WHERE id=? AND receipt_phrase IS NOT NULL "
@@ -4995,12 +5220,12 @@ class StateStore:
             params.append(instance_id)
         rows = self.conn.execute(
             "SELECT i.id, i.template_id, t.name AS template_name, i.receipt_phrase, i.receipt_prompt_at, "
-            "COALESCE(i.receipt_mode, 'text') AS receipt_mode "
+            "i.period_key, COALESCE(i.receipt_mode, 'text') AS receipt_mode "
             "FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
             "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
             "AND i.receipt_at IS NULL AND i.receipt_phrase IS NOT NULL "
-            # 2026-11-19 需求三：重推新批次会把旧批次的未回执实例置 cancelled，
-            # 必须在这里排除，否则旧批次会一直挂在 H5 待办里刷屏。
+            # 2026-11-20 切期改造：重推不再取消旧批次实例；H5 待办由 portal 层
+            # 按（模板 + 归属周期）去重，只展示最新一条未回执。
             "AND i.status IN ('pending', 'sent') "
             "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 " + "".join(filters) + "ORDER BY i.id",
             tuple(params),
@@ -5020,14 +5245,24 @@ class StateStore:
             for row in self.pending_notice_receipts(phone, platform, mode="text"):
                 if receipt_key(row["receipt_phrase"]) != normalized:
                     continue
+                now_s = self.now_str()
                 changed = self.conn.execute(
                     "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL "
                     "AND COALESCE(receipt_mode, 'text')='text' "
                     "AND template_id IN (SELECT template_id FROM task_template WHERE template_id=? "
                     "AND kind='notice' AND enabled=1 AND deleted=0)",
-                    (self.now_str(), text, row["id"], row["template_id"]),
+                    (now_s, text, row["id"], row["template_id"]),
                 )
                 if changed.rowcount:
+                    # 2026-11-20 切期改造二-3：回执完成态同步到同归属周期其余未回执实例
+                    _src = self.conn.execute(
+                        "SELECT template_id, phone, period_key FROM task_instance WHERE id = ?",
+                        (row["id"],)).fetchone()
+                    if _src is not None:
+                        self.sync_family_completion(
+                            _src["template_id"], _src["phone"], _src["period_key"],
+                            receipt_at=now_s, receipt_text=text, skip_instance_id=int(row["id"]),
+                        )
                     receipts.append(row)
         return receipts
 
@@ -5103,17 +5338,18 @@ class StateStore:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM reminder_log WHERE idem_key = ? ORDER BY retry ASC, id ASC", (idem_key,)).fetchall()]
 
-    MANUAL_PUSH_COOLDOWN_SECONDS = 120  # 2026-11-12 任务D：同模板一键推送冷却窗口（防手抖）
+    MANUAL_PUSH_COOLDOWN_SECONDS = 3  # 2026-11-20 用户拍板：防抖从 2 分钟降到 3 秒（同模板快速双击拦截）
 
     def check_manual_push_cooldown(
         self, template_id: str, actor: str = "system", now_dt: Optional[datetime] = None
     ) -> Dict[str, Any]:
-        """2026-11-12 任务D：一键推送软护栏——同模板 2 分钟内拒绝重复推送（429）。
+        """一键推送软护栏——同模板短窗口内拒绝重复推送（429）。
 
         判定口径：reminder_log 中该模板 kind='manual_push' 最近一次记录（任意成员、任意结果
-        ——failed/missed 也算「点过」，防手抖优先），attempted_at 距今 < 120s 即拒绝。
+        ——failed/missed 也算「点过」，防手抖优先），attempted_at 距今 < 冷却窗口即拒绝。
         通过后**当场记一条 marker**（无实例、phone=操作人、idem 唯一），空名单模板也计入冷却，
         不给「连点 10 次只有 1 次真发出去」留缝。返回时间基线给调用方审计与幂等键。
+        2026-11-20 用户拍板：窗口 120s → 3s（只挡快速双击，不再挡管理员连续重推）。
         """
         now_s = format_dt(now_dt or self.now())
         clean_id = (template_id or "").strip()
@@ -5131,7 +5367,7 @@ class StateStore:
                     if 0 <= elapsed < self.MANUAL_PUSH_COOLDOWN_SECONDS:
                         raise BizError(
                             429, "PUSH_COOLDOWN",
-                            f"该模板 2 分钟内已推送过一次，请稍后再试（上次推送：{last_ts[11:16]}）",
+                            f"该模板 {self.MANUAL_PUSH_COOLDOWN_SECONDS} 秒内已推送过一次，请稍后再试（上次推送：{last_ts[11:19]}）",
                         )
             self.conn.execute(
                 "INSERT OR IGNORE INTO reminder_log("
@@ -5411,18 +5647,17 @@ class StateStore:
 
     @staticmethod
     def stats_panel_period(template: Dict[str, Any]) -> str:
+        """统计周期粒度（2026-11-20 切期改造：与调度侧归属周期分类完全一致——
+        同一函数族判定，统计视角天然按「整个归属周期」聚合，不再另搞一套）。"""
         if template.get("is_adhoc"):
             return "day"
-        period = template.get("period")
-        if period in ("week", "month"):
-            return period
-        if template.get("exec_dom_days"):
-            return "month"
-        deadline_period = {"weekend": "week", "month_end": "month"}.get(template.get("deadline_type"))
-        if template.get("has_deadline") and deadline_period:
-            return deadline_period
-        weekdays = template.get("exec_weekdays") or []
-        return "week" if 0 < len(weekdays) < 7 else "day"
+        from .scheduler import canonical_period_kind
+
+        kind = canonical_period_kind(template)
+        if kind == "once":
+            # 一次性任务由前端按 once 批次族聚合（current_period_key='once'）
+            return "day"
+        return kind
 
     def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
         """面板允许查看自己名下的上传任务和回执通知。"""
@@ -5456,19 +5691,22 @@ class StateStore:
     def _stats_period_keys_for(self, period_key: str) -> Dict[str, Any]:
         """统计周期 → 实例 period_key 匹配范围（统计视角与实例生成视角解耦）。
 
-        日 'YYYY-MM-DD' → 单键；ISO 周 'YYYY-Www' → 周内 7 个日键 + 周键
-        （deadline_type=weekend 的任务是**按日推送**的，周视图必须聚整周日实例）；
-        月 'YYYY-MM' → 月键 + 'YYYY-MM-' 前缀（兼容按日推送/月推送两种实例）。
+        2026-11-20 切期改造：默认按**整个归属周期**聚合——canonical 键 + 全部重推
+        批次（`{canonical}#YYYYMMDDHHMMSS` 前缀 LIKE）一起纳入，配合
+        _stats_dedup_persons 按手机号去重（同周期推 N 次 = 1 人次）。
+        日 'YYYY-MM-DD' → 日键 + 当日批次；ISO 周 'YYYY-Www' → 周内 7 个日键
+        （legacy 按日推送的 weekend 任务）+ 周键 + 周批次；月 'YYYY-MM' → 月键 +
+        'YYYY-MM-' 日键前缀（legacy）+ 月批次；仍支持直接传单个批次键精确查看
+        （管理后台实例页保留批次对账能力）。
         """
         pk = (period_key or "").strip()
-        # 2026-11-19 需求一：重推批次键 `{canonical}#YYYYMMDDHHMMSS` 精确匹配本批次
-        # （`#` 不参与 LIKE 通配，绝不与主批次互串）。
         if "#" in pk:
-            return {"keys": [pk], "like": ""}
+            # 直接传批次键 = 精确查看该批次（历史口径保留）
+            return {"keys": [pk], "likes": []}
         if pk == "once":
-            return {"keys": [pk], "like": ""}
+            return {"keys": [pk], "likes": [pk + "#"]}
         if re.match(r"^\d{4}-\d{2}-\d{2}$", pk):
-            return {"keys": [pk], "like": ""}
+            return {"keys": [pk], "likes": [pk + "#"]}
         m = re.match(r"^(\d{4})-W(\d{1,2})$", pk)
         if m:
             year, week = int(m.group(1)), int(m.group(2))
@@ -5477,20 +5715,26 @@ class StateStore:
             monday = week1_mon + timedelta(weeks=week - 1)
             keys = [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
             keys.append(pk)
-            return {"keys": keys, "like": ""}
+            return {"keys": keys, "likes": [pk + "#"]}
         m = re.match(r"^(\d{4})-(\d{2})$", pk)
         if m:
-            return {"keys": [pk], "like": f"{pk}-"}
+            return {"keys": [pk], "likes": [pk + "-", pk + "#"]}
         raise BizError(400, "VALIDATION_FAILED", "周期格式应为 YYYY-MM-DD / YYYY-Www / YYYY-MM")
 
     def _stats_period_where(self, period_key: str, alias: str = "i") -> tuple:
         info = self._stats_period_keys_for(period_key)
-        ph = ",".join("?" for _ in info["keys"])
         prefix = f"{alias}." if alias else ""
-        if info["like"]:
-            return (f"({prefix}period_key IN ({ph}) OR {prefix}period_key LIKE ?)",
-                    [*info["keys"], info["like"] + "%"])
-        return f"{prefix}period_key IN ({ph})", list(info["keys"])
+        clauses: List[str] = []
+        params: List[Any] = list(info["keys"])
+        if info["keys"]:
+            ph = ",".join("?" for _ in info["keys"])
+            clauses.append(f"{prefix}period_key IN ({ph})")
+        for like in info.get("likes") or []:
+            clauses.append(f"{prefix}period_key LIKE ?")
+            params.append(like + "%")
+        if not clauses:
+            return "1=0", []
+        return "(" + " OR ".join(clauses) + ")", params
 
     @classmethod
     def _stats_dedup_persons(cls, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -5852,6 +6096,18 @@ class StateStore:
                 tuple(ids)).fetchall()
             for s in subs:
                 previews[int(s["instance_id"])] = dict(s)
+            # 2026-11-20 切期改造：代表实例为「同步完成闭口副本」（无自身提交行）时，
+            # 按归属周期批量回查原提交内容（优先取自身提交，缺失才回看周期原报）。
+            missing = [r for r in page_rows if int(r["id"]) not in previews]
+            if missing:
+                fam = self.latest_family_submissions(
+                    tpl["template_id"], [str(r["phone"]) for r in missing], period_key)
+                for r in missing:
+                    sub = fam.get(str(r["phone"]))
+                    if sub:
+                        # 回查行挂的是原实例 id，这里重映射到代表实例 id，
+                        # 与 _stats_submission_contents 的 by_id 键保持一致。
+                        previews[int(r["id"])] = {**sub, "instance_id": int(r["id"])}
         content = self._stats_submission_contents(previews.values(), tpl.get("schema_json") or [])
         items: List[Dict[str, Any]] = []
         for r in page_rows:
@@ -6049,6 +6305,16 @@ class StateStore:
                         f"SELECT instance_id, fields_json, note, refs_json, file_ref, created_at FROM submission "
                         f"WHERE instance_id IN ({ph}) ORDER BY id ASC", tuple(chunk)).fetchall():
                     subs[int(s["instance_id"])] = dict(s)
+            # 2026-11-20 切期改造：代表实例为「同步完成闭口副本」（无自身提交行）时，
+            # 按归属周期批量回查原提交（导出与明细同一份内容）。
+            missing = [r for r in persons if int(r["id"]) not in subs]
+            if missing:
+                fam = self.latest_family_submissions(
+                    tpl["template_id"], [str(r["phone"]) for r in missing], period_key)
+                for r in missing:
+                    sub = fam.get(str(r["phone"]))
+                    if sub:
+                        subs[int(r["id"])] = sub
             out_rows = []
             for r in persons:
                 phone = str(r["phone"])

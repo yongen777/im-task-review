@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Check, CheckCircle2, Clock, Download, Eye, ImagePlus, Paperclip, Send, ShieldCheck, Users, X, XCircle } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
 import { SubmissionAttachment, TaskInstanceDetail, TaskInstanceItem } from '../../lib/types';
@@ -390,6 +391,8 @@ export function InstanceDetailDialog({
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState('');
   const [selectedSubmissionId, setSelectedSubmissionId] = useState(submissionId);
+  /* 2026-11-20 需求 C：图片点开走原生全屏看图层 */
+  const [viewerSource, setViewerSource] = useState<{ url: string; alt?: string } | null>(null);
   const path = `/api/admin/instances/${instanceId}`;
   const detailPath = selectedSubmissionId === undefined ? path : `${path}?submission_id=${selectedSubmissionId}`;
 
@@ -558,7 +561,7 @@ export function InstanceDetailDialog({
           );
   }
   return (
-
+    <>
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div role="dialog" aria-modal="true" aria-label="任务实例详情" className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl border border-slate-200 my-8 space-y-5 max-h-[90vh] overflow-y-auto text-xs">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -742,12 +745,11 @@ export function InstanceDetailDialog({
                                 ) : (
                                   <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
                                     {imgs.map((a) => (
-                                      <a
+                                      <button
+                                        type="button"
                                         key={a.ref}
-                                        href={a.url}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="group rounded-xl border border-slate-200 overflow-hidden hover:border-blue-400 transition-colors bg-white"
+                                        onClick={() => setViewerSource({ url: a.url, alt: a.file_name })}
+                                        className="group rounded-xl border border-slate-200 overflow-hidden hover:border-blue-400 transition-colors bg-white cursor-pointer"
                                         title="点击在线查看大图"
                                       >
                                         <img
@@ -762,7 +764,7 @@ export function InstanceDetailDialog({
                                             <span>在线查看</span>
                                           </div>
                                         </div>
-                                      </a>
+                                      </button>
                                     ))}
                                   </div>
                                 )}
@@ -965,5 +967,7 @@ export function InstanceDetailDialog({
             </div>
           </div>
         </div>
-        );
+        <ImageViewer source={viewerSource} onClose={() => setViewerSource(null)} />
+    </>
+  );
 }

@@ -181,3 +181,45 @@ def test_link_default_button_and_legacy_text_default(ctx):
         result = client.get("/api/admin/stats-panel/export", params={"template_id": template_id, "period_key": "once"})
         rows = list(load_workbook(BytesIO(result.content), read_only=True).active.values)
         assert rows[1][-1] == ("H5 链接确认" if expected == "link" else "文本回复确认")
+
+
+def test_link_receipt_guide_text_customizes_second_line(ctx):
+    """2026-11-20 需求 A：spec.notice_receipt.receipt_guide_text（选填）自定义确认链接
+    消息的第二行引导语；留空/缺省回退默认「请打开链接阅读完整通知，点击「…」确认。」。"""
+    state, scheduler, notifier, _, client, _, existing, member = ctx
+    GUIDE = "请点击链接完成学习打卡，并按下方的「完成学习」按钮。"
+    created = client.post("/api/admin/templates", json={
+        "name": "引导语通知", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": existing["role_ids"], "text_tpl": "通知正文。",
+        "spec": {"notice_receipt": {"enabled": True, "mode": "link", "button_label": "完成学习",
+                                    "receipt_guide_text": GUIDE}},
+    })
+    assert created.status_code == 200, created.text
+    tid = created.json()["template_id"]
+    # 回读：spec 透传保存（兼容旧模板无此字段 = 空）
+    tpl = state.get_template(tid)
+    assert tpl["spec_json"]["notice_receipt"]["receipt_guide_text"] == GUIDE, tpl["spec_json"]
+
+    scheduler.push_now(tid)
+    link_message = next(m for m in notifier.sent_messages if "#t=" in m.text)
+    lines = link_message.text.splitlines()
+    assert len(lines) == 3, link_message.text
+    assert lines[0].startswith("【德阳量密助手】您收到《") and lines[0].endswith("通知。")
+    assert lines[1] == GUIDE
+    assert "请打开链接阅读完整通知" not in link_message.text  # 默认话术被自定义替换
+
+    # 对照：不带引导语的模板（旧模板/留空口径）→ 回落默认话术
+    plain = client.post("/api/admin/templates", json={
+        "name": "无引导语通知", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": existing["role_ids"], "text_tpl": "通知正文。",
+        "spec": {"notice_receipt": {"enabled": True, "mode": "link", "button_label": "完成学习"}},
+    })
+    assert plain.status_code == 200, plain.text
+    plain_id = plain.json()["template_id"]
+    assert "receipt_guide_text" not in (state.get_template(plain_id)["spec_json"]["notice_receipt"])
+    scheduler.push_now(plain_id)
+    fallback = next(m for m in notifier.sent_messages
+                    if "#t=" in m.text and "无引导语通知" in m.text)
+    assert "请打开链接阅读完整通知，点击「完成学习」确认。" in fallback.text, fallback.text
+    state.delete_template(tid)
+    state.delete_template(plain_id)

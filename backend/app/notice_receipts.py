@@ -55,15 +55,26 @@ def read_target(state, raw):
 
 def confirm(state, instance_id):
     with state.conn:
-        state.conn.execute(
+        now_s = state.now_str()
+        changed = state.conn.execute(
             "UPDATE task_instance SET receipt_at=?,receipt_text=receipt_phrase "
             "WHERE id=? AND receipt_mode='link' AND receipt_at IS NULL AND receipt_prompt_at IS NOT NULL "
             "AND status IN ('pending','sent') "
             "AND template_id IN (SELECT template_id FROM task_template WHERE kind='notice' AND enabled=1 AND deleted=0)",
-            (state.now_str(), instance_id),
+            (now_s, instance_id),
         )
-        # 2026-11-19 需求三：上面 WHERE 里加了 status 过滤 —— 已取消（cancelled）的实例
-        # 写不进回执，这里按「实例是否已作废」明确回 404（其余场景保持原有 403 文案）。
+        if changed.rowcount:
+            # 2026-11-20 切期改造二-3：回执完成态同步到同归属周期其余未回执实例
+            _src = state.conn.execute(
+                "SELECT template_id, phone, period_key FROM task_instance WHERE id=?", (instance_id,)
+            ).fetchone()
+            if _src is not None:
+                state.sync_family_completion(
+                    _src["template_id"], _src["phone"], _src["period_key"],
+                    receipt_at=now_s, receipt_text=None, skip_instance_id=int(instance_id),
+                )
+        # 上面 WHERE 里加了 status 过滤 —— 已取消（cancelled）的实例写不进回执，
+        # 这里按「实例是否已作废」明确回 404（其余场景保持原有 403 文案）。
         row = state.conn.execute("SELECT receipt_at, status FROM task_instance WHERE id=? FOR UPDATE",
                                  (instance_id,)).fetchone()
         if not row:

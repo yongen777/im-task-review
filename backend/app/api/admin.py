@@ -40,7 +40,7 @@ from ..channel_config import (
 )
 from ..config import format_dt
 from ..stats_export import build_stats_xlsx, export_filename
-from ..scheduler import period_key
+from ..scheduler import canonical_period_key, period_key
 from ..state import (
     SESSION_TTL_HOURS,
     BizError,
@@ -434,8 +434,10 @@ def _instance_filter_sql(
                          "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
             params.extend((key, key + "#%", key, key, key))
         else:
-            where.append("i.period_key=?")
-            params.append(key)
+            # 2026-11-20 切期改造：周/月/once 等归属周期键同时覆盖其重推批次
+            # （`{key}#YYYYMMDDHHMMSS`），与统计面板的「整个归属周期」口径一致。
+            where.append("(i.period_key=? OR i.period_key LIKE ?)")
+            params.extend((key, key + "#%"))
     if status and status.strip():
         # 2026-10-29：支持逗号分隔多状态（「已提醒 / 已完成」= approved,sent），
         # 否则统计卡片上的数字与点进去的列表条数对不上。
@@ -1407,9 +1409,11 @@ def create_admin_router(
         # 2026-11-19 需求一：本周期/历史上已推送过 → 先回一次「要不要新建批次」。
         # ⚠ 预检只读：不写冷却 marker、不建实例、不发消息；前端确认后带 ?confirmed=1 再来。
         # portal_task（授权成员发布任务）没有批次语义，保持旧行为。
+        # 2026-11-20 切期改造：预检的归属周期键改按「截止配置 + 执行日数量」分类计算
+        # （与调度侧 push_now_prepare 同一函数，彻底消除批口径漂移）。
         reprocess = False
         if not _tpl.get("portal_task"):
-            canonical = "once" if _tpl.get("is_manual") else period_key(_tpl["period"], state.now())
+            canonical = "once" if _tpl.get("is_manual") else canonical_period_key(_tpl, state.now())
             try:
                 info = state.manual_push_repush_info(template_id, canonical)
             except BizError as exc:
@@ -1422,7 +1426,7 @@ def create_admin_router(
                 }
             reprocess = bool(info["pushed_before"] and confirmed)
 
-        # 软护栏：同模板 2 分钟内拒绝重复推送（防手抖）；通过即记 marker 占位
+        # 软护栏：同模板 3 秒内拒绝重复推送（防手抖双击，2026-11-20 由 2 分钟下调）；通过即记 marker 占位
         try:
             guard = state.check_manual_push_cooldown(template_id, actor=actor)
         except BizError as exc:
@@ -1473,7 +1477,7 @@ def create_admin_router(
                 target_id=template_id,
                 detail={"pushed_at": guard["attempted_at"], "stats": stats,
                         "new_batch": prep.get("new_batch", False),
-                        "cancelled": prep.get("cancelled", 0)},
+                        "synced_completed": prep.get("synced_completed", 0)},
             )
 
         background_tasks.add_task(_bg_deliver)
@@ -1484,14 +1488,14 @@ def create_admin_router(
             detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
                     "period_key": prep["period_key"], "instance_count": prep["instance_count"],
                     "new_batch": prep.get("new_batch", False),
-                    "cancelled": prep.get("cancelled", 0)},
+                    "synced_completed": prep.get("synced_completed", 0)},
         )
         return {
             "ok": True, "queued": True, "pushed_at": guard["attempted_at"],
             "period_key": prep["period_key"], "deadline_at": prep["deadline_at"],
             "instance_count": prep["instance_count"],
             "new_batch": bool(prep.get("new_batch", False)),
-            "cancelled": int(prep.get("cancelled", 0) or 0),
+            "synced_completed": int(prep.get("synced_completed", 0) or 0),
         }
 
     # ==================================================================
@@ -2332,6 +2336,17 @@ def create_admin_router(
         inst["modules"] = effective_h5_modules(_tpl)
         inst["attachment_limits"] = task_attachment_limits(_tpl)
         submissions = state.list_submissions_for_instance(instance_id)
+        # 2026-11-20 切期改造：手动重推的「已完成闭口副本」实例本身没有提交行 →
+        # 回查同归属周期（含全部重推批次）内的原提交做展示（详情/时间线共用）。
+        submission_from_family = False
+        if not submissions and str(inst.get("status") or "") in ("submitted", "approved"):
+            family_sub = state.latest_family_submission(
+                inst["template_id"], inst["phone"], inst["period_key"],
+                exclude_instance_id=int(instance_id),
+            )
+            if family_sub:
+                submissions = [family_sub]
+                submission_from_family = True
         if inst["is_adhoc"]:
             if not submissions:
                 return error_response(404, "NOT_FOUND", "任务实例不存在")
@@ -2407,6 +2422,7 @@ def create_admin_router(
             "submissions": submissions,
             "submission_timeline": state.submission_timeline(instance_id, submissions),
             "submission": submission_view,
+            "submission_from_family": submission_from_family,
             "reminders": reminders,
         }
 

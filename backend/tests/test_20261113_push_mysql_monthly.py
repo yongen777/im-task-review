@@ -128,10 +128,11 @@ def test_fix1_prepare_creates_instances_without_sending() -> None:
         CLOCK["now"] = datetime(2026, 11, 13, 15, 0, 0)
         prep = sched.push_now_prepare(tpl_id, actor="sub")
         assert prep["instance_count"] == 2, prep
-        assert prep["period_key"] == "2026-11-13" and prep["pushed_at"] == "2026-11-13 15:00:00", prep
+        # 2026-11-20 切期改造：每月单执行日模板 → 归属月周期（推送日 11-13 仍归 2026-11）
+        assert prep["period_key"] == "2026-11" and prep["pushed_at"] == "2026-11-13 15:00:00", prep
         assert prep["deadline_at"] == "2026-11-30 17:00:00", prep
         assert ntf.sent_messages == [], "prepare 不得发送消息"
-        for inst in store.list_instances_for_period(tpl_id, "2026-11-13"):
+        for inst in store.list_instances_for_period(tpl_id, "2026-11"):
             assert inst["status"] == "pending", inst
             assert inst["deadline_at"] == "2026-11-30 17:00:00", inst
         with store.lock:
@@ -411,11 +412,11 @@ def test_fix3_monthly_full_scenario() -> None:
     已交数据互不冲突。"""
     store, app, sa, sub, sched, ntf, tpl_id = _push_setup()
     try:
-        # ── 11-13 15:00 管理员手动推送（round 1）──
+        # ── 11-13 15:00 管理员手动推送（round 1；2026-11-20 切期改造：单执行日模板归月周期）──
         CLOCK["now"] = datetime(2026, 11, 13, 15, 0, 0)
         prep = sched.push_now_prepare(tpl_id, actor="sub")
         sched.push_now_deliver(tpl_id, prep, actor="sub")
-        nov = store.list_instances_for_period(tpl_id, "2026-11-13")
+        nov = store.list_instances_for_period(tpl_id, "2026-11")
         assert len(nov) == 2 and all(i["status"] == "pending" for i in nov)
         assert all(i["deadline_at"] == "2026-11-30 17:00:00" for i in nov)
         assert all("11月30日 17:00" in m.text for m in ntf.sent_messages)
@@ -439,14 +440,14 @@ def test_fix3_monthly_full_scenario() -> None:
         with store.lock, store.conn:
             store.conn.execute(
                 "UPDATE task_instance SET status = 'submitted' "
-                "WHERE template_id = ? AND period_key = '2026-11-13'", (tpl_id,))
+                "WHERE template_id = ? AND period_key = '2026-11'", (tpl_id,))
 
         # ── 12-01 15:00:30 锚点：自动新周期 ──
         CLOCK["now"] = datetime(2026, 12, 1, 15, 0, 30)
         st = sched.run_once()
         assert st["generated_instances"] == 2, st
         assert st["sent"] == 2, st
-        dec = store.list_instances_for_period(tpl_id, "2026-12-01")
+        dec = store.list_instances_for_period(tpl_id, "2026-12")
         assert len(dec) == 2, dec
         assert all(i["deadline_at"] == "2026-12-31 17:00:00" for i in dec), dec
         assert all(i["status"] == "pending" for i in dec)
@@ -461,7 +462,7 @@ def test_fix3_monthly_full_scenario() -> None:
         assert len(ntf.sent_messages) == 4
 
         # 11 月已交数据互不冲突：仍是 submitted，不被 12 月链路复活/打扰
-        nov_after = store.list_instances_for_period(tpl_id, "2026-11-13")
+        nov_after = store.list_instances_for_period(tpl_id, "2026-11")
         assert all(i["status"] == "submitted" for i in nov_after), nov_after
         assert st["missed"] == 0, st  # 11 月已交，未触发逾期补发噪音
     finally:

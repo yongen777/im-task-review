@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
 import { copyText } from '../../lib/clipboard';
+import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import type { TaskInstanceItem } from '../../lib/types';
@@ -97,30 +98,6 @@ interface ResultList {
   items: RowItem[];
 }
 
-/* 2026-11-19 需求一：推送批次（period_key 维度聚合） */
-interface BatchItem {
-  period_key: string;
-  instance_count: number;
-  alive_count: number;
-  first_created_at: string;
-}
-
-function shortStamp(value: string): string {
-  return value ? value.slice(5, 16) : '';
-}
-
-function batchOptionLabel(item: BatchItem): string {
-  if (item.period_key === 'once') {
-    return `首次推送（${shortStamp(item.first_created_at)} · ${item.alive_count} 人）`;
-  }
-  const stem = item.period_key.split('#')[1] ?? '';
-  if (/^\d{14}/.test(stem)) {
-    const stamp = `${stem.slice(4, 6)}-${stem.slice(6, 8)} ${stem.slice(8, 10)}:${stem.slice(10, 12)}`;
-    return `${stamp} 重推批次（${item.alive_count} 人）`;
-  }
-  return `主批次（${item.alive_count} 人）`;
-}
-
 function execCycleText(task: PanelTask): string {
   if (task.is_adhoc) return '不定期';
   const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
@@ -206,7 +183,9 @@ function KpiCard({ label, value, hint, color = 'text-slate-900' }: {
   );
 }
 
-function SubmissionPreview({ content }: { content: SubmissionContent | null }) {
+function SubmissionPreview({ content, onImageClick }: {
+  content: SubmissionContent | null; onImageClick?: (source: { url: string; alt?: string }) => void;
+}) {
   if (!content || !(content.fields.length || content.note || content.attachments.length)) {
     return <span className="text-slate-400">—</span>;
   }
@@ -226,9 +205,11 @@ function SubmissionPreview({ content }: { content: SubmissionContent | null }) {
       {content.attachments.length > 0 && (
         <div className="flex flex-wrap items-center gap-1.5">
           {content.attachments.slice(0, 4).map((a) => a.is_image ? (
-            <a key={a.ref} href={a.url} target="_blank" rel="noopener noreferrer" title={a.file_name}>
+            <button type="button" key={a.ref} title={a.file_name}
+              onClick={() => onImageClick?.({ url: a.url, alt: a.file_name })}
+              className="cursor-pointer">
               <img src={a.url} alt={a.file_name} loading="lazy" className="h-10 w-12 rounded border border-slate-200 object-cover hover:border-blue-500" />
-            </a>
+            </button>
           ) : (
             <a key={a.ref} href={a.url + '?dl=1'} download={a.file_name} title={a.file_name}
               className="inline-flex max-w-full items-center gap-1 rounded-md bg-slate-100 px-2 py-1 text-blue-700 hover:bg-blue-50">
@@ -286,7 +267,6 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const tabs = isReceipt ? receiptLabels : statusLabels;
   const toast = useToast();
   const [chosenPeriod, setChosenPeriod] = useState<string>();
-  const [chosenBatch, setChosenBatch] = useState<string>();
   const canonicalKey = chosenPeriod ?? task.current_period_key;
   const [deptPath, setDeptPath] = useState('');
   const [deptOpen, setDeptOpen] = useState(false);
@@ -298,6 +278,8 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const [copying, setCopying] = useState(false);
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  /* 2026-11-20 需求 C：缩略图点开走原生全屏看图层 */
+  const [viewerSource, setViewerSource] = useState<{ url: string; alt?: string } | null>(null);
   const query = search.trim();
   const searching = query !== filter.query;
 
@@ -312,29 +294,14 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   }, [query, searching]);
 
   const base = new URLSearchParams({ template_id: task.template_id, dept_path: deptPath });
-  /* 2026-11-19 需求一：先取批次清单，再决定本次统计看哪一批 */
-  const batchesQuery = usePanelQuery<{ items: BatchItem[] }>(
-    task.is_adhoc ? '' : '/api/admin/stats-panel/batches?template_id=' + encodeURIComponent(task.template_id),
-    revision,
-  );
-  const manualBatches = useMemo(() => (batchesQuery.data?.items ?? [])
-    .filter((item) => item.period_key === 'once' || item.period_key.startsWith('once#'))
-    .sort((a, b) => (a.first_created_at < b.first_created_at ? 1 : a.first_created_at > b.first_created_at ? -1 : 0)),
-  [batchesQuery.data]);
-  const periodicBatches = useMemo(() => (batchesQuery.data?.items ?? [])
-    .filter((item) => item.period_key === canonicalKey || item.period_key.startsWith(canonicalKey + '#')),
-  [batchesQuery.data, canonicalKey]);
-  const periodKey = task.is_manual
-    ? (chosenBatch ?? manualBatches[0]?.period_key ?? task.current_period_key)
-    : (chosenBatch ?? canonicalKey);
+  /* 2026-11-20 切期改造：统计一律按「整个归属周期」聚合（服务端 period_key 已并入
+     全部重推批次并按成员手机号去重），批次下拉整体移除。
+     · 一次性任务固定 'once'（覆盖 once#… 全部批次）；
+     · 周期任务用当前归属周期键（YYYY-MM-DD / YYYY-Www / YYYY-MM）。 */
+  const periodKey = task.is_manual ? 'once' : canonicalKey;
   const scope = new URLSearchParams(base);
   scope.set('period_key', periodKey);
-  /* 复制未交名单等文案里用可读批次名，别把 once#20261119… 这类内部键甩给用户 */
-  const periodTitle = useMemo(() => {
-    if (!periodKey.includes('#')) return periodKey;
-    const hit = (batchesQuery.data?.items ?? []).find((item) => item.period_key === periodKey);
-    return hit ? batchOptionLabel(hit) : periodKey;
-  }, [periodKey, batchesQuery.data]);
+  const periodTitle = periodKey;
   const overview = usePanelQuery<Overview>('/api/admin/stats-panel/overview?' + scope, revision);
   const listParams = new URLSearchParams(task.is_adhoc ? base : scope);
   if (task.is_adhoc) listParams.set('date', periodKey);
@@ -385,13 +352,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   function selectPeriod(key: string) {
     if (!key) return;
     setChosenPeriod(key);
-    setChosenBatch(undefined); // 换周期 → 子批次选择重置
     selectDept(deptPath);
-  }
-
-  function selectBatch(key: string) {
-    setChosenBatch(key || undefined);
-    setFilter((current) => ({ ...current, page: 1 }));
   }
 
   function refresh() {
@@ -439,7 +400,8 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
         return;
       }
       const lines = rows.map((row) => [row.name, row.phone, row.dept_path].join('\t'));
-      if (await copyText(['【未交名单】' + task.name + ' · ' + periodTitle, ...lines].join('\n'))) {
+      const title = task.is_manual ? task.name : task.name + ' · ' + periodTitle;
+      if (await copyText(['【未交名单】' + title, ...lines].join('\n'))) {
         toast.success('已复制 ' + lines.length + ' 名未交人员。');
       } else toast.error('复制失败，请重试。');
     } catch (err) {
@@ -477,14 +439,8 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
         </label>
         <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
           {task.is_manual ? '推送批次' : periodLabel[task.statistics_period]}
-          {task.is_manual ? (manualBatches.length > 1 ? (
-            /* 2026-11-19 需求一：同一模板当天多次推送 → 按批次查看 */
-            <select className={fieldClass} value={periodKey} onChange={(e) => selectBatch(e.target.value)}>
-              {manualBatches.map((item) => (
-                <option key={item.period_key} value={item.period_key}>{batchOptionLabel(item)}</option>
-              ))}
-            </select>
-          ) : <span className={fieldClass}>一次性推送</span>) : task.statistics_period === 'week' ? (
+          {/* 2026-11-20 切期改造：一次性任务整族统计（once + 全部重推批次按人去重），不再切批次 */}
+          {task.is_manual ? <span className={fieldClass}>一次性推送（全部批次）</span> : task.statistics_period === 'week' ? (
             <select className={fieldClass} value={canonicalKey} onChange={(e) => selectPeriod(e.target.value)}>
               {weekOptions(task.current_period_key).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}
             </select>
@@ -509,17 +465,6 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           </div>
           {deptPath && <span className="truncate font-normal text-slate-500" title={deptPath}>{deptPath.split('/').join(' / ')}</span>}
         </div>
-        {!task.is_manual && !task.is_adhoc && periodicBatches.length > 1 && (
-          /* 2026-11-19 需求一：周期任务的重推子批次（默认选主批次 = 当日 canonical） */
-          <label className="grid min-w-0 max-w-xs gap-1.5 text-xs font-medium text-slate-600 md:col-span-3">
-            推送批次
-            <select className={fieldClass} value={periodKey} onChange={(e) => selectBatch(e.target.value)}>
-              {periodicBatches.map((item) => (
-                <option key={item.period_key} value={item.period_key}>{batchOptionLabel(item)}</option>
-              ))}
-            </select>
-          </label>
-        )}
       </div>
 
       {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}
@@ -677,7 +622,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                       <div className="whitespace-pre-wrap break-words">{row.receipt_text || '—'}</div>
                       <div className="mt-1 text-slate-500">{row.receipt_mode === 'link' ? 'H5 链接确认' : '文本回复确认'}</div>
                     </div>
-                      : <SubmissionPreview content={row.content} />}</td>
+                      : <SubmissionPreview content={row.content} onImageClick={setViewerSource} />}</td>
                     {!isReceipt && <td className="px-4 py-3 text-right">
                       <button type="button" disabled={instanceId == null} onClick={() => instanceId != null && setDetail({ instanceId, submissionId: row.submission_id })}
                         className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg bg-slate-100 px-2.5 py-1.5 font-semibold text-slate-700 hover:bg-blue-50 hover:text-blue-700 disabled:opacity-50">
@@ -716,6 +661,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
       )}
       {detail && <InstanceDetailDialog instanceId={detail.instanceId} submissionId={detail.submissionId}
         onClose={() => setDetail(null)} onChanged={() => setRevision((n) => n + 1)} />}
+      <ImageViewer source={viewerSource} onClose={() => setViewerSource(null)} />
     </div>
   );
 }

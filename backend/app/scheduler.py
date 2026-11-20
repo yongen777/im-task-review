@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 from .channels.zdxlz import SendResult
-from .config import SHANGHAI_TZ, NowFn, default_now, format_dt, parse_dt
+from .config import SHANGHAI_TZ, NowFn, canonical_part, default_now, format_dt, parse_dt
 from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例与文档都从 scheduler 导入
     H5_TOKEN_TTL_HOURS,
     NO_DEADLINE_SENTINEL,
@@ -132,6 +132,128 @@ def batch_period_key(canonical: str, dt: datetime) -> str:
     return f"{str(canonical).strip()}#{dt.strftime('%Y%m%d%H%M%S')}"
 
 
+# ── 2026-11-20 切期改造：归属周期键解析（实现在 config.canonical_part，
+# 供 state / scheduler / portal 三方共用；此处 re-export 保持既有导入路径兼容）──
+
+
+def _parse_int_list(raw: Any, lo: int, hi: int) -> Optional[List[int]]:
+    """JSON 列表字段 → 严格过滤到 [lo, hi] 的整数列表；未配置/不可解析 → None。"""
+    if isinstance(raw, list):
+        return [int(x) for x in raw if str(x).strip().isdigit() and lo <= int(x) <= hi]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [int(x) for x in parsed if str(x).strip().isdigit() and lo <= int(x) <= hi]
+        except Exception:
+            return None
+    return None
+
+
+def template_exec_days(template: Dict[str, Any]) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+    """模板执行日配置 → (.exec_weekdays 解析值, exec_dom_days 解析值)；None = 该模式未配置。
+
+    2026-11-20 切期改造：从 is_template_anchor_day 抽出（行为逐字节一致），
+    供「执行日判定」与「归属周期判定」共用同一份解析，禁止两处漂移。
+    """
+    if (template.get("period") or "") != "day":
+        return None, None
+    return _parse_int_list(template.get("exec_weekdays"), 1, 7), _parse_int_list(template.get("exec_dom_days"), 1, 31)
+
+
+# ── 2026-11-20 切期改造：业务归属周期（canonical period）三件套 ──────────
+# 用户拍板口径：单次任务的归属周期严格按「截止配置 + 执行日数量」判定，
+# 所有跨期一律按北京时间 00:00:00 自然切换：
+#   · 日周期（YYYY-MM-DD）：每天 00:00 切新期 —— 每天/工作日/多执行日+当天截止；
+#   · 周周期（YYYY-Www）：自然周（周一 00:00 ~ 周日 23:59:59）—— 本周日截止，
+#     或每周仅勾选 1 个执行日；
+#   · 月周期（YYYY-MM）：自然月 —— 月底截止，或每月仅勾选 1 个执行日；
+#   · 一次任务（once）：归属周期 = 模板本身。
+def canonical_period_kind(template: Dict[str, Any]) -> str:
+    """归属周期分类 → 'day' | 'week' | 'month' | 'once'。
+
+    判定优先级（period='day' 的 2026-11-02 起新形态模板）：
+      1) is_manual → once；
+      2) 截止 month_end → month / 截止 weekend → week（截止容器优先于执行日数量）；
+      3) 月度执行日恰 1 天 → month / 每周执行日恰 1 天 → week；
+      4) 其余（每天 / 工作日 / 多执行日 + 当天截止或无截止）→ day。
+    存量 period='week'/'month' 单锚点模板：天然映射 week/month（行为不变）。
+    通知类（kind=notice）维持按天的回执/实例模型，一律 day（本改造不动通知链）。
+    """
+    if template.get("is_manual"):
+        return "once"
+    period = (template.get("period") or "day").strip()
+    if period in ("week", "month"):
+        return period
+    # period == "day" 家族
+    if (template.get("kind") or "") == "notice":
+        return "day"
+    if template.get("has_deadline") is not None and not int(template.get("has_deadline")):
+        deadline_type = None  # 无截止 → 只看执行日数量
+    else:
+        deadline_type = str(template.get("deadline_type") or "").strip()
+    if deadline_type == "month_end":
+        return "month"
+    if deadline_type == "weekend":
+        return "week"
+    _weekdays, dom_days = template_exec_days(template)
+    if dom_days:
+        return "month" if len(dom_days) == 1 else "day"
+    if _weekdays:
+        return "week" if len(_weekdays) == 1 else "day"
+    return "day"
+
+
+def canonical_period_key(template: Dict[str, Any], dt: DateLike) -> str:
+    """模板在 dt 时刻的归属周期键（once / YYYY-MM-DD / YYYY-Www / YYYY-MM）。"""
+    kind = canonical_period_kind(template)
+    if kind == "once":
+        return "once"
+    return period_key(kind, dt)
+
+
+def canonical_period_deadline(template: Dict[str, Any], kind: str, dt: DateLike) -> str:
+    """按「归属周期」计算实例截止时刻。
+
+    · once / day / 存量 week&month 模板 → 直接沿用 calc_instance_deadline（行为不变）；
+    · day 家族升级为周/月容器时，截止锁定到**容器锚点**而非当前推送时刻：
+      - 周：本周日（weekend）或唯一执行日（same_day）当天 + deadline_time；
+      - 月：本月最后一天（month_end）或唯一执行日（same_day）+ deadline_time；
+      周三 18:00 截止的任务周四手动重推时，新归属实例的截止仍是本周三 18:00
+      （已过 → 周期闭口），而不是「周四 + 18:00」的错误顺延。
+    """
+    if template.get("is_manual") or kind in ("day",) or str(template.get("period") or "") in ("week", "month"):
+        return calc_instance_deadline(template, dt)
+    if template.get("has_deadline") is not None and not int(template.get("has_deadline")):
+        return calc_instance_deadline(template, dt)  # 无截止哨兵
+    hhmm = str(template.get("deadline_time") or template.get("deadline") or "").strip()
+    if not is_valid_hhmm(hhmm):
+        raise ValueError(f"模板截止时刻非法: {hhmm!r}")
+    d = _to_date(dt)
+    hour, minute = _parse_hhmm(hhmm)
+    deadline_type = str(template.get("deadline_type") or "").strip()
+    if kind == "week":
+        if deadline_type == "weekend":
+            due = d + timedelta(days=7 - d.isoweekday())  # 本周日（isoweekday: 周日=7）
+        else:
+            weekdays, _doms = template_exec_days(template)
+            wd = int(weekdays[0]) if weekdays else d.isoweekday()  # 唯一执行日；异常兜底当天
+            monday = d - timedelta(days=d.isoweekday() - 1)
+            due = monday + timedelta(days=wd - 1)
+    elif kind == "month":
+        if deadline_type == "month_end":
+            due = date(d.year, d.month, calendar.monthrange(d.year, d.month)[1])
+        else:
+            _wds, doms = template_exec_days(template)
+            anchor_dom = int(doms[0]) if doms else d.day
+            due = date(d.year, d.month, effective_month_dom(d.year, d.month, anchor_dom))
+    else:
+        return calc_instance_deadline(template, dt)
+    if hour == 0 and minute == 0:
+        due = due + timedelta(days=1)  # 00:00 = 基准日 24 点 = 次日 0 点（与 calc_instance_deadline 同口径）
+    return datetime.combine(due, time(hour=hour, minute=minute, second=0)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def effective_month_dom(year: int, month: int, anchor_dom: int) -> int:
     """R48：计算月度任务在指定年月的实际触发日（1~31，当月无此日取月末）。"""
     if not (1 <= int(anchor_dom) <= 31):
@@ -170,17 +292,7 @@ def is_template_anchor_day(template: Dict[str, Any], dt: DateLike) -> bool:
     """
     if (template.get("period") or "") == "day":
         # ── 月度模式（优先）──
-        raw_dom = template.get("exec_dom_days")
-        dom_days: Optional[List[int]] = None
-        if isinstance(raw_dom, list):
-            dom_days = [int(x) for x in raw_dom if str(x).strip().isdigit() and 1 <= int(x) <= 31]
-        elif isinstance(raw_dom, str) and raw_dom.strip():
-            try:
-                parsed_dom = json.loads(raw_dom)
-                if isinstance(parsed_dom, list):
-                    dom_days = [int(x) for x in parsed_dom if str(x).strip().isdigit() and 1 <= int(x) <= 31]
-            except Exception:
-                dom_days = None
+        weekdays_cfg, dom_days = template_exec_days(template)
         if dom_days:
             today = _to_date(dt)
             dom_set = set(dom_days)
@@ -193,19 +305,8 @@ def is_template_anchor_day(template: Dict[str, Any], dt: DateLike) -> bool:
                     return True
             return False
         # ── 每周模式（既有）──
-        raw = template.get("exec_weekdays")
-        days: Optional[List[int]] = None
-        if isinstance(raw, list):
-            days = [int(x) for x in raw if str(x).strip().isdigit() and 1 <= int(x) <= 7]
-        elif isinstance(raw, str) and raw.strip():
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, list):
-                    days = [int(x) for x in parsed if str(x).strip().isdigit() and 1 <= int(x) <= 7]
-            except Exception:
-                days = None
-        if days:
-            return _to_date(dt).isoweekday() in set(days)
+        if weekdays_cfg:
+            return _to_date(dt).isoweekday() in set(weekdays_cfg)
         return True
     return is_anchor_day(template["period"], dt, template.get("anchor_weekday"), template.get("anchor_dom"))
 
@@ -562,8 +663,14 @@ class Scheduler:
         cur_dt = now_dt or self.now()
         if not is_template_anchor_day(template, cur_dt):
             return []
-        p_key = period_key(template["period"], cur_dt)
-        deadline_at = calc_instance_deadline(template, cur_dt)
+        # 2026-11-20 切期改造：实例挂在「归属周期」键上（周/月容器任务的整周期唯一批次）。
+        if template.get("kind") == "notice":
+            p_key = period_key(template["period"], cur_dt)
+            deadline_at = calc_instance_deadline(template, cur_dt)
+        else:
+            kind = canonical_period_kind(template)
+            p_key = canonical_period_key(template, cur_dt)
+            deadline_at = canonical_period_deadline(template, kind, cur_dt)
         return self.state.ensure_template_instances(template["template_id"], p_key, deadline_at)
 
     def _build_planned_dt(self, ref_dt: datetime, hhmm: str) -> datetime:
@@ -1012,8 +1119,9 @@ class Scheduler:
         守卫：
           · 仅上传类模板（form/image/file）；notice 按 notice_times 自动发，拒绝手动推
           · 绕过锚点日/「推送时刻 < 提醒时刻」门：非锚点日也允许补建当期实例（软护栏另设）
-          · 2026-11-12 下午：覆盖 pending/overdue/rejected/**submitted/approved**（用户拍板：
-            立即推送支持已提交任务再次推送，便于催办/自测）；cancelled/expired/已过截止/成员停用不发送
+          · 2026-11-20 切期改造：手动重推**全员照推不再跳过已完成**——
+            已完成/已过截止成员照样收到消息，但链接打开即闭口（只读回看）；
+            cancelled（资格取消）与成员停用仍不发送
           · 同一次调用内每 (phone,seq) 只发一次（_deliver_with_log 首试 retry=0）；
             发送失败留给 reminder_log 退避机制，不在本轮重试
           · 同模板冷却护栏在 state.check_manual_push_cooldown（API 层调用），本方法不重复判
@@ -1036,10 +1144,17 @@ class Scheduler:
           · 幂等键语义不变：同一个 prep 重放只会命中既有幂等记录，绝不二次发送。
         本段只做毫秒~秒级 DB 操作，供 API 请求内安全执行（asyncio.to_thread）。
 
-        2026-11-19 需求一（同日多次推送）：reprocess=True 时 p_key 改写成批次键
-        `{canonical}#YYYYMMDDHHMMSS`（同秒碰撞追加 -2/-3），建完新实例后把旧批次
-        未完成实例置 cancelled。**默认 reprocess=False 的行为与历史逐字节一致**
-        （调度级 push_now / run_once 定时链一行不动）。
+        2026-11-19 需求一（同日多次推送）：reprocess=True 走批次键
+        `{canonical}#YYYYMMDDHHMMSS`（同秒碰撞追加 -2/-3）。
+
+        2026-11-20 切期改造（用户拍板，语义全面升级）：
+          · 归属周期键 = canonical_period_key（周/月容器任务整周期一个键）；
+          · reprocess 且 canonical 主批次仍存活 → 另起新批次；主批次已整批取消
+            （成员变动/历史停用）→ 直接复活 canonical 键（对当前成员重新开放）；
+          · **不再取消旧批次**：同周期多批次并存，防刷屏改由「H5 待办按归属周期
+            去重 + 逾期流转」承担；
+          · 生成后立即做两件收口：①已完成/已回执成员的副本同步为完成态
+            （sync_batch_completion）；②已过截止的实例统一闭口（advance 流转）。
         """
         cur_dt = now_dt or self.now()
         if cur_dt.tzinfo is None:
@@ -1055,26 +1170,37 @@ class Scheduler:
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
-        p_key = "once" if manual else period_key(tpl["period"], cur_dt)
-        if reprocess:
+        kind = canonical_period_kind(tpl)
+        p_key = canonical_period_key(tpl, cur_dt)
+        if reprocess and self.state.period_has_alive_instances(tpl["template_id"], p_key):
+            # 主批次仍有存活实例 → 管理员确认的新一轮「全员照推」另起新批次
             p_key = self._next_batch_period_key(template_id, p_key, cur_dt)
-        deadline_at = calc_instance_deadline(tpl, cur_dt)
+        deadline_at = (tpl.get("manual_deadline_at") or NO_DEADLINE_SENTINEL) if manual else canonical_period_deadline(tpl, kind, cur_dt)
         if tpl["kind"] == "notice":
             deadline_at = format_dt(cur_dt + timedelta(hours=24))
         if manual and deadline_at <= now_s:
             raise BizError(400, "INVALID_DEADLINE", "任务已到截止时间，无法推送")
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
+        # 2026-11-20：canonical 主批次曾被整批取消时，先复活当前成员的已取消行
+        # （INSERT OR IGNORE 撞唯一键会被静默吞掉，必须显式 UPDATE）。
+        if reprocess:
+            self.state.revive_cancelled_batch_rows(tpl["template_id"], p_key, deadline_at)
         instances = self.state.ensure_template_instances(
             tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
         )
-        cancelled = 0
-        if reprocess:
-            # 2026-11-19 需求三：新批次建好后取消旧批次的未完成实例（防 H5 待办刷屏）
-            cancelled = self.state.cancel_stale_instances_for_new_batch(tpl["template_id"], p_key)
+        # ① 同周期已完成/已回执成员的副本直接同步为完成态（闭口展示原提交内容）
+        synced = self.state.sync_batch_completion(tpl["template_id"], p_key)
+        # ② 已过截止的待办实例统一流转（pending → overdue，闭口显示「任务已截止」）
+        self.state.advance_instance_statuses(cur_dt)
+        refreshed = self.state.list_instances_for_period(tpl["template_id"], p_key)
+        # instance_count 只数「当轮在册」的实例：随角色变动被取消（cancelled）的
+        # 历史行不算本轮推送对象（放空模板 = 0，2026-11-17 口径回归）。
+        alive = [i for i in (refreshed or instances)
+                 if str(i.get("status") or "") not in ("cancelled", "expired")]
         return {
             "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
-            "deadline_at": deadline_at, "instance_count": len(instances),
-            "new_batch": bool(reprocess), "cancelled": cancelled,
+            "deadline_at": deadline_at, "instance_count": len(alive),
+            "new_batch": bool(reprocess), "synced_completed": int(synced),
         }
 
     def _next_batch_period_key(self, template_id: str, canonical: str, cur_dt: datetime) -> str:
@@ -1117,16 +1243,24 @@ class Scheduler:
         push_seq: Dict[str, int] = {}
         for inst in instances:
             inst_status = str(inst["status"] or "")
-            # 2026-11-12 下午（用户拍板，二-1）：立即推送**覆盖已提交/已审核通过**——
-            # pending / overdue / rejected / submitted / approved 均正常发送并签发有效链接
-            # （催办与自测场景）；cancelled（任务已关闭）与 expired（过期归档）不打扰。
+            # 2026-11-20 切期改造（用户拍板，方案B「全员照推 + 通道智能闭口」）：
+            # pending / overdue / rejected / submitted / approved 均照发（不去重已完成）；
+            # cancelled（资格取消）/ expired（过期归档）不打扰。
             if inst_status not in ("pending", "overdue", "rejected", "submitted", "approved"):
                 continue
-            # 已过截止不追发（矩阵）；rejected 以「驳回 + 24h」重交窗口为有效截止
-            eff_dl = (calc_resubmit_deadline(str(inst["deadline_at"] or ""), inst.get("reviewed_at"))
-                      if inst_status == "rejected" else str(inst["deadline_at"] or ""))
-            if eff_dl <= now_s:
-                continue  # 已过截止：不追发
+            # 闭口判定（先于消息渲染，与 H5 服务端口径一致）：
+            #   · 已完成（submitted/approved）→ 只读回看本周期原提交内容；
+            #   · 已过截止（rejected 按重交窗口）→ 闭口显示「任务已截止」；
+            #   · 其余（未完成且未过截止）→ 正常开放提交通道。
+            readonly_reason: Optional[str] = None
+            if inst_status in ("submitted", "approved"):
+                readonly_reason = "completed"
+            else:
+                # rejected 以「驳回 + 24h」重交窗口为有效截止；无截止哨兵天然恒开
+                eff_dl = (calc_resubmit_deadline(str(inst["deadline_at"] or ""), inst.get("reviewed_at"))
+                          if inst_status == "rejected" else str(inst["deadline_at"] or ""))
+                if eff_dl <= now_s:
+                    readonly_reason = "closed"
             # 成员账号被停用/移出 → 不推送（四-5 口径）
             if not self.state.is_member_active_for_roles(str(inst["phone"]), tpl.get("role_ids") or []):
                 continue
@@ -1134,7 +1268,7 @@ class Scheduler:
             seq = push_seq.get(phone, 0) + 1
             push_seq[phone] = seq
 
-            def _make_push_msg(instance=inst, template=tpl) -> str:
+            def _make_push_msg(instance=inst, template=tpl, ro=readonly_reason) -> str:
                 rendered = render_text_tpl(
                     template["text_tpl"], member_name=instance["name_snap"], member_dept=instance["dept_snap"],
                     template_name=template["name"], deadline_at=instance["deadline_at"], period=template["period"], ref_dt=cur_dt,
@@ -1144,7 +1278,23 @@ class Scheduler:
                     period_key_val=instance["period_key"], instance_id=int(instance["id"]),
                 )
                 dl_disp = format_deadline_display(instance["deadline_at"], ref_dt=cur_dt)
-                # 与 run_once 定时提醒同版式（同名内容双发是用户拍板的特批场景）
+                # 与 run_once 定时提醒同版式（同名内容双发是用户拍板的特批场景）；
+                # 闭口链接打开后由 H5 服务端窗口判定兜底（已提交→只读回看；已截止→无法提交）。
+                if ro == "completed":
+                    done_disp = (format_deadline_display(str(instance.get("submitted_at") or ""), ref_dt=cur_dt)
+                                 if instance.get("submitted_at") else "")
+                    return (
+                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                        f"截止时间：{dl_disp}\n"
+                        + (f"你已在本周期完成该任务（{done_disp}）。\n" if done_disp else "你已在本周期完成该任务。\n")
+                        + f"点击链接可查看已提交内容：\n{h5_url}"
+                    )
+                if ro == "closed":
+                    return (
+                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                        f"任务已截止（截止时间：{dl_disp}），无法提交。\n"
+                        f"点击链接可查看任务详情：\n{h5_url}"
+                    )
                 return (
                     f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
                     f"截止时间：{dl_disp}\n"
@@ -1448,9 +1598,15 @@ class Scheduler:
                 return ""
             # 2026-11-20：link 模式收尾只发「引导语 + 确认链接」。正文已在上一步完整投递，
             # 再拼 100 字摘要会在聊天里重复一大段内容（用户反馈的「尾部重复正文摘要」）。
+            # 2026-11-20 需求 A：spec.notice_receipt.receipt_guide_text（选填）可自定义第二行
+            # 引导语；留空回退默认「请打开链接阅读完整通知，点击「{短语}」确认。」
+            spec = tpl.get("spec_json") if isinstance(tpl.get("spec_json"), dict) else {}
+            guide = str(((spec.get("notice_receipt") or {}) if isinstance(spec.get("notice_receipt"), dict) else {})
+                        .get("receipt_guide_text") or "").strip()
+            second_line = guide or f"请打开链接阅读完整通知，点击「{inst['receipt_phrase']}」确认。"
             link = self.public_base_url.rstrip("/") + issue_link(self.state, inst)
             return (f"【德阳量密助手】您收到《{view['title']}》通知。\n"
-                    f"请打开链接阅读完整通知，点击「{inst['receipt_phrase']}」确认。\n{link}")
+                    f"{second_line}\n{link}")
 
         return message
 
@@ -1577,7 +1733,10 @@ class Scheduler:
                 continue
 
             planned_dt = self._build_planned_dt(cur_dt, tpl["remind_at"])
-            p_key = period_key(tpl["period"], cur_dt)
+            # 2026-11-20 切期改造：定时提醒链挂「归属周期」键——周/月容器内多执行日共享
+            # 同一批实例；同周期第二/三个执行日发送时 planned_str 不同（幂等键天然放行），
+            # 而 _pending 过滤把已完成成员天然跳过 → 方案A「只催未完成，不打扰已完成」。
+            p_key = canonical_period_key(tpl, cur_dt)
 
             # 2026-10-29：上传任务也改成「当天一进来就按人生成实例」，
             # 不再等到提醒时刻才建行——否则后台「任务实例与审核」里看不到还没到点的任务
@@ -1670,9 +1829,11 @@ class Scheduler:
                         )
 
                     # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
+                    # 2026-11-20 切期改造：逾期通知幂等键改按**归属周期**（剥掉重推批次后缀）——
+                    # 同周期手动重推出的新批次实例不再各来一条逾期通知（刷屏红线）。
                     for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
                         idem_platform = self._idem_for(
-                            make_idem_key(inst["template_id"], inst["phone"], inst["period_key"], "overdue", 1, planned_str),
+                            make_idem_key(inst["template_id"], inst["phone"], canonical_part(inst["period_key"]), "overdue", 1, planned_str),
                             platform,
                         )
                         task = self._prepare_delivery(

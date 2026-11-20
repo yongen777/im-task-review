@@ -123,10 +123,11 @@ def test_h5_badge_uses_instance_concrete_deadline() -> None:
     store, app, sa, sub, sched, ntf, tpl_id = _setup()
     try:
         _push(store, sched, tpl_id, datetime(2026, 11, 13, 15, 0, 0))
-        inst = next(i for i in store.list_instances_for_period(tpl_id, "2026-11-13")
+        # 2026-11-20 切期改造：每月单执行日模板 → 归属月周期（推送日 11-13 归 2026-11）
+        inst = next(i for i in store.list_instances_for_period(tpl_id, "2026-11")
                     if i["phone"] == PHONE_A)
         assert inst["deadline_at"] == "2026-11-30 17:00:00"
-        raw = store.issue_h5_token(PHONE_A, tpl_id, "2026-11-13", inst["id"])
+        raw = store.issue_h5_token(PHONE_A, tpl_id, "2026-11", inst["id"])
         code, info = process_h5_task_info(state=store, raw_token=raw)
         assert code == 200, info
         tpl_payload = info["template"]
@@ -228,13 +229,14 @@ def test_stats_roster_reported_and_missing() -> None:
     store, app, sa, sub, sched, ntf, tpl_id = _setup()
     try:
         _push(store, sched, tpl_id, datetime(2026, 11, 13, 15, 0, 0))
-        inst_a = next(i for i in store.list_instances_for_period(tpl_id, "2026-11-13")
+        # 2026-11-20 切期改造：单执行日月度模板 → 归属月周期（period_key=2026-11）
+        inst_a = next(i for i in store.list_instances_for_period(tpl_id, "2026-11")
                       if i["phone"] == PHONE_A)
-        raw = store.issue_h5_token(PHONE_A, tpl_id, "2026-11-13", inst_a["id"])
+        raw = store.issue_h5_token(PHONE_A, tpl_id, "2026-11", inst_a["id"])
         res = store.submit_h5_task(raw_token=raw, fields={"n": 5})
         assert res["status"] in ("submitted", "approved"), res
 
-        r = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11-13")
+        r = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11")
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["total"] == 3, body
@@ -270,7 +272,7 @@ def test_stats_roster_status_roundtrip() -> None:
             store.conn.execute(
                 "UPDATE task_instance SET status='cancelled' WHERE template_id=? AND phone=?",
                 (tpl_id, PHONE_C))
-        r = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11-13")
+        r = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11")
         body = r.json()
         by = {i["phone"]: i for i in body["items"]}
         assert by[PHONE_A]["status"] == "approved" and by[PHONE_A]["submitted_at"] == "2026-11-13 15:05:00"
@@ -286,12 +288,12 @@ def test_stats_roster_requires_template_and_period_filters() -> None:
     store, app, sa, sub, sched, ntf, tpl_id = _setup()
     try:
         _push(store, sched, tpl_id, datetime(2026, 11, 13, 15, 0, 0))
-        _push(store, sched, tpl_id, datetime(2026, 11, 14, 15, 0, 0))  # 第二期手推（11-14 建新周期实例）
+        _push(store, sched, tpl_id, datetime(2026, 11, 14, 15, 0, 0))  # 同归属月（2026-11）再推一遍
         r0 = sub.get("/api/admin/stats/roster")
         assert r0.status_code == 200 and r0.json()["total"] == 0, r0.text
-        r1 = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11-13")
-        assert r1.json()["total"] == 3, r1.text
+        r1 = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}&period_key=2026-11")
+        assert r1.json()["total"] == 3, r1.text  # 月周期按人去重：两推仍是 3 人
         r2 = sub.get(f"/api/admin/stats/roster?template_id={tpl_id}")
-        assert r2.json()["total"] == 6, r2.text
+        assert r2.json()["total"] == 3, r2.text
     finally:
         store.close()

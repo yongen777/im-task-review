@@ -489,6 +489,27 @@
       border-radius: var(--control);
       background: var(--surface-subtle);
     }
+
+    /* 2026-11-20 需求 C：原生全屏看图层 */
+    #image-viewer {
+      position: fixed; inset: 0; z-index: 80;
+      display: flex; align-items: center; justify-content: center;
+      background: #000; overscroll-behavior: contain;
+    }
+    #image-viewer[hidden] { display: none; }
+    #viewer-close {
+      position: absolute; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+      width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+      border: 1px solid rgba(255, 255, 255, .35); border-radius: 50%;
+      background: rgba(0, 0, 0, .45); color: #fff; font-size: 20px; line-height: 1;
+      z-index: 2; cursor: pointer;
+    }
+    #image-viewer img {
+      max-width: 100vw; max-height: 100vh;
+      width: auto; height: auto; object-fit: contain;
+      transform-origin: 0 0; touch-action: none; user-select: none; -webkit-user-select: none;
+      -webkit-touch-callout: default;
+    }
   </style>
 </head>
 <body>
@@ -529,6 +550,12 @@
     </div>
     <img alt="">
   </dialog>
+  <!-- 2026-11-20 需求 C：原生全屏看图层（纯黑居中、单击/Esc/返回键退出、
+       双击 1x⇄2x、双指捏合 1x~4x、滚轮缩放、放大后拖拽；长按走系统菜单） -->
+  <div id="image-viewer" hidden>
+    <button type="button" id="viewer-close" aria-label="关闭预览">×</button>
+    <img alt="">
+  </div>
   <script>
     (function () {
       const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
@@ -564,6 +591,114 @@
         time.textContent = instance.submitted_at ? " · 完成时间：" + instance.submitted_at
           : publishedAt ? " · 执行时间：" + publishedAt : "";
       }
+
+      /* ── 2026-11-20 需求 C：原生全屏看图（纯黑居中、单击/Esc/返回键退出、
+         双击 1x⇄2x、双指 1x~4x、滚轮缩放、放大后拖拽；长按走系统菜单）── */
+      const viewerEl = document.getElementById("image-viewer");
+      const viewerImg = viewerEl.querySelector("img");
+      const vState = { scale: 1, tx: 0, ty: 0, lastTap: 0, tapStart: null };
+      let viewerRevoke = null, viewerPopstate = null;
+      function viewerApply() {
+        viewerImg.style.transform = vState.scale === 1 && !vState.tx && !vState.ty
+          ? "" : `translate(${vState.tx}px, ${vState.ty}px) scale(${vState.scale})`;
+      }
+      function viewerClamp() {
+        if (vState.scale <= 1) { vState.tx = 0; vState.ty = 0; return; }
+        const maxX = Math.max(0, (viewerImg.clientWidth * vState.scale - innerWidth) / 2);
+        const maxY = Math.max(0, (viewerImg.clientHeight * vState.scale - innerHeight) / 2);
+        vState.tx = Math.min(maxX, Math.max(-maxX, vState.tx));
+        vState.ty = Math.min(maxY, Math.max(-maxY, vState.ty));
+      }
+      function viewerOpen(url) {
+        viewerImg.src = url;
+        Object.assign(vState, { scale: 1, tx: 0, ty: 0, lastTap: 0, tapStart: null });
+        viewerApply();
+        viewerEl.hidden = false;
+        try { history.pushState({ imtViewer: true }, "", location.href); } catch (e) { /* webview 拒绝时退化 */ }
+        if (!viewerOpen.bound) {
+          viewerPopstate = () => { if (!viewerEl.hidden) viewerClose(true); };
+          window.addEventListener("popstate", viewerPopstate);
+          viewerOpen.bound = true;
+        }
+        document.getElementById("viewer-close").focus();
+      }
+      function viewerClose(fromPop) {
+        viewerEl.hidden = true;
+        viewerImg.removeAttribute("src");
+        Object.assign(vState, { scale: 1, tx: 0, ty: 0, lastTap: 0, tapStart: null });
+        viewerApply();
+        if (viewerRevoke) { try { viewerRevoke(); } catch (e) {} viewerRevoke = null; }
+        if (!fromPop) { try { history.back(); } catch (e) {} }
+      }
+      function viewerToggle() {
+        vState.scale = vState.scale > 1 ? 1 : 2;
+        viewerClamp();
+        viewerApply();
+      }
+      document.getElementById("viewer-close").onclick = () => viewerClose(false);
+      viewerEl.addEventListener("click", event => {
+        if (event.target === viewerEl) { viewerClose(false); return; }
+        if (event.target !== viewerImg) return;
+        /* 单击：未放大 → 关闭；已放大 → 先复位（微信原生手感） */
+        if (vState.scale <= 1) { viewerClose(false); return; }
+        const now = Date.now();
+        if (now - (vState.lastTap || 0) < 300) { viewerToggle(); vState.lastTap = 0; return; }
+        vState.lastTap = now;
+        Object.assign(vState, { scale: 1, tx: 0, ty: 0 });
+        viewerClamp(); viewerApply();
+      });
+      document.addEventListener("keydown", event => {
+        if (!viewerEl.hidden && event.key === "Escape") viewerClose(false);
+      });
+      viewerEl.addEventListener("wheel", event => {
+        if (viewerEl.hidden) return;
+        event.preventDefault();
+        vState.scale = Math.min(4, Math.max(1, vState.scale * (event.deltaY < 0 ? 1.2 : 1 / 1.2)));
+        viewerClamp(); viewerApply();
+      }, { passive: false });
+      let vPinch = null, vDrag = null;
+      viewerEl.addEventListener("touchstart", event => {
+        if (event.touches.length === 2) {
+          const [a, b] = event.touches;
+          vPinch = { d: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY), scale: vState.scale };
+          vDrag = null;
+        } else if (event.touches.length === 1) {
+          const t = event.touches[0];
+          if (vState.scale > 1) vDrag = { x: t.clientX, y: t.clientY, tx: vState.tx, ty: vState.ty };
+          else { vDrag = null; vState.tapStart = { x: t.clientX, y: t.clientY, time: Date.now() }; }
+        }
+      }, { passive: true });
+      viewerEl.addEventListener("touchmove", event => {
+        if (vPinch && event.touches.length === 2) {
+          event.preventDefault();
+          const [a, b] = event.touches;
+          const d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+          vState.scale = Math.min(4, Math.max(1, vPinch.scale * (d / vPinch.d)));
+          viewerClamp(); viewerApply();
+        } else if (vDrag && event.touches.length === 1) {
+          event.preventDefault();
+          const t = event.touches[0];
+          vState.tx = vDrag.tx + (t.clientX - vDrag.x);
+          vState.ty = vDrag.ty + (t.clientY - vDrag.y);
+          viewerClamp(); viewerApply();
+        }
+      }, { passive: false });
+      viewerEl.addEventListener("touchend", event => {
+        if (vPinch && event.touches.length < 2) vPinch = null;
+        if (vDrag && event.touches.length === 0) vDrag = null;
+        const start = vState.tapStart;
+        if (start && event.changedTouches.length === 1) {
+          const t = event.changedTouches[0];
+          const moved = Math.hypot(t.clientX - start.x, t.clientY - start.y);
+          const elapsed = Date.now() - start.time;
+          if (moved < 10 && elapsed < 300) {
+            const now = Date.now();
+            if (now - (vState.lastTap || 0) < 300) { viewerToggle(); vState.lastTap = 0; }
+            else vState.lastTap = now;
+          }
+          vState.tapStart = null;
+        }
+      });
       const loadingEl = document.getElementById("loading");
       const contentEl = document.getElementById("content");
       const msgBox = document.getElementById("msgBox");
@@ -611,16 +746,10 @@
           }
           const blob = response.data;
           const url = URL.createObjectURL(blob);
-          const dialog = document.getElementById("preview");
-          if (attachment.mime.startsWith("image/") && typeof dialog.showModal === "function") {
-            const image = dialog.querySelector("img");
-            image.src = url;
-            image.alt = attachment.file_name;
-            dialog.addEventListener("close", () => {
-              image.removeAttribute("src");
-              URL.revokeObjectURL(url);
-            }, { once: true });
-            dialog.showModal();
+          if (attachment.mime.startsWith("image/")) {
+            /* 2026-11-20 需求 C：改走原生全屏看图层（关闭时回收 blob） */
+            viewerRevoke = () => URL.revokeObjectURL(url);
+            viewerOpen(url);
           } else {
             const link = document.createElement("a");
             link.href = url;
@@ -882,15 +1011,8 @@
                   previewButton.setAttribute("aria-label", "预览 " + item.name);
                   previewButton.appendChild(img);
                   previewButton.addEventListener("click", () => {
-                    const dialog = document.getElementById("preview");
-                    const large = dialog.querySelector("img");
-                    large.src = item.preview;
-                    large.alt = item.name;
-                    if (typeof dialog.showModal === "function") {
-                      dialog.showModal();
-                    } else {
-                      dialog.setAttribute("open", "");
-                    }
+                    /* 2026-11-20 需求 C：改走原生全屏看图层 */
+                    viewerOpen(item.preview);
                   });
                   line.prepend(previewButton);
                 }

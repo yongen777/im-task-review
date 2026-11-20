@@ -15,8 +15,9 @@ C —— 成员移除后未完成实例作废（新状态 cancelled）：
 
 D —— 上传任务一键推送（创建者分级管理员专属）：
     用户拍板原话：9 点推送和 10 点定时各发一条一模一样的提醒（测试用按钮，管理员自行
-    判断）。守卫：超管 403 / 模板属主校验 / 同模板 2 分钟软护栏 429 / 同一时刻幂等防抖 /
-    只发 pending 且未截止 / cancelled 实例不打扰 / 审计 template.push_now。
+    判断）。守卫：超管 403 / 模板属主校验 / 同模板 3 秒软护栏 429（2026-11-20 改） /
+    同一时刻幂等防抖 / 已完成/已截止闭口文案、cancelled/expired 实例不打扰 /
+    审计 template.push_now。
 
 全部相对时刻（fake clock），不碰 data/im_task.db。
 """
@@ -457,8 +458,8 @@ def test_d_push_now_double_send_with_scheduled_and_same_second_dedupe() -> None:
 
 
 def test_d_push_now_cooldown_window_429() -> None:
-    """软护栏：同模板 2 分钟内重复推送 → 先回 needs_confirm（预检不占 marker），
-    确认后撞 429 PUSH_COOLDOWN；满 2 分钟放行并新建批次（2026-11-19 需求一）。"""
+    """软护栏：同模板 3 秒内重复推送 → 先回 needs_confirm（预检不占 marker），
+    确认后撞 429 PUSH_COOLDOWN；满 3 秒放行并新建批次（2026-11-20 防抖改 3 秒）。"""
     store, app, sa, sub, sched, ntf, tpl_id = _d_setup()
     try:
         CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 0)
@@ -466,22 +467,22 @@ def test_d_push_now_cooldown_window_429() -> None:
         assert r1.status_code == 200, r1.text
         assert r1.json()["queued"] is True and r1.json()["new_batch"] is False
 
-        CLOCK["now"] = datetime(2026, 11, 12, 10, 1, 59)  # 119s < 120s
+        CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 2)  # 2s < 3s
         r2 = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
         assert r2.status_code == 200 and r2.json()["needs_confirm"] is True, (r2.status_code, r2.text)
         assert r2.json()["target_count"] == 2 and r2.json()["canonical_period_key"] == "2026-11-12"
         r2b = sub.post(f"/api/admin/templates/{tpl_id}/push-now?confirmed=1")
         assert r2b.status_code == 429 and r2b.json()["code"] == "PUSH_COOLDOWN", (r2b.status_code, r2b.text)
 
-        CLOCK["now"] = datetime(2026, 11, 12, 10, 2, 1)  # 121s ≥ 120s 放行
+        CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 4)  # 4s ≥ 3s 放行
         r3 = sub.post(f"/api/admin/templates/{tpl_id}/push-now")
         assert r3.status_code == 200 and r3.json()["needs_confirm"] is True, (r3.status_code, r3.text)
         r3b = sub.post(f"/api/admin/templates/{tpl_id}/push-now?confirmed=1")
         assert r3b.status_code == 200, r3b.text
         body = r3b.json()
         assert body["new_batch"] is True and body["instance_count"] == 2, body
-        assert body["period_key"] == "2026-11-12#20261112100201", body
-        assert body["cancelled"] == 2, body
+        assert body["period_key"] == "2026-11-12#20261112100004", body
+        assert body["synced_completed"] == 0, body  # 无人完成 → 无同步
         # 429 那次被护栏挡住：消息总数 = 首批 2 + 新批次 2
         assert len(ntf.sent_messages) == 4, len(ntf.sent_messages)
     finally:

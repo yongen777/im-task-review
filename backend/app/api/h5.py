@@ -371,6 +371,13 @@ def _completed_submission(state: StateStore, instance: Dict[str, Any], *, histor
         records = state.list_submissions_for_instance(instance["id"])
         saved = records[-1] if records else None
     if not saved:
+        # 2026-11-20 切期改造：手动重推的「已完成闭口副本」实例自身没有提交行 →
+        # 回查同归属周期（含全部重推批次）内该成员的原提交做只读回看。
+        saved = state.latest_family_submission(
+            instance["template_id"], instance["phone"], instance["period_key"],
+            exclude_instance_id=int(instance["id"]),
+        )
+    if not saved:
         return None
     try:
         refs = json.loads(saved.get("refs_json") or "[]")

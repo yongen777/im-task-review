@@ -72,6 +72,16 @@ def parse_dt(value: str) -> datetime:
     return naive.replace(tzinfo=SHANGHAI_TZ)
 
 
+def canonical_part(period_key: str) -> str:
+    """实例/批次 period_key → 归属周期键（剥掉 `#YYYYMMDDHHMMSS[-N]` 重推批次后缀）。
+
+    2026-11-20 切期改造：同一归属周期（含全部重推批次）在做「去重 / 幂等 / 完成同步」
+    时以该键为准。无 `#` 的历史键原样返回（恒等）。
+    放在 config（叶子模块）：state 与 scheduler 都要用，又不能互相 import。
+    """
+    return str(period_key or "").split("#", 1)[0]
+
+
 def _abort_missing_port() -> None:
     """§16 P11：只保留 SystemExit，不额外 print，避免重复输出。"""
     raise SystemExit(MISSING_PORT_MSG)

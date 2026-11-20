@@ -460,10 +460,28 @@ class PortalService:
                    for m in self.members(tpl['platform'], phone=inst['phone']))
 
     def todos(self, ident):
-        rows = self.s.conn.execute("SELECT * FROM task_instance WHERE phone=? AND status IN ('pending','rejected') ORDER BY deadline_at,id", (ident['phone'],)).fetchall()
-        result = []
+        """我的待办（2026-11-20 切期改造：按「模板 + 归属周期」严格去重）。
+
+        · 同一归属周期内不论定时/手动推了多少批（2026-11-19 批次键），未完成且
+          未过截止时**永远只展示最新 1 条**（MAX(id)）；
+        · 成员在任一批次上完成/回执 → sync_family_completion 把周期内全部实例同步为
+          完成态，待办里立即消失，后续重推也不再出现；
+        · 已过截止的实例由 advance 流转 overdue 后不再回到待办（即时清零）。
+        """
+        from .config import canonical_part
+
+        rows = self.s.conn.execute(
+            "SELECT * FROM task_instance WHERE phone=? AND status IN ('pending','rejected') ORDER BY deadline_at,id",
+            (ident['phone'],)).fetchall()
+        pick: dict = {}
         for row in rows:
             inst = dict(row)
+            key = (inst['template_id'], canonical_part(inst['period_key']))
+            cur = pick.get(key)
+            if cur is None or int(inst['id']) > int(cur['id']):
+                pick[key] = inst
+        result = []
+        for inst in pick.values():
             t = self.s.get_template(inst['template_id'])
             if (not t or t['kind'] == 'notice' or t.get('is_adhoc') or inst['period_key'].startswith('adhoc-')
                     or self.s.instance_close_reason(inst, t)):
@@ -472,8 +490,17 @@ class PortalService:
             if plat == ident['platform'] and effective_instance_deadline(inst) > self.s.now_str():
                 inst['template_name'] = t['name']
                 result.append(inst)
+        result.sort(key=lambda i: (i['deadline_at'], i['id']))
+        # 2026-11-20 切期改造：未回执通知同样按「模板 + 归属周期」去重（同周期
+        # 重推多批时只展示最新一条；旧批次的确认入口保留但不再刷屏）。
         receipts = self.s.pending_notice_receipts(ident['phone'], ident['platform'])
-        result.extend(reversed(receipts))
+        seen: set = set()
+        for item in reversed(list(receipts)):
+            key = (item['template_id'], canonical_part(item.get('period_key') or ''))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(item)
         return result
 
     def task_link(self, ident, instance_id):
