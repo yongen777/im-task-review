@@ -187,9 +187,15 @@ def seed(store, password, scheduler):
     leader, employee, cross, standby = DEMO_MEMBERS
     ident = {"phone": leader[0], "platform": "zdxlz"}
     portal = PortalService(store)
-    grants = portal.grant_options("zdxlz", owner, leader[0])
+    # 2026-11-21：显式勾选演示组织根部门，不再依赖 grant_options 的「默认部门」回退。
+    # 原写法 [*grants["default_dept_ids"], "preview-service"] 只在**首轮启动**有效——
+    # 授权行一旦落库，grant_options 就走「已保存 scope」分支、default_dept_ids 恒为空
+    # （portal.py grant_options L254-258），复跑时授权范围退化为仅 preview-service 一个部门，
+    # seed 里按全部演示成员 create_task 即报「接收成员超出授权范围」（portal.py:383）。
+    # 根部门 preview-root 经 recipients() 的 descendants() 展开覆盖全部 4 名演示成员，
+    # 首轮与复跑行为完全一致。
     portal.save_grant("zdxlz", owner, leader[0], {
-        "enabled": True, "dept_ids": [*grants["default_dept_ids"], "preview-service"], "role_ids": [cross_role],
+        "enabled": True, "dept_ids": ["preview-root"], "role_ids": [cross_role],
     }, DEMO_USER)
     templates = {item["name"]: item for item in store.list_templates(owner_id=owner, size=100)["items"]}
     now = store.now()
@@ -208,12 +214,13 @@ def seed(store, password, scheduler):
     ]
     fields = {"qty": 6, "position": "机房 A 区第 3 排", "date": today, "normal": True, "shift": "晚班"}
 
-    def template(title, description, modules, *, review=False, adhoc=False):
+    def template(title, description, modules, *, review=False, adhoc=False, once=False):
         # Keep earlier local runs intact while still creating fresh states on restart.
         name = title if title not in templates else f"{title} · {now:%H%M%S}"
         row = store.create_template({
             "name": name, "text_tpl": description, "role_ids": [role_id], "kind": "form",
             "period": "day", "remind_at": "08:00", "has_deadline": False,
+            "is_manual": once, "manual_deadline_at": None,
             "schema_json": schema if "fields" in modules else [], "allow_note": True,
             "is_adhoc": adhoc, "need_review": review, "spec": {"upload_modules": modules},
         }, owner_id=owner)
@@ -239,7 +246,14 @@ def seed(store, password, scheduler):
 
     broad = template("光交箱巡检回报", "核对设备数量、机柜状态，附现场图及交接明细。", ["fields", "text", "image", "file"])
     review = template("值班交接记录", "登记未结事项，交由班长确认。", ["text", "image"], review=True)
-    late = template("逾期演示 · 机房温湿度", "示例：此任务已经截止。", ["text"])
+    # 2026-11-21：逾期提醒演示任务改为「立即推送」一次性模板（period=once），每次启动都是
+    # 独立模板，todos 的逾期卡片不会像日周期那样跨启动累计（历史演示数据会让卡片
+    # 越积越多）；成员工作台 B 同样能稳定看到一条「已逾期 · 我知道了」卡片。
+    # 模板本身不配置截止（手动模板的截止必须晚于当前时间），实例直接给过去时刻——
+    # advance 流转成 overdue 后，「待提交」闭环走 H5「已逾期只读」，待办里则是「我知道了」卡片。
+    late = template("逾期演示 · 机房温湿度", "示例：此任务已经截止。", ["text"], once=True)
+    late_todo = create_instance(late, employee, period="once", due=past_deadline)
+    overdue = token(create_instance(late, leader, period="once", due=past_deadline))
     adhoc_text = template("机房环境异常上报", "描述环境异常位置及情况。", ["text"], adhoc=True)
     adhoc_image = template("交换设备隐患上报", "填写设备情况并拍照。", ["text", "image"], adhoc=True)
 
@@ -258,7 +272,6 @@ def seed(store, password, scheduler):
     submit(needs_retry, note="交接初稿。", attachments=[(image_name, image)])
     store.review_instance(needs_retry["id"], "reject", DEMO_USER, "请补充巡检点位和处理时间。")
     rejected = token(needs_retry)
-    overdue = token(create_instance(late, leader, due=past_deadline))
 
     # A completed report for history and a separate entry that has no task instance yet.
     original_clock = store._now_fn
