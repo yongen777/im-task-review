@@ -151,6 +151,28 @@
       width: 22px;
       height: 22px;
     }
+    /* 2026-11-21 需求四：二级视图统一左上角返回图标（线性左箭头，触控热区 44×44） */
+    .page-back {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      flex: none;
+      margin: -8px 2px -8px -12px;
+      padding: 0;
+      border: 0;
+      border-radius: 12px;
+      background: transparent;
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .page-back:active { background: var(--blue-soft); }
+    .page-back[hidden] { display: none; }
+    .page-back svg {
+      width: 22px;
+      height: 22px;
+    }
     .admin-icon-btn:hover { background: var(--blue-soft); color: var(--blue); }
     .admin-icon-btn:active { background: #e3eef8; color: var(--blue-active); transform: scale(0.96); }
     header small {
@@ -1074,6 +1096,9 @@
     <header>
       <div class="header-inner">
         <div class="header-top">
+          <button type="button" id="page-back" class="page-back" aria-label="返回上一级" title="返回上一级" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+          </button>
           <div class="header-brand">
             <small>德阳量密助手</small>
             <h1>个人任务工作台</h1>
@@ -1470,6 +1495,7 @@
     function show(preserveHistory = false) {
       if (expired || !info) return;
       if (tab === 'create') { creator(); return; }
+      setPageBack(null);
       const todo = tab === 'todo';
       const rows = todo ? info.todos : info.adhoc;
       const focusKey = document.activeElement?.dataset.open;
@@ -1499,11 +1525,33 @@
           const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
           const review = todo && row.status === 'rejected' ? '<div class="reject-note"><span class="tag tag-warn">待重交</span>' +
             (row.reject_reason ? '<span class="reject-reason">驳回原因：' + esc(row.reject_reason) + '</span>' : '') + '</div>' : '';
+          /* 2026-11-21 需求三：已过截止且本周期未完成 → 逾期提醒，无去完成通道，点「我知道了」即移除 */
+          if (todo && row.overdue) {
+            return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
+              '<div class="task-meta"><span class="tag tag-overdue">已逾期</span></div>' +
+              deadline + '<p class="muted">已过截止时间仍未完成；本条为提醒，不影响后台统计</p></div>' +
+              '<button type="button" class="secondary" data-ack="' + esc(row.template_id) + '">我知道了</button></article>';
+          }
           return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name || row.name) +
             '</h3>' + deadline + review + '</div><button type="button" class="primary" data-open="' + esc(key) + '">' +
             (todo ? '去完成' : '进入上报') + '</button></article>';
         }).join('') : '<div class="card empty">' +
           (todo ? '当前暂无待办' : '当前暂无可自主上报的任务事项') + '</div>');
+      /* 2026-11-21：逾期提醒「我知道了」——持久化已读后立即从待办移除，刷新/重进不再复现 */
+      list.querySelectorAll('[data-ack]').forEach(button => {
+        button.onclick = async () => {
+          button.disabled = true;
+          try {
+            await api('dismiss-overdue', { task_id: button.dataset.ack });
+            button.closest('.task-card')?.remove();
+            info = await api('info');
+            show(true);
+          } catch (error) {
+            toast(error.message);
+            button.disabled = false;
+          }
+        };
+      });
       list.querySelectorAll('[data-open]').forEach(button => {
         if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
         button.onclick = async () => {
@@ -1547,10 +1595,18 @@
     });
 
     async function creator() {
+      setPageBack(null);
       main.innerHTML = '<div class="row section-row"><h2>我发布的任务</h2>' +
         '<button type="button" id="new" class="primary">新建并发布任务</button></div><div id="tasks"><div class="card empty">正在加载统计…</div></div>';
       document.getElementById('new').onclick = form;
       await stats();
+    }
+
+    /* 2026-11-21 需求四：二级视图统一左上角返回图标（仅存在上一级时显示） */
+    function setPageBack(onBack) {
+      const button = document.getElementById('page-back');
+      button.hidden = !onBack;
+      button.onclick = onBack || null;
     }
 
     function renderPeriod(container, task, period, opened) {
@@ -1660,6 +1716,7 @@
         trigger.disabled = false;
       }
       if (!view.isConnected || expired) return;
+      setPageBack(() => creator());
       selected.clear();
       // getRandomValues also works in the HTTP WebViews used by the portal.
       const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
@@ -1807,7 +1864,6 @@
         </div>
 
         <div class="form-actions">
-          <button class="secondary" type="button" id="back">返回统计</button>
           <button type="submit" class="primary" id="publish">确认发布</button>
         </div>
       </form>`;
@@ -2022,7 +2078,6 @@
       renderModules();
       renderSchemaFields();
 
-      document.getElementById('back').onclick = creator;
       document.getElementById('form').onsubmit = async event => {
         event.preventDefault();
         if (busy) return;

@@ -1136,7 +1136,8 @@ class Scheduler:
 
     def push_now_prepare(self, template_id: str, actor: str = "system",  # noqa: ARG002
                          now_dt: Optional[datetime] = None,
-                         reprocess: bool = False) -> Dict[str, Any]:
+                         reprocess: bool = False,
+                         skip_completed: bool = False) -> Dict[str, Any]:
         """2026-11-13 修复一：一键推送·准备段（校验 + 当期实例生成，**不发送任何消息**）。
 
         返回 {template_id, pushed_at, period_key, deadline_at, instance_count}：
@@ -1180,6 +1181,15 @@ class Scheduler:
             deadline_at = format_dt(cur_dt + timedelta(hours=24))
         if manual and deadline_at <= now_s:
             raise BizError(400, "INVALID_DEADLINE", "任务已到截止时间，无法推送")
+        # 2026-11-21 需求二：勾选「过滤本周期已完成/已回执成员」→ 只给未完成者建实例并推送；
+        # 全员已完成时直接明确拒绝（不建空批次、不发消息）。
+        unfinished: Optional[set] = None
+        if skip_completed:
+            completed = self.state.period_completed_phones(tpl["template_id"], p_key)
+            deliverable = self.state.template_deliverable_members(tpl)
+            unfinished = {str(m["phone"]) for m in deliverable} - completed
+            if not unfinished:
+                raise BizError(400, "ALL_COMPLETED", "本周期全员已完成，无需推送")
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
         # 2026-11-20：canonical 主批次曾被整批取消时，先复活当前成员的已取消行
         # （INSERT OR IGNORE 撞唯一键会被静默吞掉，必须显式 UPDATE）。
@@ -1187,6 +1197,7 @@ class Scheduler:
             self.state.revive_cancelled_batch_rows(tpl["template_id"], p_key, deadline_at)
         instances = self.state.ensure_template_instances(
             tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
+            only_phones=unfinished,
         )
         # ① 同周期已完成/已回执成员的副本直接同步为完成态（闭口展示原提交内容）
         synced = self.state.sync_batch_completion(tpl["template_id"], p_key)
@@ -1201,6 +1212,7 @@ class Scheduler:
             "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
             "deadline_at": deadline_at, "instance_count": len(alive),
             "new_batch": bool(reprocess), "synced_completed": int(synced),
+            "skip_completed": bool(skip_completed), "unfinished_count": len(unfinished or ()),
         }
 
     def _next_batch_period_key(self, template_id: str, canonical: str, cur_dt: datetime) -> str:
@@ -1236,8 +1248,13 @@ class Scheduler:
             raise BizError(400, "VALIDATION_FAILED", "任务的推送配置已变更")
         instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
 
+        # 2026-11-21 需求二：勾选过滤时，已完成/已回执成员本轮不推送（只向未完成人员发）。
+        skip_completed = bool(prep.get("skip_completed"))
+        completed_phones = (self.state.period_completed_phones(tpl["template_id"], p_key)
+                            if skip_completed else set())
+
         if tpl["kind"] == "notice":
-            return self._push_manual_notice(tpl, instances, cur_dt, p_key)
+            return self._push_manual_notice(tpl, instances, cur_dt, p_key, skip_completed=skip_completed)
 
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         push_seq: Dict[str, int] = {}
@@ -1247,6 +1264,9 @@ class Scheduler:
             # pending / overdue / rejected / submitted / approved 均照发（不去重已完成）；
             # cancelled（资格取消）/ expired（过期归档）不打扰。
             if inst_status not in ("pending", "overdue", "rejected", "submitted", "approved"):
+                continue
+            # 2026-11-21 需求二：跳过已完成/已回执成员（只向未完成人员推送）
+            if skip_completed and str(inst["phone"]) in completed_phones:
                 continue
             # 闭口判定（先于消息渲染，与 H5 服务端口径一致）：
             #   · 已完成（submitted/approved）→ 只读回看本周期原提交内容；
@@ -1660,10 +1680,13 @@ class Scheduler:
             self.state.update_instance_status(instance_id, "sent")
         return len(delivered)
 
-    def _push_manual_notice(self, tpl, instances, now, period: str = "once"):
+    def _push_manual_notice(self, tpl, instances, now, period: str = "once",
+                            skip_completed: bool = False):
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         instances = [inst for inst in instances if inst["status"] in ("pending", "sent")
-                     and self.state.instance_close_reason(inst, tpl) is None]
+                     and self.state.instance_close_reason(inst, tpl) is None
+                     # 2026-11-21 需求二：过滤本周期已回执成员（不重复打扰）
+                     and not (skip_completed and inst.get("receipt_at"))]
         values = self.state.get_data_snapshot_values(tpl["template_id"], period_key(tpl["period"], now)) if tpl.get("data_keys") else {}
         stats["pushed_instances"] = self._deliver_notice(
             tpl, instances, period, 1, format_dt(now), now, values, stats, once=True,
@@ -1702,8 +1725,12 @@ class Scheduler:
                 instances = self.state.ensure_template_instances(tpl["template_id"], p_key, notice_deadline)
                 stats["generated_instances"] += max(0, len(instances) - before_cnt)
                 enabled_phones = {member["phone"] for member in members}
+                # 2026-11-21：回执通知的定时推送同样遵循「只催未完成」——成员在本归属
+                # 周期内已回执（receipt_at 非空，同周期各批次由 sync_family_completion
+                # 同步）后，到点的定时推送**直接跳过**，不再重复打扰（与上传类方案 A 对齐）。
                 instances = [inst for inst in instances if inst["phone"] in enabled_phones
-                             and inst["status"] in ("pending", "sent")]
+                             and inst["status"] in ("pending", "sent")
+                             and not inst.get("receipt_at")]
 
                 for seq_idx, nt_hhmm in enumerate(tpl.get("notice_times") or [], start=1):
                     planned_dt = self._build_planned_dt(cur_dt, nt_hhmm)

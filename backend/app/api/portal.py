@@ -44,6 +44,8 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
                 return {'ok': True, 'items': rows[:30], 'has_more': len(rows) > 30}
             if action == 'history-open':
                 return p.submission_history_link(ident, int(data.get('instance_id', 0)), edit=data.get('edit') is True)
+            if action == 'dismiss-overdue':
+                return p.dismiss_overdue(ident, data.get('task_id'), data.get('period_key'))
             p.require_creator(ident)
             if action == 'recipients':
                 return {'ok': True, **await asyncio.to_thread(p.recipients, ident)}

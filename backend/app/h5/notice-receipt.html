@@ -49,10 +49,16 @@
     }
     .rule { height: 1px; margin: 18px 0 20px; background: var(--line); }
     #body { white-space: pre-wrap; line-height: 1.9; color: #2b3540; }
-    #back {
-      min-height: 44px; margin: 0 0 6px -4px; padding: 0 6px;
-      border: 0; background: none; color: var(--accent); font-size: 14px;
+    /* 2026-11-21 需求四：二级页面统一左上角返回图标（线性左箭头，触控热区 44×44） */
+    .page-back {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 44px; height: 44px; margin: 0 0 2px -8px; padding: 0;
+      border: 0; border-radius: 12px; background: none; color: var(--accent);
+      cursor: pointer;
     }
+    .page-back:active { background: rgba(29, 78, 137, .08); }
+    .page-back[hidden] { display: none; }
+    .page-back svg { width: 22px; height: 22px; }
     /* 图片：满幅嵌入正文下方，无灰底框、无文字标题 */
     .figure {
       display: block; width: 100%; margin: 18px 0 0; padding: 0;
@@ -111,7 +117,9 @@
 </head>
 <body>
   <main>
-    <button type="button" id="back" hidden>‹ 返回工作台</button>
+    <button type="button" id="page-back" class="page-back" aria-label="返回上一级" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
     <div class="notice-card" id="loading" role="status">正在读取通知…</div>
     <article id="notice" hidden>
       <section class="notice-card">
@@ -318,8 +326,9 @@
       if (zoom.hidden) return;
       if (event.key === 'Escape') closeZoom(false);
     });
-    $('back').hidden = params.get('from') !== 'portal';
-    $('back').onclick = () => history.back();
+    /* 2026-11-21 需求四：仅从工作台跳入时显示左上角返回图标（聊天窗直接打开的根页面不显示） */
+    $('page-back').hidden = params.get('from') !== 'portal';
+    $('page-back').onclick = () => history.back();
 
     function updateButton() {
       if (!data) return;

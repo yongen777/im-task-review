@@ -1378,7 +1378,7 @@ def create_admin_router(
     # 这里再拦一层防御）；模板归属由 middleware 的 /templates/{id} 路径归属校验兜住。
     @router.post("/templates/{template_id}/push-now")
     async def push_template_now(template_id: str, request: Request, background_tasks: BackgroundTasks,
-                               confirmed: bool = False):
+                               confirmed: bool = False, skip_completed: bool = False):
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
             return err
@@ -1391,10 +1391,31 @@ def create_admin_router(
                 "请由创建该模板的分级管理员推送",
             )
         return await _queue_template_push(template_id, request, background_tasks, sess["username"],
-                                         confirmed=confirmed)
+                                         confirmed=confirmed, skip_completed=skip_completed)
+
+    @router.get("/templates/{template_id}/push-preview")
+    async def push_preview(template_id: str, request: Request):
+        """2026-11-21 需求二：推送确认弹窗的实时人数预览（只读）。
+
+        返回当前可投递总人数、本归属周期已完成/已回执人数、未完成人数——
+        前端复选框「过滤本周期已完成/已回执成员」切换时直接刷新文案。
+        """
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        _admin = _admin_profile(state, sess)
+        _tpl = state.get_template(template_id, include_deleted=False)
+        if not _tpl or _tpl.get("deleted"):
+            return error_response(404, "NOT_FOUND", "任务模板不存在")
+        if _is_super_admin(_admin):
+            return error_response(403, "SUPER_ADMIN_READONLY", "请由创建该模板的分级管理员查看")
+        canonical = "once" if _tpl.get("is_manual") else canonical_period_key(_tpl, state.now())
+        info = state.push_skip_completed_preview(template_id, canonical)
+        return {"ok": True, **info}
 
     async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks,
-                                  actor: str, confirmed: bool = False):
+                                  actor: str, confirmed: bool = False, skip_completed: bool = False):
         # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
         _tpl = state.get_template(template_id, include_deleted=False)
         if not _tpl or _tpl.get("deleted"):
@@ -1419,10 +1440,15 @@ def create_admin_router(
             except BizError as exc:
                 return biz_error_response(exc)
             if info["pushed_before"] and not confirmed:
+                # 2026-11-21 需求二：预检同样按 skip_completed 口径给出「本轮实际推送人数」。
+                preview = state.push_skip_completed_preview(template_id, info["canonical_key"])
                 return {
                     "ok": True, "needs_confirm": True,
-                    "target_count": info["target_count"],
+                    "target_count": (preview["unfinished"] if skip_completed else info["target_count"]),
                     "canonical_period_key": info["canonical_key"],
+                    "skip_completed": bool(skip_completed),
+                    "unfinished_count": preview["unfinished"],
+                    "completed_count": preview["completed"],
                 }
             reprocess = bool(info["pushed_before"] and confirmed)
 
@@ -1448,7 +1474,8 @@ def create_admin_router(
         # 投递期间 H5 提交、后台查询、调度器 tick 全部不受影响。
         try:
             prep = await asyncio.to_thread(
-                scheduler.push_now_prepare, template_id, actor=actor, reprocess=reprocess)
+                scheduler.push_now_prepare, template_id, actor=actor, reprocess=reprocess,
+                skip_completed=skip_completed)
         except BizError as exc:
             return biz_error_response(exc)
         except Exception:  # noqa: BLE001
@@ -1488,7 +1515,8 @@ def create_admin_router(
             detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
                     "period_key": prep["period_key"], "instance_count": prep["instance_count"],
                     "new_batch": prep.get("new_batch", False),
-                    "synced_completed": prep.get("synced_completed", 0)},
+                    "synced_completed": prep.get("synced_completed", 0),
+                    "skip_completed": bool(skip_completed)},
         )
         return {
             "ok": True, "queued": True, "pushed_at": guard["attempted_at"],
@@ -1496,6 +1524,8 @@ def create_admin_router(
             "instance_count": prep["instance_count"],
             "new_batch": bool(prep.get("new_batch", False)),
             "synced_completed": int(prep.get("synced_completed", 0) or 0),
+            "skip_completed": bool(skip_completed),
+            "unfinished_count": int(prep.get("unfinished_count", 0) or 0),
         }
 
     # ==================================================================

@@ -1,4 +1,4 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus,
   Edit3,
@@ -532,6 +532,18 @@ export const TemplatesView: React.FC = () => {
   const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
   /* 2026-11-19 需求一：本周期已推送过时的二次确认（新建批次并重推） */
   const [repushConfirm, setRepushConfirm] = useState<{ tpl: TemplateItem; targetCount: number } | null>(null);
+  /* 2026-11-21 需求二：推送弹窗「过滤本周期已完成 / 已回执成员」开关（默认开启）与实时人数 */
+  const [skipCompleted, setSkipCompleted] = useState(true);
+  const [pushPreview, setPushPreview] = useState<{ total: number; completed: number; unfinished: number } | null>(null);
+  useEffect(() => {
+    const tpl = pushConfirmTpl || repushConfirm?.tpl;
+    if (!tpl) { setPushPreview(null); return; }
+    let live = true;
+    api.get<{ total: number; completed: number; unfinished: number }>(
+      `/api/admin/templates/${tpl.id}/push-preview`,
+    ).then(res => { if (live) setPushPreview(res); }).catch(() => { if (live) setPushPreview(null); });
+    return () => { live = false; };
+  }, [pushConfirmTpl, repushConfirm]);
 
   // 弹窗表单状态（任务类型简化为两大类：'notice' 纯通知提醒 | 'upload' 上传任务）
   const [name, setName] = useState('');
@@ -1076,7 +1088,7 @@ export const TemplatesView: React.FC = () => {
         pushed_at?: string;
         deadline_at?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now`);
+      }>(`/api/admin/templates/${target.id}/push-now${skipCompleted ? '?skip_completed=1' : ''}`);
       if (res?.needs_confirm) {
         /* 2026-11-19 需求一：本周期已推送过 → 关掉首次确认框，改问「是否新建一批」。
            预检不写冷却 marker，用户取消也不影响后续操作。 */
@@ -1119,7 +1131,7 @@ export const TemplatesView: React.FC = () => {
         instance_count?: number;
         period_key?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1`);
+      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1${skipCompleted ? '&skip_completed=1' : ''}`);
       if (res?.queued) {
         toast.success(
           `已按归属周期再推 ${res.instance_count ?? 0} 条实例（已同步本周期完成状态 ${res.synced_completed ?? 0} 条，` +
@@ -2304,8 +2316,14 @@ export const TemplatesView: React.FC = () => {
               <span className="font-bold text-slate-900">{pushConfirmTpl.name}</span>
               」当前<b>待提交</b>的成员各推送一条提醒（内容与定时提醒一致）。
               <br />
-              此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 2 分钟内不可重复推送。
+              此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 3 秒内不可重复推送。
             </p>}
+            <PushSkipCompleted
+              checked={skipCompleted}
+              onChange={setSkipCompleted}
+              preview={pushPreview}
+              fallbackTotal={pushConfirmTpl.is_manual ? undefined : undefined}
+            />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setPushConfirmTpl(null)}
@@ -2344,6 +2362,7 @@ export const TemplatesView: React.FC = () => {
               （已完成/已回执与已过截止的成员照常收到消息，但链接只读回顾、不会再回到待办；
               未完成成员正常提交；待办与统计按本周期自动去重）
             </p>
+            <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setRepushConfirm(null)}
@@ -2365,3 +2384,33 @@ export const TemplatesView: React.FC = () => {
     </div>
   );
 };
+
+/* 2026-11-21 需求二：推送确认弹窗的「过滤本周期已完成/已回执成员」开关。
+   勾选 = 只向本周期未完成人员推送（已完成/已回执不打扰）；实时展示人数。 */
+function PushSkipCompleted({ checked, onChange, preview }: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  preview: { total: number; completed: number; unfinished: number } | null;
+  fallbackTotal?: number;
+}) {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5 space-y-1">
+      <label className="flex items-start gap-2 text-xs font-medium text-slate-700 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={event => onChange(event.target.checked)}
+          className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
+        />
+        <span>过滤本周期已完成 / 已回执成员（仅向未完成人员推送）</span>
+      </label>
+      <p className="pl-6 text-[11px] leading-relaxed text-slate-500" role="status">
+        {preview
+          ? (checked
+            ? `将向未完成 ${preview.unfinished} 人推送；本周期已完成/已回执 ${preview.completed} 人不打扰（共 ${preview.total} 人）。`
+            : `将向全部 ${preview.total} 人照推（其中已完成/已回执 ${preview.completed} 人，链接只读回顾）。`)
+          : '正在统计本周期完成情况…'}
+      </p>
+    </div>
+  );
+}

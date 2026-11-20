@@ -4876,7 +4876,8 @@ class StateStore:
 
     def ensure_template_instances(self, template_id: str, period_key: str, deadline_at: str,
                                   now_str: Optional[str] = None,
-                                  trigger_at: Optional[str] = None) -> List[Dict[str, Any]]:
+                                  trigger_at: Optional[str] = None,
+                                  only_phones: Optional[set] = None) -> List[Dict[str, Any]]:
         """为模板生成当期实例。
 
         2026-11-09 用户口径（三条）：
@@ -4926,6 +4927,10 @@ class StateStore:
             #   · 第二天：period_key 变了，激活时刻已在前一天 → 完整一天都建
             #     （对应用户口径「第二天才是刷新完整一天」）
             period_is_today = _same_day(period_key, now_s)
+            # 2026-11-21 需求二：手动推送勾选「过滤本周期已完成/已回执」时只给未完成
+            # 成员建实例（不建已完成者的新批次副本，避免后台实例页与待办里多出噪音行）。
+            if only_phones is not None:
+                members = [m for m in members if str(m.get("phone") or "") in only_phones]
             for m in members:
                 # 2026-11-09：当天激活的成员只建「激活时刻之后」的实例
                 # 判定：激活时刻**晚于**本次触发时刻 → 这次的任务还没轮到他 → 跳过
@@ -4954,6 +4959,72 @@ class StateStore:
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
 
     # ── 2026-11-19 需求一：同日多次手动推送（新批次） ──────────────────
+    def period_completed_phones(self, template_id: str, period_key: str) -> set:
+        """本归属周期内已完成（upload）/已回执（notice）的手机号集合。
+
+        2026-11-21 需求二：手动推送 `skip_completed=1` 时据此过滤——
+        周期 = canonical 键 + 其全部 `#批次`（同周期多批次共享完成态，
+        由 sync_family_completion / sync_batch_completion 保证一致）。
+        """
+        clean = (template_id or "").strip()
+        pk = (period_key or "").strip()
+        if not clean or not pk:
+            return set()
+        tpl = self.get_template(clean, include_deleted=False)
+        canon = canonical_part(pk)
+        cond = ("receipt_at IS NOT NULL" if (tpl and tpl.get("kind") == "notice")
+                else "status IN ('submitted','approved')")
+        rows = self.conn.execute(
+            "SELECT DISTINCT phone FROM task_instance WHERE template_id = ? "
+            "AND (period_key = ? OR period_key LIKE ?) AND " + cond,
+            (clean, canon, canon + "#%")).fetchall()
+        return {str(r["phone"]) for r in rows}
+
+    def push_skip_completed_preview(self, template_id: str, canonical_key: str) -> Dict[str, Any]:
+        """手动推送「过滤已完成」预览：当前可投递人数 / 已完成人数 / 未完成人数。
+
+        `canonical_key` 由调用方（API 层）按模板口径算好传入，state 不做隐式推导。
+        """
+        clean = (template_id or "").strip()
+        tpl = self.get_template(clean, include_deleted=False)
+        if not tpl:
+            raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
+        members = self.template_deliverable_members(tpl)
+        phones = {str(m["phone"]) for m in members}
+        completed = self.period_completed_phones(clean, canonical_key) & phones
+        return {
+            "total": len(phones),
+            "completed": len(completed),
+            "unfinished": len(phones - completed),
+            "canonical_key": canonical_key,
+        }
+
+    def ack_overdue_todo(self, template_id: str, period_key: str, phone: str) -> None:
+        """2026-11-21 需求三：逾期提醒「我知道了」持久化（按模板+归属周期+手机号）。
+
+        只影响 H5「我的待办」的展示，不触碰实例状态——后台统计里的
+        「已逾期未交」口径保持不变。
+        """
+        clean_tpl, clean_phone = (template_id or "").strip(), (phone or "").strip()
+        canon = canonical_part((period_key or "").strip() or "once")
+        if not clean_tpl or not clean_phone:
+            raise BizError(400, "VALIDATION_FAILED", "参数不完整")
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO overdue_ack(template_id, period_key, phone, acked_at) VALUES (?, ?, ?, ?) "
+                "ON DUPLICATE KEY UPDATE acked_at = VALUES(acked_at)",
+                (clean_tpl, canon, clean_phone, self.now_str()),
+            )
+
+    def overdue_acked_keys(self, phone: str) -> set:
+        """该手机号已点过「我知道了」的 (模板, 归属周期) 键集合。"""
+        clean = (phone or "").strip()
+        if not clean:
+            return set()
+        rows = self.conn.execute(
+            "SELECT template_id, period_key FROM overdue_ack WHERE phone = ?", (clean,)).fetchall()
+        return {(str(r["template_id"]), str(r["period_key"])) for r in rows}
+
     def manual_push_repush_info(self, template_id: str, canonical_key: str) -> Dict[str, Any]:
         """预检：该模板本周期（或历史上）是否已推送过实例。
 

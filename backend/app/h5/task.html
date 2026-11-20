@@ -92,6 +92,25 @@
       font-size: 12px;
       color: var(--muted);
     }
+    /* 2026-11-21 需求四：二级页面统一左上角返回图标（线性左箭头，触控热区 44×44） */
+    .page-back {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 44px;
+      height: 44px;
+      margin: -8px 0 -8px -10px;
+      padding: 0;
+      border: 0;
+      border-radius: 12px;
+      background: none;
+      color: var(--blue);
+      cursor: pointer;
+    }
+    .page-back:active { background: var(--blue-soft); }
+    .page-back:not([hidden]) { display: inline-flex; }
+    .page-back[hidden] { display: none; }
+    .page-back svg { width: 22px; height: 22px; }
 
     .card {
       flex: 1;
@@ -508,6 +527,9 @@
 <body>
   <div class="shell">
     <header class="topbar">
+      <button type="button" id="page-back" class="page-back" aria-label="返回上一级" hidden onclick="history.back()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
       <span class="topbar-brand">德阳量密助手</span>
       <span class="topbar-sub">任务填报</span>
     </header>
@@ -812,14 +834,8 @@
           if (!ok) return showFatalError(data.message || "任务加载失败");
           taskInfo = data;
           editing = wantsEdit && data.can_edit;
-          if (params.get("from") === "portal" && !editing) {
-            const back = document.createElement("button");
-            back.type = "button";
-            back.className = "secondary";
-            back.textContent = "返回工作台";
-            back.onclick = () => history.back();
-            taskActions.appendChild(back);
-          }
+          // 2026-11-21 需求四：从工作台进入（含修改页）显示左上角返回图标；聊天窗直接打开不显示
+          document.getElementById("page-back").hidden = params.get("from") !== "portal";
           contentEl.style.display = "block";
           document.getElementById("memberName").textContent = data.instance.name_snap;
           showTaskTime(data.instance, data.published_at);

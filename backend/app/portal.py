@@ -462,17 +462,20 @@ class PortalService:
     def todos(self, ident):
         """我的待办（2026-11-20 切期改造：按「模板 + 归属周期」严格去重）。
 
-        · 同一归属周期内不论定时/手动推了多少批（2026-11-19 批次键），未完成且
-          未过截止时**永远只展示最新 1 条**（MAX(id)）；
+        · 同一归属周期内不论定时/手动推了多少批（2026-11-19 批次键），未完成时
+          **永远只展示最新 1 条**（MAX(id)）；
         · 成员在任一批次上完成/回执 → sync_family_completion 把周期内全部实例同步为
           完成态，待办里立即消失，后续重推也不再出现；
-        · 已过截止的实例由 advance 流转 overdue 后不再回到待办（即时清零）。
+        · 2026-11-21 需求三：已过截止且本周期仍未完成 → **不再直接隐藏**，改以
+          「已逾期」提醒卡片保留（无去完成通道，按钮 =「我知道了」）；成员点过
+          「我知道了」（overdue_ack 持久化）后从待办移除，刷新/重进不再复现。
         """
         from .config import canonical_part
+        from .scheduler import canonical_period_key
 
         rows = self.s.conn.execute(
-            "SELECT * FROM task_instance WHERE phone=? AND status IN ('pending','rejected') ORDER BY deadline_at,id",
-            (ident['phone'],)).fetchall()
+            "SELECT * FROM task_instance WHERE phone=? AND status IN ('pending','rejected','overdue') "
+            "ORDER BY deadline_at,id", (ident['phone'],)).fetchall()
         pick: dict = {}
         for row in rows:
             inst = dict(row)
@@ -480,6 +483,8 @@ class PortalService:
             cur = pick.get(key)
             if cur is None or int(inst['id']) > int(cur['id']):
                 pick[key] = inst
+        acked = self.s.overdue_acked_keys(ident['phone'])
+        now_s = self.s.now_str()
         result = []
         for inst in pick.values():
             t = self.s.get_template(inst['template_id'])
@@ -487,9 +492,25 @@ class PortalService:
                     or self.s.instance_close_reason(inst, t)):
                 continue
             plat = t.get('platform') if t.get('portal_task') else next(iter(self.s.role_platforms(t['role_ids'])), '')
-            if plat == ident['platform'] and effective_instance_deadline(inst) > self.s.now_str():
+            if plat != ident['platform']:
+                continue
+            if effective_instance_deadline(inst) > now_s:
                 inst['template_name'] = t['name']
                 result.append(inst)
+                continue
+            # 已过截止：仅保留「当前归属周期」的逾期提醒（历史周期不长期占位刷屏）
+            try:
+                current_key = 'once' if t.get('is_manual') else canonical_period_key(t, self.s.now())
+            except Exception:  # noqa: BLE001 - 模板字段异常时不阻塞待办渲染
+                continue
+            if canonical_part(inst['period_key']) != current_key:
+                continue
+            if (inst['template_id'], current_key) in acked:
+                continue
+            inst['template_name'] = t['name']
+            inst['overdue'] = True
+            inst['ack_period_key'] = current_key
+            result.append(inst)
         result.sort(key=lambda i: (i['deadline_at'], i['id']))
         # 2026-11-20 切期改造：未回执通知同样按「模板 + 归属周期」去重（同周期
         # 重推多批时只展示最新一条；旧批次的确认入口保留但不再刷屏）。
@@ -503,8 +524,29 @@ class PortalService:
             result.append(item)
         return result
 
+    def dismiss_overdue(self, ident, task_id, period_key):
+        """2026-11-21 需求三：「我知道了」——按 (模板, 归属周期, 手机号) 持久化已读。
+
+        校验该实例确实属于本人在当前归属周期内的逾期未完成项，避免任意 task_id
+        被当作已读写入（只影响本人待办展示，不写实例状态）。
+        """
+        from .config import canonical_part
+
+        clean_tpl = str(task_id or '').strip()
+        if not clean_tpl:
+            raise BizError(400, 'VALIDATION_FAILED', '缺少任务编号')
+        current = [i for i in self.todos(ident) if i['template_id'] == clean_tpl]
+        inst = current[0] if current else None
+        if inst is None or not inst.get('overdue'):
+            raise BizError(404, 'NOT_FOUND', '该任务当前没有逾期提醒')
+        key = period_key or inst.get('ack_period_key') or inst['period_key']
+        self.s.ack_overdue_todo(clean_tpl, str(key), ident['phone'])
+        return {'ok': True, 'template_id': clean_tpl, 'period_key': canonical_part(str(key))}
+
     def task_link(self, ident, instance_id):
-        inst = next((i for i in self.todos(ident) if i['id'] == instance_id and not i.get('receipt_phrase')), None)
+        # 2026-11-21 需求三：逾期提醒卡片只做「我知道了」，不提供去完成通道
+        inst = next((i for i in self.todos(ident)
+                     if i['id'] == instance_id and not i.get('overdue') and not i.get('receipt_phrase')), None)
         if inst is None:
             raise BizError(403, 'TASK_UNAVAILABLE', '任务不在可提交窗口内')
         raw = self.s.issue_h5_token(inst['phone'], inst['template_id'], inst['period_key'], inst['id'],

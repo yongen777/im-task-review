@@ -268,6 +268,16 @@ CREATE TABLE IF NOT EXISTS upload_ref (
   KEY ix_upload_phone (phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS overdue_ack (
+  id          BIGINT       NOT NULL AUTO_INCREMENT,
+  template_id VARCHAR(64)  NOT NULL,
+  period_key  VARCHAR(64)  NOT NULL,
+  phone       VARCHAR(32)  NOT NULL,
+  acked_at    VARCHAR(32)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_overdue_ack (template_id, period_key, phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS h5_token (
   token_id    VARCHAR(64) NOT NULL,
   phone       VARCHAR(32) NOT NULL,

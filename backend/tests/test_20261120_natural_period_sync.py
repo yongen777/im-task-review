@@ -313,10 +313,15 @@ def test_5_wed_deadline_closed_after_cutoff_reopens_next_week(ctx):
     b_last = [m.text for m in notifier.sent_messages if m.receive_id == f"union-{SECOND}"][-1]
     assert "已在本周期完成" in a_last
     assert "任务已截止" in b_last
-    # B 通道关闭：无法提交；待办清零
+    # B 通道关闭：无法提交；待办改为「已逾期」提醒（2026-11-21 需求三：不再直接隐藏，
+# 成员点「我知道了」后才移除）
     with pytest.raises(BizError) as excinfo:
         submit(store, SECOND, tid, b_new)
     assert excinfo.value.code == "SUBMISSION_CLOSED"
+    overdue_todo = todos_of(store, SECOND, tid)
+    assert len(overdue_todo) == 1 and overdue_todo[0]["overdue"] is True, overdue_todo
+    from app.portal import PortalService
+    PortalService(store).dismiss_overdue({"phone": SECOND, "platform": "zdxlz"}, tid, "2026-W47")
     assert todos_of(store, SECOND, tid) == []
     overview = stats_overview(owner, tid, "2026-W47")
     assert overview["kpis"]["total"] == 2 and overview["kpis"]["done"] == 1, overview["kpis"]
