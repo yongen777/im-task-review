@@ -93,19 +93,12 @@
     }
     #confirm:disabled { cursor: default; background: #eceff3; color: #8a95a1; }
     #confirm[data-confirmed] { background: #e9f4ec; color: #26603c; }
-    /* 2026-11-20 需求 C：原生看图体验 —— 纯黑全屏居中、单击退出、双指/双击/滚轮缩放、
-       放大后拖拽平移、Esc/返回键关闭。长按走系统原生菜单（touch-action 不劫持长按）。 */
+    /* 2026-11-20：看图预览不设任何悬浮按钮 —— 整图铺满无遮挡，
+       退出靠「单击图片/遮罩」「Esc」「手机返回键」三种系统原生手势。 */
     #zoom {
       position: fixed; inset: 0; z-index: 40;
       display: flex; align-items: center; justify-content: center;
       background: #000; color: #fff; overscroll-behavior: contain;
-    }
-    #zoom-close {
-      position: absolute; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
-      width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
-      border: 1px solid rgba(255, 255, 255, .35); border-radius: 50%;
-      background: rgba(0, 0, 0, .45); color: #fff; font-size: 20px; line-height: 1;
-      z-index: 2;
     }
     #zoom img {
       max-width: 100vw; max-height: 100vh;
@@ -140,7 +133,6 @@
     </div>
   </footer>
   <div id="zoom" role="dialog" aria-modal="true" aria-label="图片预览" hidden>
-    <button type="button" id="close-zoom" aria-label="关闭预览">×</button>
     <img alt="">
   </div>
   <script>
@@ -223,7 +215,6 @@
           applyZoom(target);
           zoom.hidden = false;
           ensurePopstate();
-          $('close-zoom').focus();
         };
         $('media').append(button);
       }
@@ -266,7 +257,6 @@
       clampTranslate();
       applyZoom(zoom.querySelector('img'));
     }
-    $('close-zoom').onclick = () => closeZoom(false);
     zoom.addEventListener('click', event => {
       if (event.target === zoom) { closeZoom(false); return; }
       if (event.target.tagName !== 'IMG') return;
@@ -327,10 +317,6 @@
     document.addEventListener('keydown', event => {
       if (zoom.hidden) return;
       if (event.key === 'Escape') closeZoom(false);
-      if (event.key === 'Tab') {
-        event.preventDefault();
-        $('close-zoom').focus();
-      }
     });
     $('back').hidden = params.get('from') !== 'portal';
     $('back').onclick = () => history.back();

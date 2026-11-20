@@ -497,13 +497,6 @@
       background: #000; overscroll-behavior: contain;
     }
     #image-viewer[hidden] { display: none; }
-    #viewer-close {
-      position: absolute; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
-      width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
-      border: 1px solid rgba(255, 255, 255, .35); border-radius: 50%;
-      background: rgba(0, 0, 0, .45); color: #fff; font-size: 20px; line-height: 1;
-      z-index: 2; cursor: pointer;
-    }
     #image-viewer img {
       max-width: 100vw; max-height: 100vh;
       width: auto; height: auto; object-fit: contain;
@@ -550,10 +543,9 @@
     </div>
     <img alt="">
   </dialog>
-  <!-- 2026-11-20 需求 C：原生全屏看图层（纯黑居中、单击/Esc/返回键退出、
-       双击 1x⇄2x、双指捏合 1x~4x、滚轮缩放、放大后拖拽；长按走系统菜单） -->
+  <!-- 2026-11-20：原生全屏看图层（纯黑居中、不设任何悬浮按钮，整图无遮挡；
+       单击/Esc/返回键退出、双击 1x⇄2x、双指捏合 1x~4x、滚轮缩放、放大后拖拽） -->
   <div id="image-viewer" hidden>
-    <button type="button" id="viewer-close" aria-label="关闭预览">×</button>
     <img alt="">
   </div>
   <script>
@@ -620,7 +612,6 @@
           window.addEventListener("popstate", viewerPopstate);
           viewerOpen.bound = true;
         }
-        document.getElementById("viewer-close").focus();
       }
       function viewerClose(fromPop) {
         viewerEl.hidden = true;
@@ -635,7 +626,6 @@
         viewerClamp();
         viewerApply();
       }
-      document.getElementById("viewer-close").onclick = () => viewerClose(false);
       viewerEl.addEventListener("click", event => {
         if (event.target === viewerEl) { viewerClose(false); return; }
         if (event.target !== viewerImg) return;

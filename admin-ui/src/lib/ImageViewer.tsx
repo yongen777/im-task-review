@@ -99,14 +99,6 @@ export const ImageViewer: React.FC<{
         applyScale(scale * (event.deltaY < 0 ? 1.2 : 1 / 1.2), true);
       }}
     >
-      <button
-        type="button"
-        aria-label="关闭预览"
-        onClick={onClose}
-        className="absolute right-3 top-3 z-10 flex h-10 w-10 cursor-pointer items-center justify-center rounded-full border border-white/35 bg-black/45 text-xl leading-none text-white"
-      >
-        ×
-      </button>
       <img
         ref={imgRef}
         src={source.url}
