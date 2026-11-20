@@ -23,7 +23,7 @@ def portal(ctx, monkeypatch):
              {'dept_id': 'b', 'name': '跨部门', 'parent_id': ''}]
     users = {'a': {inst['phone']}, 'a1': {'13900009402'}, 'b': {'13900009403'}}
     monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (nodes, users))
-    monkeypatch.setattr(PortalService, 'grant_options', lambda self, *args: {'default_dept_ids': ['a']})
+    monkeypatch.setattr(PortalService, 'grant_options', lambda self, *args, **kwargs: {'default_dept_ids': ['a']})
     monkeypatch.setattr(PortalService, 'department_path', lambda self, platform, did: [n for n in nodes if n['dept_id'] == did])
     for phone in ('13900009402', '13900009403'):
         s.add_role_member(rid, phone, '范围成员', owner_id=tpl['owner_id'])

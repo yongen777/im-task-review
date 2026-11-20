@@ -1446,12 +1446,10 @@ class Scheduler:
                 })
             if not view:
                 return ""
-            summary = " ".join(view["body"].split())
-            if len(summary) > 100:
-                summary = summary[:100] + "…"
-            summary = summary or f"包含 {len(view['media'])} 个附件。"
+            # 2026-11-20：link 模式收尾只发「引导语 + 确认链接」。正文已在上一步完整投递，
+            # 再拼 100 字摘要会在聊天里重复一大段内容（用户反馈的「尾部重复正文摘要」）。
             link = self.public_base_url.rstrip("/") + issue_link(self.state, inst)
-            return (f"【德阳量密助手】您收到《{view['title']}》通知。\n{summary}\n\n"
+            return (f"【德阳量密助手】您收到《{view['title']}》通知。\n"
                     f"请打开链接阅读完整通知，点击「{inst['receipt_phrase']}」确认。\n{link}")
 
         return message

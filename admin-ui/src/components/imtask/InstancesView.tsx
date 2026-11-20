@@ -580,6 +580,13 @@ export const InstancesView: React.FC = () => {
                               原因：{inst.reject_reason}
                             </span>
                           )}
+                          {/* 2026-11-20：管理员代交是「提交来源」而不是「状态」，所以不塞进状态下拉框，
+                              这里用一个轻量徽标标出来，列表里一眼能认。 */}
+                          {inst.latest_submission?.source === 'admin' && (
+                            <span className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">
+                              管理员代交
+                            </span>
+                          )}
                         </div>
                       </td>
 

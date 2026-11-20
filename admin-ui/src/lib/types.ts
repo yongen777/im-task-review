@@ -215,6 +215,8 @@ export interface TaskInstanceItem {
   period: TemplatePeriod;
   period_key: string;
   is_adhoc?: boolean;
+  /* 2026-11-20：「立即推送」模板的实例没有计划执行时刻，执行时间改用 published_at */
+  is_manual?: boolean;
   published_at?: string | null;
   role_id: string;
   role_ids?: string[];
@@ -242,6 +244,8 @@ export interface TaskInstanceItem {
   owner_username?: string;
   owner_display_name?: string | null;
   platform?: OfficePlatform;
+  /* 2026-11-20：列表接口下发的最近一次提交，source='admin' 即「管理员代交」 */
+  latest_submission?: { id?: number; source?: string | null; status?: string | null; created_at?: string | null } | null;
   created_at: string;
 }
 

@@ -68,7 +68,12 @@ def test_link_notice_media_auth_and_receipt_lifecycle(ctx, movie, manual):
     token = tokens["test_recipient"]
     credentials = auth(token)
     assert state.get_h5_token(token)["expires_at"] == NO_DEADLINE_SENTINEL
-    assert "点击「确认已读」" in links["test_recipient"].text and "…" in links["test_recipient"].text
+    assert "点击「确认已读」" in links["test_recipient"].text
+    # 2026-11-20：确认链接不再拼正文摘要（正文已在上一步完整投递），只剩
+    # 「您收到《…》通知。」+ 引导语 + 链接三行，既不重复正文也不再出现截断省略号。
+    link_text = links["test_recipient"].text
+    assert len(link_text.splitlines()) == 3, link_text
+    assert "原始正文" not in link_text and "…" not in link_text
     assert client.get("/h5/notice-receipt").status_code == 200
     assert client.post("/api/h5/task/info", json={"token": token}).status_code == 401
     assert client.post("/api/h5/portal/info", json={}, headers=credentials).status_code == 401

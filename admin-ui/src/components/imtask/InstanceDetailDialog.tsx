@@ -102,6 +102,11 @@ const reminderKindLabels: Record<string, string> = {
   notice: '通知',
   notice_img: '通知图片',
   notice_img_link: '通知链接',
+  /* 2026-11-20：补齐通知附件的发送记录译名（原来这几种直接显示英文 kind） */
+  notice_file: '通知文件',
+  notice_file_link: '通知文件链接',
+  notice_video: '通知视频',
+  notice_vid_link: '通知视频链接',
   看板: '通知图片',
 };
 
@@ -148,9 +153,21 @@ function slotReached(inst: TaskInstanceItem, hhmm: string): boolean {
 export const InstancePlanTime: React.FC<{ inst: TaskInstanceItem; className?: string }> = ({ inst, className = '' }) => {
   if (inst.kind !== 'notice' && inst.submitted_at) return <span title="完成时间">{inst.submitted_at}</span>;
   if (inst.is_adhoc) return <span className="text-slate-400">—</span>;
+  /* 2026-11-20：「立即推送」的实例没有计划时刻，执行时间改用 published_at
+     （真实手动触发 / 送达时间）。批次键带 `#YYYYMMDDHHMMSS` 后缀的也是手动重推。 */
+  const manual = !!inst.is_manual || /#\d{14}(?:-\d+)?$/.test(inst.period_key || '');
+  if (manual) {
+    return inst.published_at
+      ? <span title="立即推送 · 实际送达时间">{inst.published_at}</span>
+      : <span className="text-slate-400" title="尚未推送">待推送</span>;
+  }
   if (inst.kind !== 'notice' && inst.published_at) return <span title="执行时间">{inst.published_at}</span>;
   const slots = instancePlanSlots(inst);
-  if (slots.length === 0) return <span className="text-slate-400">—</span>;
+  if (slots.length === 0) {
+    return inst.published_at
+      ? <span title="执行时间">{inst.published_at}</span>
+      : <span className="text-slate-400">—</span>;
+  }
   const pk = inst.period_key || '';
   const datePart = /^\d{4}-\d{2}-\d{2}$/.test(pk) ? pk.slice(5) : pk;
   return (

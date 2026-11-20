@@ -5549,12 +5549,16 @@ class StateStore:
         role_ids 里，只按角色查会全部塌成「未分配部门」。故对 `phones`（该周期实例里
         实际出现的手机号）中未命中或部门为空的，按同管理员（owner_id）名册兜底取
         最新非空 dept_path —— 明细、导出、部门下钻共用同一份兜底结果，口径一致。
+
+        2026-11-20：兜底那段补 platform 过滤。同一手机号在名册里可能同时挂着
+        zdxlz / wecom 两个平台的角色，不区分平台会取到另一平台的 dept_path。
+        模板的角色天然同平台，这里按 role_ids 反查平台，不必给 8 个调用点逐个加参数。
         """
         roles = [str(r).strip() for r in (role_ids or []) if str(r).strip()]
+        ph = ",".join("?" for _ in roles)
         out: Dict[str, tuple[int, str]] = {}
         if roles:
             order = {r: idx for idx, r in enumerate(roles)}
-            ph = ",".join("?" for _ in roles)
             rows = self.conn.execute(
                 f"SELECT role_id, phone, dept_path FROM member WHERE role_id IN ({ph})",
                 tuple(roles)).fetchall()
@@ -5574,15 +5578,25 @@ class StateStore:
             if phone and not (out.get(phone, (0, ""))[1]) and phone not in missing:
                 missing.append(phone)
         if missing and owner_id is not None:
+            plat = None
+            if roles:
+                plats = {str(r["platform"] or "").strip() for r in self.conn.execute(
+                    f"SELECT DISTINCT platform FROM role WHERE role_id IN ({ph})", tuple(roles)).fetchall()}
+                if len(plats) == 1:
+                    plat = plats.pop() or None
             for start in range(0, len(missing), 900):
                 chunk = missing[start:start + 900]
-                ph = ",".join("?" for _ in chunk)
+                ph2 = ",".join("?" for _ in chunk)
+                plat_sql, plat_args = ("", ())
+                if plat:
+                    plat_sql = " AND role_id IN (SELECT role_id FROM role WHERE platform = ?)"
+                    plat_args = (plat,)
                 rows = self.conn.execute(
                     f"SELECT phone, dept_path FROM member "
-                    f"WHERE owner_id = ? AND phone IN ({ph}) "
-                    f"AND dept_path IS NOT NULL AND TRIM(dept_path) <> '' "
+                    f"WHERE owner_id = ? AND phone IN ({ph2}) "
+                    f"AND dept_path IS NOT NULL AND TRIM(dept_path) <> ''{plat_sql} "
                     f"ORDER BY directory_checked_at DESC, id DESC",
-                    (int(owner_id), *chunk)).fetchall()
+                    (int(owner_id), *chunk, *plat_args)).fetchall()
                 for r in rows:
                     phone = str(r["phone"] or "").strip()
                     if out.get(phone, (0, ""))[1]:

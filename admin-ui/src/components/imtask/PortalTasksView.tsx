@@ -13,7 +13,7 @@ export async function portalAdminRequest(path: string, method = 'GET', body?: un
   return data;
 }
 
-type Department = { dept_id: string; name: string; has_children?: boolean };
+type Department = { dept_id: string; name: string; has_children?: boolean; member_count?: number };
 type ScopeOptions = {
   roles: Array<{ role_id: string; name: string }>;
   grant: null | { enabled: number; scope_json: string };
@@ -42,7 +42,10 @@ function DepartmentBranch({ department, selected, toggle, load }: {
         className="size-7 shrink-0 rounded border border-slate-200 text-slate-600">{open ? '−' : '+'}</button>
         : <span className="w-7" />}
       <label className="flex grow items-center gap-2 py-1"><input type="checkbox" checked={selected.includes(department.dept_id)}
-        onChange={() => toggle(department.dept_id)} />{department.name}</label>
+        onChange={() => toggle(department.dept_id)} />{department.name}
+        {/* 2026-11-20：部门树按已激活可投递成员裁剪，这里标注该部门（含下级）可选人数 */}
+        {typeof department.member_count === 'number' && <span className="text-slate-500">（{department.member_count} 人）</span>}
+      </label>
     </div>
     {open && <ul className="space-y-1 border-l border-slate-200 pl-4">
       {warning ? <li className="text-rose-700">{warning}</li> : !children ? <li role="status">正在读取下级部门…</li>
@@ -107,7 +110,7 @@ export function PortalGrantDialog({ phone, platform, onClose }: { phone: string;
         <fieldset disabled={saving} className="grid gap-3 sm:grid-cols-2 text-sm">
           <section className="rounded-lg border border-slate-200 p-3">
             <h3 className="font-semibold">组织部门</h3>
-            <p className="mb-2 text-slate-500">首次授权默认选中当前部门。选中部门包含全部下级。</p>
+            <p className="mb-2 text-slate-500">首次授权默认选中当前部门。选中部门包含全部下级；<strong>不勾选任何部门/角色时自动授权该成员当前所在部门（含全部下级）</strong>。</p>
             {!!depts.length && <ul className="mb-2 flex flex-wrap gap-1">
               {depts.map(id => <li key={id}><button type="button" aria-label={`移除 ${departmentNames[id] || id}`}
                 onClick={() => setDepts(current => current.filter(did => did !== id))}
@@ -133,7 +136,8 @@ export function PortalGrantDialog({ phone, platform, onClose }: { phone: string;
         </fieldset>
       </>}
       {error && <p className="text-red-600 text-sm" role="alert">{error}</p>}
-      <div className="flex justify-end gap-3 border-t border-slate-200 pt-3"><button onClick={onClose} disabled={saving}>取消</button><button className="px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-40" disabled={saving || !options || (enabled && !depts.length && !roles.length)} onClick={async () => {
+      <div className="flex justify-end gap-3 border-t border-slate-200 pt-3"><button onClick={onClose} disabled={saving}>取消</button><button className="px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-40" disabled={saving || !options} onClick={async () => {
+        /* 2026-11-20：不再在前端拦「什么都没勾」，后端会自动回退到成员当前部门（含下级）。 */
         setSaving(true); setError('');
         try { await portalAdminRequest(path, 'PUT', { enabled, dept_ids: depts, role_ids: roles }); onClose(); }
         catch (e) { setError((e as Error).message); } finally { setSaving(false); }

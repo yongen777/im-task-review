@@ -144,6 +144,10 @@ const reminderDescriptions: Record<string, Record<'sent' | 'failed' | 'skipped',
   notice: { sent: '已向成员发送通知', failed: '通知发送失败', skipped: '已跳过通知' },
   notice_img: { sent: '已向成员发送通知图片', failed: '通知图片发送失败', skipped: '已跳过通知图片' },
   notice_img_link: { sent: '已向成员发送通知链接', failed: '通知链接发送失败', skipped: '已跳过通知链接' },
+  notice_file: { sent: '已向成员发送通知文件', failed: '通知文件发送失败', skipped: '已跳过通知文件' },
+  notice_file_link: { sent: '已向成员发送通知文件链接', failed: '通知文件链接发送失败', skipped: '已跳过通知文件链接' },
+  notice_video: { sent: '已向成员发送通知视频', failed: '通知视频发送失败', skipped: '已跳过通知视频' },
+  notice_vid_link: { sent: '已向成员发送通知视频链接', failed: '通知视频链接发送失败', skipped: '已跳过通知视频链接' },
 };
 
 export function humanizeReminderLogError(result: string, error: string | null, kind?: string): string {

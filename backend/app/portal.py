@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import time
 from datetime import datetime
 
 from .config import format_dt
@@ -11,6 +12,54 @@ from .state import BizError, calc_h5_token_ttl_hours, effective_instance_deadlin
 class PortalService:
     def __init__(self, state):
         self.s = state
+        # (platform, owner) -> (monotonic 时间戳, {dept_id: 已激活可投递成员数})，
+        # 只给授权弹窗的部门树裁剪用，见 _activated_dept_index。
+        self._dept_index_cache = {}
+
+    @staticmethod
+    def _subtree_members(nodes, direct):
+        """把「各部门直属成员集合」合并成「部门子树成员集合」。
+
+        组织架构树是父子引用结构，这里按深度自底向上合并一次，
+        避免对每个部门重跑 descendants() 造成 O(n²) 的重复遍历。
+        """
+        ids = {n['dept_id'] for n in nodes}
+        parent = {n['dept_id']: (n['parent_id'] if n['parent_id'] in ids else '') for n in nodes}
+        sets = {did: set(direct.get(did) or ()) for did in ids}
+        depth = {did: 0 for did in ids}
+        for _ in range(len(ids)):
+            moved = False
+            for did in ids:
+                pid = parent[did]
+                if pid and depth[did] <= depth[pid]:
+                    depth[did] = depth[pid] + 1
+                    moved = True
+            if not moved:
+                break
+        for did in sorted(ids, key=lambda d: depth[d], reverse=True):
+            pid = parent[did]
+            if pid:
+                sets[pid] |= sets[did]
+        return sets
+
+    def _activated_dept_index(self, platform, owner):
+        """dept_id -> 该部门**子树**内「已激活可投递」成员数。
+
+        口径与 members() 一致：名册成员 + delivery_target.usable=1 + 平台匹配，
+        所以未激活 / 已离组织的成员不会撑起空部门。
+        代价是一次组织架构全量遍历（与领导 H5 选人页同源），因此做 30 秒短缓存，
+        避免弹窗每展开一层就再拉一遍通讯录。
+        """
+        key = (platform, owner)
+        cached = self._dept_index_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 30:
+            return cached[1]
+        nodes, users = self.organization(platform)
+        roster = {m['phone'] for m in self.members(platform, owner)}
+        direct = {n['dept_id']: (users.get(n['dept_id']) or set()) & roster for n in nodes}
+        index = {did: len(phones) for did, phones in self._subtree_members(nodes, direct).items()}
+        self._dept_index_cache[key] = (time.monotonic(), index)
+        return index
 
     def issue(self, phone, platform):
         if not self.members(platform, phone=phone):
@@ -180,16 +229,28 @@ class PortalService:
                 return {'dept_id': path[-1]['dept_id'], 'name': ' / '.join(d['name'] for d in path)}
         return None
 
-    def grant_options(self, platform, owner, phone, parent=''):
+    def grant_options(self, platform, owner, phone, parent='', with_directory=True):
         info = self.grant_info(platform, owner, phone)
         if parent and not self.department_path(platform, parent):
             raise BizError(403, 'INVALID_SCOPE', '部门不在当前组织架构中')
         departments = self.department_children(platform, parent)
+        notice = ''
+        if with_directory:
+            # 2026-11-20：授权弹窗的部门树按「已激活可投递成员」裁剪——子树 0 人的空部门不下发，
+            # 并把各子树人数（member_count）带给前端标注。通讯录不可用时退回未裁剪的树，
+            # 只在提示区说明，不阻断授权。
+            try:
+                counts = self._activated_dept_index(platform, owner)
+            except BizError as exc:
+                counts = None
+                notice = exc.message or '部门人数暂不可用，已展示完整组织架构'
+            if counts is not None:
+                departments = [dict(d, member_count=counts.get(d['dept_id'], 0))
+                               for d in departments if counts.get(d['dept_id'])]
         if parent:
-            return {'departments': departments}
+            return {'departments': departments, 'directory_notice': notice}
         selected = []
         default = None
-        notice = ''
         scope = json.loads(info['grant']['scope_json']) if info['grant'] and info['grant']['enabled'] else None
         if scope:
             for did in scope['dept_ids']:
@@ -197,9 +258,9 @@ class PortalService:
                 selected.append({'dept_id': did, 'name': ' / '.join(d['name'] for d in path) if path else f'部门 {did}（已不可用）'})
         else:
             try:
-                default = self.default_department(platform, phone, departments)
+                default = self.default_department(platform, phone, self.department_children(platform, parent))
             except BizError as exc:
-                notice = exc.message
+                notice = notice or exc.message
             if default:
                 selected.append(default)
         return {**info, 'departments': departments, 'selected_departments': selected,
@@ -214,15 +275,21 @@ class PortalService:
             options = self.grant_info(platform, owner, phone)
             depts = data.get('dept_ids')
             if depts is None:
-                depts = self.grant_options(platform, owner, phone)['default_dept_ids']
+                depts = self.grant_options(platform, owner, phone, with_directory=False)['default_dept_ids']
             roles = data.get('role_ids', [])
             if (not isinstance(depts, list) or not isinstance(roles, list)
                     or len(depts) > 100 or any(not isinstance(x, str) or not x for x in depts + roles)):
                 raise BizError(400, 'INVALID_SCOPE', '管辖范围格式错误')
+            if not depts and not roles:
+                # 2026-11-20：开启授权但一个部门/角色都没勾 → 不再抛 EMPTY_SCOPE，
+                # 自动回退为「成员当前所在部门」。下级部门由 recipients() 的
+                # descendants() 展开，所以这里只存当前部门本身。
+                depts = self.grant_options(platform, owner, phone, with_directory=False)['default_dept_ids']
+                if not depts:
+                    raise BizError(400, 'SCOPE_UNRESOLVED',
+                                   '未能识别该成员当前所在部门，请手动勾选部门或角色分组')
             if set(roles) - {r['role_id'] for r in options['roles']} or any(not self.department_path(platform, did) for did in set(depts)):
                 raise BizError(403, 'INVALID_SCOPE', '管辖范围超出当前组织或管理员角色')
-            if not depts and not roles:
-                raise BizError(400, 'EMPTY_SCOPE', '请选择当前部门或角色分组')
         with self.s.conn:
             self.s.conn.execute('INSERT INTO portal_grant(owner_id,platform,phone,enabled,scope_json,updated_at) '
                                 'VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE enabled=VALUES(enabled),scope_json=VALUES(scope_json),updated_at=VALUES(updated_at)',
@@ -234,20 +301,39 @@ class PortalService:
     def recipients(self, ident):
         grants = self.require_creator(ident)
         scopes = [json.loads(grant['scope_json']) for grant in grants]
-        root_ids = {did for scope in scopes for did in scope['dept_ids']}
         nodes, users, directory_error = [], {}, ''
+        root_ids = set()
         try:
-            if not root_ids:
-                roots = self.department_children(ident['platform'])
-                default = self.default_department(ident['platform'], ident['phone'], roots)
+            # 2026-11-20：每条授权**独立**回退默认部门。
+            # 原实现是所有授权共用一个 default 并在 `not root_ids` 时整体覆盖：
+            # 只要某条授权填了部门，另一条空授权的成员就永远选不到；多管理员授权同一人时
+            # 还会互相覆盖同一个默认部门。这里改为逐条判断、逐条回退，互不影响。
+            # 回退条件保持 2026-11-18 的口径不变：**该条授权没勾部门**就用「成员当前部门子树」
+            # （只勾了角色也走这条，部门树照旧可见），只是不再被别的授权连带/抑制。
+            # ⛔ 回退失败必须局部兜住：通讯录抖一下不能让整个选人页塌成空。
+            roots = None
+            for scope in scopes:
+                if scope['dept_ids']:
+                    continue
+                if roots is None:
+                    try:
+                        roots = self.department_children(ident['platform'])
+                    except BizError as exc:
+                        directory_error = exc.message
+                        break
+                try:
+                    default = self.default_department(ident['platform'], ident['phone'], roots)
+                except BizError as exc:
+                    directory_error = exc.message
+                    continue
                 if default:
-                    root_ids = {default['dept_id']}
-                    for scope in scopes:
-                        scope['dept_ids'] = [default['dept_id']]
+                    scope['dept_ids'] = [default['dept_id']]
+            root_ids = {did for scope in scopes for did in scope['dept_ids']}
             if root_ids:
                 nodes, users = self.organization(ident['platform'], root_ids)
         except BizError as exc:
-            directory_error = exc.message
+            directory_error = directory_error or exc.message
+            root_ids = {did for scope in scopes for did in scope['dept_ids']}
         all_members, allowed_nodes, roles = {}, set(), {}
         for grant, scope in zip(grants, scopes):
             ds = self.descendants(nodes, scope['dept_ids'])
@@ -266,7 +352,15 @@ class PortalService:
                     item['owner_ids'].append(grant['owner_id'])
         if directory_error and not roles:
             raise BizError(503, 'DIRECTORY_UNAVAILABLE', directory_error)
-        return {'departments': [d for d in nodes if d['dept_id'] in allowed_nodes],
+        # 2026-11-20：选人页部门树同样按「已激活可投递成员」裁剪——
+        # 子树内一个人都选不到的部门不下发，前端就不会再出现「0 人」空分支。
+        direct = {n['dept_id']: set() for n in nodes}
+        for phone, item in all_members.items():
+            for did in item['dept_ids']:
+                direct.setdefault(did, set()).add(phone)
+        subtree = self._subtree_members(nodes, direct)
+        return {'departments': [d for d in nodes
+                                if d['dept_id'] in allowed_nodes and subtree.get(d['dept_id'])],
                 'roles': list(roles.values()), 'members': list(all_members.values()), 'directory_error': directory_error}
 
     def template(self, task_id):

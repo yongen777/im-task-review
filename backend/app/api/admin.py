@@ -537,7 +537,7 @@ def _query_instances(
         rows = state.conn.execute(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
-            f"t.notice_times AS template_notice_times, "
+            f"t.notice_times AS template_notice_times, t.is_manual AS template_is_manual, "
             f"(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id=i.id AND l.result='sent' "
             f"AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
             f"'notice_file_link','notice_video','notice_vid_link','portal')) AS published_at, "
@@ -568,6 +568,9 @@ def _query_instances(
             # 免得每一行都退化成「上传任务 / 业务角色」的兜底文案。
             d["kind"] = d.get("template_kind") or "form"
             d["is_adhoc"] = d["period_key"].startswith("adhoc-")
+            # 2026-11-20：「立即推送」模板的实例没有计划执行时刻，列表/详情要改用
+            # published_at（真实手动触发/送达时间），前端靠这个标记切换取数口径。
+            d["is_manual"] = bool(d.get("template_is_manual", 0))
             try:
                 role_ids = json.loads(d.get("template_role_ids") or "[]") or []
             except Exception:
@@ -2320,6 +2323,9 @@ def create_admin_router(
         inst["template_name"] = _tpl.get("name") or inst["template_id"]
         inst["period"] = _tpl.get("period")
         inst["is_adhoc"] = inst["period_key"].startswith("adhoc-")
+        # 2026-11-20：「立即推送」模板实例的执行时间取真实送达时间（published_at），
+        # 与列表列共用同一判断，避免详情里继续显示计划时刻或「—」。
+        inst["is_manual"] = bool(_tpl.get("is_manual"))
         inst["need_review"] = bool(_tpl.get("need_review"))
         inst["role_id"] = _role_ids[0] if _role_ids else ""
         inst["role_ids"] = list(_role_ids)
