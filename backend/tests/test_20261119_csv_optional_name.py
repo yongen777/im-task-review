@@ -1,6 +1,6 @@
 import pytest
 
-from test_20261117_directory_and_upload_cleanup import Directory, P1, P2, person, role, seed, store
+from test_20261117_directory_and_upload_cleanup import Directory, P1, P2, P3, person, role, seed, store
 
 
 @pytest.fixture
@@ -69,3 +69,34 @@ def test_csv_phone_only_does_not_write_empty_name_without_directory(roster):
     store.contacts = None
     result = store.import_role_members(destination, [{"phone": P2}], dry_run=False)
     assert result["blocked"] and store.list_role_members(destination)["total"] == 0
+
+
+def test_csv_mixed_import_skips_existing_and_writes_new(roster):
+    """2026-11-21 用户拍板：本角色已存在的成员按「跳过」计数，不再阻断整批——
+    混合导入 = 已存在 1 人跳过 + 新成员 1 人正常写入。"""
+    store, destination, directory = roster
+    directory.outcomes[P3] = ("ok", person("员工丙", "zd_3", "新部门"))
+    seed(store, destination, P1, "员工甲")          # P1 已在本角色名册里
+    rows = [{"phone": P1, "name": "员工甲"}, {"phone": P3, "name": "员工丙"}]
+    result = store.import_role_members(destination, rows, dry_run=False, require_directory=True)
+    assert not result["blocked"] and result["invalid"] == []
+    assert result["will_add"] == 1 and result["already_exists"] == 1
+    assert result["already_exists_phones"] == [P1]
+    assert store.list_role_members(destination)["total"] == 2      # 原有 P1 + 新增 P3
+    assert store.get_delivery_target(P3)["external_id"] == "zd_3"
+
+
+def test_csv_single_existing_row_is_skipped_without_error(roster):
+    """单行就是已存在成员：不报错、不写脏数据，返回 已存在=1 / 新增=0 / invalid 空。"""
+    store, destination, _ = roster
+    seed(store, destination, P1, "员工甲")
+    result = store.import_role_members(destination, [{"phone": P1, "name": "员工甲"}],
+                                       dry_run=False, require_directory=True)
+    assert not result["blocked"] and result["invalid"] == []
+    assert result["will_add"] == 0 and result["already_exists"] == 1
+    assert store.list_role_members(destination)["total"] == 1
+    # 批次内重复填写同一手机号仍按原逻辑整批拦截（真正的错误不放过）
+    duplicated = store.import_role_members(
+        destination, [{"phone": P2, "name": "员工乙"}, {"phone": P2, "name": "员工乙"}],
+        dry_run=False, require_directory=True)
+    assert duplicated["blocked"] and duplicated["invalid"][0]["row"] == 2

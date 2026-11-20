@@ -237,16 +237,17 @@ class TestStage2A(unittest.TestCase):
         ]
 
         diff = self.store.import_role_members(rid, csv_rows, dry_run=True, actor="admin")
-        # 2026-11-09 新口径：与已添加成员重复的手机号**要报错**（不再静默跳过），
-        # 且「待修复后才全量导入成功」= 有错误行就整批不写入。
+        # 2026-11-21 用户拍板：本角色已存在的成员 → **跳过计数、不再报错**；
+        # 真正的错误（格式非法 / 批次内重复 / 行格式错误）仍整批拦截。
         self.assertEqual((diff["ok"], diff["dry_run"]), (True, True))
-        self.assertEqual(diff["will_add"], 0, diff)          # 2026-11-09 新口径：整批拒绝 → will_add 归零
-        self.assertEqual(diff["already_exists"], 2, diff)     # 张三（名册已有）+ 李四重复（批次内重复）
+        self.assertEqual(diff["will_add"], 0, diff)          # 仍有错误行 → 整批拒绝 → will_add 归零
+        self.assertEqual(diff["already_exists"], 1, diff)     # 张三（名册已有）→ 跳过
+        self.assertEqual(diff["already_exists_phones"], ["13800138001"], diff)
         # 姓名可留空。其余行存在格式错误时，整批在通讯录核验前被拦截。
         _by_row = {x["row"]: x for x in diff["invalid"]}
-        self.assertEqual(set(_by_row), {1, 4, 6, 7}, diff)
+        self.assertEqual(set(_by_row), {4, 6, 7}, diff)       # 格式错 / 批次重复 / 行格式错
         self.assertEqual((_by_row[4]["phone"], _by_row[4]["reason"]), ("12345", "手机号格式不正确"))
-        self.assertTrue(any(x["row"] == 1 and "重复" in x["reason"] for x in diff["invalid"]), diff["invalid"])
+        self.assertTrue(any(x["row"] == 6 and "重复" in x["reason"] for x in diff["invalid"]), diff["invalid"])
         self.assertEqual(self.store.list_role_members(rid)["total"], 1)
 
         # 有错误行 → 整批不写入（待修复后再导）

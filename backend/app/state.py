@@ -2351,6 +2351,7 @@ class StateStore:
                 if gp["dept"] is None and gr["dept"]:
                     gp["dept"] = gr["dept"]
             will_add, already_exists = 0, 0
+            already_exists_phones: List[str] = []
             invalid: List[Dict[str, Any]] = []
             to_insert: List[Tuple[int, str, str, Optional[str]]] = []
             batch_seen_phones: set[str] = set()
@@ -2383,15 +2384,16 @@ class StateStore:
                 # 2026-11-04 用户口径：CSV 里的部门若「部门管理」里没有，**不拦截**——
                 # 自动把该部门建进部门选项（成员表 dept 仍存文本快照），
                 # 这样 H5 登记页/成员表单的下拉立刻能选到，不会出现"名册里有、下拉里没有"的死锁。
-                # 2026-11-09 用户口径：重复**要报错**，不能静默跳过。
-                # 「待修复后才全量导入成功」= 有任何重复行就整批不写入。
+                # 2026-11-21 用户拍板：本角色名册里**已存在**的手机号 → 跳过并计数，
+                # **不再阻断整批**（重复导入同名册是常见操作，应以「新增 X + 跳过 Y」收尾）。
+                # 真正的错误仍按原逻辑整批拦截：格式非法 / 姓名与通讯录不符 / 通讯录查无此人 /
+                # 同一份 CSV 内重复填写同一手机号（顺序敏感，见下面 batch_seen_phones 分支）。
                 if phone in existing_phones:
                     already_exists += 1
-                    invalid.append({"row": row_num, "phone": phone,
-                                    "reason": f"手机号已存在于本角色组的成员名册中（已添加成员重复），请修复后重新导入"})
+                    if phone not in already_exists_phones:
+                        already_exists_phones.append(phone)
                     continue
                 if phone in batch_seen_phones:
-                    already_exists += 1
                     invalid.append({"row": row_num, "phone": phone,
                                     "reason": "本次导入内容中手机号重复，请修复后重新导入"})
                     continue
@@ -2585,6 +2587,7 @@ class StateStore:
                 if created_dept_ids:
                     created_depts = []
             result = {"ok": True, "dry_run": bool(dry_run), "will_add": will_add, "already_exists": already_exists,
+                      "already_exists_phones": list(already_exists_phones),
                       "invalid": invalid, "departments_created": created_depts,
                       "blocked": blocked,
                       "synced_global_rows": synced_global_rows,

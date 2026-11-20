@@ -832,6 +832,7 @@ export const RolesMembersView: React.FC = () => {
         will_add?: number;
         added?: number;
         already_exists?: number;
+        already_exists_phones?: string[];
         blocked?: boolean;
         /* 2026-11-10 对齐后端实际返回：global_reused 是布尔、数字在 global_reused_count；
            departments_created 是后端字段（此前误读成 auto_created_depts） */
@@ -867,12 +868,25 @@ export const RolesMembersView: React.FC = () => {
       setImportErrors([]);
       setImportModalOpen(false);
       const addedN = res.added ?? res.will_add ?? 0;
+      const skippedN = res.already_exists ?? 0;
+      /* 2026-11-21 用户拍板：本角色已存在的成员按「跳过」处理，不再整批报错——
+         情况 B（新增 0 且全部为已存在）：给清晰提示、不弹红框；情况 A：正常成功提示 + 跳过人数。 */
+      if (addedN === 0 && skippedN > 0) {
+        toast.success(
+          skippedN === 1
+            ? '该成员已导入本角色组，无需重复导入。'
+            : `这 ${skippedN} 名成员均已导入本角色组，无需重复导入。`,
+          '无需重复导入',
+        );
+        return;
+      }
       const syncNote =
         res.synced_global_rows && res.synced_global_rows > 0
           ? `；其中 ${res.synced_global_rows} 条名册记录的姓名/部门已同步到全局`
           : '';
+      const skippedNote = skippedN > 0 ? `，已自动跳过本角色已存在的 ${skippedN} 名成员` : '';
       toast.success(
-        `批量导入成功：新增 ${addedN} 名成员${reusedNote}${syncNote}。`,
+        `批量导入成功：新增 ${addedN} 名成员${skippedNote}${reusedNote}${syncNote}。`,
         'CSV 导入完成',
       );
     } catch (err) {
