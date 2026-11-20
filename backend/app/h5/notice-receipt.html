@@ -59,21 +59,19 @@
       border: 0; background: none; border-radius: 12px; overflow: hidden;
     }
     .figure img { display: block; width: 100%; height: auto; border-radius: 12px; }
-    /* 视频与文件附件：克制的行式卡片 */
+    /* 视频与文件附件：视频在线播放（不提供下载）；文件仅保留「下载」入口 */
     .attachments { margin-top: 18px; padding-top: 4px; border-top: 1px solid var(--line); }
     .video-block { padding: 14px 0 2px; }
     .video-block + .video-block { border-top: 1px solid var(--line); }
     video { display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 12px; background: #17202a; }
     .media-row {
-      display: flex; align-items: center; justify-content: space-between; gap: 12px;
-      min-height: 52px; padding: 4px 0;
+      display: flex; align-items: center; justify-content: flex-end; gap: 12px;
+      min-height: 48px; padding: 4px 0;
     }
     .media-row + .media-row, .video-block + .media-row { border-top: 1px solid var(--line); }
-    .media-name { min-width: 0; overflow-wrap: anywhere; font-size: 14px; line-height: 1.5; }
-    .size { display: block; color: var(--muted); font-size: 12px; }
     .download {
       flex: none; display: inline-flex; align-items: center;
-      min-height: 40px; padding: 0 12px; border-radius: 10px;
+      min-height: 40px; padding: 0 16px; border-radius: 10px;
       background: #f4f7fa; color: var(--accent); font-size: 13px; font-weight: 600;
       text-decoration: none; white-space: nowrap;
     }
@@ -192,20 +190,14 @@
       return api + '/media?token=' + encodeURIComponent(token) + '&id=' + id + (download ? '&download=1' : '');
     }
 
-    function fileSize(size) {
-      if (size < 1024) return size + ' B';
-      if (size < 1048576) return (size / 1024).toFixed(1) + ' KB';
-      return (size / 1048576).toFixed(1) + ' MB';
-    }
-
-    function downloadRow(item, label) {
+    /* 2026-11-20：视频在线播放即可，**不再提供下载**；文件不支持在线预览，
+       只保留一个「下载」入口——两者都不再显示文件名与体积描述。 */
+    function downloadLink(item) {
       const row = node('div', '', 'media-row');
-      const name = node('div', '', 'media-name');
-      name.append(node('span', item.name), node('span', fileSize(item.size), 'size'));
-      const link = node('a', label, 'download');
+      const link = node('a', '下载', 'download');
       link.href = mediaUrl(item.id, true);
       link.download = item.name;
-      row.append(name, link);
+      row.append(link);
       return row;
     }
 
@@ -245,10 +237,10 @@
         video.preload = 'metadata';
         video.src = mediaUrl(item.id);
         video.setAttribute('aria-label', item.name);
-        entry.append(video, downloadRow(item, '下载原视频'));
+        entry.append(video);
         section.append(entry);
       }
-      for (const item of files) section.append(downloadRow(item, '下载'));
+      for (const item of files) section.append(downloadLink(item));
       $('media').append(section);
     }
 
