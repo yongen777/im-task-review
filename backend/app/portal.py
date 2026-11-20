@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime
 
-from .config import format_dt
+from .config import canonical_part, format_dt
 from .state import BizError, calc_h5_token_ttl_hours, effective_instance_deadline
 
 
@@ -580,7 +580,11 @@ class PortalService:
         return [self.template(r['task_id']) for r in rows]
 
     def statistics(self, task):
-        rows = [dict(r) for r in self.s.conn.execute('SELECT * FROM task_instance WHERE template_id=? ORDER BY period_key DESC,id', (task['template_id'],)).fetchall()]
+        # 2026-11-20 对齐管理员统计口径：cancelled（发布后成员被移除/停用名册）的
+        # 历史行不计入应交，避免「应交」虚高、完成率虚低。
+        rows = [dict(r) for r in self.s.conn.execute(
+            "SELECT * FROM task_instance WHERE template_id=? AND status != 'cancelled' "
+            "ORDER BY period_key DESC,id", (task['template_id'],)).fetchall()]
         periods = {}
         for inst in rows:
             sub = self.s.get_latest_valid_submission(inst['id'])
@@ -593,10 +597,77 @@ class PortalService:
             group['pending'] = group['expected'] - group['submitted']
         return {'task_id': task['template_id'], 'name': task['name'], 'creator_phone': task['creator_phone'], 'periods': list(periods.values())}
 
+    # ── 2026-11-20 后台只读监管面板（按发布人筛选，对齐 StatisticsView）──────
+
+    def publishers(self, platform=None, owner=None):
+        """聚合「授权发布人（领导）」维度：[{phone, name, dept_path, owner_id, task_count}]。
+
+        姓名/部门取名册当前档案（无档案的领导退回手机号本身）；task_count = 该
+        领导已发布任务数（含已撤授权的历史任务——历史统计数据须完整保留可查）。
+        """
+        where, args = [], []
+        if platform:
+            where.append('platform=?')
+            args.append(platform)
+        if owner is not None:
+            where.append('owner_id=?')
+            args.append(owner)
+        sql = ('SELECT creator_phone, owner_id, COUNT(*) AS task_count FROM portal_task '
+               + ('WHERE ' + ' AND '.join(where) if where else '')
+               + ' GROUP BY creator_phone, owner_id ORDER BY MAX(created_at) DESC')
+        rows = [dict(r) for r in self.s.conn.execute(sql, tuple(args)).fetchall()]
+        phones = sorted({r['creator_phone'] for r in rows})
+        profiles = {}
+        if phones:
+            for start in range(0, len(phones), 900):
+                chunk = phones[start:start + 900]
+                ph = ','.join('?' for _ in chunk)
+                for m in self.s.conn.execute(
+                        f'SELECT phone, name, dept_path FROM member WHERE phone IN ({ph}) '
+                        'ORDER BY enabled DESC, id DESC', tuple(chunk)).fetchall():
+                    profiles.setdefault(str(m['phone']), dict(m))
+        return [{
+            'phone': r['creator_phone'],
+            'name': str((profiles.get(r['creator_phone']) or {}).get('name') or r['creator_phone']),
+            'dept_path': str((profiles.get(r['creator_phone']) or {}).get('dept_path') or ''),
+            'owner_id': int(r['owner_id'] or 0),
+            'task_count': int(r['task_count'] or 0),
+        } for r in rows]
+
+    def panel_task_meta(self, task):
+        """监管面板的任务卡片元数据（与 stats-panel/tasks 同构，前端组件可复用）。"""
+        from .scheduler import canonical_period_kind, canonical_period_key
+        if task['mode'] == 'once' or task.get('is_manual'):
+            stats_period, current_key = 'day', 'once'
+        else:
+            stats_period = canonical_period_kind(task)
+            current_key = canonical_period_key(task, self.s.now())
+            if stats_period == 'once':
+                current_key = 'once'
+        periods = {str(r['period_key']) for r in self.s.conn.execute(
+            'SELECT DISTINCT period_key FROM task_instance WHERE template_id = ? AND status != ?',
+            (task['template_id'], 'cancelled')).fetchall()}
+        canon_keys = {canonical_part(pk) for pk in periods}
+        return {
+            'task_id': task['template_id'], 'name': task['name'],
+            'creator_phone': task['creator_phone'],
+            'owner_id': task['owner_id'], 'platform': task.get('platform'),
+            'kind': 'form', 'period': task.get('period'), 'mode': task.get('mode'),
+            'statistics_period': stats_period, 'current_period_key': current_key,
+            'period_keys': sorted(canon_keys),
+            'remind_at': task.get('remind_at'), 'anchor_weekday': task.get('anchor_weekday'),
+            'anchor_dom': task.get('anchor_dom'),
+            'exec_weekdays': task.get('exec_weekdays'), 'exec_dom_days': task.get('exec_dom_days'),
+            'has_deadline': bool(task.get('has_deadline')),
+            'deadline_type': task.get('deadline_type'), 'deadline_time': task.get('deadline_time'),
+            'need_review': False, 'created_at': task.get('created_at'),
+        }
+
 
 def run_portal_tasks(scheduler, now):
     """发送前持久化唯一占位；并发 tick、发布重入与进程重启均不重发。"""
-    from .scheduler import calc_instance_deadline, is_template_anchor_day, period_key
+    from .scheduler import (canonical_period_deadline, canonical_period_key,
+                            canonical_period_kind, is_template_anchor_day)
     s, p = scheduler.state, PortalService(scheduler.state)
     for task in p.tasks():
         if not scheduler.notifiers and s.platform != task['platform']:
@@ -607,8 +678,15 @@ def run_portal_tasks(scheduler, now):
             if not is_template_anchor_day(task, now):
                 continue
             planned = scheduler._build_planned_dt(now, task.get('remind_at') or '08:00')
-            pk = period_key(task['period'], now)
-            deadline = calc_instance_deadline(task, now)
+            # _build_planned_dt 恒带上海 tz；测试可能拿 naive now 进来，比较前补齐。
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=planned.tzinfo)
+            # 2026-11-20 切期对齐：归属周期/截止与管理员同一套 canonical 规则——
+            # 周/月容器任务整周期一个键（YYYY-Www / YYYY-MM），同周期多执行日
+            # 命中同一实例（唯一键），已完成成员不再重复提醒；截止锁定容器锚点。
+            kind = canonical_period_kind(task)
+            pk = canonical_period_key(task, now)
+            deadline = canonical_period_deadline(task, kind, now)
         else:
             planned = now
             pk, deadline = 'once', task['once_deadline']
@@ -619,8 +697,13 @@ def run_portal_tasks(scheduler, now):
                 continue
             inst = s.ensure_instance(task['template_id'], m['phone'], m['name'], None, pk, deadline)
             if inst['status'] != 'pending' or now < planned:
+                # 已完成（approved/submitted）成员在同一周期内不再被催（切期对齐方案 A）。
                 continue
-            idem = hashlib.sha256(f"portal|{inst['id']}".encode()).hexdigest()
+            # 幂等键（防刷屏红线）：一次性任务 = 实例级（发过永远不重发）；
+            # 周期任务 = 实例 + **执行日**——同一个执行日的多次 tick 只发一条，
+            # 下一个执行日对仍未完成的成员再催一次（与管理员定时链同语义）。
+            idem_seed = f"portal|{inst['id']}" if task['mode'] == 'once' else f"portal|{inst['id']}|{planned.date()}"
+            idem = hashlib.sha256(idem_seed.encode()).hexdigest()
             # 任意已占位结果均不再发送：失败保留给监管，不自动冒险重发。
             if s.list_reminder_attempts(idem):
                 continue

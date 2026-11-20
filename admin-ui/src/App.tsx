@@ -70,14 +70,15 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
 
   /* 2026-11-16 任务数据统计：⛔ 超管左侧导航不显示（后端五端点对超管也一律 403） */
   if (!isSuperAdmin) {
-    navItems.push({ id: 'portal', label: '授权成员发布任务', icon: Users });
     navItems.push({
       id: 'stats',
       label: '任务数据统计',
       icon: BarChart3,
-      badgeTone: 'slate',
+      badgeTone: 'blue',
     });
   }
+  /* 2026-11-20 授权成员发布任务：分级管理员 = 归属监管；超管 = 全局只读监管（后端已放行） */
+  navItems.push({ id: 'portal', label: '授权成员发布任务', icon: Users });
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-[#f7f8fa] text-slate-900">
@@ -210,7 +211,7 @@ const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
               {activeTab === 'instances' && <InstancesView />}
               {activeTab === 'templates' && <TemplatesView />}
               {activeTab === 'roles' && <RolesMembersView />}
-              {activeTab === 'portal' && !isSuperAdmin && <PortalTasksView />}
+              {activeTab === 'portal' && <PortalTasksView />}
           {/* 2026-11-16 任务数据统计：仅分级管理员（超管导航不显示本菜单，直访也拦） */}
           {activeTab === 'stats' && !isSuperAdmin && <StatisticsView />}
               {activeTab === 'accounts' && isSuperAdmin && <AdminAccountsView />}

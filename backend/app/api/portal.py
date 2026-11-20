@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, Request, BackgroundTasks
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from ..portal import PortalService, run_portal_tasks
 from ..state import BizError
@@ -88,7 +88,8 @@ def attachment_response(state, task, ref, uploads_dir):
 
 
 def create_portal_admin_router(state):
-    from .admin import require_session, _admin_profile, _owner_filter, _is_super_admin
+    from .admin import require_session, _admin_profile, _is_super_admin
+    from ..stats_export import build_stats_xlsx, export_filename
     router, p = APIRouter(prefix='/api/admin'), PortalService(state)
 
     @router.api_route('/portal-grants/{phone}', methods=['GET', 'PUT'])
@@ -115,17 +116,106 @@ def create_portal_admin_router(state):
         except (ValueError, TypeError):
             return JSONResponse({'message': '请求格式错误'}, status_code=400)
 
+    # ── 2026-11-20 只读监管面板（按发布人筛选，布局对齐任务数据统计）──────────
+    # 权限边界：sub_admin 仅看归属自己授权的领导及任务；super_admin 全局只读
+    # （所有平台/管理员下的授权发布任务）；全链路只读，无任何写端点。
+
+    def _monitor_owner(admin):
+        """监管视图的数据归属：sub_admin=自己；super_admin=None（全局）。"""
+        return None if _is_super_admin(admin) else int(admin['id'])
+
+    def _guard_monitor_task(admin, task_id):
+        task = p.template(str(task_id or ''))
+        if not task:
+            raise BizError(404, 'NOT_FOUND', '任务不存在')
+        if not _is_super_admin(admin) and (task['owner_id'] != int(admin['id'])
+                                          or task['platform'] not in (admin.get('allowed_platforms') or [])):
+            raise BizError(403, 'FORBIDDEN', '无权查看此任务')
+        return task
+
     @router.get('/portal-tasks')
-    async def tasks(request: Request, platform: str = 'zdxlz'):
+    async def tasks(request: Request, platform: str = 'zdxlz', creator_phone: str = ''):
+        """发布人 + 任务双维度清单（一次拉全，前端本地级联筛选）。"""
         sess, err = require_session(request, state)
         if err is not None:
             return err
         admin = _admin_profile(state, sess)
-        if _is_super_admin(admin):
-            return JSONResponse({'message': '此面板仅限分级管理员使用'}, status_code=403)
-        if platform not in (admin.get('allowed_platforms') or []):
+        if platform not in ('zdxlz', 'wecom') or (not _is_super_admin(admin) and platform not in (admin.get('allowed_platforms') or [])):
             return JSONResponse({'message': '无权访问该平台'}, status_code=403)
-        return {'ok': True, 'items': [p.statistics(t) for t in p.tasks(owner=_owner_filter(admin, None), platform=platform)]}
+        owner = _monitor_owner(admin)
+        creators = str(creator_phone or '').strip() or None
+        tasks_list = [t for t in p.tasks(owner=owner, platform=platform)
+                      if creators is None or t['creator_phone'] == creators]
+        publishers = [row for row in p.publishers(platform=platform, owner=owner)
+                      if creators is None or row['phone'] == creators]
+        return {'ok': True,
+                'publishers': [{'id': pub['phone'], **pub} for pub in publishers],
+                'tasks': [p.panel_task_meta(t) for t in tasks_list]}
+
+    @router.get('/portal-tasks/{task_id}/overview')
+    async def overview(request: Request, task_id: str, period_key: str = '', dept_path: str = ''):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        admin = _admin_profile(state, sess)
+        try:
+            task = _guard_monitor_task(admin, task_id)
+            # owner_id 传任务归属管理员：既过 guard 属主校验，也让部门兜底取正确名册。
+            return await asyncio.to_thread(
+                state.stats_panel_overview, task_id, period_key, int(task['owner_id']),
+                dept_path=dept_path, allow_portal_task=True)
+        except BizError as exc:
+            return JSONResponse({'message': exc.message}, status_code=exc.status_code)
+
+    @router.get('/portal-tasks/{task_id}/instances')
+    async def instances(request: Request, task_id: str, period_key: str = '', dept_path: str = '',
+                        status_group: str = 'all', q: str = '', page: int = 1, size: int = 50):
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        admin = _admin_profile(state, sess)
+        try:
+            task = _guard_monitor_task(admin, task_id)
+            return await asyncio.to_thread(
+                lambda: state.stats_panel_instances(
+                    task_id, period_key, int(task['owner_id']), dept_path=dept_path,
+                    status_group=status_group, q=q, page=page, size=size,
+                    allow_portal_task=True))
+        except BizError as exc:
+            return JSONResponse({'message': exc.message}, status_code=exc.status_code)
+
+    @router.get('/portal-tasks/{task_id}/export')
+    async def export(request: Request, task_id: str, period_key: str = '', dept_path: str = ''):
+        """按当前任务、归属周期与部门范围导出 .xlsx（stats_export 同一出口）。"""
+        from urllib.parse import quote
+
+        sess, err = require_session(request, state, check_csrf=False)
+        if err is not None:
+            return err
+        assert sess is not None
+        admin = _admin_profile(state, sess)
+        try:
+            task = _guard_monitor_task(admin, task_id)
+            bundle = await asyncio.to_thread(
+                state.stats_panel_export_rows, task_id, period_key, int(task['owner_id']),
+                dept_path=dept_path, allow_portal_task=True)
+        except BizError as exc:
+            return JSONResponse({'message': exc.message}, status_code=exc.status_code)
+        import pathlib
+        cfg = getattr(request.app.state, 'config', None)
+        uploads_dir = (cfg.uploads_dir if cfg else state.data_dir / 'uploads') or pathlib.Path(state.data_dir) / 'uploads'
+        payload = await asyncio.to_thread(build_stats_xlsx, bundle, pathlib.Path(uploads_dir))
+        fname = export_filename(dept_path, bundle['template']['name'], state.now())
+        return Response(
+            content=payload,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={
+                'Content-Disposition': f'attachment; filename="portal-stats.xlsx"; filename*=UTF-8\'\'{quote(fname, safe="")}',
+                'Cache-Control': 'no-store',
+            },
+        )
 
     @router.get('/portal-tasks/{task_id}/attachments/{ref}')
     async def attachment(task_id: str, ref: str, request: Request):
@@ -133,12 +223,8 @@ def create_portal_admin_router(state):
         if err is not None:
             return err
         admin = _admin_profile(state, sess)
-        if _is_super_admin(admin):
-            return JSONResponse({'message': '此面板仅限分级管理员使用'}, status_code=403)
-        task = p.template(task_id)
-        if not task or task['owner_id'] != admin['id'] or task['platform'] not in (admin.get('allowed_platforms') or []):
-            return JSONResponse({'message': '无权查看'}, status_code=403)
         try:
+            task = _guard_monitor_task(admin, task_id)
             return attachment_response(state, task, ref, None)
         except BizError as exc:
             return JSONResponse({'message': exc.message}, status_code=exc.status_code)

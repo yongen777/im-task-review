@@ -39,14 +39,14 @@ interface PanelTask {
   need_review: boolean;
 }
 
-interface TreeNode {
+export interface TreeNode {
   path: string;
   name: string;
   depth: number;
   count: number;
 }
 
-interface PeriodicKpis {
+export interface PeriodicKpis {
   total: number;
   done: number;
   not_done: number;
@@ -70,13 +70,13 @@ type Overview = { dept_tree: TreeNode[] } & (
   | { mode: 'adhoc'; kpis: AdhocKpis; trend: Array<{ date: string; count: number; unique: number }> }
 );
 
-interface SubmissionContent {
+export interface SubmissionContent {
   fields: Array<{ key: string; label: string; value: string }>;
   note: string;
   attachments: Array<{ ref: string; file_name: string; is_image: boolean; url: string }>;
 }
 
-interface RowItem {
+export interface RowItem {
   id?: number;
   instance_id?: number;
   submission_id?: number;
@@ -114,7 +114,7 @@ function fmtDate(date: Date): string {
   return date.toISOString().slice(5, 10).replace('-', '/');
 }
 
-function weekOptions(currentKey: string) {
+export function weekOptions(currentKey: string) {
   const [year, week] = currentKey.split('-W').map(Number);
   const jan4 = new Date(Date.UTC(year, 0, 4));
   const monday = new Date(Date.UTC(year, 0, 4 - ((jan4.getUTCDay() + 6) % 7) + (week - 1) * 7));
@@ -134,11 +134,11 @@ function weekOptions(currentKey: string) {
   });
 }
 
-function parentPath(path: string): string {
+export function parentPath(path: string): string {
   return path.slice(0, Math.max(0, path.lastIndexOf('/')));
 }
 
-function makeTree(nodes: TreeNode[]): DeptTreeNode[] {
+export function makeTree(nodes: TreeNode[]): DeptTreeNode[] {
   const branches = new Map<string, DeptTreeNode>();
   for (const node of nodes) branches.set(node.path, { ...node, children: [] });
   const roots: DeptTreeNode[] = [];
@@ -149,7 +149,7 @@ function makeTree(nodes: TreeNode[]): DeptTreeNode[] {
   return roots;
 }
 
-function usePanelQuery<T>(url: string, revision: number) {
+export function usePanelQuery<T>(url: string, revision: number) {
   const [result, setResult] = useState<{ url: string; revision: number; data?: T; error?: string } | null>(null);
   useEffect(() => {
     if (!url) {
@@ -167,11 +167,13 @@ function usePanelQuery<T>(url: string, revision: number) {
   return { data: current?.data, error: current?.revision === revision ? current?.error : undefined, loading: current?.revision !== revision };
 }
 
-const fieldClass = 'w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500';
-const secondaryButton = 'inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50';
-const panelClass = 'rounded-2xl border border-slate-200/90 bg-white shadow-2xs';
+/* 2026-11-20：以下常量/组件导出给「授权成员发布任务」只读监管面板（PortalTasksView）
+   复用 —— 两块面板视觉与交互共用同一份实现，禁止各自漂移。 */
+export const fieldClass = 'w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500';
+export const secondaryButton = 'inline-flex items-center justify-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50';
+export const panelClass = 'rounded-2xl border border-slate-200/90 bg-white shadow-2xs';
 
-function KpiCard({ label, value, hint, color = 'text-slate-900' }: {
+export function KpiCard({ label, value, hint, color = 'text-slate-900' }: {
   label: string; value: React.ReactNode; hint?: React.ReactNode; color?: string;
 }) {
   return (
@@ -183,7 +185,7 @@ function KpiCard({ label, value, hint, color = 'text-slate-900' }: {
   );
 }
 
-function SubmissionPreview({ content, onImageClick }: {
+export function SubmissionPreview({ content, onImageClick }: {
   content: SubmissionContent | null; onImageClick?: (source: { url: string; alt?: string }) => void;
 }) {
   if (!content || !(content.fields.length || content.note || content.attachments.length)) {

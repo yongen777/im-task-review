@@ -5659,12 +5659,20 @@ class StateStore:
             return "day"
         return kind
 
-    def stats_panel_guard_template(self, template_id: str, owner_id: int) -> Dict[str, Any]:
-        """面板允许查看自己名下的上传任务和回执通知。"""
+    def stats_panel_guard_template(self, template_id: str, owner_id: int,
+                                   *, allow_portal_task: bool = False) -> Dict[str, Any]:
+        """面板允许查看自己名下的上传任务和回执通知。
+
+        2026-11-20 红线钉死：授权成员任务（`pt_` 前缀，portal_task 表）**绝不**进入
+        管理员的任务数据统计面板 —— 默认一律 404（不泄露存在性）；仅授权成员
+        监管面板（api/portal.py）显式传 allow_portal_task=True 放行。
+        """
         from .notice_media import notice_receipt_config
 
         tpl = self.get_template((template_id or "").strip(), include_deleted=False)
         if not tpl:
+            raise BizError(404, "NOT_FOUND", "任务模板不存在")
+        if tpl.get("portal_task") and not allow_portal_task:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
         if tpl.get("kind") == "notice" and not notice_receipt_config(tpl)[0]:
             raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
@@ -5881,13 +5889,13 @@ class StateStore:
         return nodes
 
     def stats_panel_overview(self, template_id: str, period_key: str, owner_id: int,
-                             dept_path: str = "") -> Dict[str, Any]:
+                             dept_path: str = "", *, allow_portal_task: bool = False) -> Dict[str, Any]:
         """面板总览：模板元信息 + 任务专属部门树 + KPI（+不定期 7 天趋势）。
 
         定期（模式A）KPI 按所选部门子树过滤；部门树恒为全周期覆盖（供下钻导航）。
         不定期（模式B）：覆盖成员=模板名册（潜在上报人）；KPI/趋势按部门子树过滤。
         """
-        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        tpl = self.stats_panel_guard_template(template_id, owner_id, allow_portal_task=allow_portal_task)
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         dept_map = self._stats_member_dept_map(role_ids)
         sel = str(dept_path or "").strip().strip("/")
@@ -6024,9 +6032,10 @@ class StateStore:
 
     def stats_panel_instances(self, template_id: str, period_key: str, owner_id: int, *,
                               dept_path: str = "", status_group: str = "all",
-                              q: str = "", page: int = 1, size: int = 50) -> Dict[str, Any]:
+                              q: str = "", page: int = 1, size: int = 50,
+                              allow_portal_task: bool = False) -> Dict[str, Any]:
         """模式A 员工明细（一人一行；周/月视图按「周期内最优状态」去重代表实例）。"""
-        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        tpl = self.stats_panel_guard_template(template_id, owner_id, allow_portal_task=allow_portal_task)
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
@@ -6222,9 +6231,9 @@ class StateStore:
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 
     def stats_panel_export_rows(self, template_id: str, period_key: str, owner_id: int, *,
-                                dept_path: str = "") -> Dict[str, Any]:
+                                dept_path: str = "", allow_portal_task: bool = False) -> Dict[str, Any]:
         """按任务、周期和部门范围装配完整明细及提交附件。"""
-        tpl = self.stats_panel_guard_template(template_id, owner_id)
+        tpl = self.stats_panel_guard_template(template_id, owner_id, allow_portal_task=allow_portal_task)
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         dept_map = self._stats_member_dept_map(role_ids, owner_id=owner_id)
         sel = str(dept_path or "").strip().strip("/")

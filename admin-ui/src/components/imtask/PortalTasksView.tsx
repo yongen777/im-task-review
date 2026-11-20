@@ -1,5 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, RefreshCw, Search, X } from 'lucide-react';
+import { plainError } from '../../lib/api';
+import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
+import { useToast } from '../../lib/toast';
+import { AdminScopeHeader } from './AdminScopeHeader';
+import { DepartmentTree } from './DepartmentTree';
+import {
+  KpiCard, SubmissionPreview, fieldClass, makeTree, panelClass, parentPath,
+  secondaryButton, usePanelQuery,
+  type PeriodicKpis, type RowItem, type TreeNode,
+} from './StatisticsView';
 
 export async function portalAdminRequest(path: string, method = 'GET', body?: unknown) {
   const response = await fetch('/api/admin/' + path, {
@@ -146,27 +157,458 @@ export function PortalGrantDialog({ phone, platform, onClose }: { phone: string;
   </div>;
 }
 
-type Submission = { note?: string; refs_json?: string; fields_json?: string };
-type Member = { id: number; name_snap: string; phone: string; status: string; submission?: Submission };
-type Period = { period_key: string; expected: number; submitted: number; pending: number; members: Member[] };
-type Task = { task_id: string; name: string; creator_phone: string; periods: Period[] };
+/* ── 2026-11-20 只读监管面板重构：以「授权发布人（领导）」为核心筛选维度，
+      选中任务后的 KPI / 部门下钻 / 成员明细 / 导出与「任务数据统计」同一套
+      组件与口径（按整个归属周期按人去重，不展示批次）。全程只读。 ────────── */
+
+interface PublisherRow {
+  id: string;
+  phone: string;
+  name: string;
+  dept_path: string;
+  owner_id: number;
+  task_count: number;
+}
+
+interface PortalTaskMeta {
+  task_id: string;
+  name: string;
+  creator_phone: string;
+  owner_id: number;
+  platform?: string;
+  kind: string;
+  period?: string;
+  mode?: string;
+  statistics_period: 'day' | 'week' | 'month';
+  current_period_key: string;
+  period_keys: string[];
+  remind_at?: string | null;
+  anchor_weekday?: number | null;
+  anchor_dom?: number | null;
+  exec_weekdays?: number[] | null;
+  exec_dom_days?: number[] | null;
+  has_deadline: boolean;
+  deadline_type?: string | null;
+  deadline_time?: string | null;
+  created_at?: string;
+}
+
+interface PanelResultList {
+  total: number;
+  items: RowItem[];
+}
+
+interface PanelOverview {
+  dept_tree: TreeNode[];
+  kpis: PeriodicKpis;
+  dept_stats: Record<string, { covered: number; done: number }>;
+}
+
+const PAGE_SIZE = 50;
+const monitorTabs = { all: '全部', done: '已完成', todo: '未完成' } as const;
+type MonitorTab = keyof typeof monitorTabs;
+
+const monitorPeriodLabel = (key: string) => (key === 'once' ? '一次性任务' : key);
+
+function execCycleText(task: PortalTaskMeta): string {
+  const weekdays = ['一', '二', '三', '四', '五', '六', '日'];
+  if (task.exec_dom_days?.length) return '每月' + task.exec_dom_days.join('、') + '号';
+  if (task.period === 'week') return '每周' + weekdays[(task.anchor_weekday || 1) - 1];
+  if (task.period === 'month') return '每月' + (task.anchor_dom || 1) + '号';
+  if (task.exec_weekdays?.length && task.exec_weekdays.length < 7) {
+    return '每周' + task.exec_weekdays.map((day) => weekdays[day - 1]).join('、');
+  }
+  return '每天';
+}
 
 export function PortalTasksView() {
+  return <PortalMonitorCatalog />;
+}
+
+function PortalMonitorCatalog() {
   const { platform } = useAppStore();
-  const [tasks, setTasks] = useState<Task[]>([]), [error, setError] = useState('');
+  const [data, setData] = useState<{ publishers: PublisherRow[]; tasks: PortalTaskMeta[] } | null>(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [publisherId, setPublisherId] = useState('');
+  const [taskId, setTaskId] = useState('');
+
   useEffect(() => {
     let live = true;
-    setTasks([]); setError('');
-    const refresh = () => portalAdminRequest(`portal-tasks?platform=${platform}`).then(d => { if (live) { setTasks(d.items); setError(''); } }).catch(e => { if (live) setError(e.message); });
-    void refresh(); const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 30000);
-    return () => { live = false; clearInterval(timer); };
+    const load = () => portalAdminRequest(`portal-tasks?platform=${platform}`)
+      .then((result: { publishers?: PublisherRow[]; tasks?: PortalTaskMeta[] }) => {
+        if (!live) return;
+        setData({ publishers: result.publishers || [], tasks: result.tasks || [] });
+        setError('');
+      })
+      .catch((err: Error) => { if (live) setError(err.message); })
+      .finally(() => { if (live) setLoading(false); });
+    void load();
+    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, 30000);
+    return () => { live = false; window.clearInterval(timer); };
   }, [platform]);
-  return <section className="space-y-4"><div><h1 className="text-xl font-bold">授权成员发布任务</h1><p className="text-sm text-slate-500 mt-2">只读监管 · 每 30 秒刷新收集统计</p></div>
-    {error && <p className="text-red-600">{error}</p>}
-    {!tasks.length && !error && <div className="bg-white rounded-xl border p-8 text-slate-500">当前没有授权成员发布的任务</div>}
-    {tasks.map(t => <article key={t.task_id} className="bg-white border rounded-xl p-5 space-y-3"><h2 className="font-bold">{t.name}</h2><p className="text-xs text-slate-500">发布成员：{t.creator_phone.slice(0, 3)}****{t.creator_phone.slice(-4)}</p>
-      {!t.periods.length && <p className="text-sm text-slate-500">等待首个执行周期</p>}
-      {t.periods.map(p => <details key={p.period_key} open><summary className="cursor-pointer text-sm font-semibold">{p.period_key} · 应交 {p.expected} / 已交 {p.submitted} / 未交 {p.pending}</summary><div className="divide-y mt-3">{p.members.map(m => <details key={m.id} className="py-2 text-sm"><summary className="cursor-pointer">{m.name_snap} · {m.status === 'approved' ? '已完成' : '未提交'}</summary>{m.submission ? <div className="pl-4 py-2 space-y-2"><p className="whitespace-pre-wrap">{m.submission.note}</p>{(JSON.parse(m.submission.refs_json || '[]') as string[]).map(ref => <a key={ref} className="text-blue-600 mr-3" target="_blank" rel="noreferrer" href={`/api/admin/portal-tasks/${t.task_id}/attachments/${ref}`}>查看图片</a>)}</div> : <p className="text-slate-400 pl-4">暂无提交内容</p>}</details>)}</div></details>)}
-    </article>)}
+
+  const publishers = data?.publishers ?? [];
+  const tasks = useMemo(
+    () => (data?.tasks ?? []).filter((item) => !publisherId || item.creator_phone === publisherId),
+    [data, publisherId],
+  );
+
+  useEffect(() => {
+    if (taskId && !tasks.some((item) => item.task_id === taskId)) setTaskId(tasks[0]?.task_id || '');
+    else if (!taskId && tasks.length) setTaskId(tasks[0].task_id);
+  }, [tasks, taskId]);
+
+  const task = tasks.find((item) => item.task_id === taskId);
+  return <section className="space-y-4">
+    <AdminScopeHeader title="授权成员发布任务"
+      description={<>只读监管 · 按授权发布人筛选任务 · 每 30 秒自动刷新</>} />
+    {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}
+    <div className={panelClass + ' grid items-start gap-3 p-4 md:grid-cols-[minmax(0,1.4fr)_minmax(0,2fr)_minmax(0,1fr)_minmax(0,1.35fr)]'}>
+      <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
+        发布人（授权领导）
+        <select className={fieldClass} value={publisherId} onChange={(e) => setPublisherId(e.target.value)}>
+          <option value="">全部授权成员（{publishers.length} 位 · {data?.tasks?.length ?? 0} 个任务）</option>
+          {publishers.map((item) => (
+            <option key={item.phone} value={item.phone}>
+              {item.name} · {item.dept_path || '部门未分配'} · 已发布 {item.task_count} 个任务
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
+        该领导发布的任务
+        <select className={fieldClass} value={taskId} onChange={(e) => setTaskId(e.target.value)} disabled={!tasks.length}>
+          {!tasks.length && <option value="">该发布人暂无任务</option>}
+          {tasks.map((item) => {
+            const creator = publishers.find((pub) => pub.phone === item.creator_phone);
+            return <option key={item.task_id} value={item.task_id}>
+              {item.name}{!publisherId && creator ? ' · ' + creator.name : ''}
+            </option>;
+          })}
+        </select>
+        {task && <span className="font-normal text-slate-500">
+          {task.mode === 'once' ? '一次性推送' : <>执行周期 {execCycleText(task)}{task.remind_at ? ' · 执行时间 ' + task.remind_at : ''}</>}
+        </span>}
+      </label>
+      {task ? <PortalTaskMonitor key={task.task_id} task={task} /> : (
+        <div className="md:col-span-2">
+          {!loading && !error && !data?.tasks?.length && (
+            <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">
+              当前平台暂无授权成员发布的任务
+            </div>
+          )}
+          {!loading && !error && !!data?.tasks?.length && !tasks.length && (
+            <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">该发布人暂无任务</div>
+          )}
+        </div>
+      )}
+    </div>
   </section>;
+}
+
+function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
+  const toast = useToast();
+  const [chosenPeriod, setChosenPeriod] = useState<string>();
+  const [deptPath, setDeptPath] = useState('');
+  const [deptOpen, setDeptOpen] = useState(false);
+  const [status, setStatus] = useState<MonitorTab>('all');
+  const [search, setSearch] = useState('');
+  const [filter, setFilter] = useState({ query: '', page: 1 });
+  const [revision, setRevision] = useState(0);
+  const [exporting, setExporting] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  /* 2026-11-20 需求 C：附件图片点开走原生全屏看图层（缩放/拖拽/Esc） */
+  const [viewerSource, setViewerSource] = useState<{ url: string; alt?: string } | null>(null);
+
+  /* 归属周期：一次性任务固定 once；周期任务 = 当前归属周期 + 全部历史周期（无批次） */
+  const periodOptions = useMemo(() => {
+    const keys = new Set<string>([task.current_period_key, ...(task.period_keys || [])].filter(Boolean));
+    return [...keys].sort().reverse();
+  }, [task]);
+  const isOnce = task.current_period_key === 'once' || task.mode === 'once';
+  const periodKey = isOnce ? 'once'
+    : (chosenPeriod && periodOptions.includes(chosenPeriod) ? chosenPeriod : task.current_period_key);
+
+  const query = search.trim();
+  const searching = query !== filter.query;
+  useEffect(() => {
+    if (!searching) return;
+    if (!query) { setFilter({ query: '', page: 1 }); return; }
+    const timeout = window.setTimeout(() => setFilter({ query, page: 1 }), 180);
+    return () => window.clearTimeout(timeout);
+  }, [query, searching]);
+
+  const base = `/api/admin/portal-tasks/${task.task_id}`;
+  const scope = new URLSearchParams({ period_key: periodKey, dept_path: deptPath });
+  const overview = usePanelQuery<PanelOverview>(`${base}/overview?` + scope, revision);
+  const listParams = new URLSearchParams(scope);
+  listParams.set('status_group', status);
+  listParams.set('q', filter.query);
+  listParams.set('page', String(filter.page));
+  listParams.set('size', String(PAGE_SIZE));
+  const roster = usePanelQuery<PanelResultList>(`${base}/instances?` + listParams, revision);
+  const { data: overviewData } = overview;
+  const { data: list } = roster;
+  const totalPages = Math.max(1, Math.ceil((list?.total ?? 0) / PAGE_SIZE));
+  const page = filter.page;
+  const refreshing = overview.loading || roster.loading;
+  const error = overview.error || roster.error;
+  const deptNodes = overviewData?.dept_tree;
+  const tree = useMemo(() => makeTree(deptNodes ?? []), [deptNodes]);
+  const deptName = deptPath.split('/').pop() || '全部覆盖部门';
+  const deptChildren = overviewData
+    ? (deptNodes ?? []).filter((node) => parentPath(node.path) === deptPath).map((node) => {
+        const counts = overviewData.dept_stats[node.path] ?? { covered: node.count, done: 0 };
+        return { ...node, ...counts, rate: counts.covered ? 100 * counts.done / counts.covered : 0 };
+      }).sort((a, b) => b.rate - a.rate || b.done - a.done || a.name.localeCompare(b.name, 'zh-CN'))
+    : [];
+
+  /* 30 秒轮询刷新监管口径（只读，不写任何状态） */
+  useEffect(() => {
+    const timer = window.setInterval(() => { if (!document.hidden) setRevision((n) => n + 1); }, 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (list && page > totalPages) setFilter((current) => ({ ...current, page: totalPages }));
+  }, [list, page, totalPages]);
+
+  useEffect(() => {
+    if (deptPath && deptNodes && !deptNodes.some((node) => node.path === deptPath)) {
+      setDeptPath('');
+      setFilter((current) => ({ ...current, page: 1 }));
+    }
+  }, [deptPath, deptNodes]);
+
+  useEffect(() => {
+    if (!refreshing && !error && overviewData && list) setLastUpdated(new Date());
+  }, [refreshing, error, overviewData, list]);
+
+  function selectDept(path: string) {
+    setDeptPath(path);
+    setDeptOpen(false);
+    setFilter((current) => ({ ...current, page: 1 }));
+  }
+
+  function refresh() {
+    setRevision((n) => n + 1);
+  }
+
+  async function exportXlsx() {
+    setExporting(true);
+    try {
+      const response = await fetch(`${base}/export?` + scope, { credentials: 'same-origin', cache: 'no-store' });
+      if (!response.ok) {
+        const result = await response.json().catch(() => null);
+        throw new Error(result?.message || ('导出失败（HTTP ' + response.status + '）'));
+      }
+      const file = /filename\*=UTF-8''([^;]+)/i.exec(response.headers.get('Content-Disposition') || '');
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = file ? decodeURIComponent(file[1]) : '授权任务统计.xlsx';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      toast.error(plainError(String(err)));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return <>
+    {/* 归属周期（按周期按人去重，不展示批次下拉） */}
+    <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
+      归属周期
+      {isOnce
+        ? <span className={fieldClass}>一次性任务（全部数据）</span>
+        : <select className={fieldClass} value={periodKey} onChange={(e) => {
+            setChosenPeriod(e.target.value);
+            setFilter((current) => ({ ...current, page: 1 }));
+          }}>
+            {periodOptions.map((key) => <option key={key} value={key}>{monitorPeriodLabel(key)}</option>)}
+          </select>}
+      {lastUpdated && <span className="font-normal text-slate-500">更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}</span>}
+    </label>
+
+    {/* 覆盖部门（点击部门行下钻筛选下方明细） */}
+    <div className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
+      <span id="portal-dept-label">覆盖部门</span>
+      <div className="flex min-w-0 gap-1.5">
+        {deptPath && <button type="button" onClick={() => selectDept(parentPath(deptPath))}
+          title="返回上一级部门" aria-label="返回上一级部门" className={secondaryButton + ' shrink-0 !px-2.5'}>
+          <ChevronLeft className="h-4 w-4" />
+        </button>}
+        <button type="button" aria-labelledby="portal-dept-label portal-dept-value" aria-haspopup="dialog" onClick={() => setDeptOpen(true)}
+          disabled={!tree.length} className={fieldClass + ' flex min-w-0 items-center gap-2 text-left disabled:opacity-50'} title={deptPath || deptName}>
+          <Building2 className="h-4 w-4 shrink-0 text-blue-500" />
+          <span id="portal-dept-value" className="min-w-0 flex-1 truncate">{deptName}</span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+        </button>
+      </div>
+      {deptPath && <span className="truncate font-normal text-slate-500" title={deptPath}>{deptPath.split('/').join(' / ')}</span>}
+    </div>
+
+    {/* KPI：与「任务数据统计」同款四卡 */}
+    {overviewData && (
+      <div className="md:col-span-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <KpiCard label="应参与" value={overviewData.kpis.total} />
+        <KpiCard label="已完成" value={overviewData.kpis.done} color="text-emerald-700"
+          hint="免审任务 · 提交即完成" />
+        <KpiCard label="未完成" value={overviewData.kpis.not_done} color="text-amber-700"
+          hint={'待提交 ' + overviewData.kpis.pending + ' · 逾期 ' + overviewData.kpis.overdue + ' · 驳回 ' + overviewData.kpis.rejected} />
+        <KpiCard label="完成率" value={overviewData.kpis.total ? overviewData.kpis.rate + '%' : '—'} color="text-blue-700"
+          hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: overviewData.kpis.rate + '%' }} /></div>} />
+      </div>
+    )}
+
+    {/* 部门完成情况：按部门完成率进度条（点击下钻） */}
+    {deptChildren.length > 0 && (
+      <section className={panelClass + ' overflow-hidden md:col-span-4'} aria-labelledby="portal-dept-progress-title">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 px-5 py-4">
+          <h3 id="portal-dept-progress-title" className="text-base font-bold text-slate-900">部门完成情况</h3>
+          <span className="text-xs text-slate-500">按完成率从高到低 · 点击部门查看明细</span>
+        </div>
+        <div className="max-h-[26rem] overflow-auto">
+          <table className="w-full min-w-[560px] table-fixed text-sm">
+            <thead className="sticky top-0 bg-slate-50 text-left text-xs text-slate-600">
+              <tr><th className="w-[26%] px-5 py-2.5">部门</th><th className="px-4 py-2.5">完成率</th>
+                <th className="w-[19%] px-4 py-2.5 text-right">已提交 / 应提交</th>
+                <th className="w-[15%] px-5 py-2.5 text-right">未提交</th></tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {deptChildren.map((node) => (
+                <tr key={node.path} className="hover:bg-blue-50/60">
+                  <td className="px-5 py-3">
+                    <button type="button" onClick={() => selectDept(node.path)} title={node.name}
+                      className="group flex max-w-full items-center gap-1 text-left font-semibold text-slate-900 hover:text-blue-700">
+                      <span className="min-w-0 truncate">{node.name}</span><ChevronRight className="h-4 w-4 shrink-0 text-blue-500" />
+                    </button>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center gap-3">
+                      <span className="w-14 shrink-0 text-right text-base font-bold tabular-nums text-blue-800">{node.rate.toFixed(1)}%</span>
+                      <div className="h-3 flex-1 overflow-hidden rounded bg-slate-100" aria-hidden="true">
+                        <div className="h-full rounded bg-blue-600" style={{ width: node.rate + '%' }} />
+                      </div>
+                    </div>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-3 text-right tabular-nums text-slate-500"><strong className="text-base text-slate-900">{node.done}</strong> / {node.covered}</td>
+                  <td className="px-5 py-3 text-right font-semibold tabular-nums text-amber-800">{node.covered - node.done}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    )}
+
+    {/* 成员提交明细：全部/已完成/未完成 + 实时搜索 + 提交内容与附件全屏 */}
+    <section className={panelClass + ' overflow-hidden md:col-span-4'} aria-busy={roster.loading || searching}>
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-slate-900">成员提交明细</h3>
+          {list && !searching && <span className="text-xs tabular-nums text-slate-500">{list.total} 人</span>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
+            <input aria-label="搜索姓名或手机号" placeholder="搜索姓名或手机号" value={search} onChange={(e) => setSearch(e.target.value)}
+              className={fieldClass + ' w-44 pl-8 pr-8'} />
+            {search && <button type="button" aria-label="清除搜索" onClick={() => setSearch('')}
+              className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
+          </div>
+          <button type="button" onClick={refresh} disabled={refreshing} className={secondaryButton}>
+            <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
+          </button>
+          <button type="button" onClick={() => void exportXlsx()} disabled={exporting || overview.loading || !!overview.error}
+            title="导出当前任务、归属周期和部门范围内的全量数据（含部门汇总与成员明细）"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+            <Download className="h-3.5 w-3.5" /> {exporting ? '导出中…' : '导出 Excel'}
+          </button>
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-1.5 border-b border-slate-100 px-4 py-2.5">
+        {(Object.keys(monitorTabs) as MonitorTab[]).map((tab) => (
+          <button type="button" key={tab} aria-pressed={tab === status} onClick={() => { setStatus(tab); setFilter((current) => ({ ...current, page: 1 })); }}
+            className={'rounded-lg px-2.5 py-1.5 text-xs font-medium ' + (tab === status ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50')}>
+            {monitorTabs[tab]}
+          </button>
+        ))}
+      </div>
+      {error && <div role="alert" className="border-b border-slate-100 bg-rose-50/60 px-4 py-2 text-xs text-rose-700">{error}</div>}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] table-fixed text-left text-xs">
+          <thead className="bg-slate-50 text-slate-600">
+            <tr>
+              <th className="w-28 px-4 py-3 font-medium">成员</th>
+              <th className="w-[17%] px-3 py-3 font-medium">所属部门</th>
+              <th className="w-24 px-3 py-3 font-medium">状态</th>
+              <th className="w-36 px-3 py-3 font-medium">提交时间</th>
+              <th className="px-3 py-3 font-medium">上报内容</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {(!list?.items.length || searching) ? (
+              <tr><td colSpan={5} className="px-4 py-10 text-center text-slate-500">
+                {searching || roster.loading ? '正在加载明细…' : roster.error ? '明细加载失败' : filter.query ? '没有匹配的记录' : '当前范围暂无记录'}
+              </td></tr>
+            ) : list.items.map((row) => (
+              <tr key={row.instance_id ?? row.id ?? row.phone} className="align-top hover:bg-slate-50/70">
+                <td className="px-4 py-3">
+                  <div className="break-words font-semibold text-slate-900">{row.name}</div>
+                  <div className="mt-0.5 text-[11px] tabular-nums text-slate-500">{row.phone}</div>
+                </td>
+                <td className="px-3 py-3 text-slate-700" title={row.dept_path}>
+                  <span className="line-clamp-2 break-words">{row.dept_path.split('/').pop() || '—'}</span>
+                </td>
+                <td className="px-3 py-3">
+                  <span className={'inline-flex whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[11px] font-semibold '
+                    + (row.status === 'approved' ? 'border-emerald-200 text-emerald-700'
+                      : row.status === 'rejected' ? 'border-rose-200 text-rose-700'
+                      : row.status === 'overdue' || row.status === 'expired' ? 'border-amber-200 text-amber-700'
+                      : 'border-slate-200 text-slate-600')}>
+                    {row.status === 'approved' ? '已完成' : row.status === 'rejected' ? '已驳回'
+                      : row.status === 'overdue' || row.status === 'expired' ? '已逾期' : '未提交'}
+                  </span>
+                </td>
+                <td className="px-3 py-3 tabular-nums text-slate-600">
+                  {row.submitted_at?.slice(5, 16) || '—'}
+                  {row.late_submit && <div className="mt-0.5 text-amber-700">迟交</div>}
+                </td>
+                <td className="px-3 py-3"><SubmissionPreview content={row.content} onImageClick={setViewerSource} /></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex items-center justify-end gap-2 border-t border-slate-100 bg-slate-50/60 px-4 py-2 text-xs text-slate-600">
+        <button type="button" onClick={() => setFilter((current) => ({ ...current, page: page - 1 }))}
+          aria-label="上一页" disabled={page <= 1 || roster.loading || searching} className={secondaryButton + ' !p-1.5'}><ChevronLeft className="h-3.5 w-3.5" /></button>
+        <span className="tabular-nums">第 {page} / {totalPages} 页</span>
+        <button type="button" onClick={() => setFilter((current) => ({ ...current, page: page + 1 }))}
+          aria-label="下一页" disabled={page >= totalPages || roster.loading || searching} className={secondaryButton + ' !p-1.5'}><ChevronRight className="h-3.5 w-3.5" /></button>
+      </div>
+    </section>
+
+    {deptOpen && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
+        <section role="dialog" aria-modal="true" aria-labelledby="portal-dept-tree-title" className={panelClass + ' w-full max-w-lg p-6 shadow-2xl'}>
+          <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+            <h3 id="portal-dept-tree-title" className="font-bold text-slate-900">覆盖部门</h3>
+            <button type="button" aria-label="关闭覆盖部门" className="rounded-lg p-1 text-slate-500 hover:bg-slate-100" onClick={() => setDeptOpen(false)}><X className="h-5 w-5" /></button>
+          </div>
+          <div className="mt-3 max-h-[60vh] overflow-y-auto">
+            <button type="button" onClick={() => selectDept('')} aria-pressed={!deptPath}
+              className={'mb-2 w-full rounded-lg px-2.5 py-2 text-left text-xs font-semibold ' + (!deptPath ? 'bg-blue-50 text-blue-700' : 'text-slate-700 hover:bg-slate-50')}>全部覆盖部门</button>
+            <DepartmentTree nodes={tree} selected={deptPath} onSelect={selectDept} />
+          </div>
+        </section>
+      </div>
+    )}
+    <ImageViewer source={viewerSource} onClose={() => setViewerSource(null)} />
+  </>;
 }

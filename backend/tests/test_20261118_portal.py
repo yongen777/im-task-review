@@ -117,8 +117,10 @@ def test_publish_once_three_ticks_completion_and_isolation(portal):
     assert (stats['periods'][0]['expected'], stats['periods'][0]['submitted'], stats['periods'][0]['pending']) == (1, 1, 0)
     assert stats['periods'][0]['members'][0]['submission']['note'] == '真实提交内容'
     assert owner.get('/api/admin/portal-tasks').status_code == 200
-    assert owner.get('/api/admin/portal-tasks').json()['items'][0]['task_id'] == t['template_id']
-    assert admin.get('/api/admin/portal-tasks').status_code == 403
+    # 2026-11-20 面板重构：清单端点按「发布人 + 任务」两组返回（tasks 取代旧 items）
+    assert owner.get('/api/admin/portal-tasks').json()['tasks'][0]['task_id'] == t['template_id']
+    # 2026-11-20 需求：超管全局只读监管放行（授权配置仍 403，由下面 grant 端点守住）
+    assert admin.get('/api/admin/portal-tasks').status_code == 200
     assert owner.post(f"/api/admin/instances/{inst['id']}/mark-submitted", json={}).status_code == 403
     assert owner.put('/api/admin/templates/' + t['template_id'], json={'name': '代改'}).status_code == 403
     assert owner.put('/api/admin/portal-tasks/' + t['template_id'], json={}).status_code in (404, 405)
@@ -188,8 +190,8 @@ def test_admin_scope_platform_and_readonly_boundaries(portal):
     assert admin.put('/api/admin/portal-grants/' + ident['phone'], json={'enabled': True}).status_code == 403
     task = publish(p, ident)
     run_portal_tasks(scheduler, s.now())
-    assert foreign.get('/api/admin/portal-tasks').json()['items'] == []
-    assert owner.get('/api/admin/portal-tasks?platform=wecom').json()['items'] == []
+    assert foreign.get('/api/admin/portal-tasks').json()['tasks'] == []
+    assert owner.get('/api/admin/portal-tasks?platform=wecom').json()['tasks'] == []
     assert not p.grants({'phone': ident['phone'], 'platform': 'wecom'})
     # 停用当前管理范围的成员行，不允许另一管理员或平台的同手机号绕过。
     s.update_role_member(tpl['role_ids'][0], ident['phone'], enabled=False)
@@ -271,7 +273,7 @@ def test_multiple_admin_grants_do_not_mix_task_ownership(portal):
     assert err.value.code == 'OWNER_SCOPE_MISMATCH'
     result = publish(p, ident, phones=['13900009404'])
     assert p.template(result['task_id'])['owner_id'] == foreign_id
-    assert foreign.get('/api/admin/portal-tasks').json()['items'][0]['task_id'] == result['task_id']
+    assert foreign.get('/api/admin/portal-tasks').json()['tasks'][0]['task_id'] == result['task_id']
 
 
 def test_http_publish_upload_submit_and_private_attachment(portal):
