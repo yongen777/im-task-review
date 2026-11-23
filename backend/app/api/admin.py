@@ -15,7 +15,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -379,16 +379,13 @@ _INSTANCE_STATUS_SQL = "CASE WHEN i.status = 'submitted' AND t.kind <> 'notice' 
 # 通知提醒 6 项 / 上传任务 9 项（含 pending 细分为「待推送 / 待上传」）。
 # 列表徽章（refined_status 下发）、详情徽章（同一字段）、下拉筛选（status=refined 键）、
 # KPI 聚合（stats.refined 计数）四处共用这一份口径，保证数字与筛出来的行完全一致。
-_PUBLISHED_AT_SUBSQL = (
-    "(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id = i.id AND l.result = 'sent' "
-    "AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
-    "'notice_file_link','notice_video','notice_vid_link','portal'))"
-)
-# 最新一次有效提交（status != 'rejected'）的来源，与管理端「管理员代交」徽标同源。
-_LATEST_SOURCE_SUBSQL = (
-    "(SELECT s.source FROM submission s WHERE s.instance_id = i.id AND s.status != 'rejected' "
-    "ORDER BY s.id DESC LIMIT 1)"
-)
+#
+# 2026-11-23 第二波性能治本：原版在 CASE 里对 reminder_log / submission 各做
+# 逐行相关子查询（published_at 展开 2 次 + latest source 展开 3 次），十万行后
+# MySQL 5.7 统计明显变慢；改为读 SCHEMA_VERSION=3 的物化冗余列
+#   · i.first_sent_at        = 首次成功投递时间（reminder_log 'sent' 钩子 + 迁移回填维护）
+#   · i.latest_submit_source = 最新非驳回提交来源（提交/代交/驳回钩子维护）
+# 单条 SQL 零相关子查询，条件语义与旧口径逐条等价。
 _IS_ADHOC_SQL = "(t.is_adhoc = 1 OR i.period_key LIKE 'adhoc-%')"
 _IS_UPLOAD_SQL = "COALESCE(t.kind, '') <> 'notice'"
 
@@ -397,7 +394,7 @@ _REFINED_STATUS_SQL: Dict[str, str] = {
     # 通用：待推送（通知=尚未发送；上传=非自主上报且提醒未送达）
     "push_pending": (
         "(i.status = 'pending' AND (t.kind = 'notice' "
-        f"OR ({_IS_UPLOAD_SQL} AND NOT {_IS_ADHOC_SQL} AND {_PUBLISHED_AT_SUBSQL} IS NULL)))"
+        f"OR ({_IS_UPLOAD_SQL} AND NOT {_IS_ADHOC_SQL} AND i.first_sent_at IS NULL)))"
     ),
     # 通用：已取消（成员移出/模板停用等作废行，两种类型语义一致）
     "cancelled": "(i.status = 'cancelled')",
@@ -416,19 +413,19 @@ _REFINED_STATUS_SQL: Dict[str, str] = {
     "notice_expired": "(t.kind = 'notice' AND i.status = 'expired')",
     # 上传任务：待上传（提醒已送达仍未交，或自主上报待提交）
     "upload_pending": (
-        f"(i.status = 'pending' AND {_IS_UPLOAD_SQL} AND ({_IS_ADHOC_SQL} OR {_PUBLISHED_AT_SUBSQL} IS NOT NULL))"
+        f"(i.status = 'pending' AND {_IS_UPLOAD_SQL} AND ({_IS_ADHOC_SQL} OR i.first_sent_at IS NOT NULL))"
     ),
     # 上传任务：已提交（待审核）
     "reviewing": f"({_IS_UPLOAD_SQL} AND i.status = 'submitted' AND t.need_review = 1)",
     # 上传任务：已完成（管理员代交优先于普通完成判定）
     "done_admin": (
         f"({_IS_UPLOAD_SQL} AND (i.status = 'approved' OR (i.status = 'submitted' AND t.need_review = 0)) "
-        f"AND {_LATEST_SOURCE_SUBSQL} = 'admin')"
+        "AND i.latest_submit_source = 'admin')"
     ),
-    # 上传任务：已完成（审核通过或免审自交）
+    # 上传任务：已完成（审核通过或免审自交；含历史无提交行副本——家族共享展示不落列，与旧子查询口径一致）
     "done": (
         f"({_IS_UPLOAD_SQL} AND (i.status = 'approved' OR (i.status = 'submitted' AND t.need_review = 0)) "
-        f"AND ({_LATEST_SOURCE_SUBSQL} IS NULL OR {_LATEST_SOURCE_SUBSQL} <> 'admin'))"
+        "AND (i.latest_submit_source IS NULL OR i.latest_submit_source <> 'admin'))"
     ),
     # 上传任务：已驳回（待重交）
     "rejected": f"({_IS_UPLOAD_SQL} AND i.status = 'rejected')",
@@ -640,13 +637,17 @@ def _instance_filter_sql(
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
             # 2026-11-19 需求一：日期视图同时覆盖「当日重推批次」（period_key 形如 2026-11-19#…）
             # 与手动模板的 once#… 批次；否则按日期筛实例会漏掉重推出的那一批。
+            # 2026-11-23 第二波：手动批次按创建日期过滤改范围条件
+            # （原 LEFT(i.created_at,10)=? 对字段套函数，索引用不上；YYYY-MM-DD HH:MM:SS
+            # 定长字典序与范围比较等价，语义不变）。
+            day_end = (datetime.strptime(key, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00"
             where.append("(i.period_key=? OR i.period_key LIKE ? "
                          "OR (t.is_manual=1 AND (i.period_key='once' OR i.period_key LIKE 'once#%') "
-                         "AND LEFT(i.created_at,10)=?) "
+                         "AND i.created_at>=? AND i.created_at<?) "
                          "OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
                          "OR (i.submitted_at IS NULL AND EXISTS (SELECT 1 FROM submission s "
                          "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
-            params.extend((key, key + "#%", key, key, key))
+            params.extend((key, key + "#%", key + " 00:00:00", day_end, key, key))
         else:
             # 2026-11-20 切期改造：周/月/once 等归属周期键同时覆盖其重推批次
             # （`{key}#YYYYMMDDHHMMSS`），与统计面板的「整个归属周期」口径一致。
@@ -758,9 +759,9 @@ def _query_instances(
             f"SELECT i.*, t.name AS template_name, t.kind AS template_kind, t.need_review, "
             f"t.role_ids AS template_role_ids, t.remind_at AS template_remind_at, "
             f"t.notice_times AS template_notice_times, t.is_manual AS template_is_manual, "
-            f"(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id=i.id AND l.result='sent' "
-            f"AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
-            f"'notice_file_link','notice_video','notice_vid_link','portal')) AS published_at, "
+            # 2026-11-23：published_at 改读物化列（原为逐行相关子查询；写入由
+            # reminder_log 'sent' 钩子 + 迁移回填维护，语义 = 首次成功投递时间）。
+            f"i.first_sent_at AS published_at, "
             # 2026-11-04 多管理员分级：超管全局查看时需要看到「创建人」
             f"u.username AS owner_username, u.display_name AS owner_display_name "
             # 2026-10-30 用户需求：同一天内按「执行时刻」从早到晚排（08:00 在 09:00 上面），

@@ -4408,7 +4408,7 @@ class StateStore:
                 late = bool(instance["late_submit"] or now_s > instance["deadline_at"])
                 self.conn.execute(
                     "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, "
-                    "reviewed_at = NULL, reviewer = NULL, reject_reason = NULL WHERE id = ?",
+                    "reviewed_at = NULL, reviewer = NULL, reject_reason = NULL, latest_submit_source = 'admin' WHERE id = ?",
                     (new_status, now_s, int(late), instance_id),
                 )
                 self._insert_audit_unlocked(
@@ -4710,7 +4710,7 @@ class StateStore:
             )
             sub_id = int(cur.lastrowid)
             self.conn.execute(
-                "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL WHERE id = ?",
+                "UPDATE task_instance SET status = ?, submitted_at = ?, late_submit = ?, reviewed_at = NULL, reviewer = NULL, latest_submit_source = 'user' WHERE id = ?",
                 (new_status, now_s, late_submit, int(inst["id"])),
             )
             # 2026-11-20 切期改造二-3（双向同步）：本周期内该成员名下其余未完成实例
@@ -4769,6 +4769,9 @@ class StateStore:
                 )
                 if latest_sub:
                     self.conn.execute("UPDATE submission SET status = 'rejected' WHERE id = ?", (int(latest_sub["id"]),))
+                # 2026-11-23：驳回后「最新非驳回提交」集合变化，重算物化列
+                # （无其他非驳回记录时置 NULL，与 get_latest_valid_submission 同口径）。
+                self._refresh_latest_submit_source_unlocked(instance_id)
             self._insert_audit_unlocked(reviewer, f"instance.{act}", "task_instance", str(instance_id), {"reason": clean_reason if act == "reject" else None}, now_s)
             res = dict(self.conn.execute("SELECT * FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone())
             res["resubmit_deadline"] = calc_resubmit_deadline(res["deadline_at"], res.get("reviewed_at")) if res["status"] == "rejected" else None
@@ -5358,12 +5361,28 @@ class StateStore:
             return dict(row) if row else None
 
     def instance_published_at(self, instance_id: int) -> Optional[str]:
+        """首次送达时间：2026-11-23 起读物化列 first_sent_at（写入由 reminder_log
+        'sent' 记录钩子与迁移回填共同维护）；历史行/异常路径漏写时现场按
+        reminder_log 重算一次并顺手回填（自愈，口径 = _FIRST_SENT_KINDS）。"""
         row = self.conn.execute(
-            "SELECT MIN(sent_at) AS published_at FROM reminder_log WHERE instance_id=? AND result='sent' "
-            "AND kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
-            "'notice_file_link','notice_video','notice_vid_link','portal')", (instance_id,),
+            "SELECT first_sent_at AS published_at FROM task_instance WHERE id = ?",
+            (int(instance_id),),
         ).fetchone()
-        return row["published_at"] if row else None
+        if row is None:
+            return None
+        if row["published_at"]:
+            return row["published_at"]
+        kinds_sql = ", ".join(f"'{k}'" for k in sorted(self._FIRST_SENT_KINDS))
+        legacy = self.conn.execute(
+            f"SELECT MIN(sent_at) AS published_at FROM reminder_log "
+            f"WHERE instance_id = ? AND result = 'sent' AND kind IN ({kinds_sql})",
+            (int(instance_id),),
+        ).fetchone()
+        value = legacy["published_at"] if legacy else None
+        if value:
+            with self.lock, self.conn:
+                self._mark_first_sent_unlocked(instance_id, value)
+        return value
 
     def get_instance_by_key(self, template_id: str, phone: str, period_key: str) -> Optional[Dict[str, Any]]:
         with self.lock:
@@ -5452,6 +5471,41 @@ class StateStore:
             )
         return {"attempted_at": now_s}
 
+    # ── 2026-11-23 物化冗余列（SCHEMA_VERSION=3）────────────────────────────
+    # 「首次送达时间」kind 口径 = admin 细分状态 published_at 的单一事实源：
+    # 提醒/推送/通知正文与附件/工作台下发算送达；回执提示(notice_receipt)、
+    # 提交回执(submit_ack)、驳回/逾期提示不算。与 db.py 迁移回填 SQL、
+    # instance_published_at 兜底保持一致（专项测试锁定三处一致）。
+    _FIRST_SENT_KINDS = frozenset({
+        "remind", "manual_push", "notice", "notice_img", "notice_img_link",
+        "notice_file", "notice_file_link", "notice_video", "notice_vid_link", "portal",
+    })
+
+    def _mark_first_sent_unlocked(self, instance_id, sent_at: Optional[str]) -> None:
+        """reminder_log 记到 result='sent' 时顺手物化「首次送达时间」。
+
+        仅当原值为 NULL 时写入（IS NULL 条件兜底幂等），保持「首次送达」语义；
+        后续重推/重发的 sent 不覆盖。单条 UPDATE，事务内原子，无需额外加锁。
+        """
+        if not instance_id:
+            return
+        self.conn.execute(
+            "UPDATE task_instance SET first_sent_at = ? WHERE id = ? AND first_sent_at IS NULL",
+            (sent_at, int(instance_id)),
+        )
+
+    def _refresh_latest_submit_source_unlocked(self, instance_id) -> None:
+        """重算「最新非驳回提交来源」物化列（无有效提交/驳回后置 NULL）。"""
+        row = self.conn.execute(
+            "SELECT source FROM submission WHERE instance_id = ? AND status != 'rejected' "
+            "ORDER BY id DESC LIMIT 1",
+            (int(instance_id),),
+        ).fetchone()
+        self.conn.execute(
+            "UPDATE task_instance SET latest_submit_source = ? WHERE id = ?",
+            (row["source"] if row else None, int(instance_id)),
+        )
+
     def record_reminder_log(
         self,
         *,
@@ -5475,13 +5529,26 @@ class StateStore:
                 ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (template_id, instance_id, phone, kind, planned_at, attempt_ts, sent_at, result, error, int(retry), idem_key),
             )
-            return int(cur.lastrowid) if cur.rowcount > 0 else None
+            if cur.rowcount > 0:
+                # 2026-11-23：投递成功时顺手物化首次送达时间（幂等，见 _mark_first_sent_unlocked）
+                if result == "sent" and kind in self._FIRST_SENT_KINDS:
+                    self._mark_first_sent_unlocked(instance_id, sent_at or attempt_ts)
+                return int(cur.lastrowid)
+            return None
 
     def complete_claimed_reminder(self, log_id: int, *, sent_at: Optional[str], result: str, error: Optional[str]) -> None:
-        self.conn.execute(
+        cur = self.conn.execute(
             "UPDATE reminder_log SET sent_at=?, result=?, error=? WHERE id=? AND result='pending'",
             (sent_at, result, error, int(log_id)),
         )
+        # 2026-11-23：调度器两段式投递（claim→complete）补记首次送达时间。
+        # 调用方（scheduler._record_delivery 等）已持有 conn 事务，这里读行补物化即可。
+        if result == "sent" and int(cur.rowcount or 0) > 0:
+            row = self.conn.execute(
+                "SELECT instance_id, kind, sent_at FROM reminder_log WHERE id = ?", (int(log_id),)
+            ).fetchone()
+            if row and row["instance_id"] and row["kind"] in self._FIRST_SENT_KINDS:
+                self._mark_first_sent_unlocked(row["instance_id"], row["sent_at"] or sent_at)
 
     def list_reminder_logs(self, template_id: Optional[str] = None, instance_id: Optional[int] = None, owner_id: Optional[int] = None) -> List[Dict[str, Any]]:
         where, params = [], []

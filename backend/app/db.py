@@ -45,7 +45,9 @@ def _is_read_only(sql: str) -> bool:
 
 # 2（2026-11-19）：task_instance 增加 role_name_snapshot（历史实例的角色名快照，
 # 模板改绑角色后不再随当前 role_ids 漂移）。
-SCHEMA_VERSION = 2
+# 3（2026-11-23）：任务实例物化冗余列 first_sent_at / latest_submit_source（消除
+# admin 统计的逐行相关子查询）+ 4 张核心大表高选择性索引（MySQL 5.7.43 幂等补建）。
+SCHEMA_VERSION = 3
 
 # §16 P6 台账约定：10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit)
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
@@ -110,7 +112,8 @@ CREATE TABLE IF NOT EXISTS member (
   owner_id   INT          NOT NULL DEFAULT 1,
   created_at VARCHAR(32)  NOT NULL,
   PRIMARY KEY (id),
-  UNIQUE KEY uk_member_role_phone (role_id, phone)
+  UNIQUE KEY uk_member_role_phone (role_id, phone),
+  KEY ix_member_phone (phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS delivery_target (
@@ -121,7 +124,8 @@ CREATE TABLE IF NOT EXISTS delivery_target (
   usable        TINYINT      NOT NULL DEFAULT 1,
   activated_at  VARCHAR(32)  NOT NULL,
   last_event_at VARCHAR(32)  NOT NULL,
-  PRIMARY KEY (platform, phone)
+  PRIMARY KEY (platform, phone),
+  KEY ix_dt_plat_ext (platform, external_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS task_template (
@@ -193,11 +197,14 @@ CREATE TABLE IF NOT EXISTS task_instance (
   resubmit_decided_by   VARCHAR(64) DEFAULT NULL,
   resubmit_decided_at   VARCHAR(32) DEFAULT NULL,
   resubmit_deadline     VARCHAR(32) DEFAULT NULL,
+  first_sent_at VARCHAR(32) DEFAULT NULL,
+  latest_submit_source VARCHAR(32) DEFAULT NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uk_inst_tpl_phone_period (template_id(64), phone, period_key),
   KEY ix_inst_status (status, deadline_at),
   KEY ix_inst_period (period_key),
-  KEY ix_inst_receipt (phone, receipt_platform, receipt_at)
+  KEY ix_inst_receipt (phone, receipt_platform, receipt_at),
+  KEY ix_inst_phone_status_dl (phone, status, deadline_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS notice_receipt_view (
@@ -232,7 +239,8 @@ CREATE TABLE IF NOT EXISTS submission (
   status      VARCHAR(16)  NOT NULL,
   created_at  VARCHAR(32)  NOT NULL,
   PRIMARY KEY (id),
-  KEY ix_sub_inst (instance_id, id)
+  KEY ix_sub_inst (instance_id, id),
+  KEY ix_sub_inst_status_id (instance_id, status, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS reminder_log (
@@ -289,7 +297,9 @@ CREATE TABLE IF NOT EXISTS h5_token (
   expires_at  VARCHAR(32) NOT NULL,
   consumed    TINYINT     NOT NULL DEFAULT 0,
   PRIMARY KEY (token_id),
-  KEY ix_h5tok_phone_tpl (phone, template_id)
+  KEY ix_h5tok_phone_tpl (phone, template_id),
+  KEY ix_h5tok_instance (instance_id),
+  KEY ix_h5tok_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS admin_user (
@@ -755,6 +765,56 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
         proxy.execute("ALTER TABLE reminder_log ADD INDEX ix_rem_instance_sent (instance_id, result, kind, sent_at)")
     if not proxy.execute("SHOW INDEX FROM admin_audit WHERE Key_name='ix_audit_target_action'").fetchone():
         proxy.execute("ALTER TABLE admin_audit ADD INDEX ix_audit_target_action (target_type, target_id, action, id)")
+
+    # ── 2026-11-23 SCHEMA_VERSION=3：物化冗余列 + 高选择性索引（幂等，MySQL 5.7.43 兼容）──
+    # ⛔ 不用 CREATE INDEX IF NOT EXISTS（MySQL 8.0 专属）；统一查 information_schema.statistics。
+    # 索引字节核算（utf8mb4 每字符 4 字节，5.7 DYNAMIC 行格式 + innodb_large_prefix 上限 3072）：
+    #   ix_inst_phone_status_dl 128+64+128=320B；ix_dt_plat_ext 64+512=576B；其余 ≤ 128B，全部远低于上限。
+    _materialized_cols = []
+    for column, definition in (
+        ("first_sent_at", "VARCHAR(32) DEFAULT NULL"),
+        ("latest_submit_source", "VARCHAR(32) DEFAULT NULL"),
+    ):
+        if not proxy.execute("SHOW COLUMNS FROM task_instance LIKE ?", (column,)).fetchone():
+            proxy.execute(f"ALTER TABLE task_instance ADD COLUMN {column} {definition}")
+            _materialized_cols.append(column)
+
+    # 首次新增列时对生产既有历史行做一次性回填（ correlated 子查询查 reminder_log /
+    # submission 两张外表，MySQL 5.7 合法；再次启动时列已存在，零操作）。
+    # kind 清单与 state._FIRST_SENT_KINDS 保持一致（admin 细分口径的单一事实源，测试锁定）。
+    if "first_sent_at" in _materialized_cols:
+        proxy.execute(
+            "UPDATE task_instance i SET first_sent_at = ("
+            "SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id = i.id "
+            "AND l.result = 'sent' AND l.kind IN ('remind','manual_push','notice','notice_img',"
+            "'notice_img_link','notice_file','notice_file_link','notice_video','notice_vid_link','portal')"
+            ") WHERE i.first_sent_at IS NULL")
+    if "latest_submit_source" in _materialized_cols:
+        proxy.execute(
+            "UPDATE task_instance i SET latest_submit_source = ("
+            "SELECT s.source FROM submission s WHERE s.instance_id = i.id "
+            "AND s.status != 'rejected' ORDER BY s.id DESC LIMIT 1)")
+
+    for table, index_name, ddl in (
+        ("task_instance", "ix_inst_phone_status_dl",
+         "ALTER TABLE task_instance ADD INDEX ix_inst_phone_status_dl (phone, status, deadline_at)"),
+        ("member", "ix_member_phone",
+         "ALTER TABLE member ADD INDEX ix_member_phone (phone)"),
+        ("delivery_target", "ix_dt_plat_ext",
+         "ALTER TABLE delivery_target ADD INDEX ix_dt_plat_ext (platform, external_id)"),
+        ("h5_token", "ix_h5tok_instance",
+         "ALTER TABLE h5_token ADD INDEX ix_h5tok_instance (instance_id)"),
+        ("h5_token", "ix_h5tok_expires",
+         "ALTER TABLE h5_token ADD INDEX ix_h5tok_expires (expires_at)"),
+        ("submission", "ix_sub_inst_status_id",
+         "ALTER TABLE submission ADD INDEX ix_sub_inst_status_id (instance_id, status, id)"),
+    ):
+        exists = proxy.execute(
+            "SELECT COUNT(1) AS cnt FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?",
+            (table, index_name)).fetchone()
+        if not exists or int(exists["cnt"] or 0) == 0:
+            proxy.execute(ddl)
 
 
 def _init_mysql_schema(proxy: "MySQLConnProxy", now_str_fn) -> None:

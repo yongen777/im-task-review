@@ -137,17 +137,23 @@ def test_remove_member_preserves_terminal_instances_of_that_role():
         s.close()
 
 
-# ── ④ 导入：重复整批拒绝 + 首次导入可改姓名部门并同步全局 ──────
-def test_import_duplicate_phone_blocks_whole_batch():
+# ── ④ 导入：本角色重复→跳过计数（9bbf41a 已拍板）+ 首次导入可改姓名部门并同步全局 ──────
+def test_import_duplicate_phone_skips_already_exists():
+    """2026-11-20 commit 9bbf41a「CSV 批量导入：本角色已存在成员改为跳过计数，
+    不再阻断整批」为已推送的用户拍板口径；本用例原断言（blocked=True、invalid
+    含「重复」）是该轮漏适配的旧语义，2026-11-23 全量体检时按现行口径补正：
+    同角色重复 → already_exists 计数 + 零写入 + 不阻断；真错误行才走整批拒绝。"""
     s = _store()
     try:
         rid = _role(s, "组")
         s.add_role_member(rid, "13700000005", "张三", "市场部", actor="t")
         res = s.import_role_members(rid, [{"row": 1, "phone": "13700000005", "name": "李四", "dept": "渠道部"}],
                                     dry_run=False, actor="t")
-        assert res.get("blocked") is True, res
+        assert res.get("blocked") is False, res
         assert res.get("will_add") == 0, res
-        assert any("重复" in (x.get("reason") or "") for x in res.get("invalid") or []), res
+        assert res.get("already_exists") == 1, res
+        assert res.get("already_exists_phones") == ["13700000005"], res
+        assert res.get("invalid") == [], res
         n = s.conn.execute("SELECT COUNT(*) FROM member WHERE role_id = ?", (rid,)).fetchone()[0]
         assert n == 1, n
     finally:
