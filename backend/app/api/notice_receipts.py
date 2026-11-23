@@ -16,6 +16,7 @@ def create_notice_receipt_router(state):
     router = APIRouter()
 
     @router.get(PAGE)
+    @router.get(PAGE + "/")
     def page():
         html = (Path(__file__).parents[1] / "h5" / "notice-receipt.html").read_text(encoding="utf-8")
         return HTMLResponse(html, headers=HEADERS)

@@ -60,7 +60,10 @@ def confirm(state, instance_id):
             "UPDATE task_instance SET receipt_at=?,receipt_text=receipt_phrase "
             "WHERE id=? AND receipt_mode='link' AND receipt_at IS NULL AND receipt_prompt_at IS NOT NULL "
             "AND status IN ('pending','sent') "
-            "AND template_id IN (SELECT template_id FROM task_template WHERE kind='notice' AND enabled=1 AND deleted=0)",
+            # 2026-11-23：授权成员（pt_）发布的通知同样可 H5 链接确认。
+            "AND (template_id IN (SELECT template_id FROM task_template WHERE kind='notice' AND enabled=1 AND deleted=0) "
+            "     OR (LEFT(template_id, 3)='pt_' AND EXISTS "
+            "         (SELECT 1 FROM portal_task pt WHERE pt.task_id=template_id)))",
             (now_s, instance_id),
         )
         if changed.rowcount:

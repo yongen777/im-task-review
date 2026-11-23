@@ -48,19 +48,19 @@ def test_department_choices_use_explicit_scope_or_current_subtree(portal, monkey
     platform, phone, owner = ident['platform'], ident['phone'], tpl['owner_id']
     rid = s.create_role('授权角色', owner_id=owner)['role_id']
     s.add_role_member(rid, phone, '测试成员', owner_id=owner)
-    monkeypatch.setattr(p, 'department_children', lambda platform, parent='': [])
-    monkeypatch.setattr(p, 'default_department', lambda platform, phone, roots: {'dept_id': 'a'})
+    # 2026-11-23：部门树改由本地名册 dept_path 实时聚合（旧的 department_children /
+    # default_department 已整体移除），这里不再需要替身。
 
     p.save_grant(platform, owner, phone, {'enabled': True, 'dept_ids': [], 'role_ids': [rid]}, 't')
     scope = p.recipients(ident)
-    assert {d['dept_id'] for d in scope['departments']} == {'a', 'a1'}
+    assert {d['dept_id'] for d in scope['departments']} == {'本部门', '本部门/下级部门'}
     assert {m['phone'] for m in scope['members']} == {phone, '13900009402'}
     with pytest.raises(BizError, match='接收成员超出授权范围'):
         publish(p, ident, phones=['13900009403'])
 
-    p.save_grant(platform, owner, phone, {'enabled': True, 'dept_ids': ['b'], 'role_ids': [rid]}, 't')
+    p.save_grant(platform, owner, phone, {'enabled': True, 'dept_ids': ['跨部门'], 'role_ids': [rid]}, 't')
     scope = p.recipients(ident)
-    assert {d['dept_id'] for d in scope['departments']} == {'b'}
+    assert {d['dept_id'] for d in scope['departments']} == {'跨部门'}
     assert {m['phone'] for m in scope['members']} == {phone, '13900009403'}
     with pytest.raises(BizError, match='接收成员超出授权范围'):
         publish(p, ident, phones=['13900009402'])

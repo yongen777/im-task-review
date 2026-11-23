@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, RefreshCw, Search, X } from 'lucide-react';
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, RefreshCw, Search, Users, X } from 'lucide-react';
 import { plainError } from '../../lib/api';
 import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
@@ -177,6 +177,8 @@ interface PortalTaskMeta {
   owner_id: number;
   platform?: string;
   kind: string;
+  is_notice?: boolean;
+  has_receipt?: boolean;
   period?: string;
   mode?: string;
   statistics_period: 'day' | 'week' | 'month';
@@ -199,8 +201,12 @@ interface PanelResultList {
 }
 
 interface PanelOverview {
+  template: { template_id: string; name: string; kind?: string; is_notice?: boolean; has_receipt?: boolean; is_receipt?: boolean };
   dept_tree: TreeNode[];
-  kpis: PeriodicKpis;
+  kpis: PeriodicKpis & {
+    expected_replies?: number; replied?: number; pending_replies?: number; reply_rate?: number;
+    expected_delivery?: number; delivered?: number; pending_delivery?: number; delivery_rate?: number;
+  };
   dept_stats: Record<string, { covered: number; done: number }>;
 }
 
@@ -226,8 +232,9 @@ export function PortalTasksView() {
 }
 
 function PortalMonitorCatalog() {
-  const { platform } = useAppStore();
+  const { platform, isSuperAdmin, setTabFocus } = useAppStore();
   const [data, setData] = useState<{ publishers: PublisherRow[]; tasks: PortalTaskMeta[] } | null>(null);
+  const [grantCount, setGrantCount] = useState(0);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
   const [publisherId, setPublisherId] = useState('');
@@ -236,9 +243,10 @@ function PortalMonitorCatalog() {
   useEffect(() => {
     let live = true;
     const load = () => portalAdminRequest(`portal-tasks?platform=${platform}`)
-      .then((result: { publishers?: PublisherRow[]; tasks?: PortalTaskMeta[] }) => {
+      .then((result: { publishers?: PublisherRow[]; tasks?: PortalTaskMeta[]; grant_count?: number }) => {
         if (!live) return;
         setData({ publishers: result.publishers || [], tasks: result.tasks || [] });
+        setGrantCount(result.grant_count || 0);
         setError('');
       })
       .catch((err: Error) => { if (live) setError(err.message); })
@@ -260,11 +268,16 @@ function PortalMonitorCatalog() {
   }, [tasks, taskId]);
 
   const task = tasks.find((item) => item.task_id === taskId);
+  const hasAnyTask = (data?.tasks?.length ?? 0) > 0;
+  /* 2026-11-23：彻底没有任务时改渲染精致空状态卡片（三步引导 + 分级管理员配置入口）。 */
+  const showEmpty = !loading && !error && !hasAnyTask;
   return <section className="space-y-4">
     <AdminScopeHeader title="授权成员发布任务"
       description={<>只读监管 · 按授权发布人筛选任务 · 每 30 秒自动刷新</>} />
     {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}
-    <div className={panelClass + ' grid items-start gap-3 p-4 md:grid-cols-[minmax(0,1.4fr)_minmax(0,2fr)_minmax(0,1fr)_minmax(0,1.35fr)]'}>
+    {showEmpty
+      ? <PortalMonitorEmpty authorized={grantCount} isSuperAdmin={isSuperAdmin} onConfigure={() => setTabFocus('roles')} />
+      : <div className={panelClass + ' grid items-start gap-3 p-4 md:grid-cols-[minmax(0,1.4fr)_minmax(0,2fr)_minmax(0,1fr)_minmax(0,1.35fr)]'}>
       <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
         发布人（授权领导）
         <select className={fieldClass} value={publisherId} onChange={(e) => setPublisherId(e.target.value)}>
@@ -282,8 +295,9 @@ function PortalMonitorCatalog() {
           {!tasks.length && <option value="">该发布人暂无任务</option>}
           {tasks.map((item) => {
             const creator = publishers.find((pub) => pub.phone === item.creator_phone);
+            const kindTag = item.is_notice ? (item.has_receipt ? ' · 通知（回执）' : ' · 通知') : '';
             return <option key={item.task_id} value={item.task_id}>
-              {item.name}{!publisherId && creator ? ' · ' + creator.name : ''}
+              {item.name}{kindTag}{!publisherId && creator ? ' · ' + creator.name : ''}
             </option>;
           })}
         </select>
@@ -293,15 +307,63 @@ function PortalMonitorCatalog() {
       </label>
       {task ? <PortalTaskMonitor key={task.task_id} task={task} /> : (
         <div className="md:col-span-2">
-          {!loading && !error && !data?.tasks?.length && (
-            <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">
-              当前平台暂无授权成员发布的任务
-            </div>
-          )}
           {!loading && !error && !!data?.tasks?.length && !tasks.length && (
             <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">该发布人暂无任务</div>
           )}
+          {loading && <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">正在加载任务清单…</div>}
         </div>
+      )}
+    </div>}
+  </section>;
+}
+
+/* 2026-11-23：空状态卡片——柔和蓝灰双色线性图标 + 主副标题 + 三步引导条；
+   分级管理员（sub_admin）底部给「前往成员名册配置授权」主操作，超管保持纯只读摘要。 */
+function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
+  authorized: number;
+  isSuperAdmin: boolean;
+  onConfigure: () => void;
+}) {
+  const steps = [
+    { title: '授权领导', desc: '在角色名册为指定成员开放 H5 建任务权限' },
+    { title: '手机发布', desc: '授权领导在个人工作台下发上传或通知任务' },
+    { title: '实时监管', desc: '此处按领导与部门实时查看统计并导出报表' },
+  ];
+  return <section className={panelClass + ' overflow-hidden'} aria-labelledby="portal-empty-title">
+    <div className="flex flex-col items-center px-6 py-12 text-center">
+      <div className="grid size-20 place-items-center rounded-2xl bg-gradient-to-br from-blue-50 via-slate-50 to-white ring-1 ring-blue-100">
+        <svg viewBox="0 0 48 48" fill="none" aria-hidden="true" className="size-11">
+          <path d="M15 9.5A3.5 3.5 0 0 1 18.5 6h11A3.5 3.5 0 0 1 33 9.5V35a3.5 3.5 0 0 1-3.5 3.5h-11A3.5 3.5 0 0 1 15 35V9.5Z"
+            stroke="#1d4e89" strokeWidth="2" strokeLinejoin="round" />
+          <path d="M21 6.5h6v5.5h-6z" stroke="#93b4d8" strokeWidth="2" strokeLinejoin="round" />
+          <path d="M19.5 20h9M19.5 26h6" stroke="#93b4d8" strokeWidth="2" strokeLinecap="round" />
+          <circle cx="33.5" cy="33.5" r="7" fill="#f6fafd" stroke="#1d4e89" strokeWidth="2" />
+          <path d="m30.6 33.6 2 2 3.6-4" stroke="#1d4e89" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </div>
+      <h3 id="portal-empty-title" className="mt-5 text-lg font-bold text-slate-900">还没有授权成员发布任务</h3>
+      <p className="mt-1.5 max-w-xl text-sm leading-6 text-slate-500">
+        {isSuperAdmin
+          ? '超管只读：授权由成员所属分级管理员在名册内完成，领导在手机工作台发布后，这里会自动出现可监管的统计与报表。'
+          : '按三步开通：先给领导开放 H5 建任务权限，领导在手机工作台发布上传或通知任务，发布后这里实时汇总统计。'}
+      </p>
+      <ol className="mt-7 grid w-full max-w-3xl gap-3 text-left sm:grid-cols-3">
+        {steps.map((step, index) => (
+          <li key={step.title} className="rounded-xl border border-slate-100 bg-slate-50/70 px-4 py-3.5">
+            <div className="flex items-center gap-2">
+              <span className="grid size-6 place-items-center rounded-full bg-blue-600 text-[11px] font-bold text-white">{index + 1}</span>
+              <strong className="text-sm text-slate-900">{step.title}</strong>
+            </div>
+            <p className="mt-1.5 text-xs leading-5 text-slate-500">{step.desc}</p>
+          </li>
+        ))}
+      </ol>
+      {!isSuperAdmin && (
+        <button type="button" onClick={onConfigure}
+          className="mt-7 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700">
+          <Users className="size-4" />前往成员名册配置授权
+          {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">已授权 {authorized} 人</span>}
+        </button>
       )}
     </div>
   </section>;
@@ -350,6 +412,15 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
   const roster = usePanelQuery<PanelResultList>(`${base}/instances?` + listParams, revision);
   const { data: overviewData } = overview;
   const { data: list } = roster;
+  /* 2026-11-23：通知任务口径——回执通知「已回复/待回复」，纯广播通知「已送达/未送达」。 */
+  const monitorMeta = overviewData?.template;
+  const hasReceipt = Boolean(monitorMeta?.has_receipt);
+  const isNotice = Boolean(monitorMeta?.is_notice || monitorMeta?.is_receipt || hasReceipt);
+  const tabLabels: Record<MonitorTab, string> = hasReceipt
+    ? { all: '全部', done: '已回复', todo: '待回复' }
+    : isNotice ? { all: '全部', done: '已送达', todo: '未送达' } : monitorTabs;
+  const timeHeader = isNotice ? (hasReceipt ? '回复时间' : '送达时间') : '提交时间';
+  const contentHeader = isNotice ? (hasReceipt ? '回复内容' : '送达情况') : '上报内容';
   const totalPages = Math.max(1, Math.ceil((list?.total ?? 0) / PAGE_SIZE));
   const page = filter.page;
   const refreshing = overview.loading || roster.loading;
@@ -452,18 +523,47 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
       {deptPath && <span className="truncate font-normal text-slate-500" title={deptPath}>{deptPath.split('/').join(' / ')}</span>}
     </div>
 
-    {/* KPI：与「任务数据统计」同款四卡 */}
-    {overviewData && (
-      <div className="md:col-span-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
-        <KpiCard label="应参与" value={overviewData.kpis.total} />
-        <KpiCard label="已完成" value={overviewData.kpis.done} color="text-emerald-700"
+    {/* KPI：上传任务 = 应参与/已完成/未完成/完成率；回执通知 = 应回复/已回复/待回复/回复率；
+        纯广播通知 = 应送达/已送达/未送达/送达率（2026-11-23 与领导 H5 面板同一口径） */}
+    {overviewData && (() => {
+      const k = overviewData.kpis;
+      const meta = overviewData.template || {};
+      const hasReceipt = Boolean(meta.has_receipt);
+      const isNotice = Boolean(meta.is_notice || meta.is_receipt || hasReceipt);
+      if (hasReceipt) {
+        const expected = k.expected_replies ?? k.total ?? 0;
+        const replied = k.replied ?? k.done ?? 0;
+        const rate = k.reply_rate ?? k.rate ?? 0;
+        return <div className="md:col-span-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+          <KpiCard label="应回复" value={expected} />
+          <KpiCard label="已回复" value={replied} color="text-emerald-700" hint="链接确认 / 文本回复" />
+          <KpiCard label="待回复" value={k.pending_replies ?? expected - replied} color="text-amber-700" hint="已送达未回执" />
+          <KpiCard label="回复率" value={expected ? rate + '%' : '—'} color="text-blue-700"
+            hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: rate + '%' }} /></div>} />
+        </div>;
+      }
+      if (isNotice) {
+        const expected = k.expected_delivery ?? k.total ?? 0;
+        const delivered = k.delivered ?? k.done ?? 0;
+        const rate = k.delivery_rate ?? k.rate ?? 0;
+        return <div className="md:col-span-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+          <KpiCard label="应送达" value={expected} />
+          <KpiCard label="已送达" value={delivered} color="text-emerald-700" hint="正文 + 附件已下发" />
+          <KpiCard label="未送达" value={k.pending_delivery ?? expected - delivered} color="text-amber-700" hint="含发送失败 / 仍在队列" />
+          <KpiCard label="送达率" value={expected ? rate + '%' : '—'} color="text-blue-700"
+            hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: rate + '%' }} /></div>} />
+        </div>;
+      }
+      return <div className="md:col-span-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <KpiCard label="应参与" value={k.total} />
+        <KpiCard label="已完成" value={k.done} color="text-emerald-700"
           hint="免审任务 · 提交即完成" />
-        <KpiCard label="未完成" value={overviewData.kpis.not_done} color="text-amber-700"
-          hint={'待提交 ' + overviewData.kpis.pending + ' · 逾期 ' + overviewData.kpis.overdue + ' · 驳回 ' + overviewData.kpis.rejected} />
-        <KpiCard label="完成率" value={overviewData.kpis.total ? overviewData.kpis.rate + '%' : '—'} color="text-blue-700"
-          hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: overviewData.kpis.rate + '%' }} /></div>} />
-      </div>
-    )}
+        <KpiCard label="未完成" value={k.not_done} color="text-amber-700"
+          hint={'待提交 ' + k.pending + ' · 逾期 ' + k.overdue + ' · 驳回 ' + k.rejected} />
+        <KpiCard label="完成率" value={k.total ? k.rate + '%' : '—'} color="text-blue-700"
+          hint={<div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-blue-500" style={{ width: k.rate + '%' }} /></div>} />
+      </div>;
+    })()}
 
     {/* 部门完成情况：按部门完成率进度条（点击下钻） */}
     {deptChildren.length > 0 && (
@@ -535,7 +635,7 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
         {(Object.keys(monitorTabs) as MonitorTab[]).map((tab) => (
           <button type="button" key={tab} aria-pressed={tab === status} onClick={() => { setStatus(tab); setFilter((current) => ({ ...current, page: 1 })); }}
             className={'rounded-lg px-2.5 py-1.5 text-xs font-medium ' + (tab === status ? 'bg-blue-50 text-blue-700' : 'text-slate-600 hover:bg-slate-50')}>
-            {monitorTabs[tab]}
+            {tabLabels[tab]}
           </button>
         ))}
       </div>
@@ -547,8 +647,8 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
               <th className="w-28 px-4 py-3 font-medium">成员</th>
               <th className="w-[17%] px-3 py-3 font-medium">所属部门</th>
               <th className="w-24 px-3 py-3 font-medium">状态</th>
-              <th className="w-36 px-3 py-3 font-medium">提交时间</th>
-              <th className="px-3 py-3 font-medium">上报内容</th>
+              <th className="w-36 px-3 py-3 font-medium">{timeHeader}</th>
+              <th className="px-3 py-3 font-medium">{contentHeader}</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
@@ -571,15 +671,21 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
                       : row.status === 'rejected' ? 'border-rose-200 text-rose-700'
                       : row.status === 'overdue' || row.status === 'expired' ? 'border-amber-200 text-amber-700'
                       : 'border-slate-200 text-slate-600')}>
-                    {row.status === 'approved' ? '已完成' : row.status === 'rejected' ? '已驳回'
+                    {isNotice
+                      ? (row.status === 'approved' ? (hasReceipt ? '已回复' : '已送达') : (hasReceipt ? '待回复' : '未送达'))
+                      : row.status === 'approved' ? '已完成' : row.status === 'rejected' ? '已驳回'
                       : row.status === 'overdue' || row.status === 'expired' ? '已逾期' : '未提交'}
                   </span>
                 </td>
                 <td className="px-3 py-3 tabular-nums text-slate-600">
-                  {row.submitted_at?.slice(5, 16) || '—'}
+                  {(row.submitted_at ?? (hasReceipt ? row.receipt_at : null))?.slice(5, 16) || '—'}
                   {row.late_submit && <div className="mt-0.5 text-amber-700">迟交</div>}
                 </td>
-                <td className="px-3 py-3"><SubmissionPreview content={row.content} onImageClick={setViewerSource} /></td>
+                <td className="px-3 py-3">
+                  {isNotice
+                    ? <span className="text-slate-600">{hasReceipt ? (row.receipt_text || '—') : (row.status === 'approved' ? '正文与附件已下发' : '尚未送达')}</span>
+                    : <SubmissionPreview content={row.content} onImageClick={setViewerSource} />}
+                </td>
               </tr>
             ))}
           </tbody>

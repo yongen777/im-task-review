@@ -18,16 +18,14 @@ def portal(ctx, monkeypatch):
     rid = tpl['role_ids'][0]
     p = PortalService(s)
     ident = {'phone': inst['phone'], 'platform': 'zdxlz'}
-    nodes = [{'dept_id': 'a', 'name': '本部门', 'parent_id': ''},
-             {'dept_id': 'a1', 'name': '下级部门', 'parent_id': 'a'},
-             {'dept_id': 'b', 'name': '跨部门', 'parent_id': ''}]
-    users = {'a': {inst['phone']}, 'a1': {'13900009402'}, 'b': {'13900009403'}}
-    monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (nodes, users))
-    monkeypatch.setattr(PortalService, 'grant_options', lambda self, *args, **kwargs: {'default_dept_ids': ['a']})
-    monkeypatch.setattr(PortalService, 'department_path', lambda self, platform, did: [n for n in nodes if n['dept_id'] == did])
-    for phone in ('13900009402', '13900009403'):
-        s.add_role_member(rid, phone, '范围成员', owner_id=tpl['owner_id'])
-        s.upsert_delivery_target(phone, phone)
+    # 2026-11-23：授权/选人改走本地名册 dept_path（零远程通讯录调用）——
+    # fixture 只把「已导入成员的真实部门」写进名册，不再提供 organization 替身。
+    for phone, dept in ((inst['phone'], '本部门'), ('13900009402', '本部门/下级部门'), ('13900009403', '跨部门')):
+        if phone != inst['phone']:
+            s.add_role_member(rid, phone, '范围成员', owner_id=tpl['owner_id'])
+            s.upsert_delivery_target(phone, phone)
+        s.conn.execute('UPDATE member SET dept_path=? WHERE role_id=? AND phone=?', (dept, rid, phone))
+    s.conn.commit()
     p.save_grant('zdxlz', tpl['owner_id'], inst['phone'], {'enabled': True}, 'tester')
     return p, ident, ctx
 
@@ -82,7 +80,7 @@ def test_default_descendants_cross_department_and_role_scope(portal):
     with pytest.raises(BizError) as err:
         publish(p, ident, phones=['13900009403'])
     assert err.value.status_code == 403
-    p.save_grant('zdxlz', tpl['owner_id'], ident['phone'], {'enabled': True, 'dept_ids': ['b'], 'role_ids': []}, 't')
+    p.save_grant('zdxlz', tpl['owner_id'], ident['phone'], {'enabled': True, 'dept_ids': ['跨部门'], 'role_ids': []}, 't')
     assert {m['phone'] for m in p.recipients(ident)['members']} == {'13900009403'}
     p.save_grant('zdxlz', tpl['owner_id'], ident['phone'], {'enabled': True, 'dept_ids': [], 'role_ids': tpl['role_ids']}, 't')
     assert len(p.recipients(ident)['members']) == 3
@@ -199,17 +197,30 @@ def test_admin_scope_platform_and_readonly_boundaries(portal):
     assert not p.can_submit({'phone': ident['phone']}, t)
 
 
-def test_new_organization_read_and_directory_failure(portal, monkeypatch):
+def test_local_tree_zero_remote_calls_and_directory_failure(portal):
+    """2026-11-23：授权弹窗与领导选人完全走本地名册 dept_path —— 0 次远程通讯录调用；
+    历史空授权 + 名册无部门时按 503 拒绝（不再远程解析）。"""
     p, ident, (s, _, _, _, _, _, tpl, _) = portal
-    # fixture 的 organization 是受控通讯录替身；每次发布都重新读取。
-    monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (
-        [{'dept_id': 'a', 'parent_id': '', 'name': '本部门'}], {'a': set()}))
+
+    class ExplodingContacts:
+        def __getattr__(self, name):
+            raise AssertionError('授权/选人不允许访问远程通讯录：' + name)
+
+    s.contacts = ExplodingContacts()
+    options = p.grant_options('zdxlz', tpl['owner_id'], ident['phone'])
+    assert [d['dept_id'] for d in options['departments']] == ['本部门', '本部门/下级部门', '跨部门']
+    assert [d['dept_id'] for d in options['selected_departments']] == ['本部门']
+    assert options['directory_notice'] == ''
+    assert {m['phone'] for m in p.recipients(ident)['members']} == {ident['phone'], '13900009402'}
     with pytest.raises(BizError) as err:
-        publish(p, ident)
+        p.grant_options('zdxlz', tpl['owner_id'], ident['phone'], parent='无此部门')
     assert err.value.status_code == 403
-    def unavailable(self, platform, root_ids=None):
-        raise BizError(503, 'DIRECTORY_UNAVAILABLE', '通讯录查询失败')
-    monkeypatch.setattr(PortalService, 'organization', unavailable)
+    # 历史空授权 + 名册缺部门：无法定位默认部门 → 503（口径与 2026-11-20 一致）
+    s.conn.execute("UPDATE portal_grant SET scope_json=? WHERE phone=? AND platform=?",
+                   ('{"dept_ids": [], "role_ids": []}', ident['phone'], 'zdxlz'))
+    s.conn.execute('UPDATE member SET dept_path=NULL WHERE role_id=? AND phone=?',
+                   (tpl['role_ids'][0], ident['phone']))
+    s.conn.commit()
     with pytest.raises(BizError) as err:
         p.recipients(ident)
     assert err.value.status_code == 503
@@ -231,30 +242,24 @@ def test_failed_delivery_and_concurrent_ticks_never_duplicate(portal):
     assert len(logs) == 1 and logs[0]['result'] == 'failed'
 
 
-def test_official_directory_tree_default_department(monkeypatch):
+def test_local_tree_default_department():
+    """2026-11-23：默认部门直接取名册 dept_path——全路径节点、含下级、零远程调用。"""
     s = _store()
     try:
         inst = _instance(s, 'zdxlz')
-        class Directory:
-            def get_department(self, did):
-                return {'dept_id': did, 'name': '官方根部门'}
-            def department_children(self, did):
-                return [{'dept_id': 'child', 'name': '官方当前部门'}] if did == 'root' else []
-            def dept_users_all(self, did):
-                return [{'phone': inst['phone']}] if did == 'child' else []
-            def search_by_phone_strict(self, phone):
-                return 'ok', {'dept_path': '官方根部门/官方当前部门'}
-        s.contacts = Directory()
-        monkeypatch.setenv('IMT_ORG_ROOT_DEPT_ID', 'root')
         p = PortalService(s)
-        nodes, users = p.organization('zdxlz')
-        assert [n['dept_id'] for n in nodes] == ['root', 'child']
-        assert users['child'] == {inst['phone']}
-        assert p.grant_options('zdxlz', 1, inst['phone'])['default_dept_ids'] == ['child']
-        monkeypatch.delenv('IMT_ORG_ROOT_DEPT_ID')
-        with pytest.raises(BizError) as err:
-            p.organization('zdxlz')
-        assert err.value.status_code == 503
+        rid = s.conn.execute('SELECT role_id FROM member WHERE phone=?', (inst['phone'],)).fetchone()[0]
+        s.conn.execute('UPDATE member SET dept_path=? WHERE role_id=? AND phone=?',
+                       ('官方根部门/官方当前部门', rid, inst['phone']))
+        s.conn.commit()
+        tree = p.local_dept_tree('zdxlz', 1)
+        assert [d['dept_id'] for d in tree['departments']] == ['官方根部门', '官方根部门/官方当前部门']
+        assert [d['member_count'] for d in tree['departments']] == [1, 1]
+        assert p.local_default_department('zdxlz', 1, inst['phone'])['dept_id'] == '官方根部门/官方当前部门'
+        options = p.grant_options('zdxlz', 1, inst['phone'])
+        assert options['default_dept_ids'] == ['官方根部门/官方当前部门']
+        children = p.grant_options('zdxlz', 1, inst['phone'], parent='官方根部门')['departments']
+        assert [d['dept_id'] for d in children] == ['官方根部门/官方当前部门']
     finally:
         s.close()
 

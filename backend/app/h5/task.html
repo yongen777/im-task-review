@@ -572,7 +572,10 @@
   </div>
   <script>
     (function () {
-      const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      /* 2026-11-23：查询参数与 hash 双兼容——工作台跳转用 `?from=portal#t=…`，
+         直接下发的链接仍是 `#t=…`；两处都读到才能保证手机端返回图标与令牌都生效。 */
+      const params = new URLSearchParams(window.location.search);
+      new URLSearchParams(window.location.hash.replace(/^#/, "")).forEach((value, key) => params.set(key, value));
       const token = params.get("t") || "";
       const wantsEdit = params.get("edit") === "1";
       const result = params.get("result");

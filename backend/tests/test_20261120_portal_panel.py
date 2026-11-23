@@ -31,13 +31,8 @@ def panel(ctx, monkeypatch):
     p = PortalService(s)
     leader = {'phone': inst['phone'], 'platform': 'zdxlz'}
     ident_b = {'phone': MEMBER_B, 'platform': 'zdxlz'}
-    nodes = [{'dept_id': 'a', 'name': '本部门', 'parent_id': ''},
-             {'dept_id': 'a1', 'name': '下级部门', 'parent_id': 'a'},
-             {'dept_id': 'b', 'name': '跨部门', 'parent_id': ''}]
-    users = {'a': {inst['phone']}, 'a1': {MEMBER_B}, 'b': {'13900009403'}}
-    monkeypatch.setattr(PortalService, 'organization', lambda self, platform, root_ids=None: (nodes, users))
-    monkeypatch.setattr(PortalService, 'grant_options', lambda self, *a, **k: {'default_dept_ids': ['a']})
-    monkeypatch.setattr(PortalService, 'department_path', lambda self, platform, did: [n for n in nodes if n['dept_id'] == did])
+    # 2026-11-23：授权弹窗与领导选人全部改走本地名册 dept_path（零远程通讯录调用），
+    # 因此 fixture 只需把成员的真实部门写进名册，不再需要 organization/department_path 替身。
     s.add_role_member(tpl['role_ids'][0], MEMBER_B, '范围甲', owner_id=tpl['owner_id'])
     s.upsert_delivery_target(MEMBER_B, MEMBER_B)
     # 监管面板的部门维度口径：成员名册部门（leader 归「本部门」，B 归「本部门/下级部门」）

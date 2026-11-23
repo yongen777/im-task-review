@@ -40,6 +40,9 @@ interface AppContextType {
   /* 2026-11-16 任务数据统计：模板行「统计」按钮 → 联动选中任务（seq 自增支持重复点击重置） */
   statsFocus: { id: string; seq: number };
   setStatsFocus: (templateId: string) => void;
+  /* 2026-11-23 授权成员发布任务：空状态「前往成员名册配置授权」→ 切到角色名册页（seq 自增支持重复点击） */
+  tabFocus: { tab: string; seq: number };
+  setTabFocus: (tab: string) => void;
   refreshAll: () => Promise<void>;
   refreshTemplates: () => Promise<void>;
   refreshRoles: () => Promise<void>;
@@ -74,6 +77,11 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
   const [statsFocus, setStatsFocusState] = useState<{ id: string; seq: number }>({ id: '', seq: 0 });
   const setStatsFocus = useCallback((templateId: string) => {
     setStatsFocusState((s) => ({ id: String(templateId || ''), seq: s.seq + 1 }));
+  }, []);
+  /* 2026-11-23：跨页签跳转（空状态 CTA → 角色与成员名册） */
+  const [tabFocus, setTabFocusState] = useState<{ tab: string; seq: number }>({ tab: '', seq: 0 });
+  const setTabFocus = useCallback((tab: string) => {
+    setTabFocusState((s) => ({ tab: String(tab || ''), seq: s.seq + 1 }));
   }, []);
   // 平台/管理员切换会立刻触发新一轮 refreshAll，上一轮的响应可能更慢才回来；
   // 用自增序号只认最后一轮，避免旧平台的数据覆盖当前平台的列表。
@@ -218,6 +226,8 @@ export const AppProvider: React.FC<{ me: CurrentAdminInfo; children: React.React
         memberDistinctTotal,
         statsFocus,
         setStatsFocus,
+        tabFocus,
+        setTabFocus,
         refreshAll,
         refreshTemplates,
         refreshRoles,

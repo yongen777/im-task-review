@@ -12,9 +12,70 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
     router, p = APIRouter(), PortalService(state)
 
     @router.get('/h5/portal')
+    @router.get('/h5/portal/')
     def page():
         return HTMLResponse((Path(__file__).parents[1] / 'h5' / 'portal.html').read_text(encoding='utf-8'),
                             headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+    @router.get('/h5/portal-create')
+    @router.get('/h5/portal-create/')
+    def create_page():
+        """2026-11-23：领导「新建任务」独立全屏页（上传任务 / 通知提醒双模）。"""
+        return HTMLResponse((Path(__file__).parents[1] / 'h5' / 'portal-create.html').read_text(encoding='utf-8'),
+                            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
+
+    @router.post('/api/h5/portal-asset/upload')
+    async def asset_upload(request: Request):
+        """领导端通知素材上传：复用后台 notice_asset 存储与校验（限 9/64/100MB）。"""
+        import io
+
+        from starlette.datastructures import UploadFile as StarletteUploadFile
+
+        from ..notice_media import LIMITS, store_asset
+
+        try:
+            ident = p.authenticate(request.headers.get('Authorization', '').removeprefix('Bearer '))
+            grants = p.require_creator(ident)
+            owner = min(int(g['owner_id']) for g in grants)
+            async with request.form() as form:
+                kind = str(form.get('kind') or '').strip()
+                file = form.get('file')
+                if kind not in LIMITS:
+                    raise BizError(400, 'INVALID_UPLOAD', '请选择要上传的图片、文件或视频')
+                if not isinstance(file, StarletteUploadFile) or not str(file.filename or '').strip():
+                    raise BizError(400, 'VALIDATION_FAILED', '请选择上传文件')
+                content = await file.read(LIMITS[kind] + 1)
+                if len(content) > LIMITS[kind]:
+                    raise BizError(400, 'FILE_SIZE_REJECTED',
+                                   f'附件必须非空且不超过 {LIMITS[kind] // (1024 * 1024)} MB')
+                asset = await asyncio.to_thread(
+                    store_asset, state, owner, kind, file.filename, io.BytesIO(content), len(content))
+                return {'ok': True, 'asset': asset}
+        except BizError as exc:
+            return JSONResponse({'code': exc.code, 'message': exc.message}, status_code=exc.status_code)
+        except (ValueError, TypeError):
+            return JSONResponse({'code': 'INVALID_BODY', 'message': '上传请求格式错误'}, status_code=400)
+
+    @router.get('/api/h5/portal-asset/{asset_id}')
+    def asset_preview(asset_id: str, request: Request):
+        """通知素材预览/下载（仅发布人本人授权范围可见）。"""
+        from ..notice_media import asset_path, get_asset
+
+        try:
+            ident = p.authenticate(request.headers.get('Authorization', '').removeprefix('Bearer '))
+            owners = {int(g['owner_id']) for g in p.require_creator(ident)}
+            asset = get_asset(state, asset_id)
+            if not asset or int(asset['owner_id']) not in owners:
+                raise BizError(404, 'NOT_FOUND', '附件不存在')
+            path = asset_path(state, asset)
+            if not path:
+                raise BizError(404, 'NOT_FOUND', '附件不可用')
+            inline = asset['kind'] in ('image', 'video')
+            return FileResponse(path, filename=asset['file_name'], media_type=asset['mime'],
+                                content_disposition_type='inline' if inline else 'attachment',
+                                headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
+        except BizError as exc:
+            return JSONResponse({'code': exc.code, 'message': exc.message}, status_code=exc.status_code)
 
     @router.post('/api/h5/portal/{action}')
     async def api(action: str, request: Request, background: BackgroundTasks):
@@ -150,7 +211,10 @@ def create_portal_admin_router(state):
                       if creators is None or t['creator_phone'] == creators]
         publishers = [row for row in p.publishers(platform=platform, owner=owner)
                       if creators is None or row['phone'] == creators]
+        # 2026-11-23：空状态卡片展示「当前已授权人数」，供分级管理员判断先去名册配置授权。
+        grant_count = p.grant_count(platform=platform, owner=owner)
         return {'ok': True,
+                'grant_count': grant_count,
                 'publishers': [{'id': pub['phone'], **pub} for pub in publishers],
                 'tasks': [p.panel_task_meta(t) for t in tasks_list]}
 

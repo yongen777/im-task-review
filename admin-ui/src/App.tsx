@@ -26,13 +26,18 @@ interface MainAppProps {
 }
 
 const MainApp: React.FC<MainAppProps> = ({ me, onLoggedOut }) => {
-  const { loading, templates, roles, stats, platform, statsFocus } = useAppStore();
+  const { loading, templates, roles, stats, platform, statsFocus, tabFocus } = useAppStore();
   const [activeTab, setActiveTab] = useState<TabKey>('instances');
 
   /* 2026-11-16 模板行「统计」按钮：跨面板联动切到统计页并选中该任务 */
   useEffect(() => {
     if (statsFocus.seq > 0) setActiveTab('stats');
   }, [statsFocus.seq]);
+
+  /* 2026-11-23 授权成员发布任务空状态 →「前往成员名册配置授权」跨页签跳转 */
+  useEffect(() => {
+    if (tabFocus.seq > 0 && tabFocus.tab) setActiveTab(tabFocus.tab as TabKey);
+  }, [tabFocus.seq, tabFocus.tab]);
 
   const isSuperAdmin = me.role_level !== 'sub_admin';
   const submittedCount = stats?.by_status?.submitted || 0;

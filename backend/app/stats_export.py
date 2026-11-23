@@ -78,6 +78,32 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
     from openpyxl.utils import get_column_letter
 
     rows = bundle['rows']
+    if bundle.get('is_delivery'):
+        # 2026-11-23：纯广播通知 → 送达口径（应送达 / 已送达 / 未送达 / 送达率）
+        wb = Workbook()
+        details = wb.active
+        details.title = '送达明细'
+        summary = wb.create_sheet('送达汇总')
+        details.append(['序号', '姓名', '手机号', '完整部门路径', '送达状态', '送达时间'])
+        for index, row in enumerate(rows, start=1):
+            delivered = bool(row.get('delivered'))
+            details.append([index, _safe_text(row['name_snap']), _safe_text(row['phone']), _safe_text(row['dept_path']),
+                            '已送达' if delivered else '未送达',
+                            row.get('submitted_at') if delivered else None])
+        sent_ok = sum(bool(row.get('delivered')) for row in rows)
+        summary.append(['应送达', '已送达', '未送达', '送达率'])
+        summary.append([len(rows), sent_ok, len(rows) - sent_ok, sent_ok / len(rows) if rows else 0])
+        summary['D2'].number_format = '0.0%'
+        for sheet, widths in ((details, [8, 18, 16, 42, 14, 23]), (summary, [14, 14, 14, 14])):
+            sheet.freeze_panes = 'A2'
+            for cell, width in zip(sheet[1], widths):
+                cell.font = Font(bold=True, color='183153')
+                cell.fill = PatternFill('solid', fgColor='E8F0FE')
+                sheet.column_dimensions[cell.column_letter].width = width
+        details.auto_filter.ref = details.dimensions
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
     if bundle.get('is_receipt'):
         wb = Workbook()
         details = wb.active

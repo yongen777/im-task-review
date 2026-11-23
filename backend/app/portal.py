@@ -1,8 +1,6 @@
 """个人工作台：独立授权/任务存储，共享提交与上传基础设施。"""
 import hashlib
 import json
-import os
-import time
 from datetime import datetime
 
 from .config import canonical_part, format_dt
@@ -12,54 +10,43 @@ from .state import BizError, calc_h5_token_ttl_hours, effective_instance_deadlin
 class PortalService:
     def __init__(self, state):
         self.s = state
-        # (platform, owner) -> (monotonic 时间戳, {dept_id: 已激活可投递成员数})，
-        # 只给授权弹窗的部门树裁剪用，见 _activated_dept_index。
-        self._dept_index_cache = {}
 
-    @staticmethod
-    def _subtree_members(nodes, direct):
-        """把「各部门直属成员集合」合并成「部门子树成员集合」。
+    # ── 2026-11-23 本地部门树（根治授权弹窗 / 选人页「组织架构读取超时」）──────
+    #
+    # 授权弹窗（grant_options）与领导 H5 选人页（recipients）**只**基于本地名册
+    # member.dept_path 实时聚合，打开即毫秒级，绝不再递归调用全省通讯录接口。
+    # 节点 dept_id = 部门全路径（'/' 连接，与 member.dept_path 同格式）：
+    # 稳定、可回溯，与「部门路径授权记录」天然兼容；口径与 members() 完全一致
+    # （已导入 + 已启用 + 未离职 + 已激活可投递），所以未激活成员不会撑起空部门。
 
-        组织架构树是父子引用结构，这里按深度自底向上合并一次，
-        避免对每个部门重跑 descendants() 造成 O(n²) 的重复遍历。
-        """
-        ids = {n['dept_id'] for n in nodes}
-        parent = {n['dept_id']: (n['parent_id'] if n['parent_id'] in ids else '') for n in nodes}
-        sets = {did: set(direct.get(did) or ()) for did in ids}
-        depth = {did: 0 for did in ids}
-        for _ in range(len(ids)):
-            moved = False
-            for did in ids:
-                pid = parent[did]
-                if pid and depth[did] <= depth[pid]:
-                    depth[did] = depth[pid] + 1
-                    moved = True
-            if not moved:
-                break
-        for did in sorted(ids, key=lambda d: depth[d], reverse=True):
-            pid = parent[did]
-            if pid:
-                sets[pid] |= sets[did]
-        return sets
+    def local_dept_tree(self, platform, owner):
+        """owner 名下名册的部门树：全路径节点 + 各部门子树可投递成员集合。"""
+        members = self.members(platform, owner)
+        nodes, subtree = {}, {}
+        for m in members:
+            path = str(m.get('dept_path') or '').replace('|', '/').strip().strip('/')
+            parts = [p.strip() for p in path.split('/') if p.strip()] if path else []
+            acc = []
+            for part in parts:
+                acc.append(part)
+                nodes.setdefault('/'.join(acc), {'name': part})
+            for node in nodes:
+                if path == node or path.startswith(node + '/'):
+                    subtree.setdefault(node, set()).add(m['phone'])
+        departments = [{'dept_id': node, 'name': nodes[node]['name'],
+                        'parent_id': node.rsplit('/', 1)[0] if '/' in node else '',
+                        'has_children': any(other.startswith(node + '/') for other in nodes),
+                        'member_count': len(subtree.get(node) or ())} for node in nodes]
+        departments.sort(key=lambda d: d['dept_id'])
+        return {'departments': departments, 'paths': set(nodes), 'subtree': subtree}
 
-    def _activated_dept_index(self, platform, owner):
-        """dept_id -> 该部门**子树**内「已激活可投递」成员数。
-
-        口径与 members() 一致：名册成员 + delivery_target.usable=1 + 平台匹配，
-        所以未激活 / 已离组织的成员不会撑起空部门。
-        代价是一次组织架构全量遍历（与领导 H5 选人页同源），因此做 30 秒短缓存，
-        避免弹窗每展开一层就再拉一遍通讯录。
-        """
-        key = (platform, owner)
-        cached = self._dept_index_cache.get(key)
-        if cached and time.monotonic() - cached[0] < 30:
-            return cached[1]
-        nodes, users = self.organization(platform)
-        roster = {m['phone'] for m in self.members(platform, owner)}
-        direct = {n['dept_id']: (users.get(n['dept_id']) or set()) & roster for n in nodes}
-        index = {did: len(phones) for did, phones in self._subtree_members(nodes, direct).items()}
-        self._dept_index_cache[key] = (time.monotonic(), index)
-        return index
+    def local_default_department(self, platform, owner, phone):
+        """成员本人当前部门——直接取本地名册 dept_path，不再远程核对。"""
+        row = next((m for m in self.members(platform, owner, phone)), None)
+        path = str((row or {}).get('dept_path') or '').replace('|', '/').strip().strip('/')
+        if not path:
+            return None
+        return {'dept_id': path, 'name': path.replace('/', ' / ')}
 
     def issue(self, phone, platform):
         if not self.members(platform, phone=phone):
@@ -91,95 +78,9 @@ class PortalService:
     def admin_contacts(self, ident):
         return self.s.member_admin_contacts(ident['phone'], ident['platform'])
 
-    def directory(self, platform):
-        c = getattr(self.s, 'wecom_contacts' if platform == 'wecom' else 'contacts', None)
-        if c is None:
-            raise BizError(503, 'DIRECTORY_UNAVAILABLE', '最新组织架构暂不可用，请稍后重试')
-        return c
-
-    def department_children(self, platform, parent=''):
-        c = self.directory(platform)
-        try:
-            if platform == 'wecom':
-                departments = c.org_departments(parent)
-            elif parent:
-                departments = c.department_children(parent)
-            else:
-                root = os.environ.get('IMT_ORG_ROOT_DEPT_ID', '').strip()
-                if not root:
-                    raise BizError(503, 'DIRECTORY_UNAVAILABLE', '量子密信尚未配置组织根部门')
-                item = c.get_department(root)
-                departments = [item] if item else []
-            if not parent and not departments:
-                raise BizError(503, 'DIRECTORY_UNAVAILABLE', '组织根部门读取失败，请检查通讯录配置')
-            return [{'dept_id': str(d['dept_id']), 'name': d['name'], 'parent_id': parent,
-                     'has_children': d.get('has_children', True)} for d in departments]
-        except BizError:
-            raise
-        except Exception as exc:
-            raise BizError(503, 'DIRECTORY_UNAVAILABLE', '组织部门读取失败，请稍后重试') from exc
-
-    def department_path(self, platform, dept_id):
-        c = self.directory(platform)
-        if platform == 'wecom':
-            nodes = {str(d['dept_id']): d for d in c.org_directory()}
-            item = nodes.get(dept_id)
-            trail = []
-            while item and len(trail) < len(nodes):
-                trail.append(item)
-                parent = str(item['parent_id'])
-                if parent == '0':
-                    return list(reversed(trail))
-                item = nodes.get(parent)
-            return []
-        root = os.environ.get('IMT_ORG_ROOT_DEPT_ID', '').strip()
-        current = c.get_department(dept_id) if root else None
-        if not current:
-            return []
-        trail = [current] + (c.department_parents(dept_id) if dept_id != root else [])
-        for idx, item in enumerate(trail):
-            if str(item['dept_id']) == root:
-                return list(reversed(trail[:idx+1]))
-        return []
-
-    def organization(self, platform, root_ids=None):
-        c = self.directory(platform)
-        nodes, users, seen = [], {}, set()
-        def visit(d, parent=''):
-            did = str(d['dept_id'])
-            if did in seen:
-                return
-            if len(seen) >= 3000:
-                raise BizError(503, 'DIRECTORY_LIMIT', '组织架构过大，请联系管理员')
-            seen.add(did)
-            nodes.append({'dept_id': did, 'name': d['name'], 'parent_id': parent})
-            rows = c.org_department_users(did) if platform == 'wecom' else c.dept_users_all(did)
-            users[did] = {str(u.get('phone') or '') for u in rows if u.get('phone')}
-            children = self.department_children(platform, did) if d.get('has_children', True) else []
-            for child in children:
-                visit(child, did)
-        try:
-            roots = self.department_children(platform) if root_ids is None else []
-            if root_ids is not None:
-                paths = [self.department_path(platform, did) for did in root_ids]
-                roots = [path[-1] for path in paths if path and not any(str(d['dept_id']) in root_ids for d in path[:-1])]
-            for root in roots:
-                visit(root)
-        except BizError:
-            raise
-        except Exception as exc:
-            raise BizError(503, 'DIRECTORY_UNAVAILABLE', '最新组织架构查询失败，请稍后重试') from exc
-        return nodes, users
-
-    @staticmethod
-    def descendants(nodes, roots):
-        result = set(roots)
-        for _ in range(len(nodes)):
-            added = {n['dept_id'] for n in nodes if n['parent_id'] in result} - result
-            if not added:
-                break
-            result.update(added)
-        return result
+    # 2026-11-23：旧的远程通讯录树（directory / department_children / department_path /
+    # organization / descendants）已整体移除——授权弹窗与选人页改走 local_dept_tree，
+    # 打开即毫秒级，不再有「组织架构读取超时」。
 
     def grants(self, ident):
         rows = self.s.conn.execute('SELECT * FROM portal_grant WHERE phone=? AND platform=? AND enabled=1',
@@ -201,70 +102,30 @@ class PortalService:
                                  (owner, platform, phone)).fetchone()
         return {'roles': self.s.list_roles(platform=platform, owner_id=owner), 'grant': dict(row) if row else None}
 
-    def default_department(self, platform, phone, roots):
-        c = self.directory(platform)
-        verify = c.resolve_user_strict if platform == 'wecom' else c.search_by_phone_strict
-        status, profile = verify(phone)
-        if status != 'ok':
-            raise BizError(503, 'DIRECTORY_UNAVAILABLE', '成员当前部门核对失败，请稍后重试')
-        if not profile or not profile.get('dept_path'):
-            return None
-        official_path = profile['dept_path'].replace('|', '/')
-        exact = next((d for d in profile.get('departments', []) if isinstance(d, dict) and d.get('dept_id')
-                      and str(d.get('full_name') or '').replace('|', '/') == official_path), None)
-        if exact:
-            path = self.department_path(platform, str(exact['dept_id']))
-            if path:
-                return {'dept_id': str(path[-1]['dept_id']), 'name': ' / '.join(d['name'] for d in path)}
-        names = [name.strip() for name in official_path.split('/') if name.strip()]
-        for index, name in enumerate(names):
-            root = next((item for item in roots if item['name'] == name), None)
-            if root:
-                path = [root]
-                for segment in names[index+1:]:
-                    candidates = [d for d in self.department_children(platform, path[-1]['dept_id']) if d['name'] == segment]
-                    if len(candidates) != 1:
-                        return None
-                    path.append(candidates[0])
-                return {'dept_id': path[-1]['dept_id'], 'name': ' / '.join(d['name'] for d in path)}
-        return None
-
     def grant_options(self, platform, owner, phone, parent='', with_directory=True):
         info = self.grant_info(platform, owner, phone)
-        if parent and not self.department_path(platform, parent):
-            raise BizError(403, 'INVALID_SCOPE', '部门不在当前组织架构中')
-        departments = self.department_children(platform, parent)
-        notice = ''
-        if with_directory:
-            # 2026-11-20：授权弹窗的部门树按「已激活可投递成员」裁剪——子树 0 人的空部门不下发，
-            # 并把各子树人数（member_count）带给前端标注。通讯录不可用时退回未裁剪的树，
-            # 只在提示区说明，不阻断授权。
-            try:
-                counts = self._activated_dept_index(platform, owner)
-            except BizError as exc:
-                counts = None
-                notice = exc.message or '部门人数暂不可用，已展示完整组织架构'
-            if counts is not None:
-                departments = [dict(d, member_count=counts.get(d['dept_id'], 0))
-                               for d in departments if counts.get(d['dept_id'])]
+        tree = self.local_dept_tree(platform, owner)
         if parent:
-            return {'departments': departments, 'directory_notice': notice}
-        selected = []
-        default = None
+            if parent not in tree['paths']:
+                raise BizError(403, 'INVALID_SCOPE', '部门不在当前授权范围内')
+            children = [dict(d) for d in tree['departments'] if d['parent_id'] == parent]
+            if with_directory:
+                children = [c for c in children if c['member_count']]
+            return {'departments': children, 'directory_notice': ''}
+        departments = [d for d in tree['departments'] if d['member_count']] if with_directory else tree['departments']
+        selected, default = [], None
         scope = json.loads(info['grant']['scope_json']) if info['grant'] and info['grant']['enabled'] else None
         if scope:
             for did in scope['dept_ids']:
-                path = self.department_path(platform, did)
-                selected.append({'dept_id': did, 'name': ' / '.join(d['name'] for d in path) if path else f'部门 {did}（已不可用）'})
+                known = did in tree['paths']
+                selected.append({'dept_id': did,
+                                 'name': did.replace('/', ' / ') if known else f'部门 {did}（历史授权，请重新勾选）'})
         else:
-            try:
-                default = self.default_department(platform, phone, self.department_children(platform, parent))
-            except BizError as exc:
-                notice = notice or exc.message
+            default = self.local_default_department(platform, owner, phone)
             if default:
                 selected.append(default)
         return {**info, 'departments': departments, 'selected_departments': selected,
-                'default_dept_ids': [default['dept_id']] if default else [], 'directory_notice': notice}
+                'default_dept_ids': [default['dept_id']] if default else [], 'directory_notice': ''}
 
     def save_grant(self, platform, owner, phone, data, actor):
         if not self.members(platform, owner, phone):
@@ -275,20 +136,31 @@ class PortalService:
             options = self.grant_info(platform, owner, phone)
             depts = data.get('dept_ids')
             if depts is None:
-                depts = self.grant_options(platform, owner, phone, with_directory=False)['default_dept_ids']
+                default = self.local_default_department(platform, owner, phone)
+                depts = [default['dept_id']] if default else []
             roles = data.get('role_ids', [])
             if (not isinstance(depts, list) or not isinstance(roles, list)
                     or len(depts) > 100 or any(not isinstance(x, str) or not x for x in depts + roles)):
                 raise BizError(400, 'INVALID_SCOPE', '管辖范围格式错误')
             if not depts and not roles:
-                # 2026-11-20：开启授权但一个部门/角色都没勾 → 不再抛 EMPTY_SCOPE，
-                # 自动回退为「成员当前所在部门」。下级部门由 recipients() 的
-                # descendants() 展开，所以这里只存当前部门本身。
-                depts = self.grant_options(platform, owner, phone, with_directory=False)['default_dept_ids']
+                # 2026-11-20：开启授权但一个部门/角色都没勾 → 自动回退为「成员当前所在部门」。
+                # 2026-11-23：回退数据源改为本地名册 dept_path（零远程调用）。
+                default = self.local_default_department(platform, owner, phone)
+                depts = [default['dept_id']] if default else []
                 if not depts:
                     raise BizError(400, 'SCOPE_UNRESOLVED',
                                    '未能识别该成员当前所在部门，请手动勾选部门或角色分组')
-            if set(roles) - {r['role_id'] for r in options['roles']} or any(not self.department_path(platform, did) for did in set(depts)):
+            # 2026-11-23：部门 id = 本地名册部门全路径；**历史保存的旧 dept_ids 原样放行**，
+            # 保证已有授权记录重新保存（不勾动）不会被 403 挡住。
+            previous = set()
+            if options['grant'] and options['grant']['enabled']:
+                try:
+                    previous = set(json.loads(options['grant']['scope_json']).get('dept_ids') or [])
+                except (ValueError, TypeError):
+                    previous = set()
+            tree_paths = self.local_dept_tree(platform, owner)['paths']
+            if set(roles) - {r['role_id'] for r in options['roles']} or any(
+                    did not in tree_paths and did not in previous for did in set(depts)):
                 raise BizError(403, 'INVALID_SCOPE', '管辖范围超出当前组织或管理员角色')
         with self.s.conn:
             self.s.conn.execute('INSERT INTO portal_grant(owner_id,platform,phone,enabled,scope_json,updated_at) '
@@ -299,69 +171,64 @@ class PortalService:
         return {'ok': True}
 
     def recipients(self, ident):
+        """领导选人页可选范围：**完全走本地名册部门树**（0 次远程通讯录调用）。
+
+        每条授权独立生效：部门授权 → 该部门子树；未勾部门 → 回退「成员本人部门」
+        子树（2026-11-20 口径不变）；另叠加角色授权。部门 id = 部门全路径，
+        与 grant_options 的树同一口径，授权范围校验与选人 100% 一致。
+        """
         grants = self.require_creator(ident)
-        scopes = [json.loads(grant['scope_json']) for grant in grants]
-        nodes, users, directory_error = [], {}, ''
-        root_ids = set()
-        try:
-            # 2026-11-20：每条授权**独立**回退默认部门。
-            # 原实现是所有授权共用一个 default 并在 `not root_ids` 时整体覆盖：
-            # 只要某条授权填了部门，另一条空授权的成员就永远选不到；多管理员授权同一人时
-            # 还会互相覆盖同一个默认部门。这里改为逐条判断、逐条回退，互不影响。
-            # 回退条件保持 2026-11-18 的口径不变：**该条授权没勾部门**就用「成员当前部门子树」
-            # （只勾了角色也走这条，部门树照旧可见），只是不再被别的授权连带/抑制。
-            # ⛔ 回退失败必须局部兜住：通讯录抖一下不能让整个选人页塌成空。
-            roots = None
-            for scope in scopes:
-                if scope['dept_ids']:
-                    continue
-                if roots is None:
-                    try:
-                        roots = self.department_children(ident['platform'])
-                    except BizError as exc:
-                        directory_error = exc.message
-                        break
-                try:
-                    default = self.default_department(ident['platform'], ident['phone'], roots)
-                except BizError as exc:
-                    directory_error = exc.message
-                    continue
+        all_members, allowed_nodes, node_names, roles = {}, set(), {}, {}
+        directory_error = ''
+        for grant in grants:
+            scope = json.loads(grant['scope_json'])
+            tree = self.local_dept_tree(ident['platform'], grant['owner_id'])
+            node_names.update({p: d['name'] for p, d in ((n['dept_id'], n) for n in tree['departments'])})
+            ds = set()
+            for did in scope['dept_ids']:
+                if did in tree['paths']:
+                    ds |= {p for p in tree['paths'] if p == did or p.startswith(did + '/')}
+            if not ds:
+                # 2026-11-23 向下兼容：未勾部门，或历史远程 dept_ids 全部无法本地解析时，
+                # 回退「成员本人当前部门」子树（授权继续生效，不会因升级突然失效）。
+                default = self.local_default_department(ident['platform'], grant['owner_id'], ident['phone'])
                 if default:
-                    scope['dept_ids'] = [default['dept_id']]
-            root_ids = {did for scope in scopes for did in scope['dept_ids']}
-            if root_ids:
-                nodes, users = self.organization(ident['platform'], root_ids)
-        except BizError as exc:
-            directory_error = directory_error or exc.message
-            root_ids = {did for scope in scopes for did in scope['dept_ids']}
-        all_members, allowed_nodes, roles = {}, set(), {}
-        for grant, scope in zip(grants, scopes):
-            ds = self.descendants(nodes, scope['dept_ids'])
+                    ds |= {p for p in tree['paths']
+                           if p == default['dept_id'] or p.startswith(default['dept_id'] + '/')}
+                else:
+                    directory_error = directory_error or '未能识别成员当前所在部门，请让管理员重新配置授权范围'
             allowed_nodes.update(ds)
-            phones = set().union(*(users.get(d, set()) for d in ds)) if ds else set()
+            phones = set().union(*(tree['subtree'].get(d, set()) for d in ds)) if ds else set()
             live_roles = {r['role_id']: r for r in self.s.list_roles(platform=ident['platform'], owner_id=grant['owner_id'])}
             rs = set(scope['role_ids']) & set(live_roles)
             roles.update({rid: live_roles[rid] for rid in rs})
             for m in self.members(ident['platform'], grant['owner_id']):
-                if m['phone'] in phones or m['role_id'] in rs:
-                    item = all_members.setdefault(m['phone'], {'phone': m['phone'], 'name': m['name'],
-                        'dept_ids': [], 'role_ids': [], 'owner_ids': [], 'member_role_ids': []})
-                    item['dept_ids'].extend(did for did in ds if did not in item['dept_ids'] and m['phone'] in users.get(did, set()))
-                    item['role_ids'].extend([m['role_id']] if m['role_id'] in rs else [])
-                    item['member_role_ids'].append(m['role_id'])
-                    item['owner_ids'].append(grant['owner_id'])
-        if directory_error and not roles:
+                if m['phone'] not in phones and m['role_id'] not in rs:
+                    continue
+                item = all_members.setdefault(m['phone'], {'phone': m['phone'], 'name': m['name'],
+                    'dept_ids': [], 'role_ids': [], 'owner_ids': [], 'member_role_ids': []})
+                path = str(m.get('dept_path') or '').replace('|', '/').strip().strip('/')
+                ancestors = []
+                acc = []
+                for part in [p for p in path.split('/') if p]:
+                    acc.append(part)
+                    ancestors.append('/'.join(acc))
+                item['dept_ids'].extend(did for did in ancestors
+                                        if did in allowed_nodes and did not in item['dept_ids'])
+                item['role_ids'].extend([m['role_id']] if m['role_id'] in rs else [])
+                item['member_role_ids'].append(m['role_id'])
+                item['owner_ids'].append(grant['owner_id'])
+        if directory_error and not roles and not allowed_nodes:
             raise BizError(503, 'DIRECTORY_UNAVAILABLE', directory_error)
-        # 2026-11-20：选人页部门树同样按「已激活可投递成员」裁剪——
-        # 子树内一个人都选不到的部门不下发，前端就不会再出现「0 人」空分支。
-        direct = {n['dept_id']: set() for n in nodes}
-        for phone, item in all_members.items():
-            for did in item['dept_ids']:
-                direct.setdefault(did, set()).add(phone)
-        subtree = self._subtree_members(nodes, direct)
-        return {'departments': [d for d in nodes
-                                if d['dept_id'] in allowed_nodes and subtree.get(d['dept_id'])],
-                'roles': list(roles.values()), 'members': list(all_members.values()), 'directory_error': directory_error}
+        # 2026-11-20：选人页部门树按「已激活可投递成员」裁剪——子树 0 人的空部门不下发。
+        departments = [{'dept_id': path, 'name': node_names.get(path) or path.rsplit('/', 1)[-1],
+                        'parent_id': path.rsplit('/', 1)[0] if '/' in path else '',
+                        'has_children': any(other.startswith(path + '/') for other in allowed_nodes),
+                        'member_count': sum(1 for item in all_members.values() if path in item['dept_ids'])}
+                       for path in sorted(allowed_nodes)]
+        return {'departments': [d for d in departments if d['member_count']],
+                'roles': list(roles.values()), 'members': list(all_members.values()),
+                'directory_error': directory_error}
 
     def template(self, task_id):
         row = self.s.conn.execute('SELECT * FROM portal_task WHERE task_id=?', (task_id,)).fetchone()
@@ -395,34 +262,49 @@ class PortalService:
         mode = data.get('mode', 'once')
         if mode not in ('once', 'day', 'week', 'month'):
             raise BizError(400, 'INVALID_PERIOD', '任务周期无效')
+        kind = 'notice' if data.get('kind') == 'notice' else 'upload'
         payload = {k: data[k] for k in ('name', 'remind_at', 'has_deadline', 'deadline_type', 'deadline_time', 'anchor_weekday', 'anchor_dom', 'exec_weekdays', 'exec_dom_days') if k in data}
         payload.setdefault('remind_at', '08:00')
         payload.setdefault('has_deadline', mode != 'once')
         payload.setdefault('deadline_time', '23:59')
         if mode == 'once':
             payload.update({'remind_at': '00:00', 'has_deadline': False})
-        raw_spec = data.get('spec')
-        if raw_spec is None:
-            raw_spec = {}
-        if not isinstance(raw_spec, dict):
-            raise BizError(400, 'INVALID_MODULES', '提交内容配置格式错误')
-        modules = data.get('upload_modules', raw_spec.get('upload_modules', ['text']))
-        if not isinstance(modules, list) or not modules or any(m not in ('fields', 'text', 'image', 'file') for m in modules):
-            raise BizError(400, 'INVALID_MODULES', '请至少选择一种提交内容类型')
-        spec = {key: raw_spec[key] for key in ('fields', 'allow_multiple_images', 'allow_multiple_files') if key in raw_spec}
-        for key in ('allow_multiple_images', 'allow_multiple_files'):
-            if key in data and key not in spec:
-                spec[key] = data[key]
-        spec.update({'upload_modules': list(dict.fromkeys(modules)), 'require_review': False,
-                     'text_label': '文字情况说明', 'text_placeholder': '请填写补充说明…'})
-        payload.update({'role_ids': sorted({r for m in selected for r in m['member_role_ids']}),
-                        'kind': 'upload', 'need_review': False, 'is_adhoc': False,
-                        'period': mode if mode != 'once' else 'day', 'enabled': True,
-                        'text_tpl': data.get('description') or data.get('name') or '',
-                        'schema_json': data.get('schema_json'), 'allow_note': True,
-                        'spec': spec, 'max_file_mb': 10 if 'file' in modules else 9})
+        if kind == 'notice':
+            # 2026-11-23：领导 H5「通知提醒」——文本/图片/文件/视频（复用后台同款素材校验与存储）
+            # + 可选回执（link 默认 / text），投递走 scheduler._deliver_notice 同一条链。
+            spec = self._notice_spec(data, task_owner)
+            payload.update({'role_ids': sorted({r for m in selected for r in m['member_role_ids']}),
+                            'kind': 'notice', 'need_review': False, 'is_adhoc': False,
+                            'period': 'day', 'enabled': True, 'allow_note': False,
+                            'text_tpl': data.get('description') or data.get('name') or '',
+                            'schema_json': None, 'spec': spec})
+            if mode == 'once':
+                payload['is_manual'] = True
+            else:
+                payload['notice_times'] = [str(data.get('remind_at') or '08:00')]
+        else:
+            raw_spec = data.get('spec')
+            if raw_spec is None:
+                raw_spec = {}
+            if not isinstance(raw_spec, dict):
+                raise BizError(400, 'INVALID_MODULES', '提交内容配置格式错误')
+            modules = data.get('upload_modules', raw_spec.get('upload_modules', ['text']))
+            if not isinstance(modules, list) or not modules or any(m not in ('fields', 'text', 'image', 'file') for m in modules):
+                raise BizError(400, 'INVALID_MODULES', '请至少选择一种提交内容类型')
+            spec = {key: raw_spec[key] for key in ('fields', 'allow_multiple_images', 'allow_multiple_files') if key in raw_spec}
+            for key in ('allow_multiple_images', 'allow_multiple_files'):
+                if key in data and key not in spec:
+                    spec[key] = data[key]
+            spec.update({'upload_modules': list(dict.fromkeys(modules)), 'require_review': False,
+                         'text_label': '文字情况说明', 'text_placeholder': '请填写补充说明…'})
+            payload.update({'role_ids': sorted({r for m in selected for r in m['member_role_ids']}),
+                            'kind': 'upload', 'need_review': False, 'is_adhoc': False,
+                            'period': mode if mode != 'once' else 'day', 'enabled': True,
+                            'text_tpl': data.get('description') or data.get('name') or '',
+                            'schema_json': data.get('schema_json'), 'allow_note': True,
+                            'spec': spec, 'max_file_mb': 10 if 'file' in modules else 9})
         # 周期和动态截止字段统一由现有模板校验器处理。
-        norm = self.s._validate_and_normalize_template_unlocked(payload, existing=None)
+        norm = self.s._validate_and_normalize_template_unlocked(payload, existing=None, owner_id=task_owner)
         norm['role_ids'] = json.loads(norm.pop('role_ids_json'))
         norm['schema_json'] = json.loads(norm['schema_json'] or '[]')
         norm['spec_json'] = json.loads(norm['spec_json'] or '{}')
@@ -451,6 +333,42 @@ class PortalService:
                 (task_id, ident['platform'], ident['phone'], task_owner, json.dumps(norm, ensure_ascii=False),
                  json.dumps(selected, ensure_ascii=False), self.s.now_str()))
         return {'ok': True, 'task_id': task_id}
+
+    def _notice_spec(self, data, owner):
+        """领导端通知内容 spec：素材（图片/文件/视频，复用 notice_asset）+ 可选回执配置。"""
+        from .notice_media import get_asset
+
+        items = data.get('notice_items')
+        if items is None:
+            items = []
+        if not isinstance(items, list) or len(items) > 30:
+            raise BizError(400, 'INVALID_NOTICE_ITEMS', '通知附件过多或格式错误')
+        out = []
+        for item in items:
+            if not isinstance(item, dict) or item.get('format') not in ('image', 'file', 'video'):
+                raise BizError(400, 'INVALID_NOTICE_ITEMS', '通知附件类型无效')
+            fmt = str(item['format'])
+            asset = get_asset(self.s, str(item.get('asset_id') or ''))
+            if not asset or int(asset['owner_id']) != int(owner) or asset['kind'] != fmt:
+                raise BizError(403, 'INVALID_NOTICE_ASSET', '通知附件不属于当前授权范围或已失效，请重新上传')
+            out.append({'format': fmt, 'asset_id': asset['asset_id'],
+                        'file_name': asset['file_name'], 'file_size': int(asset['size'] or 0),
+                        'file_mime': asset['mime']})
+        receipt = data.get('notice_receipt')
+        if receipt is None:
+            receipt = {}
+        if not isinstance(receipt, dict):
+            raise BizError(400, 'INVALID_RECEIPT', '回执配置格式错误')
+        enabled = bool(receipt.get('enabled'))
+        mode = 'text' if str(receipt.get('mode') or 'link') == 'text' else 'link'
+        raw_label = receipt.get('phrase') if mode == 'text' else receipt.get('button_label')
+        label = str(raw_label or '').strip()[:80] or '我已知晓'
+        config = {'enabled': enabled, 'mode': mode,
+                  ('phrase' if mode == 'text' else 'button_label'): label}
+        guide = str(receipt.get('guide_text') or '').strip()
+        if mode == 'link' and guide:
+            config['receipt_guide_text'] = guide[:120]
+        return {'notice_items': out, 'notice_receipt': config}
 
     def can_submit(self, inst, tpl):
         target = next((m for m in tpl['recipients'] if m['phone'] == inst['phone']), None)
@@ -624,22 +542,60 @@ class PortalService:
     def statistics(self, task):
         # 2026-11-20 对齐管理员统计口径：cancelled（发布后成员被移除/停用名册）的
         # 历史行不计入应交，避免「应交」虚高、完成率虚低。
+        # 2026-11-23：通知任务改按送达/回执口径——回执通知 = 应回复/已回复/待回复/回复率，
+        # 纯广播 = 应送达/已送达（与后台监管面板、.xlsx 导出同一口径）。
+        from .notice_media import notice_receipt_config
+
+        is_notice = task.get('kind') == 'notice'
+        receipt_mode, receipt_phrase = notice_receipt_config(task) if is_notice else (None, None)
         rows = [dict(r) for r in self.s.conn.execute(
             "SELECT * FROM task_instance WHERE template_id=? AND status != 'cancelled' "
             "ORDER BY period_key DESC,id", (task['template_id'],)).fetchall()]
         periods = {}
         for inst in rows:
-            sub = self.s.get_latest_valid_submission(inst['id'])
-            inst['submission'] = sub
-            group = periods.setdefault(inst['period_key'], {'period_key': inst['period_key'], 'expected': 0, 'submitted': 0, 'members': []})
+            if is_notice:
+                inst['submission'] = None
+                inst['delivered'] = inst['status'] in ('sent', 'approved')
+                inst['replied'] = bool(inst.get('receipt_at'))
+            else:
+                inst['submission'] = self.s.get_latest_valid_submission(inst['id'])
+            group = periods.setdefault(inst['period_key'], {
+                'period_key': inst['period_key'], 'expected': 0, 'submitted': 0, 'members': [],
+                'kind': 'notice' if is_notice else 'upload'})
             group['expected'] += 1
-            group['submitted'] += int(inst['status'] in ('approved', 'submitted'))
+            group['submitted'] += int(inst['delivered']) if is_notice else int(inst['status'] in ('approved', 'submitted'))
             group['members'].append(inst)
         for group in periods.values():
             group['pending'] = group['expected'] - group['submitted']
-        return {'task_id': task['template_id'], 'name': task['name'], 'creator_phone': task['creator_phone'], 'periods': list(periods.values())}
+            if is_notice:
+                group.update({'receipt_mode': receipt_mode, 'receipt_phrase': receipt_phrase,
+                              'delivered': group['submitted'],
+                              'receipt_expected': group['submitted'] if receipt_mode else 0,
+                              'replied': sum(1 for m in group['members'] if m['replied']) if receipt_mode else 0})
+                group['pending_reply'] = group['receipt_expected'] - group['replied'] if receipt_mode else 0
+                group['reply_rate'] = (round(100.0 * group['replied'] / group['receipt_expected'], 1)
+                                       if group['receipt_expected'] else 0)
+        return {'task_id': task['template_id'], 'name': task['name'],
+                'creator_phone': task['creator_phone'],
+                'kind': 'notice' if is_notice else 'upload',
+                'receipt_mode': receipt_mode, 'receipt_phrase': receipt_phrase,
+                'periods': list(periods.values())}
 
     # ── 2026-11-20 后台只读监管面板（按发布人筛选，对齐 StatisticsView）──────
+
+    def grant_count(self, platform=None, owner=None):
+        """当前已授权、可发布 H5 任务的领导人数（只读监管空状态用）。"""
+        where, args = ['enabled=1'], []
+        if platform:
+            where.append('platform=?')
+            args.append(platform)
+        if owner is not None:
+            where.append('owner_id=?')
+            args.append(owner)
+        row = self.s.conn.execute(
+            'SELECT COUNT(*) AS c FROM portal_grant WHERE ' + ' AND '.join(where),
+            tuple(args)).fetchone()
+        return int((row['c'] if row else 0) or 0)
 
     def publishers(self, platform=None, owner=None):
         """聚合「授权发布人（领导）」维度：[{phone, name, dept_path, owner_id, task_count}]。
@@ -690,11 +646,16 @@ class PortalService:
             'SELECT DISTINCT period_key FROM task_instance WHERE template_id = ? AND status != ?',
             (task['template_id'], 'cancelled')).fetchall()}
         canon_keys = {canonical_part(pk) for pk in periods}
+        from .notice_media import notice_receipt_config
+        is_notice = task.get('kind') == 'notice'
         return {
             'task_id': task['template_id'], 'name': task['name'],
             'creator_phone': task['creator_phone'],
             'owner_id': task['owner_id'], 'platform': task.get('platform'),
-            'kind': 'form', 'period': task.get('period'), 'mode': task.get('mode'),
+            'kind': 'notice' if is_notice else 'form',
+            'is_notice': is_notice,
+            'has_receipt': bool(notice_receipt_config(task)[0]) if is_notice else False,
+            'period': task.get('period'), 'mode': task.get('mode'),
             'statistics_period': stats_period, 'current_period_key': current_key,
             'period_keys': sorted(canon_keys),
             'remind_at': task.get('remind_at'), 'anchor_weekday': task.get('anchor_weekday'),
@@ -734,10 +695,17 @@ def run_portal_tasks(scheduler, now):
             pk, deadline = 'once', task['once_deadline']
         if deadline <= format_dt(now):
             continue
+        is_notice = task.get('kind') == 'notice'
+        notice_instances = []
         for m in task['recipients']:
             if not p.can_submit({'phone': m['phone']}, task):
                 continue
             inst = s.ensure_instance(task['template_id'], m['phone'], m['name'], None, pk, deadline)
+            if is_notice:
+                inst = _prepare_notice_instance(s, task, inst)
+                if inst['status'] in ('pending', 'sent') and now >= planned:
+                    notice_instances.append(inst)
+                continue
             if inst['status'] != 'pending' or now < planned:
                 # 已完成（approved/submitted）成员在同一周期内不再被催（切期对齐方案 A）。
                 continue
@@ -769,3 +737,35 @@ def run_portal_tasks(scheduler, now):
                 except Exception:
                     result = 'failed'
                 s.conn.execute('UPDATE reminder_log SET result=?,sent_at=? WHERE idem_key=?', (result, s.now_str() if result == 'sent' else None, idem))
+        if is_notice and notice_instances:
+            _deliver_portal_notice(scheduler, task, notice_instances, pk, planned, now)
+
+
+# ── 2026-11-23 领导端通知任务（与后台通知模板共用同一条投递链）────────────────
+
+def _prepare_notice_instance(state, task, inst):
+    """pt_ 通知实例：固化回执模式与短语（pt_ 建实例不走管理员实例建链）。"""
+    if inst.get('receipt_phrase'):
+        return inst
+    from .notice_media import notice_receipt_config
+
+    mode, phrase = notice_receipt_config(task)
+    if not phrase:
+        return inst
+    state.conn.execute(
+        "UPDATE task_instance SET receipt_phrase=?, receipt_mode=?, receipt_platform=? "
+        "WHERE id=? AND receipt_prompt_at IS NULL",
+        (phrase, mode, task['platform'], inst['id']))
+    return dict(state.conn.execute("SELECT * FROM task_instance WHERE id=?", (inst['id'],)).fetchone())
+
+
+def _deliver_portal_notice(scheduler, task, instances, period_key, planned, now):
+    """通知投递：正文 → 媒体（图片/文件/视频）→ 收尾（H5 确认链接 / 回执短语）。
+
+    直接复用 scheduler._deliver_notice——幂等占位、回执提示标记、状态置 sent、
+    附件不可用告警全部与后台通知模板逐字节一致（所见即所得）。
+    """
+    stats = {'sent': 0, 'skipped': 0, 'failed': 0, 'pushed_instances': 0}
+    return scheduler._deliver_notice(
+        task, instances, task.get('period') or 'day', 1, format_dt(planned), now, {},
+        stats, once=task['mode'] == 'once')

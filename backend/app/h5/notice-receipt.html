@@ -162,9 +162,13 @@
       zoomState.tx = Math.min(maxX, Math.max(-maxX, zoomState.tx));
       zoomState.ty = Math.min(maxY, Math.max(-maxY, zoomState.ty));
     }
-    const params = new URLSearchParams(location.hash.slice(1));
+    /* 2026-11-23：查询参数与 hash 双兼容（`?from=portal#t=…` 与 `#t=…` 都能读到）。 */
+    const params = new URLSearchParams(location.search);
+    new URLSearchParams(location.hash.slice(1)).forEach((value, key) => params.set(key, value));
     const token = params.get('t') || '';
-    const api = location.pathname.split('/h5/')[0] + '/api/h5/notice-receipt';
+    /* 前缀只取 '/h5/' 之前的部分，异常路径退化为空串（原 split('/')[0] 会拼出错误地址）。 */
+    const api = (location.pathname.includes('/h5/')
+      ? location.pathname.slice(0, location.pathname.indexOf('/h5/')) : '') + '/api/h5/notice-receipt';
     const confirmButton = $('confirm');
     const zoom = $('zoom');
     let data, reachedEnd = false, previousFocus, confirming = false;

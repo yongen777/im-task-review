@@ -650,6 +650,7 @@ def create_h5_router(
         return remember
 
     @router.get("/h5/task", response_class=HTMLResponse)
+    @router.get("/h5/task/", response_class=HTMLResponse)
     async def h5_task_page():
         return HTMLResponse(content=load_h5_html("task.html"), headers={"Cache-Control": "no-store"})
 

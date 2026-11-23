@@ -1159,7 +1159,19 @@
     const CHEVRON_SVG = '<svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4l4 4-4 4"/></svg>';
     const ATTACHMENT_ICON_SVG = '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5.5 6.5 10a1.4 1.4 0 0 1-2-2l4.8-4.8a2.7 2.7 0 0 1 3.8 3.8l-5.6 5.6a3.7 3.7 0 0 1-5.2-5.2l4.9-4.9"/></svg>';
     const params = new URLSearchParams(location.hash.slice(1));
-    const token = params.get('t') || '', prefix = location.pathname.split('/h5/')[0];
+    const token = params.get('t') || '';
+    /* 2026-11-23：前缀只取 '/h5/' 之前的部分；异常路径下退化为空串，
+       避免 split('/')[0] 把整段路径当成前缀拼出错误地址（手机端 404）。 */
+    const prefix = location.pathname.includes('/h5/') ? location.pathname.slice(0, location.pathname.indexOf('/h5/')) : '';
+    /* 2026-11-23：跳转统一把 from=portal 放进标准 query 参数——
+       原实现 `result.url + '&from=portal'` 会拼成 `/h5/task#t=xxx&from=portal`，
+       hash 内容被污染 → 手机端 WebView 命中错误路径返回 {"detail":"Not Found"}。 */
+    function portalJump(url) {
+      const hashAt = url.indexOf('#');
+      if (hashAt < 0) return prefix + url + (url.includes('?') ? '&' : '?') + 'from=portal';
+      const path = url.slice(0, hashAt), hash = url.slice(hashAt);
+      return prefix + path + (path.includes('?') ? '&' : '?') + 'from=portal' + hash;
+    }
     let toastTimer;
     let jumpToHistory = params.get('tab') === 'history';
     let info = null, tab = params.get('tab') === 'adhoc' ? 'adhoc' : 'todo', scope = null, busy = false, selected = new Set(), expired = false;
@@ -1367,7 +1379,7 @@
           button.disabled = true;
           try {
             const result = await api('history-open', { instance_id: Number(button.dataset.history), edit: button.hasAttribute('data-edit') });
-            location.href = prefix + result.url + '&from=portal';
+            location.href = portalJump(result.url);
           } catch (error) { toast(error.message); button.disabled = false; }
         };
       });
@@ -1560,7 +1572,7 @@
             const key = button.dataset.open;
             const action = button.hasAttribute('data-receipt') ? 'notice-open' : todo ? 'open' : 'adhoc';
             const result = await api(action, todo ? { instance_id: Number(key) } : { template_id: key });
-            location.href = prefix + result.url + '&from=portal';
+            location.href = portalJump(result.url);
           } catch (error) {
             toast(error.message);
             button.disabled = false;
@@ -1598,7 +1610,10 @@
       setPageBack(null);
       main.innerHTML = '<div class="row section-row"><h2>我发布的任务</h2>' +
         '<button type="button" id="new" class="primary">新建并发布任务</button></div><div id="tasks"><div class="card empty">正在加载统计…</div></div>';
-      document.getElementById('new').onclick = form;
+      /* 2026-11-23：新建任务改走独立全屏页（上传任务 / 通知提醒双模），不再嵌在统计上方。 */
+      document.getElementById('new').onclick = () => {
+        location.href = prefix + '/h5/portal-create#t=' + token;
+      };
       await stats();
     }
 
@@ -1611,23 +1626,67 @@
 
     function renderPeriod(container, task, period, opened) {
       const now = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' });
+      const isNotice = period.kind === 'notice' || task.kind === 'notice';
+      const receiptMode = period.receipt_mode || task.receipt_mode || '';
       const pct = period.expected > 0 ? Math.min(100, Math.round((period.submitted / period.expected) * 100)) : 0;
-      container.innerHTML = '<div class="kpis"><span>应交<strong>' + period.expected +
-        '</strong></span><span>已交<strong>' + period.submitted + '</strong></span><span>未交<strong>' +
-        period.pending + '</strong></span></div><div class="progress-wrap"><div class="progress-head"><span>收集进度</span><span>' +
-        period.submitted + ' / ' + period.expected + ' · ' + pct + '%</span></div><progress class="progress" aria-label="收集进度" value="' +
-        period.submitted + '" max="' + Math.max(period.expected, 1) + '"></progress></div>' + period.members.map(member => {
-          const status = member.status === 'approved' ? '已完成'
-            : member.status === 'submitted' ? '待审核'
-            : member.status === 'rejected' ? '已驳回'
-            : member.deadline_at < now ? '已逾期' : '未提交';
-          const tagClass = member.status === 'approved' ? 'tag-approved'
-            : member.status === 'submitted' ? 'tag-submitted'
-            : member.status === 'rejected' ? 'tag-rejected'
-            : member.deadline_at < now ? 'tag-overdue' : 'tag-pending';
+      /* 2026-11-23：口径与后台监管面板一致——回执通知 = 应回复/已回复/待回复/回复率；
+         纯广播通知 = 应送达/已送达/未送达；上传任务保持 应交/已交/未交。 */
+      let kpis, progressHead, progressValue, progressMax;
+      if (isNotice && receiptMode) {
+        const expectedReplies = period.receipt_expected || 0;
+        const replied = period.replied || 0;
+        const rate = period.reply_rate || 0;
+        kpis = '<div class="kpis"><span>应回复<strong>' + expectedReplies +
+          '</strong></span><span>已回复<strong>' + replied + '</strong></span><span>待回复<strong>' +
+          (period.pending_reply || 0) + '</strong></span></div>';
+        progressHead = '回复进度';
+        progressValue = replied;
+        progressMax = expectedReplies;
+        kpis += '<div class="muted reply-rate">回复率 ' + rate + '%</div>';
+      } else if (isNotice) {
+        kpis = '<div class="kpis"><span>应送达<strong>' + period.expected +
+          '</strong></span><span>已送达<strong>' + period.submitted + '</strong></span><span>未送达<strong>' +
+          period.pending + '</strong></span></div>';
+        progressHead = '送达进度';
+        progressValue = period.submitted;
+        progressMax = period.expected;
+      } else {
+        kpis = '<div class="kpis"><span>应交<strong>' + period.expected +
+          '</strong></span><span>已交<strong>' + period.submitted + '</strong></span><span>未交<strong>' +
+          period.pending + '</strong></span></div>';
+        progressHead = '收集进度';
+        progressValue = period.submitted;
+        progressMax = period.expected;
+      }
+      const progressTotal = isNotice && receiptMode ? (period.receipt_expected || 0) : period.expected;
+      const progressDone = isNotice && receiptMode ? (period.replied || 0) : period.submitted;
+      const capPct = progressTotal > 0 ? Math.min(100, Math.round((progressDone / progressTotal) * 100)) : 0;
+      container.innerHTML = kpis + '<div class="progress-wrap"><div class="progress-head"><span>' + progressHead + '</span><span>' +
+        progressDone + ' / ' + progressTotal + ' · ' + capPct + '%</span></div><progress class="progress" aria-label="' + progressHead + '" value="' +
+        progressDone + '" max="' + Math.max(progressTotal, 1) + '"></progress></div>' + period.members.map(member => {
+          let status, tagClass;
+          if (isNotice && receiptMode) {
+            status = member.replied ? '已回复' : '待回复';
+            tagClass = member.replied ? 'tag-approved' : 'tag-pending';
+          } else if (isNotice) {
+            status = member.delivered ? '已送达' : '未送达';
+            tagClass = member.delivered ? 'tag-approved' : 'tag-pending';
+          } else {
+            status = member.status === 'approved' ? '已完成'
+              : member.status === 'submitted' ? '待审核'
+              : member.status === 'rejected' ? '已驳回'
+              : member.deadline_at < now ? '已逾期' : '未提交';
+            tagClass = member.status === 'approved' ? 'tag-approved'
+              : member.status === 'submitted' ? 'tag-submitted'
+              : member.status === 'rejected' ? 'tag-rejected'
+              : member.deadline_at < now ? 'tag-overdue' : 'tag-pending';
+          }
           const submission = member.submission;
           const attachments = submission ? refs(submission) : [];
-          const content = submission ? '<div class="member-body">' + (submission.note ? '<p>' + esc(submission.note) + '</p>' : '') +
+          const content = isNotice
+            ? '<div class="member-body"><p class="muted">' + (member.replied ? '回复时间 ' + esc(member.receipt_at)
+                : member.delivered ? '已送达，等待回复' : '尚未送达') + '</p></div>'
+            : submission ? '<div class="member-body">' + (submission.note ? '<p>' + esc(submission.note) + '</p>' : '') +
             (attachments.length ? '<div class="attachments">' +
               attachments.map((ref, index) => '<button type="button" class="secondary" data-ref="' + esc(ref) +
                 '">' + ATTACHMENT_ICON_SVG + '<span>查看附件 ' + (index + 1) + '</span></button>').join('') + '</div>' : (!submission.note ? '<p class="muted">已提交</p>' : '')) +
@@ -1703,490 +1762,7 @@
       try { items = JSON.parse(s.refs_json || '[]'); } catch { items = []; }
       return [...new Set([...(Array.isArray(items) ? items : []), s.file_ref].filter(Boolean))];
     }
-    async function form() {
-      const view = document.getElementById('tasks');
-      const trigger = document.getElementById('new');
-      trigger.disabled = true;
-      try {
-        scope = await api('recipients');
-      } catch (error) {
-        toast(error.message);
-        return;
-      } finally {
-        trigger.disabled = false;
-      }
-      if (!view.isConnected || expired) return;
-      setPageBack(() => creator());
-      selected.clear();
-      // getRandomValues also works in the HTTP WebViews used by the portal.
-      const requestId = Array.from(crypto.getRandomValues(new Uint8Array(16)),
-        byte => byte.toString(16).padStart(2, '0')).join('');
 
-      const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
-      const WEEKDAY_NAMES = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
-      const MODULE_META = [
-        { key: 'fields', title: '字段报数', desc: '数字/文本/布尔填报' },
-        { key: 'text', title: '文字说明', desc: '补充情况或原因' },
-        { key: 'image', title: '图片上传', desc: '现场照片截图凭证' },
-        { key: 'file', title: '文件上传', desc: '表格或文档附件' }
-      ];
-      const MOD_CHECK_SVG = '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5l3 3 6-6.5"/></svg>';
-
-      let scheduleKind = 'once';
-      let execWeekdays = [1, 2, 3, 4, 5, 6, 7];
-      let execDomDays = [1];
-      let deadlineType = 'same_day';
-      const uploadModules = new Set(['text']);
-      const schemaFields = [
-        { key: 'field_1', label: '今日累计完成数', type: 'number', required: true }
-      ];
-
-      function localDatetimeNowValue() {
-        const now = new Date();
-        const pad = n => String(n).padStart(2, '0');
-        return now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate()) +
-          'T' + pad(now.getHours()) + ':' + pad(now.getMinutes());
-      }
-
-      function parseLocalDatetimeMs(valStr) {
-        const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(valStr);
-        if (!m) return NaN;
-        return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0), 0).getTime();
-      }
-
-      function describeWeekdays(days) {
-        const s = [...new Set(days)].sort((a, b) => a - b);
-        if (s.length === 7) return '每天执行';
-        if (s.length === 0) return '尚未选择（请至少选 1 天）';
-        if (s.length === 5 && s.every((d, i) => d === i + 1)) return '仅工作日（周一至周五）';
-        if (s.length === 2 && s[0] === 6 && s[1] === 7) return '仅周末（周六、周日）';
-        return '每' + s.map(d => WEEKDAY_NAMES[d - 1]).join('、');
-      }
-
-      function describeDomDays(days) {
-        const s = [...new Set(days)].sort((a, b) => a - b);
-        if (s.length === 0) return '尚未选择（请至少选 1 天）';
-        return '每月 ' + s.map(d => (d === 31 ? '31（含月底）' : String(d))).join('、') + ' 号执行';
-      }
-
-      main.innerHTML = `<form class="card form-card" id="form" novalidate>
-        <div class="form-head">
-          <h2>新建任务</h2>
-          <p class="form-sub">配置任务要求、接收成员、执行周期与提交内容</p>
-        </div>
-
-        <label class="field" for="name">任务名称</label>
-        <input id="name" required maxlength="128" placeholder="例如：外出队伍晒图与意向单报数上传">
-
-        <label class="field" for="description">发送给用户的提醒文本（自动附上专属 H5 链接）</label>
-        <textarea id="description" required maxlength="2000" placeholder="请输入下发给用户的提醒文案，系统将在消息底部自动附上专属 H5 上传链接…"></textarea>
-        <p class="field-hint">系统下发消息时将在底部自动附上专属 H5 上传链接。</p>
-
-        <div class="field-label"><span>接收成员</span><span class="muted" id="count" role="status">已选 0 人</span></div>
-        ${scope.directory_error ? `<p class="muted" role="status">${esc(scope.directory_error)}</p>` : ''}
-        <div class="scope" id="scope"></div>
-
-        <div class="form-section">
-          <div class="field-label"><span>执行方式</span></div>
-          <div class="seg-track seg-3" role="group" aria-label="执行方式">
-            <button type="button" data-schedule="once" class="active">一次性推送</button>
-            <button type="button" data-schedule="weekly">每周执行</button>
-            <button type="button" data-schedule="monthly">每月执行</button>
-          </div>
-
-          <div id="once-panel">
-            <label class="field" for="deadline_at">截止时间（留空不限）</label>
-            <input type="datetime-local" id="deadline_at">
-            <p class="field-hint">发布后立即向所选成员推送一次；不填截止时间则长期有效。</p>
-          </div>
-
-          <div id="recurring-panel" class="hidden">
-            <div id="weekly-panel">
-              <div class="field-label">
-                <span>执行日</span>
-                <div class="preset-actions">
-                  <button type="button" class="mini-btn" id="preset-workday">工作日</button>
-                  <button type="button" class="mini-btn" id="preset-everyday">每天</button>
-                </div>
-              </div>
-              <div class="week-grid" id="weekday-grid"></div>
-              <p class="field-hint" id="weekday-summary"></p>
-            </div>
-
-            <div id="monthly-panel" class="hidden">
-              <div class="field-label">
-                <span>每月执行日</span>
-                <div class="preset-actions">
-                  <button type="button" class="mini-btn" id="preset-monthend">每月月底（31号）</button>
-                </div>
-              </div>
-              <div class="dom-grid" id="dom-grid"></div>
-              <p class="field-hint" id="dom-summary"></p>
-            </div>
-
-            <label class="field" for="remind_at">执行时间</label>
-            <input type="time" id="remind_at" value="08:15">
-
-            <div class="field-label"><span>截止配置</span></div>
-            <label class="choice choice-card"><input type="checkbox" id="has_deadline" checked><span>设置截止时间</span></label>
-            <div id="deadline-detail">
-              <div class="seg-track seg-3" style="margin-top:8px;" role="group" aria-label="截止日期规则">
-                <button type="button" data-dltype="same_day" class="active">当天截止</button>
-                <button type="button" data-dltype="weekend">本周日截止</button>
-                <button type="button" data-dltype="month_end">本月月底</button>
-              </div>
-              <label class="sub-field-label" for="deadline_time">截止时刻</label>
-              <input type="time" id="deadline_time" value="18:00">
-            </div>
-            <p class="field-hint" id="deadline-hint">到截止时刻后 H5 提交入口关闭；不设截止时任务长期有效。</p>
-          </div>
-        </div>
-
-        <div class="form-section">
-          <div class="field-label"><span>选择需要员工提交的内容类型（可多选）</span></div>
-          <div class="mod-grid" id="module-grid"></div>
-
-          <div id="cfg-fields" class="sub-panel hidden">
-            <div class="sub-panel-head">
-              <span>配置报数字段列表</span>
-              <button type="button" class="mini-btn" id="add-schema-field">+ 添加字段</button>
-            </div>
-            <div class="schema-list" id="schema-list"></div>
-          </div>
-
-          <div id="cfg-image" class="sub-panel hidden">
-            <label class="choice"><input type="checkbox" id="multiple_images"><span>允许上传多张图片（最多 10 张）</span></label>
-          </div>
-
-          <div id="cfg-file" class="sub-panel hidden">
-            <label class="choice"><input type="checkbox" id="multiple_files"><span>允许上传多个文件（最多 10 个）</span></label>
-          </div>
-        </div>
-
-        <div class="form-actions">
-          <button type="submit" class="primary" id="publish">确认发布</button>
-        </div>
-      </form>`;
-
-      const box = document.getElementById('scope');
-      const departments = scope.departments;
-      const deptIds = new Set(departments.map(dept => dept.dept_id));
-      const children = new Map();
-      departments.forEach(dept => {
-        const parent = deptIds.has(dept.parent_id) ? dept.parent_id : '';
-        if (!children.has(parent)) children.set(parent, []);
-        children.get(parent).push(dept);
-      });
-      function memberRows(members) {
-        return members.map(member => '<label class="choice"><input type="checkbox" data-phone="' +
-          esc(member.phone) + '"><span>' + esc(member.name) + '</span><span class="member-phone">' +
-          esc(member.phone.slice(0, 3) + '****' + member.phone.slice(-4)) + '</span></label>').join('');
-      }
-      function groupToggle(members, label) {
-        return '<label class="choice"><input type="checkbox" data-group="' +
-          esc(members.map(member => member.phone).join(',')) + '"' + (members.length ? '' : ' disabled') +
-          '><span>' + esc(label) + '</span></label>';
-      }
-      function branchIds(id) {
-        return [id, ...(children.get(id) || []).flatMap(dept => branchIds(dept.dept_id))];
-      }
-      function departmentBranch(dept) {
-        const ids = new Set(branchIds(dept.dept_id));
-        const members = scope.members.filter(member => member.dept_ids.some(id => ids.has(id)));
-        const direct = members.filter(member => member.dept_ids.includes(dept.dept_id));
-        return '<details class="branch"><summary><span class="summary-main">' + esc(dept.name) + '<span class="summary-count">' + members.length +
-          ' 人</span></span>' + CHEVRON_SVG + '</summary><div>' + groupToggle(members, '全选本部门及下级') + memberRows(direct) +
-          (children.get(dept.dept_id) || []).map(departmentBranch).join('') + '</div></details>';
-      }
-      box.innerHTML = (departments.length ? '<details open><summary><span class="summary-main">按部门选择</span>' + CHEVRON_SVG + '</summary>' +
-        (children.get('') || []).map(departmentBranch).join('') + '</details>' : '') +
-        (scope.roles.length ? '<details class="member-section"><summary><span class="summary-main">按角色选择</span>' + CHEVRON_SVG + '</summary>' +
-          scope.roles.map(role => {
-            const members = scope.members.filter(member => member.role_ids.includes(role.role_id));
-            return '<details class="branch"><summary><span class="summary-main">' + esc(role.name) + '<span class="summary-count">' + members.length +
-              ' 人</span></span>' + CHEVRON_SVG + '</summary><div>' + groupToggle(members, '全选本角色') + memberRows(members) + '</div></details>';
-          }).join('') + '</details>' : '') +
-        '<details class="member-section"' + (!departments.length && !scope.roles.length ? ' open' : '') +
-        '><summary><span class="summary-main">全部可选成员<span class="summary-count">' + scope.members.length + ' 人</span></span>' + CHEVRON_SVG + '</summary>' +
-        memberRows(scope.members) + '</details>';
-      function syncScope() {
-        box.querySelectorAll('[data-phone]').forEach(input => {
-          input.checked = selected.has(input.dataset.phone);
-        });
-        box.querySelectorAll('[data-group]').forEach(input => {
-          const phones = input.dataset.group.split(',').filter(Boolean);
-          input.checked = phones.length > 0 && phones.every(phone => selected.has(phone));
-          input.indeterminate = !input.checked && phones.some(phone => selected.has(phone));
-        });
-        document.getElementById('count').textContent = '已选 ' + selected.size + ' 人';
-      }
-      box.onchange = event => {
-        const input = event.target;
-        const phones = input.dataset.phone ? [input.dataset.phone] : (input.dataset.group || '').split(',').filter(Boolean);
-        phones.forEach(phone => {
-          if (input.checked) selected.add(phone);
-          else selected.delete(phone);
-        });
-        syncScope();
-      };
-
-      function renderWeekdays() {
-        const grid = document.getElementById('weekday-grid');
-        grid.innerHTML = WEEKDAYS.map((lbl, idx) => {
-          const day = idx + 1;
-          const active = execWeekdays.includes(day);
-          return '<button type="button" class="day-btn' + (active ? ' active' : '') + '" data-wd="' + day + '" aria-pressed="' + active + '">' + lbl + '</button>';
-        }).join('');
-        grid.querySelectorAll('[data-wd]').forEach(btn => {
-          btn.onclick = () => {
-            const d = Number(btn.dataset.wd);
-            if (execWeekdays.includes(d)) {
-              if (execWeekdays.length === 1) { toast('至少保留 1 个执行日'); return; }
-              execWeekdays = execWeekdays.filter(x => x !== d);
-            } else {
-              execWeekdays = [...execWeekdays, d].sort((a, b) => a - b);
-            }
-            renderWeekdays();
-          };
-        });
-        document.getElementById('weekday-summary').textContent = describeWeekdays(execWeekdays) + '（未选日子不提醒、不产生逾期）';
-      }
-
-      function renderDomDays() {
-        const grid = document.getElementById('dom-grid');
-        grid.innerHTML = Array.from({ length: 31 }, (_, i) => i + 1).map(day => {
-          const active = execDomDays.includes(day);
-          return '<button type="button" class="day-btn' + (active ? ' active' : '') + '" data-dom="' + day + '" aria-pressed="' + active + '">' + day + '</button>';
-        }).join('');
-        grid.querySelectorAll('[data-dom]').forEach(btn => {
-          btn.onclick = () => {
-            const d = Number(btn.dataset.dom);
-            if (execDomDays.includes(d)) execDomDays = execDomDays.filter(x => x !== d);
-            else execDomDays = [...execDomDays, d].sort((a, b) => a - b);
-            renderDomDays();
-          };
-        });
-        document.getElementById('dom-summary').textContent = describeDomDays(execDomDays) + '（选 31 号自动适配大小月最后一天）';
-      }
-
-      function renderSchedule() {
-        document.querySelectorAll('[data-schedule]').forEach(btn => {
-          btn.classList.toggle('active', btn.dataset.schedule === scheduleKind);
-        });
-        document.getElementById('once-panel').classList.toggle('hidden', scheduleKind !== 'once');
-        document.getElementById('recurring-panel').classList.toggle('hidden', scheduleKind === 'once');
-        document.getElementById('weekly-panel').classList.toggle('hidden', scheduleKind !== 'weekly');
-        document.getElementById('monthly-panel').classList.toggle('hidden', scheduleKind !== 'monthly');
-      }
-
-      function renderDeadlineDetail() {
-        const on = document.getElementById('has_deadline').checked;
-        document.getElementById('deadline-detail').classList.toggle('hidden', !on);
-        document.getElementById('deadline-hint').textContent = on
-          ? '到截止时刻后 H5 提交入口关闭，逾期后统一提示「当前任务已过期，无法提交」。'
-          : '无截止时间：任务长期有效，H5 页面显示「截止 不限」。';
-        document.querySelectorAll('[data-dltype]').forEach(btn => {
-          btn.classList.toggle('active', btn.dataset.dltype === deadlineType);
-        });
-      }
-
-      function renderModules() {
-        const grid = document.getElementById('module-grid');
-        grid.innerHTML = MODULE_META.map(mod => {
-          const active = uploadModules.has(mod.key);
-          return '<button type="button" class="mod-btn' + (active ? ' active' : '') + '" data-mod="' + mod.key + '" aria-pressed="' + active + '">' +
-            '<div class="mod-head"><span class="mod-title">' + mod.title + '</span><span class="mod-check">' + (active ? MOD_CHECK_SVG : '') + '</span></div>' +
-            '<span class="mod-desc">' + mod.desc + '</span></button>';
-        }).join('');
-        grid.querySelectorAll('[data-mod]').forEach(btn => {
-          btn.onclick = () => {
-            const key = btn.dataset.mod;
-            if (uploadModules.has(key)) {
-              if (uploadModules.size === 1) { toast('至少保留一种提交内容类型'); return; }
-              uploadModules.delete(key);
-            } else {
-              uploadModules.add(key);
-              if (key === 'fields' && schemaFields.length === 0) {
-                schemaFields.push({ key: 'field_1', label: '今日累计完成数', type: 'number', required: true });
-              }
-            }
-            renderModules();
-          };
-        });
-        document.getElementById('cfg-fields').classList.toggle('hidden', !uploadModules.has('fields'));
-        document.getElementById('cfg-image').classList.toggle('hidden', !uploadModules.has('image'));
-        document.getElementById('cfg-file').classList.toggle('hidden', !uploadModules.has('file'));
-      }
-
-      function renderSchemaFields() {
-        const list = document.getElementById('schema-list');
-        list.innerHTML = schemaFields.map((f, idx) => '<div class="schema-row" data-fidx="' + idx + '">' +
-          '<input type="text" maxlength="40" placeholder="字段名称，如：今日累计上门户数" value="' + esc(f.label) + '" data-flabel="' + idx + '">' +
-          '<div class="schema-row-sub">' +
-          '<select aria-label="字段类型" data-ftype="' + idx + '">' +
-          '<option value="number"' + (f.type === 'number' ? ' selected' : '') + '>数字报数</option>' +
-          '<option value="text"' + (f.type === 'text' ? ' selected' : '') + '>单行文本</option>' +
-          '<option value="boolean"' + (f.type === 'boolean' ? ' selected' : '') + '>布尔（是／否）</option>' +
-          '<option value="date"' + (f.type === 'date' ? ' selected' : '') + '>日期</option>' +
-          '</select>' +
-          '<label class="choice-inline"><input type="checkbox" data-freq="' + idx + '"' + (f.required ? ' checked' : '') + '><span>必填</span></label>' +
-          '<button type="button" class="remove-btn" data-fdel="' + idx + '"' + (schemaFields.length <= 1 ? ' disabled' : '') + '>删除</button>' +
-          '</div></div>').join('');
-        list.querySelectorAll('[data-flabel]').forEach(inp => {
-          inp.oninput = () => { schemaFields[Number(inp.dataset.flabel)].label = inp.value; };
-        });
-        list.querySelectorAll('[data-ftype]').forEach(sel => {
-          sel.onchange = () => { schemaFields[Number(sel.dataset.ftype)].type = sel.value; };
-        });
-        list.querySelectorAll('[data-freq]').forEach(chk => {
-          chk.onchange = () => { schemaFields[Number(chk.dataset.freq)].required = chk.checked; };
-        });
-        list.querySelectorAll('[data-fdel]').forEach(btn => {
-          btn.onclick = () => {
-            if (schemaFields.length <= 1) return;
-            schemaFields.splice(Number(btn.dataset.fdel), 1);
-            renderSchemaFields();
-          };
-        });
-      }
-
-      document.querySelectorAll('[data-schedule]').forEach(btn => {
-        btn.onclick = () => { scheduleKind = btn.dataset.schedule; renderSchedule(); };
-      });
-      document.getElementById('preset-workday').onclick = () => { execWeekdays = [1, 2, 3, 4, 5]; renderWeekdays(); };
-      document.getElementById('preset-everyday').onclick = () => { execWeekdays = [1, 2, 3, 4, 5, 6, 7]; renderWeekdays(); };
-      document.getElementById('preset-monthend').onclick = () => { execDomDays = [31]; renderDomDays(); };
-      document.getElementById('has_deadline').onchange = renderDeadlineDetail;
-      document.querySelectorAll('[data-dltype]').forEach(btn => {
-        btn.onclick = () => { deadlineType = btn.dataset.dltype; renderDeadlineDetail(); };
-      });
-      document.getElementById('add-schema-field').onclick = () => {
-        if (schemaFields.length >= 20) { toast('最多添加 20 个报数字段'); return; }
-        schemaFields.push({ key: 'field_' + (schemaFields.length + 1), label: '', type: 'number', required: true });
-        renderSchemaFields();
-      };
-
-      const onceDeadlineInput = document.getElementById('deadline_at');
-      const syncOnceDeadlineMin = () => { onceDeadlineInput.min = localDatetimeNowValue(); };
-      syncOnceDeadlineMin();
-      onceDeadlineInput.addEventListener('focus', syncOnceDeadlineMin);
-
-      renderWeekdays();
-      renderDomDays();
-      renderSchedule();
-      renderDeadlineDetail();
-      renderModules();
-      renderSchemaFields();
-
-      document.getElementById('form').onsubmit = async event => {
-        event.preventDefault();
-        if (busy) return;
-        const val = id => document.getElementById(id).value;
-        const taskName = val('name').trim();
-        const taskDesc = val('description').trim();
-        if (!taskName) { toast('请输入任务名称'); return; }
-        if (!taskDesc) { toast('请输入发送给用户的提醒文本'); return; }
-        if (selected.size === 0) { toast('请至少选择 1 名接收成员'); return; }
-        if (scheduleKind === 'weekly' && execWeekdays.length === 0) { toast('请至少选择 1 个每周执行日'); return; }
-        if (scheduleKind === 'monthly' && execDomDays.length === 0) { toast('请至少选择 1 个每月执行日'); return; }
-
-        const onceDeadline = val('deadline_at').trim();
-        if (scheduleKind === 'once' && onceDeadline) {
-          const dlMs = parseLocalDatetimeMs(onceDeadline);
-          if (Number.isNaN(dlMs) || dlMs <= Date.now()) {
-            toast('一次性推送的截止时间必须晚于当前时间');
-            return;
-          }
-        }
-
-        const hasDeadline = document.getElementById('has_deadline').checked;
-        const remindAt = val('remind_at').trim();
-        const deadlineTime = val('deadline_time').trim();
-        if (scheduleKind !== 'once') {
-          if (!remindAt) { toast('请填写执行时间'); return; }
-          if (hasDeadline) {
-            if (!deadlineTime) { toast('请填写截止时刻'); return; }
-            if (deadlineType === 'same_day' && deadlineTime !== '00:00' && remindAt >= deadlineTime) {
-              toast('当天截止时，执行时间必须早于截止时刻');
-              return;
-            }
-          }
-        }
-
-        const modules = ['fields', 'text', 'image', 'file'].filter(m => uploadModules.has(m));
-        if (!modules.length) { toast('请至少选择一种需要员工提交的内容类型'); return; }
-
-        let normalizedFields = [];
-        if (uploadModules.has('fields')) {
-          if (!schemaFields.length) { toast('请至少添加 1 个报数字段'); return; }
-          for (let i = 0; i < schemaFields.length; i++) {
-            const label = String(schemaFields[i].label || '').trim();
-            if (!label) { toast('请填写第 ' + (i + 1) + ' 个报数字段的名称'); return; }
-            normalizedFields.push({
-              key: 'field_' + (i + 1),
-              label,
-              type: schemaFields[i].type || 'number',
-              required: Boolean(schemaFields[i].required),
-            });
-          }
-        }
-
-        const multipleImages = uploadModules.has('image') && document.getElementById('multiple_images').checked;
-        const multipleFiles = uploadModules.has('file') && document.getElementById('multiple_files').checked;
-        const textLabel = '文字情况说明';
-        const textPlaceholder = '请填写补充说明…';
-        const mode = scheduleKind === 'once' ? 'once' : 'day';
-
-        const data = {
-          request_id: requestId,
-          name: taskName,
-          description: taskDesc,
-          phones: [...selected],
-          mode,
-          deadline_at: scheduleKind === 'once' ? onceDeadline : '',
-          remind_at: scheduleKind === 'once' ? '00:00' : remindAt,
-          has_deadline: scheduleKind === 'once' ? Boolean(onceDeadline) : hasDeadline,
-          deadline_type: scheduleKind === 'once' ? null : (hasDeadline ? deadlineType : null),
-          deadline_time: scheduleKind === 'once' ? null : (hasDeadline ? deadlineTime : null),
-          exec_weekdays: scheduleKind === 'weekly'
-            ? (execWeekdays.length === 7 ? null : [...execWeekdays].sort((a, b) => a - b))
-            : null,
-          exec_dom_days: scheduleKind === 'monthly'
-            ? [...execDomDays].sort((a, b) => a - b)
-            : [],
-          upload_modules: modules,
-          need_review: false,
-          schema_json: normalizedFields,
-          allow_multiple_images: multipleImages,
-          allow_multiple_files: multipleFiles,
-          text_label: textLabel,
-          text_placeholder: textPlaceholder,
-          spec: {
-            require_review: false,
-            upload_modules: modules,
-            allow_multiple_images: multipleImages,
-            allow_multiple_files: multipleFiles,
-            fields: normalizedFields,
-            text_label: textLabel,
-            text_placeholder: textPlaceholder,
-          },
-        };
-
-        busy = true;
-        document.getElementById('publish').disabled = true;
-        try {
-          await api('create', data);
-          toast('任务已发布');
-          await creator();
-        } catch (error) {
-          toast(error.message);
-        } finally {
-          busy = false;
-          const button = document.getElementById('publish');
-          if (button) button.disabled = false;
-        }
-      };
-    }
     refresh();
     setInterval(() => {
       if (document.hidden || expired) return;

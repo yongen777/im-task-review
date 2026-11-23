@@ -5295,19 +5295,40 @@ class StateStore:
         if instance_id is not None:
             filters.append("AND i.id=? ")
             params.append(instance_id)
+        # 2026-11-23：授权成员（pt_）发布的回执通知同样进入「我的待办」——
+        # 管理员模板走 task_template 白名单，pt_ 模板走 portal_task 存在性校验。
         rows = self.conn.execute(
             "SELECT i.id, i.template_id, t.name AS template_name, i.receipt_phrase, i.receipt_prompt_at, "
             "i.period_key, COALESCE(i.receipt_mode, 'text') AS receipt_mode "
-            "FROM task_instance i JOIN task_template t ON t.template_id=i.template_id "
+            "FROM task_instance i LEFT JOIN task_template t ON t.template_id=i.template_id "
             "WHERE i.phone=? AND i.receipt_platform=? AND i.receipt_prompt_at IS NOT NULL "
             "AND i.receipt_at IS NULL AND i.receipt_phrase IS NOT NULL "
             # 2026-11-20 切期改造：重推不再取消旧批次实例；H5 待办由 portal 层
             # 按（模板 + 归属周期）去重，只展示最新一条未回执。
             "AND i.status IN ('pending', 'sent') "
-            "AND t.kind='notice' AND t.enabled=1 AND t.deleted=0 " + "".join(filters) + "ORDER BY i.id",
+            "AND ((t.template_id IS NOT NULL AND t.kind='notice' AND t.enabled=1 AND t.deleted=0) "
+            "     OR (t.template_id IS NULL AND i.template_id LIKE 'pt\\_%' ESCAPE '\\\\')) "
+            + "".join(filters) + "ORDER BY i.id",
             tuple(params),
         ).fetchall()
-        return [dict(row) for row in rows]
+        result = [dict(row) for row in rows]
+        missing = sorted({r["template_id"] for r in result if not r.get("template_name")})
+        if missing:
+            names = {}
+            for start in range(0, len(missing), 900):
+                chunk = missing[start:start + 900]
+                ph = ",".join("?" for _ in chunk)
+                for row in self.conn.execute(
+                        f"SELECT task_id, template_json FROM portal_task WHERE task_id IN ({ph})",
+                        tuple(chunk)).fetchall():
+                    try:
+                        names[str(row["task_id"])] = str((json.loads(row["template_json"]) or {}).get("name") or "")
+                    except (TypeError, ValueError):
+                        names[str(row["task_id"])] = ""
+            for r in result:
+                if not r.get("template_name"):
+                    r["template_name"] = names.get(str(r["template_id"])) or str(r["template_id"])
+        return result
 
     def acknowledge_notice_receipts(self, phone: str, platform: str, text: str) -> List[Dict[str, Any]]:
         from .notice_media import receipt_key
@@ -5326,8 +5347,10 @@ class StateStore:
                 changed = self.conn.execute(
                     "UPDATE task_instance SET receipt_at=?,receipt_text=? WHERE id=? AND receipt_at IS NULL "
                     "AND COALESCE(receipt_mode, 'text')='text' "
-                    "AND template_id IN (SELECT template_id FROM task_template WHERE template_id=? "
-                    "AND kind='notice' AND enabled=1 AND deleted=0)",
+                    "AND (template_id IN (SELECT template_id FROM task_template WHERE template_id=? "
+                    "AND kind='notice' AND enabled=1 AND deleted=0) "
+                    "OR (LEFT(template_id, 3)='pt_' AND EXISTS "
+                    "(SELECT 1 FROM portal_task pt WHERE pt.task_id=template_id)))",
                     (now_s, text, row["id"], row["template_id"]),
                 )
                 if changed.rowcount:
@@ -5816,7 +5839,10 @@ class StateStore:
         if tpl.get("portal_task") and not allow_portal_task:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
         if tpl.get("kind") == "notice" and not notice_receipt_config(tpl)[0]:
-            raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
+            # 2026-11-23：纯广播通知（无回执）不进管理员任务数据统计；
+            # 但授权成员监管面板（allow_portal_task）需要「应送达/已送达」口径 → 放行 pt_ 通知。
+            if not (allow_portal_task and tpl.get("portal_task")):
+                raise BizError(404, "NOT_FOUND", "该任务不是上传任务，无统计数据")
         if int(tpl.get("owner_id") or 0) != int(owner_id):
             raise BizError(403, "FORBIDDEN_OWNER", "只能查看自己名下任务的统计数据")
         return tpl
@@ -5829,6 +5855,23 @@ class StateStore:
             "CASE WHEN receipt_at IS NULL THEN 'pending' ELSE 'approved' END AS status, "
             "receipt_at AS submitted_at FROM task_instance "
             f"WHERE template_id = ? AND {per_sql} AND status != 'cancelled' AND receipt_phrase IS NOT NULL",
+            (template_id, *params),
+        ).fetchall()]
+
+    def _stats_delivery_rows(self, template_id: str, period: str) -> List[Dict[str, Any]]:
+        """纯广播通知的送达口径：sent/approved = 已送达，其余未送达（2026-11-23）。"""
+        per_sql, params = self._stats_period_where(period.strip(), alias="i")
+        return [dict(row) for row in self.conn.execute(
+            "SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.receipt_at, NULL AS receipt_text, "
+            "'text' AS receipt_mode, "
+            "CASE WHEN i.status IN ('sent', 'approved') THEN 'approved' ELSE 'pending' END AS status, "
+            "CASE WHEN i.status IN ('sent', 'approved') THEN quiet.at END AS submitted_at "
+            "FROM task_instance i "
+            "LEFT JOIN (SELECT instance_id, MAX(sent_at) AS at FROM reminder_log "
+            "           WHERE result = 'sent' AND kind IN ('notice', 'notice_receipt', 'notice_img', "
+            "           'notice_file', 'notice_video', 'notice_img_link', 'notice_file_link', 'notice_vid_link') "
+            "           GROUP BY instance_id) quiet ON quiet.instance_id = i.id "
+            f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled'",
             (template_id, *params),
         ).fetchall()]
 
@@ -6047,6 +6090,10 @@ class StateStore:
             p = self._stats_phone_path(phone, dept_map)
             return p == sel or p.startswith(sel + "/")
 
+        from .notice_media import notice_receipt_config as _receipt_cfg
+
+        _is_notice = tpl.get("kind") == "notice"
+        _has_receipt = bool(_receipt_cfg(tpl)[0]) if _is_notice else False
         tpl_meta = {
             "template_id": tpl["template_id"], "name": tpl["name"], "kind": tpl.get("kind"),
             "period": tpl.get("period"), "is_adhoc": bool(tpl.get("is_adhoc")),
@@ -6055,7 +6102,9 @@ class StateStore:
             "need_review": bool(tpl.get("need_review")),
             "modules": effective_h5_modules(tpl),
             "schema_fields": [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")],
-            "is_receipt": tpl["kind"] == "notice",
+            # 2026-11-23：通知任务细分口径——is_receipt=有回执，is_notice=通知类，
+            # 纯广播通知的前端标签走「应送达/已送达」。
+            "is_notice": _is_notice, "has_receipt": _has_receipt, "is_receipt": _has_receipt,
         }
 
         if tpl_meta["is_adhoc"]:
@@ -6108,10 +6157,15 @@ class StateStore:
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
         per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
-        rows = self._stats_receipt_rows(tpl["template_id"], period_key) if tpl_meta["is_receipt"] else self.conn.execute(
-            "SELECT id, phone, name_snap, dept_snap, status, submitted_at, deadline_at "
-            f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
-            (tpl["template_id"], *per_params)).fetchall()
+        if tpl_meta["is_receipt"]:
+            rows = self._stats_receipt_rows(tpl["template_id"], period_key)
+        elif tpl_meta["is_notice"]:
+            rows = self._stats_delivery_rows(tpl["template_id"], period_key)
+        else:
+            rows = self.conn.execute(
+                "SELECT id, phone, name_snap, dept_snap, status, submitted_at, deadline_at "
+                f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
+                (tpl["template_id"], *per_params)).fetchall()
         # 周/月聚合视角：同人多实例去重成一人一行（日视图唯一键保证恒等）
         persons = self._stats_dedup_persons([dict(r) for r in rows])
         # 2026-11-19 需求五：用「本期实例里实际出现的手机号」做部门兜底，
@@ -6167,6 +6221,10 @@ class StateStore:
                 "by_status": {k: v for k, v in by_status.items()},
                 **({"expected_replies": total, "replied": done, "pending_replies": not_done, "reply_rate": rate}
                    if tpl_meta["is_receipt"] else {}),
+                # 2026-11-23：纯广播通知 → 应送达 / 已送达 / 未送达 / 送达率
+                **({"expected_delivery": total, "delivered": done,
+                    "pending_delivery": not_done, "delivery_rate": rate}
+                   if tpl_meta["is_notice"] and not tpl_meta["is_receipt"] else {}),
             },
             "dept_stats": dept_stats,
         }
@@ -6182,11 +6240,17 @@ class StateStore:
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         sel = str(dept_path or "").strip().strip("/")
         per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
-        is_receipt = tpl["kind"] == "notice"
-        rows = self._stats_receipt_rows(tpl["template_id"], period_key) if is_receipt else [dict(r) for r in self.conn.execute(
-            "SELECT id, phone, name_snap, dept_snap, status, submitted_at, late_submit "
-            f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
-            (tpl["template_id"], *per_params)).fetchall()]
+        from .notice_media import notice_receipt_config
+        has_receipt = tpl["kind"] == "notice" and bool(notice_receipt_config(tpl)[0])
+        if has_receipt:
+            rows = self._stats_receipt_rows(tpl["template_id"], period_key)
+        elif tpl["kind"] == "notice":
+            rows = self._stats_delivery_rows(tpl["template_id"], period_key)
+        else:
+            rows = [dict(r) for r in self.conn.execute(
+                "SELECT id, phone, name_snap, dept_snap, status, submitted_at, late_submit "
+                f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
+                (tpl["template_id"], *per_params)).fetchall()]
 
         def _keep(r: Dict[str, Any]) -> bool:
             group = str(status_group or "all").strip().lower()
@@ -6238,7 +6302,7 @@ class StateStore:
         # 当前页代表实例的最近一次提交（内容预览用；不翻全库）
         previews: Dict[int, Dict[str, Any]] = {}
         ids = [int(r["id"]) for r in page_rows]
-        if ids and not is_receipt:
+        if ids and not has_receipt:
             ph = ",".join("?" for _ in ids)
             subs = self.conn.execute(
                 f"SELECT instance_id, fields_json, note, refs_json, file_ref FROM submission "
@@ -6269,7 +6333,7 @@ class StateStore:
                 "status": str(r["status"]), "submitted_at": r["submitted_at"],
                 "late_submit": bool(r.get("late_submit")),
                 "preview": self._stats_submission_preview(submitted), "content": submitted,
-                **({key: r[key] for key in ("receipt_at", "receipt_text", "receipt_mode")} if is_receipt else {}),
+                **({key: r[key] for key in ("receipt_at", "receipt_text", "receipt_mode")} if has_receipt else {}),
             })
         return {"ok": True, "total": total, "page": p_no, "size": p_size, "items": items}
 
@@ -6381,7 +6445,11 @@ class StateStore:
         if tpl["kind"] == "notice":
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-            persons = self._stats_dedup_persons(self._stats_receipt_rows(tpl["template_id"], period_key))
+            from .notice_media import notice_receipt_config
+            has_receipt = bool(notice_receipt_config(tpl)[0])
+            source_rows = (self._stats_receipt_rows(tpl["template_id"], period_key) if has_receipt
+                           else self._stats_delivery_rows(tpl["template_id"], period_key))
+            persons = self._stats_dedup_persons(source_rows)
             # 2026-11-19 需求五：导出与明细/下钻共用同一份兜底后的 dept_map
             dept_map = self._stats_member_dept_map(
                 role_ids, owner_id=owner_id, phones=[str(row["phone"]) for row in persons])
@@ -6390,7 +6458,11 @@ class StateStore:
                 path = self._stats_phone_path(row["phone"], dept_map)
                 if not sel or path == sel or path.startswith(sel + "/"):
                     rows.append({**row, "dept_path": path})
-            return {"template": tpl, "is_receipt": True, "rows": rows}
+            if not has_receipt:
+                for row in rows:
+                    row["delivered"] = str(row.get("status")) in self.STATS_PANEL_DONE
+            return {"template": tpl, "is_receipt": has_receipt,
+                    **({"is_delivery": True} if not has_receipt else {}), "rows": rows}
         modules = effective_h5_modules(tpl)
         schema_fields = [f for f in (tpl.get("schema_json") or []) if isinstance(f, dict) and f.get("key")]
         content_fields = [f for f in schema_fields if str(f.get("type") or "").lower() not in ("file", "image")]
