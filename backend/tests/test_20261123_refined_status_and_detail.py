@@ -67,9 +67,18 @@ def ctx(tmp_path):
     owner = owner_login("Sub@2026Ready")
 
     try:
-        yield store, scheduler, notifier, owner, owner_id
+        yield store, scheduler, notifier, owner, owner_id, admin, app
     finally:
         store.close()
+
+
+def _login(ctx, username, password):
+    """用 fixture 里的 FastAPI 应用登录任意账号（跨租户越权用例复用）。"""
+    client = TestClient(ctx[6])
+    response = client.post("/api/admin/login", json={"username": username, "password": password})
+    assert response.status_code == 200, response.text
+    client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
+    return client
 
 
 def make_form(store, owner_id, rid, name, *, review=False):
@@ -90,7 +99,7 @@ def submit_as_user(store, phone, tid, inst, note="成员提交"):
 @pytest.fixture
 def dataset(ctx):
     """造齐 13 种细分状态各至少 1 行（cancelled 2 行），并回填预期实例清单。"""
-    store, scheduler, notifier, owner, owner_id = ctx
+    store, scheduler, notifier, owner, owner_id, _super, _app = ctx
     rid = store.create_role("细分状态组", owner_id=owner_id)["role_id"]
     member_a, member_b, member_c = "13900009501", "13900009502", "13900009503"
     # 甲/乙在角色里（推送类实例按人生成）；丙**不在角色**——只留一条「已取消」行，
@@ -326,3 +335,61 @@ def test_upload_detail_carries_latest_submission_source(ctx, dataset):
     user_detail = ctx[3].get(f"/api/admin/instances/{expected['done']['id']}").json()
     assert user_detail["instance"]["refined_status"] == "done"
     assert user_detail["instance"]["latest_submission"]["source"] == "user"
+
+
+# ── 4. 安全回归：详情端点按管理员归属隔离（2026-11-23 审计修补） ─────────
+def test_instance_detail_rejects_cross_owner_access(ctx, dataset, monkeypatch):
+    """分级管理员用别人的 instance_id 猜测访问 → 403 FORBIDDEN_OWNER，两层防线：
+    ① register_admin_guard 中间件 _check_path_ownership（第一层）；
+    ② 端点内 owner_id 隔离（纵深防御：中间件查询异常静默放行时仍拦截）。
+    归属本人 200；超管全局只读 200。"""
+    import app.api.admin as admin_module
+    expected, *_ = dataset
+    store, scheduler, notifier, owner, owner_id, super_client, _app = ctx
+    target = expected["reviewing"]["id"]
+
+    # 另一个分级管理员（隔壁租户），走与 owner 相同的登录/改密流程
+    created = post_verified_admin(super_client, {"username": "refined_other"})
+    assert created.status_code == 200, created.text
+    other_id = created.json()["account"]["id"]
+    assert other_id != owner_id
+    first = _login(ctx, "refined_other", StateStore.DEFAULT_SUB_ADMIN_PASSWORD)
+    changed = first.post("/api/admin/change-password", json={
+        "old_password": StateStore.DEFAULT_SUB_ADMIN_PASSWORD, "new_password": "Other@2026Ready"})
+    assert changed.status_code == 200, changed.text
+    other = _login(ctx, "refined_other", "Other@2026Ready")
+
+    # 第一层：路径归属中间件拦截
+    resp = other.get(f"/api/admin/instances/{target}")
+    assert resp.status_code == 403 and resp.json()["code"] == "FORBIDDEN_OWNER"
+
+    # 第二层（反向验证）：拆掉中间件归属校验，端点内守卫必须独立拦下
+    monkeypatch.setattr(admin_module, "_check_path_ownership", lambda *a, **k: None)
+    resp = other.get(f"/api/admin/instances/{target}")
+    assert resp.status_code == 403 and resp.json()["code"] == "FORBIDDEN_OWNER"
+    monkeypatch.undo()
+
+    # 归属本人与超管均放行；隔壁租户在列表里也看不到（口径一致）
+    assert owner.get(f"/api/admin/instances/{target}").status_code == 200
+    assert super_client.get(f"/api/admin/instances/{target}").status_code == 200
+    assert all(item["id"] != target for item in
+               other.get("/api/admin/instances?size=100").json()["items"])
+
+
+# ── 5. SQL 与 Python 兜底口径对齐（2026-11-23 审计修补） ────────────────
+def test_refined_sql_and_python_fallback_aligned(ctx, dataset):
+    """通知历史脏行（如 status='submitted'，正常链路不会出现）在列表、详情与
+    统计三处同落「已送达」，兜底不再漂移到「已取消」。"""
+    expected, *_ = dataset
+    store, scheduler, notifier, owner, owner_id, super_client, _app = ctx
+    dirty_id = expected["sent"]["id"]
+    with store.lock, store.conn:
+        store.conn.execute("UPDATE task_instance SET status='submitted' WHERE id=?", (dirty_id,))
+
+    rows = owner.get("/api/admin/instances?size=100").json()["items"]
+    assert next(r for r in rows if r["id"] == dirty_id)["refined_status"] == "sent"
+    detail = owner.get(f"/api/admin/instances/{dirty_id}").json()
+    assert detail["instance"]["refined_status"] == "sent"
+    stats = owner.get("/api/admin/stats").json()["stats"]
+    assert stats["refined"]["sent"] >= 1
+    assert sum(stats["refined"].values()) == stats["total"]

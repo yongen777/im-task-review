@@ -446,11 +446,17 @@ _REFINED_CASE_ORDER = [
 
 
 def refined_status_case_sql() -> str:
-    """生成「一行 → 细分状态键」的 CASE 表达式（stats 聚合分组用）。"""
+    """生成「一行 → 细分状态键」的 CASE 表达式（stats 聚合分组用）。
+
+    兜底分支与 compute_refined_status() 逐口径对齐（2026-11-23 审计修补）：
+    通知类历史脏行（如 status='submitted'，正常链路不会出现）按「已送达」展示，
+    其余未知态一律归「待上传」——避免同一条记录在统计与详情中落入不同状态。
+    """
     branches = " ".join(
         f"WHEN {_REFINED_STATUS_SQL[key]} THEN '{key}'" for key in _REFINED_CASE_ORDER
     )
-    return f"CASE {branches} ELSE 'cancelled' END"
+    fallback = "CASE WHEN t.kind = 'notice' THEN 'sent' ELSE 'upload_pending' END"
+    return f"CASE {branches} ELSE {fallback} END"
 
 
 def compute_refined_status(
@@ -2569,6 +2575,15 @@ def create_admin_router(
         inst = state.get_instance(instance_id)
         if not inst:
             return error_response(404, "NOT_FOUND", "任务实例不存在")
+        # 2026-11-23 安全审计修补（纵深防御第二层）：详情按管理员归属隔离——
+        # 分级管理员只能查看自己 owner_id 名下的实例；超管保持全局只读放行
+        # （与列表/统计的全局视角一致）。第一层在 register_admin_guard 中间件的
+        # _check_path_ownership（403 FORBIDDEN_OWNER），但其查询异常时会静默放行，
+        # 端点内必须再拦一次，保证单独依赖本层时也不越权。
+        _detail_admin = _admin_profile(state, sess)
+        if (not _is_super_admin(_detail_admin)
+                and int(inst.get("owner_id") or 0) != int(_detail_admin.get("id") or 0)):
+            return error_response(403, "FORBIDDEN_OWNER", "该任务实例不属于当前管理员")
         tpl = state.get_template(inst["template_id"], include_deleted=True)
         # 2026-10-30 详情补齐模板侧字段：
         # · kind / role_id：列表早就用模板补了，详情漏了，前端只能退化成「业务角色」

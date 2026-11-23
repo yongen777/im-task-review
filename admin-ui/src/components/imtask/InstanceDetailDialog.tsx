@@ -775,17 +775,22 @@ export function InstanceDetailDialog({
                 2026-11-23 顶部时间字段统一：
                 · 推送类（定时/立即上传、定时/立即通知、回执通知）→「送达时间」（未推送显示待推送）
                   +「提交时间 / 回执确认时间」（未完成/未回复显示 —）+ 有截止则展示「截止时间」；
+                · 纯广播通知（未开启回执）→ 只显示「送达时间」，不渲染「回执确认时间」
+                  （2026-11-23 审计修补：避免误显示「回执确认时间：未回复」）；
                 · 自主上报（无推送环节）→ 不显示送达时间，仅展示「提交时间」。 */}
             {(() => {
               const inst = detailData.instance;
               const isNotice = inst.kind === 'notice';
               const isAdhoc = !!inst.is_adhoc;
+              const receiptOn = isNotice && !!inst.receipt_mode;
               const deadlineRaw = String(inst.deadline_at || '');
               const hasDeadline = !isNotice && !isAdhoc && !!deadlineRaw && !deadlineRaw.startsWith('9999-12-31');
               const confirmAt = isNotice ? (inst.receipt_at || null) : (inst.submitted_at || null);
               const gridCols = isAdhoc
                 ? 'sm:grid-cols-3'
-                : isNotice ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3 lg:grid-cols-5';
+                : isNotice
+                  ? (receiptOn ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3')
+                  : 'sm:grid-cols-3 lg:grid-cols-5';
               return (
                 <div className={`grid grid-cols-2 ${gridCols} gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/70`}>
               <div>
@@ -814,14 +819,14 @@ export function InstanceDetailDialog({
                     : <span className="text-slate-400" title="尚未推送">待推送</span>}
                 </div>
               </div>}
-              <div>
+              {(!isNotice || receiptOn) && <div>
                 <div className="text-[11px] text-slate-400">{isNotice ? '回执确认时间' : '提交时间'}</div>
                 <div className="font-mono text-slate-700 mt-0.5">
                   {confirmAt
                     ? <span title={isNotice ? '成员完成回执确认的时间' : '成员提交任务的时间'}>{confirmAt}</span>
                     : <span className="text-slate-400">{isNotice ? '未回复' : '未完成'}</span>}
                 </div>
-              </div>
+              </div>}
               {hasDeadline && (
                 <div>
                   <div className="text-[11px] text-slate-400">截止时间</div>
