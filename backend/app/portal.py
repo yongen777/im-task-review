@@ -7,6 +7,16 @@ from .config import canonical_part, format_dt
 from .state import BizError, calc_h5_token_ttl_hours, effective_instance_deadline
 
 
+def _norm_dept_path(raw):
+    """dept_path 规范化：'/' 两侧空格剔除、空段丢弃、'|' 容错替换。
+
+    建树（local_dept_tree）、默认部门（local_default_department）与选人
+    （recipients）**必须共用同一份规范化**，否则「本部门 / 下级」这类
+    斜杠带空格的历史数据会在子树匹配时静默漏人。
+    """
+    return '/'.join(p.strip() for p in str(raw or '').replace('|', '/').split('/') if p.strip())
+
+
 class PortalService:
     def __init__(self, state):
         self.s = state
@@ -24,8 +34,10 @@ class PortalService:
         members = self.members(platform, owner)
         nodes, subtree = {}, {}
         for m in members:
-            path = str(m.get('dept_path') or '').replace('|', '/').strip().strip('/')
-            parts = [p.strip() for p in path.split('/') if p.strip()] if path else []
+            path = _norm_dept_path(m.get('dept_path'))
+            if not path:
+                continue
+            parts = path.split('/')
             acc = []
             for part in parts:
                 acc.append(part)
@@ -43,7 +55,7 @@ class PortalService:
     def local_default_department(self, platform, owner, phone):
         """成员本人当前部门——直接取本地名册 dept_path，不再远程核对。"""
         row = next((m for m in self.members(platform, owner, phone)), None)
-        path = str((row or {}).get('dept_path') or '').replace('|', '/').strip().strip('/')
+        path = _norm_dept_path((row or {}).get('dept_path'))
         if not path:
             return None
         return {'dept_id': path, 'name': path.replace('/', ' / ')}
@@ -207,10 +219,12 @@ class PortalService:
                     continue
                 item = all_members.setdefault(m['phone'], {'phone': m['phone'], 'name': m['name'],
                     'dept_ids': [], 'role_ids': [], 'owner_ids': [], 'member_role_ids': []})
-                path = str(m.get('dept_path') or '').replace('|', '/').strip().strip('/')
+                # 2026-11-23 补丁：与 local_dept_tree 同一份规范化——斜杠两侧空格
+                # 不剔除会让祖先路径对不上 allowed_nodes（成员静默丢部门、漏勾选）。
+                path = _norm_dept_path(m.get('dept_path'))
                 ancestors = []
                 acc = []
-                for part in [p for p in path.split('/') if p]:
+                for part in ([p for p in path.split('/') if p] if path else []):
                     acc.append(part)
                     ancestors.append('/'.join(acc))
                 item['dept_ids'].extend(did for did in ancestors

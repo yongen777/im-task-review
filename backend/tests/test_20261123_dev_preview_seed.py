@@ -98,3 +98,20 @@ def test_dev_preview_seed_replay_after_grant_saved(preview):
     # 复跑后授权范围仍覆盖全部演示成员（跨组联查任务照常发布）
     assert store.conn.execute(
         "SELECT COUNT(*) AS n FROM portal_task").fetchone()["n"] >= 4
+
+def test_preview_app_serves_portal_create_page(preview):
+    """2026-11-23 补丁：预览服务注册 /h5/portal-create（领导独立建任务页），
+    H5_FILES 增补后 make_app 的页面路由返回 200 且注入自动刷新脚本。"""
+    module, store, scheduler = preview
+    from fastapi.testclient import TestClient
+
+    app = module.make_app(store, scheduler, 1, "preview-open-key")
+    client = TestClient(app, headers={"host": "127.0.0.1"})
+    for route in ("portal", "portal-create", "task", "notice-receipt"):
+        response = client.get("/h5/" + route)
+        assert response.status_code == 200, (route, response.status_code)
+    assert "portal-create" in module.H5_FILES
+    page = client.get("/h5/portal-create")
+    assert "portal-create.html" == module.H5_FILES["portal-create"]
+    assert "通知提醒" in page.text and "上传任务" in page.text
+    assert "checkPreviewUpdate" in page.text  # 预览热更新脚本已注入

@@ -249,3 +249,25 @@ def test_h5_leader_notice_http_asset_and_create(leader):
         request_id='notice-http-02', notice_items=[{'format': 'file', 'asset_id': asset_id}])).status_code == 403
     foreign = {'Authorization': 'Bearer ' + p.issue(MEMBER_B, ident['platform'])}
     assert client.get('/api/h5/portal-asset/' + asset_id, headers=foreign).status_code == 403
+
+def test_local_tree_normalizes_slash_padding(leader):
+    """2026-11-23 补丁：dept_path 斜杠两侧带空格时不再静默漏人。
+
+    建树、默认部门与选人三处共用 _norm_dept_path——' 本部门 / 下级部门 '
+    规范化为 '本部门/下级部门'，授权子树匹配与成员挂靠部门保持一致。
+    """
+    p, ident, owner_id, (s, *_) = leader
+    s.conn.execute('UPDATE member SET dept_path=? WHERE phone=?',
+                   ('  本部门 /  下级部门  ', MEMBER_B))
+    s.conn.commit()
+    tree = p.local_dept_tree('zdxlz', owner_id)
+    assert [d['dept_id'] for d in tree['departments']] == ['本部门', '本部门/下级部门']
+    assert [d['member_count'] for d in tree['departments']] == [2, 1]
+    assert p.local_default_department('zdxlz', owner_id, MEMBER_B)['dept_id'] == '本部门/下级部门'
+    # 规范化后的默认部门能被子树授权命中（不被空格打散）
+    p.save_grant('zdxlz', owner_id, ident['phone'], {'enabled': True, 'dept_ids': ['本部门'], 'role_ids': []}, 't')
+    scope = p.recipients(ident)
+    assert {m['phone'] for m in scope['members']} == {ident['phone'], MEMBER_B}
+    assert {d['dept_id'] for d in scope['departments']} == {'本部门', '本部门/下级部门'}
+    member_b = next(m for m in scope['members'] if m['phone'] == MEMBER_B)
+    assert set(member_b['dept_ids']) == {'本部门', '本部门/下级部门'}

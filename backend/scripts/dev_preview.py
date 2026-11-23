@@ -32,8 +32,8 @@ DEMO_DEPARTMENTS = {
     "preview-switch": ("交换维护组", "preview-network"),
     "preview-service": ("服务保障部", "preview-root"),
 }
-H5_FILES = {"portal": "portal.html", "task": "task.html", "image": "image.html",
-            "notice-receipt": "notice-receipt.html"}
+H5_FILES = {"portal": "portal.html", "portal-create": "portal-create.html", "task": "task.html",
+            "image": "image.html", "notice-receipt": "notice-receipt.html"}
 
 
 def local_database():
@@ -206,15 +206,23 @@ def seed(store, password, scheduler):
     leader, employee, cross, standby = DEMO_MEMBERS
     ident = {"phone": leader[0], "platform": "zdxlz"}
     portal = PortalService(store)
-    # 2026-11-21：显式勾选演示组织根部门，不再依赖 grant_options 的「默认部门」回退。
-    # 原写法 [*grants["default_dept_ids"], "preview-service"] 只在**首轮启动**有效——
-    # 授权行一旦落库，grant_options 就走「已保存 scope」分支、default_dept_ids 恒为空
-    # （portal.py grant_options L254-258），复跑时授权范围退化为仅 preview-service 一个部门，
-    # seed 里按全部演示成员 create_task 即报「接收成员超出授权范围」（portal.py:383）。
-    # 根部门 preview-root 经 recipients() 的 descendants() 展开覆盖全部 4 名演示成员，
-    # 首轮与复跑行为完全一致。
+    # 2026-11-23：授权/选人部门树改为**本地名册 dept_path 实时聚合**（portal.py
+    # local_dept_tree，零远程调用），旧的远程部门 id（preview-root 等 preview-*）不再是
+    # 合法 dept_id。这里先把 4 名演示成员的 dept_path 幂等刷新为 DemoDirectory 的全路径
+    # （部门树 / 监管面板部门维度共用这份口径），再把授权勾到根路径「本地演示组织」
+    # ——经子树展开覆盖全部 4 名演示成员，首轮与复跑行为完全一致。
+    demo_directory = DemoDirectory()
+    with store.conn:
+        for phone, name, dept, dept_id in DEMO_MEMBERS:
+            full_path = demo_directory.get_department(dept_id)["full_name"]
+            store.conn.execute(
+                "UPDATE member m JOIN role r ON m.role_id = r.role_id SET m.dept_path = ?, m.dept = ? "
+                "WHERE m.phone = ? AND m.owner_id = ? AND r.platform = 'zdxlz'",
+                (full_path, dept, phone, owner),
+            )
     portal.save_grant("zdxlz", owner, leader[0], {
-        "enabled": True, "dept_ids": ["preview-root"], "role_ids": [cross_role],
+        "enabled": True, "dept_ids": [demo_directory.get_department("preview-root")["full_name"]],
+        "role_ids": [cross_role],
     }, DEMO_USER)
     templates = {item["name"]: item for item in store.list_templates(owner_id=owner, size=100)["items"]}
     now = store.now()
@@ -399,7 +407,7 @@ def make_app(store, scheduler, owner, open_key):
                                 headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
         return page
 
-    for route in ("portal", "task", "notice-receipt"):
+    for route in ("portal", "portal-create", "task", "notice-receipt"):
         app.add_api_route("/h5/" + route, live_page(H5_FILES[route]), methods=["GET"])
     app.include_router(create_h5_router(store, store.data_dir / "uploads", notifier=scheduler.notifier,
                                         scheduler=scheduler))
