@@ -375,6 +375,214 @@ def register_admin_guard(app: FastAPI, state: StateStore) -> None:
 # 兼容旧版免审代交留下的 submitted，筛选与统计按完成状态处理。
 _INSTANCE_STATUS_SQL = "CASE WHEN i.status = 'submitted' AND t.kind <> 'notice' AND t.need_review = 0 THEN 'approved' ELSE i.status END"
 
+# ── 2026-11-23 执行状态细分：按任务类型智能联动 ──────────────────────────
+# 通知提醒 6 项 / 上传任务 9 项（含 pending 细分为「待推送 / 待上传」）。
+# 列表徽章（refined_status 下发）、详情徽章（同一字段）、下拉筛选（status=refined 键）、
+# KPI 聚合（stats.refined 计数）四处共用这一份口径，保证数字与筛出来的行完全一致。
+_PUBLISHED_AT_SUBSQL = (
+    "(SELECT MIN(l.sent_at) FROM reminder_log l WHERE l.instance_id = i.id AND l.result = 'sent' "
+    "AND l.kind IN ('remind','manual_push','notice','notice_img','notice_img_link','notice_file',"
+    "'notice_file_link','notice_video','notice_vid_link','portal'))"
+)
+# 最新一次有效提交（status != 'rejected'）的来源，与管理端「管理员代交」徽标同源。
+_LATEST_SOURCE_SUBSQL = (
+    "(SELECT s.source FROM submission s WHERE s.instance_id = i.id AND s.status != 'rejected' "
+    "ORDER BY s.id DESC LIMIT 1)"
+)
+_IS_ADHOC_SQL = "(t.is_adhoc = 1 OR i.period_key LIKE 'adhoc-%')"
+_IS_UPLOAD_SQL = "COALESCE(t.kind, '') <> 'notice'"
+
+# 细分键 → 精确 SQL 条件（互斥且并集覆盖全部实例行；kind 自带，可与其他筛选自由组合）。
+_REFINED_STATUS_SQL: Dict[str, str] = {
+    # 通用：待推送（通知=尚未发送；上传=非自主上报且提醒未送达）
+    "push_pending": (
+        "(i.status = 'pending' AND (t.kind = 'notice' "
+        f"OR ({_IS_UPLOAD_SQL} AND NOT {_IS_ADHOC_SQL} AND {_PUBLISHED_AT_SUBSQL} IS NULL)))"
+    ),
+    # 通用：已取消（成员移出/模板停用等作废行，两种类型语义一致）
+    "cancelled": "(i.status = 'cancelled')",
+    # 通知提醒：已送达（已发送且未开启回执；兼容历史 approved 无回执行）
+    "sent": (
+        "(t.kind = 'notice' AND i.status IN ('sent','approved') AND i.receipt_at IS NULL "
+        "AND (i.receipt_mode IS NULL OR i.status = 'approved'))"
+    ),
+    # 通知提醒：待回复（开启回执、已发送、尚未确认）
+    "await_reply": (
+        "(t.kind = 'notice' AND i.status = 'sent' AND i.receipt_mode IS NOT NULL AND i.receipt_at IS NULL)"
+    ),
+    # 通知提醒：已回复（任意送达态 + 回执时间已落库）
+    "replied": "(t.kind = 'notice' AND i.status IN ('sent','approved') AND i.receipt_at IS NOT NULL)",
+    # 通知提醒：未送达（当天 23:59 后仍未发出的实例）
+    "notice_expired": "(t.kind = 'notice' AND i.status = 'expired')",
+    # 上传任务：待上传（提醒已送达仍未交，或自主上报待提交）
+    "upload_pending": (
+        f"(i.status = 'pending' AND {_IS_UPLOAD_SQL} AND ({_IS_ADHOC_SQL} OR {_PUBLISHED_AT_SUBSQL} IS NOT NULL))"
+    ),
+    # 上传任务：已提交（待审核）
+    "reviewing": f"({_IS_UPLOAD_SQL} AND i.status = 'submitted' AND t.need_review = 1)",
+    # 上传任务：已完成（管理员代交优先于普通完成判定）
+    "done_admin": (
+        f"({_IS_UPLOAD_SQL} AND (i.status = 'approved' OR (i.status = 'submitted' AND t.need_review = 0)) "
+        f"AND {_LATEST_SOURCE_SUBSQL} = 'admin')"
+    ),
+    # 上传任务：已完成（审核通过或免审自交）
+    "done": (
+        f"({_IS_UPLOAD_SQL} AND (i.status = 'approved' OR (i.status = 'submitted' AND t.need_review = 0)) "
+        f"AND ({_LATEST_SOURCE_SUBSQL} IS NULL OR {_LATEST_SOURCE_SUBSQL} <> 'admin'))"
+    ),
+    # 上传任务：已驳回（待重交）
+    "rejected": f"({_IS_UPLOAD_SQL} AND i.status = 'rejected')",
+    # 上传任务：已逾期未交
+    "overdue": f"({_IS_UPLOAD_SQL} AND i.status = 'overdue')",
+    # 上传任务：已失效（逾期超 72h / 驳回重交窗口关闭）
+    "expired": f"({_IS_UPLOAD_SQL} AND i.status = 'expired')",
+}
+# CASE 分支顺序即优先级（done_admin 必须先于 done；其余互斥）。
+_REFINED_CASE_ORDER = [
+    "push_pending", "upload_pending", "reviewing", "done_admin", "done",
+    "rejected", "overdue", "expired", "sent", "await_reply", "replied",
+    "notice_expired", "cancelled",
+]
+
+
+def refined_status_case_sql() -> str:
+    """生成「一行 → 细分状态键」的 CASE 表达式（stats 聚合分组用）。"""
+    branches = " ".join(
+        f"WHEN {_REFINED_STATUS_SQL[key]} THEN '{key}'" for key in _REFINED_CASE_ORDER
+    )
+    return f"CASE {branches} ELSE 'cancelled' END"
+
+
+def compute_refined_status(
+    *,
+    kind: str,
+    status: str,
+    need_review: bool,
+    is_adhoc: bool = False,
+    published_at: Optional[str] = None,
+    receipt_mode: Optional[str] = None,
+    receipt_at: Optional[str] = None,
+    latest_submission_source: Optional[str] = None,
+) -> str:
+    """纯函数版细分判定（列表/详情逐行计算用，与 _REFINED_STATUS_SQL 逐条对齐）。"""
+    status = str(status or "")
+    is_notice = str(kind or "form") == "notice"
+    receipt_mode = receipt_mode or None
+    receipt_at = receipt_at or None
+    source = latest_submission_source or None
+    if status == "cancelled":
+        return "cancelled"
+    if is_notice:
+        if status == "pending":
+            return "push_pending"
+        if status == "expired":
+            return "notice_expired"
+        if status in ("sent", "approved"):
+            if receipt_at:
+                return "replied"
+            if status == "sent" and receipt_mode:
+                return "await_reply"
+            return "sent"
+        return "sent"  # 历史脏行兜底：送达态之外不再细分
+    if status == "pending":
+        if is_adhoc or published_at:
+            return "upload_pending"
+        return "push_pending"
+    if status == "submitted":
+        return "reviewing" if need_review else ("done_admin" if source == "admin" else "done")
+    if status == "approved":
+        return "done_admin" if source == "admin" else "done"
+    if status == "rejected":
+        return "rejected"
+    if status == "overdue":
+        return "overdue"
+    if status == "expired":
+        return "expired"
+    return "upload_pending"
+
+
+def _notice_media_admin_url(state: StateStore, *, asset: Optional[Dict[str, Any]],
+                            name: str, kind: str, size: int, mime: str) -> Dict[str, Any]:
+    """把通知附件归一成后台可展示的结构（URL 走登录态的 notice-assets 预览接口）。"""
+    return {
+        "kind": str(kind or (asset or {}).get("kind") or "file"),
+        "name": str(name or (asset or {}).get("file_name") or "附件"),
+        "url": f"/api/admin/notice-assets/{asset['asset_id']}" if asset else "",
+        "size": int(size or (asset or {}).get("size") or 0),
+        "mime": str(mime or (asset or {}).get("mime") or ""),
+    }
+
+
+def _build_notice_view(state: StateStore, inst: Dict[str, Any],
+                       tpl: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """通知类实例「实际下发内容与附件」：优先该次下发的 notice_receipt_view 快照，
+    无快照（未推送 / text 回执模式未落快照）时回退模板当前正文与附件。
+
+    · 快照由调度器在发送 H5 确认链接时写入（scheduler._notice_link_message → save_view），
+      含 title / body / published_at / media[{kind,name,relative,size,mime}]；
+    · media.relative 形如 notice_assets/<asset_id>.<ext>，这里反查 notice_asset 拿
+      asset_id，前端才能用 /api/admin/notice-assets/{asset_id} 在线预览/下载。
+    """
+    from ..notice_media import get_asset
+
+    row = state.conn.execute(
+        "SELECT content_json FROM notice_receipt_view WHERE instance_id = ?", (int(inst["id"]),)
+    ).fetchone()
+    if row:
+        try:
+            view = json.loads(row["content_json"])
+        except Exception:
+            view = None
+        if isinstance(view, dict):
+            media: List[Dict[str, Any]] = []
+            for item in view.get("media") or []:
+                if not isinstance(item, dict):
+                    continue
+                relative = str(item.get("relative") or "")
+                asset = None
+                storage = relative[len("notice_assets/"):] if relative.startswith("notice_assets/") else ""
+                if storage and re.fullmatch(r"[0-9a-f]{32}\.[a-z0-9]+", storage):
+                    found = state.conn.execute(
+                        "SELECT * FROM notice_asset WHERE storage_name = ?", (storage,)
+                    ).fetchone()
+                    asset = dict(found) if found else None
+                media.append(_notice_media_admin_url(
+                    state, asset=asset, name=str(item.get("name") or ""),
+                    kind=str(item.get("kind") or ""), size=int(item.get("size") or 0),
+                    mime=str(item.get("mime") or ""),
+                ))
+            return {
+                "title": str(view.get("title") or inst.get("template_name") or ""),
+                "body": str(view.get("body") or ""),
+                "published_at": view.get("published_at"),
+                "media": media,
+                "source": "snapshot",
+            }
+    # 无快照：回退模板当前正文与附件（asset 项可在线预览；legacy 直链/看板图无
+    # 后台预览通道，保留文件名提示不丢证据）。
+    _tpl = tpl or {}
+    spec = _tpl.get("spec_json") or {}
+    items = spec.get("notice_items") if isinstance(spec, dict) else None
+    media = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict) or item.get("format") not in ("image", "file", "video"):
+                continue
+            asset = get_asset(state, str(item.get("asset_id") or "")) if item.get("asset_id") else None
+            if asset and int(asset.get("owner_id") or 0) != int(_tpl.get("owner_id") or 0):
+                asset = None
+            media.append(_notice_media_admin_url(
+                state, asset=asset, name=str(item.get("file_name") or ""),
+                kind=str(item.get("format") or ""), size=0, mime="",
+            ))
+    return {
+        "title": str(_tpl.get("name") or inst.get("template_name") or ""),
+        "body": str(_tpl.get("text_tpl") or ""),
+        "published_at": None,
+        "media": media,
+        "source": "template",
+    }
+
 
 def _instance_filter_sql(
     state: StateStore,
@@ -441,14 +649,18 @@ def _instance_filter_sql(
     if status and status.strip():
         # 2026-10-29：支持逗号分隔多状态（「已提醒 / 已完成」= approved,sent），
         # 否则统计卡片上的数字与点进去的列表条数对不上。
+        # 2026-11-23：同时支持「细分状态键」（push_pending / await_reply / done_admin …），
+        # 与原生 DB 状态键可混用，多值之间按 OR 组合。
         _parts = [x.strip() for x in status.split(",") if x.strip()]
-        if len(_parts) == 1:
-            where.append(f"({_INSTANCE_STATUS_SQL}) = ?")
-            params.append(_parts[0])
-        elif _parts:
-            placeholders = ",".join("?" for _ in _parts)
-            where.append(f"({_INSTANCE_STATUS_SQL}) IN ({placeholders})")
-            params.extend(_parts)
+        _conds: List[str] = []
+        for part in _parts:
+            if part in _REFINED_STATUS_SQL:
+                _conds.append(_REFINED_STATUS_SQL[part])
+            else:
+                _conds.append(f"({_INSTANCE_STATUS_SQL}) = ?")
+                params.append(part)
+        if _conds:
+            where.append("(" + " OR ".join(_conds) + ")")
     # 2026-11-12 任务E3：「补交申请状态」筛选随申请补交链路一并下线。
 
     # 任务类型：notice=纯通知；upload=所有上传类（form/image/file）
@@ -591,6 +803,17 @@ def _query_instances(
             if d["is_adhoc"] and sub and not d["submitted_at"]:
                 d["submitted_at"] = sub["created_at"]
             d["latest_submission"] = sub
+            # 2026-11-23：细分状态下发（列表徽章与详情徽章共用同一口径）
+            d["refined_status"] = compute_refined_status(
+                kind=d.get("template_kind") or "form",
+                status=d.get("status") or "",
+                need_review=bool(d.get("need_review", 0)),
+                is_adhoc=bool(d.get("is_adhoc", 0)),
+                published_at=d.get("published_at"),
+                receipt_mode=d.get("receipt_mode"),
+                receipt_at=d.get("receipt_at"),
+                latest_submission_source=(sub or {}).get("source"),
+            )
             items.append(d)
 
         return {"total": total, "items": items}
@@ -2393,6 +2616,31 @@ def create_admin_router(
             if inst.get("status") == "rejected"
             else None
         )
+        # 2026-11-23：详情徽章与列表徽章共用同一份细分口径（含管理员代交判定），
+        # latest_submission 与列表行结构保持一致（source 供前端兜底推导）。
+        latest_valid = next(
+            (s for s in reversed(submissions) if str(s.get("status") or "") != "rejected"),
+            None,
+        )
+        inst["latest_submission"] = (
+            {"id": latest_valid.get("id"), "source": latest_valid.get("source"),
+             "status": latest_valid.get("status"), "created_at": latest_valid.get("created_at")}
+            if latest_valid else None
+        )
+        inst["refined_status"] = compute_refined_status(
+            kind=inst["kind"],
+            status=inst.get("status") or "",
+            need_review=inst["need_review"],
+            is_adhoc=bool(inst.get("is_adhoc")),
+            published_at=inst.get("published_at"),
+            receipt_mode=inst.get("receipt_mode"),
+            receipt_at=inst.get("receipt_at"),
+            latest_submission_source=(latest_valid or {}).get("source"),
+        )
+        notice_view = (
+            _build_notice_view(state, inst, tpl)
+            if inst["kind"] == "notice" else None
+        )
 
         # 2026-10-28：详情页要能直接看到「字段 / 文字说明 / 图片 / 文件」，
         # 前端只需要一份归一化的 submission（含每个附件的文件名、类型、能否预览）。
@@ -2454,6 +2702,8 @@ def create_admin_router(
             "submission": submission_view,
             "submission_from_family": submission_from_family,
             "reminders": reminders,
+            # 2026-11-23：通知类真实下发内容与附件（快照优先，模板当前正文/附件兜底）
+            "notice_view": notice_view,
         }
 
     # ── 2026-10-29 逾期补交审核（2026-11-12 任务E3 整体下线）──────────────
@@ -2901,8 +3151,20 @@ def create_admin_router(
                 counts["late_submit"] += int(r["late_cnt"] or 0)
                 if st in counts:
                     counts[st] = cnt
+            # 2026-11-23：细分状态计数（通知 6 项 / 上传 9 项），KPI 卡片与
+            # 下拉筛选的数字与列表行数完全同源（同一份 _REFINED_STATUS_SQL）。
+            refined_counts = {
+                key: 0 for key in _REFINED_CASE_ORDER
+            }
+            refined_rows = state.conn.execute(
+                f"SELECT {refined_status_case_sql()} AS refined, COUNT(1) AS cnt "
+                f"{from_sql} {where_sql} GROUP BY refined",
+                tuple(params),
+            ).fetchall()
+            for r in refined_rows:
+                refined_counts[str(r["refined"])] = int(r["cnt"] or 0)
 
-        return {"ok": True, "stats": counts}
+        return {"ok": True, "stats": {**counts, "refined": refined_counts}}
 
     # ==================================================================
     # 2026-11-16 · 上传任务数据统计分析面板（仅分级管理员；单任务独占；

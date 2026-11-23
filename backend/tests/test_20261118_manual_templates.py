@@ -164,9 +164,19 @@ def test_manual_upload_claims_before_concurrent_delivery_and_honors_deadline(ctx
         scheduler.push_now_prepare(tid, now_dt=now + timedelta(hours=1))
 
 
-def test_portal_task_panel_endpoints_are_sub_admin_only(portal):
+def test_portal_task_panel_monitor_scopes(portal):
+    """监管面板访问边界（2026-11-23 适配 0b1e195 已拍板口径）。
+
+    0b1e195「授权成员发布任务：只读监管面板重构」明确：super_admin 全局只读放行
+    监管面板（列表+详情+导出），sub_admin 仍只见自己名下；授权配置（PUT）依旧
+    仅限归属 sub_admin。本用例在 2026-11-20 重构时漏改（仍断言 super_admin 403），
+    2026-11-23 既有失败止损时按现行口径补正：
+      · sub_admin 访问自己名下面板 → 200；
+      · super_admin 只读监管 → 200（全局视图）；
+      · 附件占位 ref 过 guard 后由 attachment_response 判定 → 404（不再 403）。
+    """
     service, identity, (_, _, _, admin, owner, *_) = portal
     task_id = publish(service, identity)["task_id"]
     assert owner.get("/api/admin/portal-tasks").status_code == 200
-    assert admin.get("/api/admin/portal-tasks").status_code == 403
-    assert admin.get(f"/api/admin/portal-tasks/{task_id}/attachments/placeholder").status_code == 403
+    assert admin.get("/api/admin/portal-tasks").status_code == 200
+    assert admin.get(f"/api/admin/portal-tasks/{task_id}/attachments/placeholder").status_code == 404

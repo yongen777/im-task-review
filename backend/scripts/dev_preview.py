@@ -117,6 +117,7 @@ def demo_files():
 
 
 def seed_notice_receipts(store, scheduler, owner, role_id, phone, image, pdf, run_id):
+    from app.config import format_dt
     from app.notice_media import store_asset
     from app.notice_receipts import issue_link
 
@@ -138,10 +139,14 @@ def seed_notice_receipts(store, scheduler, owner, role_id, phone, image, pdf, ru
                 items.append(asset("video", path.name, path.read_bytes()))
 
     def notice(title, body, config, media=()):
+        # config=None → 不开启回执（已送达演示）；否则 {"mode": ...} 开启回执。
+        spec = {"notice_items": list(media)}
+        if config is not None:
+            spec["notice_receipt"] = {"enabled": True, **config}
         template = store.create_template({
             "name": f"{title} · {run_id[:4]}", "kind": "notice", "period": "day", "is_manual": True,
             "text_tpl": body, "role_ids": [role_id],
-            "spec": {"notice_receipt": {"enabled": True, **config}, "notice_items": list(media)},
+            "spec": spec,
         }, owner_id=owner)
         scheduler.push_now(template["template_id"])
         return store.get_instance_by_key(template["template_id"], phone, "once")
@@ -155,6 +160,20 @@ def seed_notice_receipts(store, scheduler, owner, role_id, phone, image, pdf, ru
     detailed = notice("机柜巡检通知", long_body, {"mode": "link", "button_label": "确认已读"}, items)
     short = notice("晚班交接提示", "今晚交接按原计划进行。", {"mode": "link"})
     notice("文本回执演示", "请回到聊天框完成确认。", {"mode": "text", "phrase": "预览已阅"})
+    # 2026-11-23：补齐通知细分状态演示——
+    #   已送达：不开启回执的通知（receipt_mode 为空）；
+    #   已回复：文本回执通知模拟成员已在聊天框回复短语；
+    #   未送达：建模板但不推送，实例给过期截止 → advance 后 expired。
+    notice("部门周知", "本周例会调整至周四 15:00，请知悉。", None)
+    store.acknowledge_notice_receipts(phone, "zdxlz", "预览已阅")
+    expired_tpl = store.create_template({
+        "name": f"未送达演示 · 停电检修 · {run_id[:4]}", "kind": "notice", "period": "day",
+        "is_manual": True, "text_tpl": "示例：此通知从未送达。", "role_ids": [role_id],
+        "spec": {},
+    }, owner_id=owner)
+    store.ensure_instance(expired_tpl["template_id"], phone, "演示成员", None, "once",
+                          format_dt(store.now() - timedelta(hours=2)))
+    store.advance_instance_statuses(store.now())
     return {"H5 通知确认 · 图文和附件": issue_link(store, detailed),
             "H5 通知确认 · 单屏短文": issue_link(store, short)}
 
@@ -258,6 +277,13 @@ def seed(store, password, scheduler):
     adhoc_image = template("交换设备隐患上报", "填写设备情况并拍照。", ["text", "image"], adhoc=True)
 
     pending = token(create_instance(broad, leader))
+    # 2026-11-23：补一条「提醒已送达、成员尚未提交」的演示行（细分状态「待上传」）——
+    # 定时模板直接建的 pending 实例默认没有送达记录（细分显示「待推送」），
+    # 这条补上 remind 送达记录形成对照，后台实例页两种形态都能直接验收。
+    delivered_row = create_instance(broad, standby)
+    store.record_reminder_log(template_id=broad, instance_id=delivered_row["id"], phone=standby[0],
+                              kind="remind", planned_at=format_dt(now), sent_at=format_dt(now),
+                              result="sent", error=None, idem_key=f"preview|{delivered_row['id']}")
     completed = submit(create_instance(broad, employee), data=fields,
                        note="设备运行正常。巡检记录和交接明细已附。", attachments=[(image_name, image), (pdf_name, pdf)])
     delegated = create_instance(broad, cross)
@@ -291,17 +317,27 @@ def seed(store, password, scheduler):
         })
         tid = issued["task_id"]
         period = "once" if mode == "once" else period_key("week", now)
-        create_instance(tid, leader, period=period)
+        # 2026-11-23：领导工作台任务随发布即通过聊天送达——补一条 portal 送达记录，
+        # 这批 pending 实例在「执行状态细分」下显示「待上传」；而管理员定时模板的
+        # pending 实例（broad）没有送达记录 → 「待推送」，两种形态都能直接验收。
+        for member in (leader, standby):
+            delivered = create_instance(tid, member, period=period)
+            store.record_reminder_log(template_id=tid, instance_id=delivered["id"], phone=member[0],
+                                      kind="portal", planned_at=format_dt(now), sent_at=format_dt(now),
+                                      result="sent", error=None, idem_key=f"preview|{delivered['id']}")
         submit(create_instance(tid, employee, period=period), note="交换机运行正常，机柜温度 24°C。",
                attachments=[(image_name, image)])
         create_instance(tid, cross, period=period, due=past_deadline)
-        create_instance(tid, standby, period=period)
         if mode == "week":
             previous = period_key("week", now - timedelta(days=7))
             submit(create_instance(tid, employee, period=previous), note="上一周期：完成设备核验。",
                    attachments=[(image_name, image)])
 
     create_instance(broad, standby, period=yesterday, due=past_deadline)
+    # 2026-11-23：补一条「已失效」演示行——截止已过 72h 补偿窗口，advance 后 expired，
+    # 配合上传任务 9 项细分状态在后台实例页直接验收。
+    create_instance(broad, cross, period=period_key("day", now - timedelta(days=4)),
+                    due=format_dt(now - timedelta(days=4)))
     store.advance_instance_statuses(now)
     expired = store.issue_h5_token(leader[0], "", "zdxlz", None, purpose="portal", ttl_hours=-1)
     routes = {

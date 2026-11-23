@@ -381,6 +381,8 @@ function statsToMock(d: any): InstanceStats {
     ok: true,
     total,
     by_status: by as any,
+    /* 2026-11-23：细分状态计数透传（KPI 卡片与下拉筛选同源） */
+    refined: (s.refined && typeof s.refined === 'object') ? s.refined : undefined,
     /* 通知类实例的终态是 sent，应和「审核通过」一起算作完成 */
     completion_rate: rate(by.submitted + by.approved + by.sent, total),
     on_time_rate: rate(by.approved + by.submitted + by.sent, total),
@@ -584,6 +586,8 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
       submission_timeline: Array.isArray(d.submission_timeline) ? d.submission_timeline : [],
       template: d.template || null,
       reminders: (d.reminders || d.items || []).map(remToMock),
+      /* 2026-11-23：通知类实际下发内容与附件（快照优先，模板正文/附件兜底） */
+      notice_view: d.notice_view ?? null,
     } as unknown as T;
   }
   return d as T;

@@ -16,7 +16,15 @@ import {
   Search,
   ListFilter,
 } from 'lucide-react';
-import { getInstanceStatusMeta, InstanceDetailDialog, InstancePlanTime, useInstanceRoleLabel } from './InstanceDetailDialog';
+import {
+  getInstanceStatusMeta,
+  InstanceDetailDialog,
+  InstancePlanTime,
+  NOTICE_STATUS_OPTIONS,
+  REFINED_STATUS_LABELS,
+  UPLOAD_STATUS_OPTIONS,
+  useInstanceRoleLabel,
+} from './InstanceDetailDialog';
 import PendingReviewPanel from './PendingReviewPanel';
 import { AdminScopeHeader } from './AdminScopeHeader';
 import { api, plainError } from '../../lib/api';
@@ -24,10 +32,68 @@ import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import {
   InstanceStats,
+  RefinedInstanceStatus,
   TaskInstanceItem,
 } from '../../lib/types';
 
 const PAGE_SIZE = 20;
+
+/* 2026-11-23 执行状态细分：全部类型下的三组（通用 / 通知提醒 / 上传任务） */
+const COMMON_STATUS_OPTIONS = NOTICE_STATUS_OPTIONS.filter(
+  (o) => o.value === 'push_pending' || o.value === 'cancelled',
+);
+const NOTICE_ONLY_OPTIONS = NOTICE_STATUS_OPTIONS.filter(
+  (o) => o.value !== 'push_pending' && o.value !== 'cancelled',
+);
+const UPLOAD_ONLY_OPTIONS = UPLOAD_STATUS_OPTIONS.filter(
+  (o) => o.value !== 'push_pending' && o.value !== 'cancelled',
+);
+
+function statusChoicesFor(kind: string) {
+  if (kind === 'notice') return NOTICE_STATUS_OPTIONS;
+  if (kind === 'upload') return UPLOAD_STATUS_OPTIONS;
+  return [...COMMON_STATUS_OPTIONS, ...NOTICE_ONLY_OPTIONS, ...UPLOAD_ONLY_OPTIONS];
+}
+
+/* KPI 卡片配色（激活 / 常态 / 数字色），五种业务色 + 全部 */
+const KPI_TONES: Record<string, { active: string; idle: string; label: string; value: string }> = {
+  all: {
+    active: 'bg-blue-50/60 border-blue-300 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-slate-300',
+    label: 'text-slate-500',
+    value: 'text-slate-900',
+  },
+  emerald: {
+    active: 'bg-emerald-50/70 border-emerald-400 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-emerald-200',
+    label: 'text-emerald-700',
+    value: 'text-emerald-600',
+  },
+  blue: {
+    active: 'bg-blue-50/80 border-blue-400 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-blue-200',
+    label: 'text-blue-700',
+    value: 'text-blue-600',
+  },
+  amber: {
+    active: 'bg-amber-50/70 border-amber-400 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-amber-200',
+    label: 'text-amber-700',
+    value: 'text-amber-600',
+  },
+  slate: {
+    active: 'bg-slate-100 border-slate-400 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-slate-300',
+    label: 'text-slate-600',
+    value: 'text-slate-700',
+  },
+  rose: {
+    active: 'bg-rose-50/70 border-rose-400 shadow-2xs',
+    idle: 'bg-white border-slate-200/90 hover:border-rose-200',
+    label: 'text-rose-700',
+    value: 'text-rose-600',
+  },
+};
 
 function getTodayDateString(): string {
   const d = new Date();
@@ -43,9 +109,30 @@ export const InstancesView: React.FC = () => {
   const [roleFilter, setRoleFilter] = useState<string>('');
   const [kindFilter, setKindFilter] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('');
-  const combinedStatusLabel = statusFilter === 'approved,sent'
-    ? '已提醒 / 已完成'
-    : statusFilter === 'rejected,overdue' ? '已驳回 / 已逾期' : '';
+
+  /* 2026-11-23 执行状态细分与联动：
+     · 状态下拉随任务类型切换（通知 6 项 / 上传 9 项 / 全部类型三组 optgroup）；
+     · KPI 卡片与下拉同源（stats.refined 计数），点击卡片组合筛选。 */
+  const statusChoices = useMemo(() => statusChoicesFor(kindFilter), [kindFilter]);
+  const activeStatusLabel = useMemo(() => {
+    if (!statusFilter) return '';
+    if (statusChoices.some((o) => o.value === statusFilter)) return '';
+    return statusFilter
+      .split(',')
+      .map((v) => REFINED_STATUS_LABELS[v] || v)
+      .filter(Boolean)
+      .join(' + ');
+  }, [statusFilter, statusChoices]);
+
+  const handleKindChange = (value: string) => {
+    setKindFilter(value);
+    // 切换任务类型后，当前细分状态可能不再适用（如通知类下没有「已驳回」）→ 清空状态筛选
+    if (!statusFilter) return;
+    const offerable = new Set(statusChoicesFor(value).map((o) => o.value));
+    if (!statusFilter.split(',').every((v) => offerable.has(v as RefinedInstanceStatus))) {
+      setStatusFilter('');
+    }
+  };
   const [phoneFilter, setPhoneFilter] = useState<string>('');
   const [periodKeyFilter, setPeriodKeyFilter] = useState<string>(() => getTodayDateString());
 
@@ -235,78 +322,53 @@ export const InstancesView: React.FC = () => {
         description="支持按任务类型（通知提醒 / 上传任务）筛选查看执行记录，对需审核的上传任务进行通过或驳回。"
       />
 
-      {/* 统计指标卡片 */}
-      {localStats && (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-          <div
-            onClick={() => setStatusFilter('')}
-            className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === ''
-                ? 'bg-blue-50/60 border-blue-300 shadow-2xs'
-                : 'bg-white border-slate-200/90 hover:border-slate-300'
-            }`}
-          >
-            <div className="text-xs text-slate-500 font-medium">全部任务实例</div>
-            <div className="text-xl font-bold text-slate-900 font-mono mt-1">{localStats.total}</div>
+      {/* 统计指标卡片（2026-11-23：随任务类型联动，点击卡片组合筛选；计数与下拉同源） */}
+      {localStats && (() => {
+        const refined = localStats.refined ?? {};
+        const r = (k: RefinedInstanceStatus) => refined[k] || 0;
+        const cards: Array<{ label: string; count: number; status: string; tone: keyof typeof KPI_TONES }> =
+          kindFilter === 'notice'
+            ? [
+                { label: '全部任务实例', count: localStats.total, status: '', tone: 'all' },
+                { label: '已送达', count: r('sent'), status: 'sent', tone: 'blue' },
+                { label: '待回复', count: r('await_reply'), status: 'await_reply', tone: 'amber' },
+                { label: '已回复', count: r('replied'), status: 'replied', tone: 'emerald' },
+                { label: '未送达 / 已取消', count: r('notice_expired') + r('cancelled'), status: 'notice_expired,cancelled', tone: 'slate' },
+              ]
+            : kindFilter === 'upload'
+              ? [
+                  { label: '全部任务实例', count: localStats.total, status: '', tone: 'all' },
+                  { label: '待推送 / 待上传', count: r('push_pending') + r('upload_pending'), status: 'push_pending,upload_pending', tone: 'slate' },
+                  { label: '已完成（含代交）', count: r('done') + r('done_admin'), status: 'done,done_admin', tone: 'emerald' },
+                  { label: '已提交（待审核）', count: r('reviewing'), status: 'reviewing', tone: 'blue' },
+                  { label: '已驳回 / 已逾期 / 已失效', count: r('rejected') + r('overdue') + r('expired'), status: 'rejected,overdue,expired', tone: 'rose' },
+                ]
+              : [
+                  { label: '全部任务实例', count: localStats.total, status: '', tone: 'all' },
+                  { label: '已完成 / 已送达', count: r('done') + r('done_admin') + r('sent') + r('replied'), status: 'done,done_admin,sent,replied', tone: 'emerald' },
+                  { label: '待推送 / 待上传', count: r('push_pending') + r('upload_pending'), status: 'push_pending,upload_pending', tone: 'slate' },
+                  { label: '已提交（待审核）', count: r('reviewing'), status: 'reviewing', tone: 'blue' },
+                  { label: '已驳回 / 已逾期', count: r('rejected') + r('overdue'), status: 'rejected,overdue', tone: 'rose' },
+                ];
+        return (
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            {cards.map((card) => {
+              const tone = KPI_TONES[card.tone];
+              const active = statusFilter === card.status;
+              return (
+                <div
+                  key={card.label}
+                  onClick={() => setStatusFilter(card.status)}
+                  className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${active ? tone.active : tone.idle}`}
+                >
+                  <div className={`text-xs font-medium ${tone.label}`}>{card.label}</div>
+                  <div className={`text-xl font-bold font-mono mt-1 ${tone.value}`}>{card.count}</div>
+                </div>
+              );
+            })}
           </div>
-
-          <div
-            onClick={() => setStatusFilter('approved,sent')}
-            className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'approved,sent'
-                ? 'bg-emerald-50/70 border-emerald-400 shadow-2xs'
-                : 'bg-white border-slate-200/90 hover:border-emerald-200'
-            }`}
-          >
-            <div className="text-xs text-emerald-700 font-semibold">已提醒 / 已完成</div>
-            <div className="text-xl font-bold text-emerald-600 font-mono mt-1">
-              {(localStats.by_status.approved || 0) + (localStats.by_status.sent || 0)}
-            </div>
-          </div>
-
-          <div
-            onClick={() => setStatusFilter('pending')}
-            className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'pending'
-                ? 'bg-slate-100 border-slate-400 shadow-2xs'
-                : 'bg-white border-slate-200/90 hover:border-slate-300'
-            }`}
-          >
-            <div className="text-xs text-slate-600 font-medium">待提醒 / 待上传</div>
-            <div className="text-xl font-bold text-slate-700 font-mono mt-1">
-              {localStats.by_status.pending || 0}
-            </div>
-          </div>
-
-          <div
-            onClick={() => setStatusFilter('submitted')}
-            className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'submitted'
-                ? 'bg-blue-50/80 border-blue-400 shadow-2xs'
-                : 'bg-white border-slate-200/90 hover:border-blue-200'
-            }`}
-          >
-            <div className="text-xs text-blue-700 font-semibold">已提交（待审核）</div>
-            <div className="text-xl font-bold text-blue-600 font-mono mt-1">
-              {localStats.by_status.submitted || 0}
-            </div>
-          </div>
-
-          <div
-            onClick={() => setStatusFilter('rejected,overdue')}
-            className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
-              statusFilter === 'rejected,overdue'
-                ? 'bg-rose-50/70 border-rose-400 shadow-2xs'
-                : 'bg-white border-slate-200/90 hover:border-rose-200'
-            }`}
-          >
-            <div className="text-xs text-rose-700 font-medium">已驳回 / 已逾期</div>
-            <div className="text-xl font-bold text-rose-600 font-mono mt-1">
-              {(localStats.by_status.rejected || 0) + (localStats.by_status.overdue || 0)}
-            </div>
-          </div>
-        </div>
-      )}
+        );
+      })()}
 
       {/* 2026-10-30 审核待办：跨日期聚合「用户提交待审 + 补交申请待审」，无待办时整卡不渲染 */}
       <PendingReviewPanel
@@ -419,10 +481,10 @@ export const InstancesView: React.FC = () => {
             </select>
           </div>
 
-          {/* 2. 按任务类型查询（替换原按任务模板查询） */}
+          {/* 2. 按任务类型查询（状态下拉随它联动，2026-11-23） */}
           <select
             value={kindFilter}
-            onChange={(e) => setKindFilter(e.target.value)}
+            onChange={(e) => handleKindChange(e.target.value)}
             className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-medium outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
           >
             <option value="">全部任务类型</option>
@@ -430,26 +492,34 @@ export const InstancesView: React.FC = () => {
             <option value="upload">上传任务（H5链接反馈）</option>
           </select>
 
-          {/* 3. 按状态查询（已移除已过期 expired） */}
+          {/* 3. 按执行状态细分查询：通知 6 项 / 上传 9 项 / 全部类型三组 optgroup */}
           <select
             aria-label="执行状态"
-            value={combinedStatusLabel ? '' : statusFilter}
+            value={activeStatusLabel ? '' : statusFilter}
             onChange={(e) => setStatusFilter(e.target.value)}
             className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-slate-700 font-medium outline-none focus:bg-white focus:border-blue-500 cursor-pointer"
           >
             <option value="">全部执行状态</option>
-            <option value="pending">待提醒 / 待上传</option>
-            <option value="sent">已提醒（通知类已送达）</option>
-            <option value="submitted">已提交（待审核）</option>
-            <option value="approved">已完成（审核通过）</option>
-            <option value="rejected">已驳回待重交</option>
-            <option value="overdue">已逾期未交</option>
-            <option value="cancelled">已取消</option>
+            {kindFilter === '' ? (
+              <>
+                <optgroup label="通用">
+                  {COMMON_STATUS_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </optgroup>
+                <optgroup label="通知提醒">
+                  {NOTICE_ONLY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </optgroup>
+                <optgroup label="上传任务">
+                  {UPLOAD_ONLY_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </optgroup>
+              </>
+            ) : (
+              statusChoices.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)
+            )}
           </select>
-          {combinedStatusLabel && (
-            <button type="button" onClick={() => setStatusFilter('')} aria-label={`清除筛选：${combinedStatusLabel}`}
+          {activeStatusLabel && (
+            <button type="button" onClick={() => setStatusFilter('')} aria-label={`清除筛选：${activeStatusLabel}`}
               className="inline-flex items-center gap-1 rounded-lg bg-blue-50 px-2 py-1 font-medium text-blue-700 hover:bg-blue-100">
-              {combinedStatusLabel}<X className="h-3.5 w-3.5" />
+              {activeStatusLabel}<X className="h-3.5 w-3.5" />
             </button>
           )}
 
@@ -499,7 +569,7 @@ export const InstancesView: React.FC = () => {
                       <div className="space-y-1">
                         <div className="font-semibold text-slate-500">该日期暂无通知提醒实例</div>
                         <div className="text-[11px]">
-                          通知提醒实例会在当天首次调度时按人生成（状态「待提醒」），到点发送后变「已提醒」；
+                          通知提醒实例会在当天首次调度时按人生成（状态「待推送」），到点送达后变「已送达 / 待回复」，成员确认后变「已回复」；
                           若模板当天被停用或成员为空则不会生成。
                         </div>
                       </div>
@@ -580,13 +650,8 @@ export const InstancesView: React.FC = () => {
                               原因：{inst.reject_reason}
                             </span>
                           )}
-                          {/* 2026-11-20：管理员代交是「提交来源」而不是「状态」，所以不塞进状态下拉框，
-                              这里用一个轻量徽标标出来，列表里一眼能认。 */}
-                          {inst.latest_submission?.source === 'admin' && (
-                            <span className="inline-flex items-center gap-1 rounded-md border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">
-                              管理员代交
-                            </span>
-                          )}
+                          {/* 2026-11-23：管理员代交升级为细分状态徽章「已完成（管理员代交）」，
+                              不再额外挂轻量小标，列表/详情/筛选三处口径统一。 */}
                         </div>
                       </td>
 

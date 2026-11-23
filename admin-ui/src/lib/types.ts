@@ -207,6 +207,22 @@ export type InstanceStatus =
   | 'expired'
   | 'cancelled';
 
+/* 2026-11-23 执行状态细分（通知 6 项 / 上传 9 项），与后端 _REFINED_STATUS_SQL 同键 */
+export type RefinedInstanceStatus =
+  | 'push_pending'      /* 通用 · 待推送 */
+  | 'upload_pending'    /* 上传 · 待上传 */
+  | 'sent'              /* 通知 · 已送达 */
+  | 'await_reply'       /* 通知 · 待回复 */
+  | 'replied'           /* 通知 · 已回复 */
+  | 'notice_expired'    /* 通知 · 未送达 */
+  | 'reviewing'         /* 上传 · 已提交（待审核） */
+  | 'done'              /* 上传 · 已完成 */
+  | 'done_admin'        /* 上传 · 已完成（管理员代交） */
+  | 'rejected'          /* 上传 · 已驳回（待重交） */
+  | 'overdue'           /* 上传 · 已逾期未交 */
+  | 'expired'           /* 上传 · 已失效 */
+  | 'cancelled';        /* 通用 · 已取消 */
+
 export interface TaskInstanceItem {
   id: number;
   template_id: number;
@@ -232,6 +248,13 @@ export interface TaskInstanceItem {
   modules?: string[];
   attachment_limits?: { image: number; file: number };
   status: InstanceStatus;
+  /* 2026-11-23：后端统一下发的细分状态键（列表徽章 / 详情徽章 / 筛选同源） */
+  refined_status?: RefinedInstanceStatus;
+  /* 2026-11-23：通知回执字段（已回复 / 待回复判定 + 详情「回执确认时间」） */
+  receipt_mode?: string | null;
+  receipt_at?: string | null;
+  receipt_text?: string | null;
+  receipt_phrase?: string | null;
   submitted_at: string | null;
   reviewed_by: string | null;
   reviewed_at: string | null;
@@ -313,6 +336,23 @@ export interface ReminderLogItem {
   member_name?: string;
 }
 
+export interface NoticeViewMedia {
+  kind: 'image' | 'file' | 'video' | string;
+  name: string;
+  url: string;
+  size: number;
+  mime: string;
+}
+
+/* 2026-11-23：通知类实例「实际下发内容与附件」（快照优先，模板当前正文/附件兜底） */
+export interface NoticeView {
+  title: string;
+  body: string;
+  published_at?: string | null;
+  media: NoticeViewMedia[];
+  source: 'snapshot' | 'template';
+}
+
 export interface TaskInstanceDetail {
   ok: boolean;
   instance: TaskInstanceItem;
@@ -326,7 +366,8 @@ export interface TaskInstanceDetail {
     status: InstanceStatus | null;
   }>;
   reminders: ReminderLogItem[];
-  /** 模板快照（详情页用来把字段 key 还原成中文标签） */
+  notice_view?: NoticeView | null;
+  /* 模板快照（详情页用来把字段 key 还原成中文标签） */
   template?: {
     name?: string;
     kind?: string;
@@ -347,6 +388,8 @@ export interface InstanceStats {
   ok: boolean;
   total: number;
   by_status: Record<InstanceStatus, number>;
+  /* 2026-11-23：细分状态计数（KPI 卡片与下拉筛选同源） */
+  refined?: Partial<Record<RefinedInstanceStatus, number>>;
   completion_rate: number;
   on_time_rate: number;
   overdue_rate: number;

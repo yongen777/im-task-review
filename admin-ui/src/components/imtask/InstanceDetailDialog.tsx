@@ -4,95 +4,158 @@ import { api, plainError } from '../../lib/api';
 import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
 import { humanizeReminderLogError, useToast } from '../../lib/toast';
-import { SubmissionAttachment, TaskInstanceDetail, TaskInstanceItem } from '../../lib/types';
+import {
+  NoticeView,
+  RefinedInstanceStatus,
+  SubmissionAttachment,
+  TaskInstanceDetail,
+  TaskInstanceItem,
+} from '../../lib/types';
 
-export function getInstanceStatusMeta(inst: Pick<TaskInstanceItem, 'kind' | 'status' | 'need_review' | 'submitted_at'>): {
+/* ══ 2026-11-23 执行状态细分（通知 6 项 / 上传 9 项）════════════════════
+   列表徽章、详情徽章、下拉筛选三处共用这一份键值与文案；
+   后端 admin.py 的 _REFINED_STATUS_SQL / refined_status 与此逐键对齐。 */
+export interface StatusOption {
+  value: RefinedInstanceStatus;
+  label: string;
+}
+
+export const NOTICE_STATUS_OPTIONS: StatusOption[] = [
+  { value: 'push_pending', label: '待推送' },
+  { value: 'sent', label: '已送达' },
+  { value: 'await_reply', label: '待回复' },
+  { value: 'replied', label: '已回复' },
+  { value: 'notice_expired', label: '未送达' },
+  { value: 'cancelled', label: '已取消' },
+];
+
+export const UPLOAD_STATUS_OPTIONS: StatusOption[] = [
+  { value: 'push_pending', label: '待推送' },
+  { value: 'upload_pending', label: '待上传' },
+  { value: 'reviewing', label: '已提交（待审核）' },
+  { value: 'done', label: '已完成' },
+  { value: 'done_admin', label: '已完成（管理员代交）' },
+  { value: 'rejected', label: '已驳回（待重交）' },
+  { value: 'overdue', label: '已逾期未交' },
+  { value: 'expired', label: '已失效' },
+  { value: 'cancelled', label: '已取消' },
+];
+
+/* 全部细分键 → 中文文案（KPI 卡片组合筛选的「筛选中」标签复用） */
+export const REFINED_STATUS_LABELS: Record<string, string> = Object.fromEntries(
+  [...NOTICE_STATUS_OPTIONS, ...UPLOAD_STATUS_OPTIONS].map((o) => [o.value, o.label]),
+);
+
+export function refineInstanceStatus(
+  inst: Pick<TaskInstanceItem, 'kind' | 'status' | 'need_review' | 'submitted_at'> &
+    Partial<Pick<TaskInstanceItem, 'refined_status' | 'published_at' | 'is_adhoc' | 'receipt_mode' | 'receipt_at' | 'latest_submission'>>,
+): RefinedInstanceStatus {
+  // 后端统一下发的细分键优先（列表/详情逐行由 _REFINED_STATUS_SQL 同源计算）
+  if (inst.refined_status && REFINED_STATUS_META[inst.refined_status]) return inst.refined_status;
+  const status = inst.status || 'pending';
+  const isNotice = inst.kind === 'notice';
+  const source = inst.latest_submission?.source ?? null;
+  if (status === 'cancelled') return 'cancelled';
+  if (isNotice) {
+    if (status === 'pending') return 'push_pending';
+    if (status === 'expired') return 'notice_expired';
+    if (status === 'sent' || status === 'approved') {
+      if (inst.receipt_at) return 'replied';
+      if (status === 'sent' && inst.receipt_mode) return 'await_reply';
+      return 'sent';
+    }
+    return 'sent'; // 历史脏行兜底：送达态之外不再细分
+  }
+  if (status === 'pending') {
+    if (inst.is_adhoc) return 'upload_pending';
+    /* published_at === null = 后端确认「提醒未送达」→ 待推送；
+       undefined = 调用方没带该字段（统计面板行）→ 沿用旧口径「待上传」 */
+    return inst.published_at ? 'upload_pending' : inst.published_at === null ? 'push_pending' : 'upload_pending';
+  }
+  if (status === 'submitted') return inst.need_review ? 'reviewing' : source === 'admin' ? 'done_admin' : 'done';
+  if (status === 'approved') return source === 'admin' ? 'done_admin' : 'done';
+  if (status === 'rejected') return 'rejected';
+  if (status === 'overdue') return 'overdue';
+  if (status === 'expired') return 'expired';
+  return 'upload_pending';
+}
+
+const REFINED_STATUS_META: Record<RefinedInstanceStatus, { label: string; className: string; icon: React.ReactNode }> = {
+  push_pending: {
+    label: '待推送',
+    className: 'bg-slate-100 text-slate-600 border-slate-200',
+    icon: <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
+  },
+  upload_pending: {
+    label: '待上传',
+    className: 'bg-slate-100 text-slate-700 border-slate-300',
+    icon: <Clock className="w-3.5 h-3.5 text-slate-500 shrink-0" />,
+  },
+  sent: {
+    label: '已送达',
+    className: 'bg-blue-50 text-blue-700 border-blue-200',
+    icon: <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
+  },
+  await_reply: {
+    label: '待回复',
+    className: 'bg-amber-50 text-amber-700 border-amber-200',
+    icon: <Clock className="w-3.5 h-3.5 text-amber-600 shrink-0" />,
+  },
+  replied: {
+    label: '已回复',
+    className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+    icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />,
+  },
+  notice_expired: {
+    label: '未送达',
+    className: 'bg-slate-100 text-slate-500 border-slate-200',
+    icon: <AlertTriangle className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
+  },
+  reviewing: {
+    label: '已提交（待审核）',
+    className: 'bg-blue-50 text-blue-700 border-blue-200',
+    icon: <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
+  },
+  done: {
+    label: '已完成',
+    className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+    icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />,
+  },
+  done_admin: {
+    label: '已完成（管理员代交）',
+    className: 'bg-teal-50 text-teal-700 border-teal-200',
+    icon: <Send className="w-3.5 h-3.5 text-teal-600 shrink-0" />,
+  },
+  rejected: {
+    label: '已驳回（待重交）',
+    className: 'bg-rose-50 text-rose-700 border-rose-200',
+    icon: <XCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />,
+  },
+  overdue: {
+    label: '已逾期未交',
+    className: 'bg-amber-50 text-amber-800 border-amber-200',
+    icon: <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />,
+  },
+  expired: {
+    label: '已失效',
+    className: 'bg-slate-100 text-slate-500 border-slate-200',
+    icon: <AlertTriangle className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
+  },
+  cancelled: {
+    /* 2026-11-12 任务E5：成员移出分组后实例作废（cancelled），灰色「已取消」徽章；
+       2026-11-23：通知类同样走细分表，不再误显示「待提醒」 */
+    label: '已取消',
+    className: 'bg-slate-100 text-slate-500 border-slate-200',
+    icon: <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
+  },
+};
+
+export function getInstanceStatusMeta(inst: Parameters<typeof refineInstanceStatus>[0]): {
   label: string;
   className: string;
   icon: React.ReactNode;
 } {
-  // 纯通知提醒任务：只区分「待提醒」与「已提醒」（2026-10-28 方案A：notice 也有实例了）
-  if (inst.kind === 'notice') {
-    if (inst.status === 'sent') {
-      return {
-        label: '已提醒',
-        className: 'bg-blue-50 text-blue-700 border-blue-200',
-        icon: <CheckCircle2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
-      };
-    }
-    if (inst.status === 'approved' || inst.submitted_at) {
-      return {
-        label: '已提醒',
-        className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-        icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />,
-      };
-    }
-    if (inst.status === 'expired') {
-      return {
-        label: '未送达',
-        className: 'bg-slate-100 text-slate-500 border-slate-200',
-        icon: <AlertTriangle className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
-      };
-    }
-    return {
-      label: '待提醒',
-      className: 'bg-slate-100 text-slate-600 border-slate-200',
-      icon: <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
-    };
-  }
-
-  // 2026-11-12 任务E3：「申请补交」链路下线，补交相关徽章（补交审核中/已通过/已拒绝）一并移除；
-  // 任务E5：cancelled（成员移出分组后作废）补「已取消」徽章。
-
-  // 上传任务（upload / form / image / file）
-  switch (inst.status) {
-    case 'submitted':
-      if (inst.need_review !== false) {
-        return {
-          label: '已提交（待审核）',
-          className: 'bg-blue-50 text-blue-700 border-blue-200',
-          icon: <Clock className="w-3.5 h-3.5 text-blue-600 shrink-0" />,
-        };
-      }
-      // 免审任务的管理员代交和员工自交共用提交徽章。
-      return completedStatus('已完成');
-    case 'approved':
-      return completedStatus(inst.need_review ? '已完成（审核通过）' : '已完成');
-    case 'rejected':
-      return {
-        label: '已驳回待重交',
-        className: 'bg-rose-50 text-rose-700 border-rose-200',
-        icon: <XCircle className="w-3.5 h-3.5 text-rose-600 shrink-0" />,
-      };
-    case 'overdue':
-    case 'expired':
-      return {
-        label: inst.status === 'overdue' ? '已逾期未交' : '已过期',
-        className: 'bg-amber-50 text-amber-800 border-amber-200',
-        icon: <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />,
-      };
-    case 'cancelled':
-      /* 2026-11-12 任务E5：成员移出分组后实例作废（cancelled），灰色「已取消」徽章 */
-      return {
-        label: '已取消',
-        className: 'bg-slate-100 text-slate-500 border-slate-200',
-        icon: <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
-      };
-    default:
-      return {
-        label: '待上传',
-        className: 'bg-slate-100 text-slate-600 border-slate-200',
-        icon: <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />,
-      };
-  }
-}
-
-function completedStatus(label: string) {
-  return {
-    label,
-    className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-    icon: <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />,
-  };
+  return REFINED_STATUS_META[refineInstanceStatus(inst)];
 }
 
 const reminderKindLabels: Record<string, string> = {
@@ -100,9 +163,12 @@ const reminderKindLabels: Record<string, string> = {
   manual_push: '手动推送',
   reject: '驳回通知',
   overdue: '逾期提醒',
-  notice: '通知',
+  notice: '通知正文',
+  notice_receipt: '通知回执提示',
+  portal: '工作台任务下发',
+  submit_ack: '提交成功回执',
   notice_img: '通知图片',
-  notice_img_link: '通知链接',
+  notice_img_link: '通知图片链接',
   /* 2026-11-20：补齐通知附件的发送记录译名（原来这几种直接显示英文 kind） */
   notice_file: '通知文件',
   notice_file_link: '通知文件链接',
@@ -118,6 +184,10 @@ const reminderResultBadges: Record<string, { label: string; color: string }> = {
   need_activate: { label: '需重激活', color: 'bg-amber-50 text-amber-700' },
   missed: { label: '已过期跳过', color: 'bg-slate-100 text-slate-700' },
   failed: { label: '发送失败', color: 'bg-rose-50 text-rose-700' },
+  /* 2026-11-23：补齐占位/熔断/限流三种结果徽标，界面不露英文 key */
+  pending: { label: '发送中', color: 'bg-blue-50 text-blue-700' },
+  circuit_open: { label: '通道熔断', color: 'bg-rose-50 text-rose-700' },
+  rate_limited: { label: '触发限流', color: 'bg-amber-50 text-amber-700' },
 };
 
 /* 2026-10-29：执行时间统一在这里算——列表和详情共用一份，避免两处再走偏。
@@ -338,6 +408,112 @@ function ManualSubmissionForm({
         </button>
       </div>
     </form>
+  );
+}
+
+/* 2026-11-23：通知类「实际下发内容与附件」卡片 —— 渲染该次下发的正文快照与
+   图片（ImageViewer 缩略图）/ 视频（在线播放）/ 文件（下载），与 H5 阅读页同源。 */
+function NoticeContentCard({ view, onPreview }: {
+  view: NoticeView;
+  onPreview: (url: string, alt?: string) => void;
+}) {
+  const usable = view.media.filter((m) => !!m.url);
+  const images = usable.filter((m) => m.kind === 'image');
+  const videos = usable.filter((m) => m.kind === 'video');
+  const files = usable.filter((m) => m.kind !== 'image' && m.kind !== 'video');
+  const missing = view.media.filter((m) => !m.url);
+  return (
+    <div className="p-4 rounded-xl bg-white border border-slate-200 space-y-3">
+      {view.body && (
+        <div>
+          <div className="text-[11px] font-semibold text-slate-500 mb-1">通知正文</div>
+          <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200/70 text-slate-800 leading-relaxed whitespace-pre-wrap break-words">
+            {view.body}
+          </div>
+        </div>
+      )}
+
+      {images.length > 0 && (
+        <div>
+          <div className="text-[11px] font-semibold text-slate-500 mb-1">图片（{images.length}）</div>
+          <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
+            {images.map((a) => (
+              <button
+                type="button"
+                key={a.url}
+                onClick={() => onPreview(a.url, a.name)}
+                className="group rounded-xl border border-slate-200 overflow-hidden hover:border-blue-400 transition-colors bg-white cursor-pointer"
+                title="点击在线查看大图"
+              >
+                <img src={a.url} alt={a.name} className="w-full h-24 object-cover group-hover:opacity-90" />
+                <div className="px-2 py-1.5 border-t border-slate-100">
+                  <div className="text-[10px] text-slate-500 truncate">{a.name}</div>
+                  <div className="text-[10px] text-blue-600 flex items-center gap-1 mt-0.5">
+                    <Eye className="w-3 h-3" />
+                    <span>在线查看</span>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {videos.length > 0 && (
+        <div>
+          <div className="text-[11px] font-semibold text-slate-500 mb-1">视频（{videos.length}）</div>
+          <div className="space-y-2">
+            {videos.map((a) => (
+              <div key={a.url} className="rounded-xl border border-slate-200 overflow-hidden bg-white">
+                <video controls preload="metadata" src={a.url} className="w-full max-h-72 bg-slate-900" />
+                <div className="px-2.5 py-1.5 border-t border-slate-100 flex items-center justify-between gap-3">
+                  <span className="text-[10px] text-slate-500 truncate">{a.name}</span>
+                  <a href={`${a.url}?dl=1`} download={a.name}
+                    className="px-2 py-0.5 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-semibold hover:bg-blue-100 inline-flex items-center gap-1 shrink-0">
+                    <Download className="w-3 h-3" />
+                    <span>下载</span>
+                  </a>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {files.length > 0 && (
+        <div>
+          <div className="text-[11px] font-semibold text-slate-500 mb-1">文件（{files.length}）</div>
+          <div className="space-y-2">
+            {files.map((a) => (
+              <div key={a.url || a.name} className="p-2.5 rounded-xl border border-slate-200 bg-white flex items-center justify-between gap-3">
+                <div className="min-w-0 flex items-center gap-2">
+                  <Paperclip className="w-4 h-4 text-slate-400 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-semibold text-slate-800 truncate">{a.name}</div>
+                    <div className="text-[10px] text-slate-400">{a.size > 0 ? `${(a.size / 1024).toFixed(0)} KB` : ''}</div>
+                  </div>
+                </div>
+                <a href={`${a.url}?dl=1`} download={a.name}
+                  className="px-2.5 py-1 rounded-lg bg-blue-50 text-blue-700 border border-blue-200 text-[11px] font-semibold hover:bg-blue-100 inline-flex items-center gap-1 shrink-0">
+                  <Download className="w-3 h-3" />
+                  <span>下载</span>
+                </a>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {missing.length > 0 && (
+        <div className="text-[11px] text-slate-400">
+          {missing.map((a) => a.name).join('、')}：附件文件已清理或不可用，无法在线预览。
+        </div>
+      )}
+
+      {view.published_at && (
+        <div className="text-[11px] text-slate-400">下发时间：{view.published_at}</div>
+      )}
+    </div>
   );
 }
 
@@ -595,12 +771,23 @@ export function InstanceDetailDialog({
               </button>
             </div>
 
-            {/* 1. 基础信息卡片（接收人带上角色） */}
-            <div
-              className={`grid grid-cols-2 ${
-                detailData.instance.kind === 'notice' ? 'sm:grid-cols-3' : 'sm:grid-cols-4'
-              } gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/70`}
-            >
+            {/* 1. 基础信息卡片（接收人带上角色）
+                2026-11-23 顶部时间字段统一：
+                · 推送类（定时/立即上传、定时/立即通知、回执通知）→「送达时间」（未推送显示待推送）
+                  +「提交时间 / 回执确认时间」（未完成/未回复显示 —）+ 有截止则展示「截止时间」；
+                · 自主上报（无推送环节）→ 不显示送达时间，仅展示「提交时间」。 */}
+            {(() => {
+              const inst = detailData.instance;
+              const isNotice = inst.kind === 'notice';
+              const isAdhoc = !!inst.is_adhoc;
+              const deadlineRaw = String(inst.deadline_at || '');
+              const hasDeadline = !isNotice && !isAdhoc && !!deadlineRaw && !deadlineRaw.startsWith('9999-12-31');
+              const confirmAt = isNotice ? (inst.receipt_at || null) : (inst.submitted_at || null);
+              const gridCols = isAdhoc
+                ? 'sm:grid-cols-3'
+                : isNotice ? 'sm:grid-cols-2 lg:grid-cols-4' : 'sm:grid-cols-3 lg:grid-cols-5';
+              return (
+                <div className={`grid grid-cols-2 ${gridCols} gap-3 bg-slate-50 p-3.5 rounded-xl border border-slate-200/70`}>
               <div>
                 <div className="text-[11px] text-slate-400">接收人（含角色）</div>
                 <div className="flex flex-wrap items-center gap-1.5 mt-0.5">
@@ -619,29 +806,38 @@ export function InstanceDetailDialog({
                   {detailData.instance.phone}
                 </div>
               </div>
-              {(!detailData.instance.is_adhoc || detailData.instance.submitted_at) && <div>
-                <div className="text-[11px] text-slate-400">{detailData.instance.kind !== 'notice' && detailData.instance.submitted_at ? '完成时间' : '执行时间'}</div>
+              {!isAdhoc && <div>
+                <div className="text-[11px] text-slate-400">送达时间</div>
                 <div className="font-mono text-slate-700 mt-0.5">
-                  <InstancePlanTime inst={detailData.instance} />
+                  {detailData.instance.published_at
+                    ? <span title="提醒实际送达时间">{detailData.instance.published_at}</span>
+                    : <span className="text-slate-400" title="尚未推送">待推送</span>}
                 </div>
               </div>}
-              {detailData.instance.kind !== 'notice' && !detailData.instance.is_adhoc && (
+              <div>
+                <div className="text-[11px] text-slate-400">{isNotice ? '回执确认时间' : '提交时间'}</div>
+                <div className="font-mono text-slate-700 mt-0.5">
+                  {confirmAt
+                    ? <span title={isNotice ? '成员完成回执确认的时间' : '成员提交任务的时间'}>{confirmAt}</span>
+                    : <span className="text-slate-400">{isNotice ? '未回复' : '未完成'}</span>}
+                </div>
+              </div>
+              {hasDeadline && (
                 <div>
                   <div className="text-[11px] text-slate-400">截止时间</div>
                   <div className="font-mono text-slate-700 mt-0.5">
-                    {/* 2026-11-12 任务E1：无截止模板的实例截止时间存哨兵 9999-12-31 → 显示「不限」；
-                        2026-11-13：具体时间戳统一缩写为「11月30日 17:00」样式（三端口径） */}
+                    {/* 2026-11-13：具体时间戳统一缩写为「11月30日 17:00」样式（三端口径） */}
                     {(() => {
-                      const raw = String(detailData.instance.deadline_at || '');
-                      if (raw.startsWith('9999-12-31')) return '不限';
-                      const m2 = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
-                      if (!m2) return raw || '—';
+                      const m2 = deadlineRaw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+                      if (!m2) return deadlineRaw || '—';
                       return `${Number(m2[2])}月${Number(m2[3])}日 ${m2[4]}:${m2[5]}`;
                     })()}
                   </div>
                 </div>
               )}
-            </div>
+                </div>
+              );
+            })()}
 
             {detailData.instance.reject_reason && (
               <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-800">
@@ -652,12 +848,12 @@ export function InstanceDetailDialog({
 
             {/* 2026-11-12 任务E3：逾期补交申请记录区块已随「申请补交」链路下线删除 */}
 
-            {/* 2. 提交内容与附件下载 (/api/admin/uploads/{ref}) */}
+            {/* 2. 提交内容与凭证 / 通知下发内容与附件（2026-11-23 通知类真实渲染该次下发快照） */}
             <div className="space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
                   <Paperclip className="w-3.5 h-3.5 text-blue-600" />
-                  <span>{detailData.instance.kind === 'notice' ? '提醒任务下发内容与附件' : '提交内容与凭证'}</span>
+                  <span>{detailData.instance.kind === 'notice' ? '通知下发内容与附件' : '提交内容与凭证'}</span>
                 </h4>
                 {canMarkSubmitted && !manualSubmissionOpen && (
                   <button type="button" onClick={() => setManualSubmissionOpen(true)}
@@ -669,9 +865,17 @@ export function InstanceDetailDialog({
                   className="rounded-xl bg-blue-50 px-3 py-2 font-semibold text-blue-700 hover:bg-blue-100">编辑提交内容</button>}
               </div>
 
-              {!detailData.submission ? (
+              {detailData.instance.kind === 'notice' ? (
+                detailData.notice_view && (detailData.notice_view.body || detailData.notice_view.media.length > 0) ? (
+                  <NoticeContentCard view={detailData.notice_view} onPreview={(url, alt) => setViewerSource({ url, alt })} />
+                ) : (
+                  <div className="p-6 rounded-xl bg-slate-50 border border-slate-200/70 text-center text-slate-400">
+                    该通知尚未配置下发正文或附件。
+                  </div>
+                )
+              ) : !detailData.submission ? (
                 <div className="p-6 rounded-xl bg-slate-50 border border-slate-200/70 text-center text-slate-400">
-                  该任务实例尚未产生提交或下发记录。
+                  该任务实例尚未产生提交记录。
                 </div>
               ) : (
                 <div className="p-4 rounded-xl bg-white border border-slate-200 space-y-3">
@@ -830,6 +1034,53 @@ export function InstanceDetailDialog({
               )}
             </div>
 
+            {/* 2026-11-23：通知开启回执 → 附「成员回执记录」（状态 / 确认时间 / 内容与方式） */}
+            {detailData.instance.kind === 'notice' && detailData.instance.receipt_mode && (
+              <section className="space-y-2.5">
+                <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                  <span>成员回执记录</span>
+                </h4>
+                <div className="border border-slate-200 rounded-xl overflow-hidden">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 font-bold">
+                        <th className="py-2 px-3">回执状态</th>
+                        <th className="py-2 px-3">回执确认时间</th>
+                        <th className="py-2 px-3">回执内容 / 方式</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      <tr>
+                        <td className="py-2.5 px-3">
+                          {detailData.instance.receipt_at ? (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg border text-[11px] font-semibold bg-emerald-50 text-emerald-700 border-emerald-200">
+                              <CheckCircle2 className="w-3 h-3" />已回复
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-lg border text-[11px] font-semibold bg-amber-50 text-amber-700 border-amber-200">
+                              <Clock className="w-3 h-3" />待回复
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2.5 px-3 font-mono text-slate-600">
+                          {detailData.instance.receipt_at || '—'}
+                        </td>
+                        <td className="py-2.5 px-3 text-slate-600">
+                          {detailData.instance.receipt_mode === 'link'
+                            ? `在 H5 通知确认页点击「${detailData.instance.receipt_phrase || '我已知晓'}」完成确认`
+                            : `在聊天框回复短语「${detailData.instance.receipt_phrase || '我已知晓'}」完成确认`}
+                          {detailData.instance.receipt_text && (
+                            <span className="block text-slate-400 mt-0.5">回复内容：{detailData.instance.receipt_text}</span>
+                          )}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
+
             {canMarkSubmitted && manualSubmissionOpen && (
               <ManualSubmissionForm detail={detailData} busy={manualSubmissionBusy}
                 onCancel={() => setManualSubmissionOpen(false)} onConfirm={(body) => void save('manual', body)} />
@@ -868,11 +1119,11 @@ export function InstanceDetailDialog({
               </section>
             )}
 
-            {/* 3. 提醒发送记录 */}
-            {detailData.instance.kind === 'notice' && <div className="space-y-2.5">
+            {/* 3. 消息发送记录（2026-11-23：通知与上传统一展示，口径同源汉化） */}
+            <div className="space-y-2.5">
               <h4 className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
                 <Send className="w-3.5 h-3.5 text-blue-600" />
-                <span>办公软件提醒发送记录 ({detailData.reminders.length})</span>
+                <span>办公软件消息发送记录 ({detailData.reminders.length})</span>
               </h4>
 
               {detailData.reminders.length === 0 ? (
@@ -920,7 +1171,7 @@ export function InstanceDetailDialog({
                   </table>
                 </div>
               )}
-            </div>}
+            </div>
 
             {/* 弹窗底部：仅分级管理员可审核通过/驳回；超管只读查看 */}
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between">

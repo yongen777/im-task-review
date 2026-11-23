@@ -76,6 +76,14 @@ const ERROR_CODE_DICT: Record<string, string> = {
   NEED_ACTIVATE: '员工尚未给机器人发送过消息激活会话（平台返回 500），需引导员工在当前办公软件中向机器人发任意消息完成激活。',
   CHANNEL_NOT_CONFIGURED: '当前办公软件通道尚未配置，当前处于本地演练模式，未实际发出外部消息。',
   HTTP_TIMEOUT: '请求办公软件网关超时，系统将按退避策略（30秒 / 2分钟 / 5分钟）自动重试。',
+  /* 2026-11-23：发送记录「状态说明」列的 reminder_log error 码补齐，界面不露英文 key */
+  TASK_CLOSED: '任务已关闭（成员移出分组 / 模板停用或删除），本次不再发送。',
+  UNACTIVATED: '成员尚未激活绑定，本次未发送。',
+  COMPENSATION_WINDOW_EXCEEDED: '已超过调度补偿窗口，系统跳过本次发送。',
+  NOTICE_VIEW_UNAVAILABLE: '通知内容快照不可用，确认链接未发出。',
+  NOTICE_MEDIA_UNAVAILABLE: '通知附件当前不可用，未继续发送。',
+  CIRCUIT_OPEN: '通道连续失败触发熔断保护，本条已短路未发送。',
+  SCHEDULER_UNAVAILABLE: '调度服务暂不可用，本次推送未执行。',
 };
 
 export function humanizeMessage(raw: unknown, fallback = '操作未成功，请稍后重试'): string {
@@ -141,9 +149,11 @@ const reminderDescriptions: Record<string, Record<'sent' | 'failed' | 'skipped',
   submit_ack: { sent: '已向提交人回执「提交成功」', failed: '提交成功回执发送失败', skipped: '已跳过提交成功回执' },
   reject: { sent: '已向提交人发送驳回通知', failed: '驳回通知发送失败', skipped: '已跳过驳回通知' },
   overdue: { sent: '已向成员发送逾期提醒', failed: '逾期提醒发送失败', skipped: '已跳过逾期提醒' },
-  notice: { sent: '已向成员发送通知', failed: '通知发送失败', skipped: '已跳过通知' },
+  notice: { sent: '已向成员发送通知正文', failed: '通知正文发送失败', skipped: '已跳过通知正文' },
+  notice_receipt: { sent: '已向成员发送通知回执提示', failed: '通知回执提示发送失败', skipped: '已跳过通知回执提示' },
+  portal: { sent: '已下发工作台任务提醒', failed: '工作台任务提醒发送失败', skipped: '已跳过工作台任务提醒' },
   notice_img: { sent: '已向成员发送通知图片', failed: '通知图片发送失败', skipped: '已跳过通知图片' },
-  notice_img_link: { sent: '已向成员发送通知链接', failed: '通知链接发送失败', skipped: '已跳过通知链接' },
+  notice_img_link: { sent: '已向成员发送通知图片链接', failed: '通知图片链接发送失败', skipped: '已跳过通知图片链接' },
   notice_file: { sent: '已向成员发送通知文件', failed: '通知文件发送失败', skipped: '已跳过通知文件' },
   notice_file_link: { sent: '已向成员发送通知文件链接', failed: '通知文件链接发送失败', skipped: '已跳过通知文件链接' },
   notice_video: { sent: '已向成员发送通知视频', failed: '通知视频发送失败', skipped: '已跳过通知视频' },
@@ -157,6 +167,10 @@ export function humanizeReminderLogError(result: string, error: string | null, k
   if (error === 'CIRCUIT_OPEN') return '通道临时熔断保护中，暂未继续发送';
   if (result === 'missed') return '已错过补偿窗口，系统已跳过本次发送';
   if (result === 'no_target') return '该成员尚未在当前办公软件激活绑定';
+  /* 2026-11-23：补齐占位 / 熔断 / 限流三种结果的中文说明，界面不露英文 key */
+  if (result === 'pending') return '发送进行中，等待通道回执确认';
+  if (result === 'circuit_open') return '通道临时熔断保护中，本条已短路未发送';
+  if (result === 'rate_limited') return '触发发送限流，本条已延后处理';
   if (result === 'sent' || result === 'failed' || result === 'skipped') {
     const description = (reminderDescriptions[kind || ''] ?? reminderDescriptions.remind)[result];
     return error && result !== 'sent' ? `${description}。 ${humanizeMessage(error, '请检查发送记录')}` : description;
