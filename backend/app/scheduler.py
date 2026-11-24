@@ -1173,6 +1173,7 @@ class Scheduler:
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
+        skip_completed = skip_completed and self.state.supports_push_completion_filter(tpl)
         if variable_notice_config(tpl) or reserve_variable_push:
             return self._prepare_variable_notice(template_id, cur_dt, actor, reprocess,
                                                  skip_completed, reserve_variable_push)
@@ -1250,6 +1251,7 @@ class Scheduler:
             config = variable_notice_config(tpl)
             if not config or tpl["kind"] != "notice" or not tpl["is_manual"]:
                 raise BizError(409, "VARIABLE_NOTICE_CHANGED", "模板的变量表格配置已变更，请刷新后重试")
+            skip_completed = skip_completed and state.supports_push_completion_filter(tpl)
             _, members = validate(state, tpl["owner_id"], tpl["text_tpl"], config, lock=True)
             platform = config["platform"]
             if platform not in (self.notifiers or {state.platform: self.notifier}):

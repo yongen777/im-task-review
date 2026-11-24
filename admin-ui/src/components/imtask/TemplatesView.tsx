@@ -101,6 +101,15 @@ function describeTemplateSchedule(tpl: TemplateItem): string {
   return label.startsWith('周') ? `每周 ${label}` : label;
 }
 
+function isBroadcastNotice(tpl: TemplateItem): boolean {
+  return tpl.kind === 'notice' && !tpl.spec?.notice_receipt?.enabled;
+}
+
+function broadcastAudience(tpl: TemplateItem, total?: number): string {
+  const audience = tpl.spec?.variable_notice ? '变量表格中的成员' : '当前角色中符合资格的成员';
+  return total === undefined ? `将向${audience}发送通知。` : `将向${audience}共 ${total} 人发送通知。`;
+}
+
 const NOTICE_KINDS: NoticeContentFormat[] = ['text', 'image', 'file', 'video'];
 const NOTICE_LABELS: Record<NoticeContentFormat, string> = { text: '文本', image: '图片', file: '文件', video: '视频' };
 const NOTICE_UPLOADS = {
@@ -543,7 +552,8 @@ export const TemplatesView: React.FC = () => {
   useEffect(() => {
     const tpl = pushConfirmTpl || repushConfirm?.tpl;
     setPushIssues([]);
-    if (!tpl) { setPushPreview(null); return; }
+    setPushPreview(null);
+    if (!tpl) return;
     let live = true;
     api.get<{ total: number; completed: number; unfinished: number }>(
       `/api/admin/templates/${tpl.id}/push-preview`,
@@ -1156,6 +1166,7 @@ export const TemplatesView: React.FC = () => {
   const handleConfirmPush = async () => {
     if (!pushConfirmTpl) return;
     const target = pushConfirmTpl;
+    const filterCompleted = skipCompleted && !isBroadcastNotice(target);
     setPushingId(target.id);
     try {
       const res = await api.post<{
@@ -1168,7 +1179,7 @@ export const TemplatesView: React.FC = () => {
         pushed_at?: string;
         deadline_at?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now${skipCompleted ? '?skip_completed=1' : ''}`);
+      }>(`/api/admin/templates/${target.id}/push-now?skip_completed=${Number(filterCompleted)}`);
       if (res?.needs_confirm) {
         /* 2026-11-19 需求一：本周期已推送过 → 关掉首次确认框，改问「是否新建一批」。
            预检不写冷却 marker，用户取消也不影响后续操作。 */
@@ -1203,6 +1214,8 @@ export const TemplatesView: React.FC = () => {
   const handleConfirmRepush = async () => {
     if (!repushConfirm) return;
     const target = repushConfirm.tpl;
+    const broadcast = isBroadcastNotice(target);
+    const filterCompleted = skipCompleted && !broadcast;
     setPushingId(target.id);
     try {
       const res = await api.post<{
@@ -1212,10 +1225,11 @@ export const TemplatesView: React.FC = () => {
         instance_count?: number;
         period_key?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1${skipCompleted ? '&skip_completed=1' : ''}`);
+      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1&skip_completed=${Number(filterCompleted)}`);
       if (res?.queued) {
         toast.success(
-          `已按归属周期再推 ${res.instance_count ?? 0} 条实例（已同步本周期完成状态 ${res.synced_completed ?? 0} 条，` +
+          broadcast ? `向 ${res.instance_count ?? 0} 人重推通知，消息正在后台投递。` :
+            `已按归属周期再推 ${res.instance_count ?? 0} 条实例（已同步本周期完成状态 ${res.synced_completed ?? 0} 条，` +
             `已完成/已截止成员收到只读回顾链接）；消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。`,
           '重推已启动',
         );
@@ -2424,7 +2438,9 @@ export const TemplatesView: React.FC = () => {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            {pushConfirmTpl.is_manual ? <p className="text-xs text-slate-600 leading-relaxed">
+            {isBroadcastNotice(pushConfirmTpl) ? <p className="text-xs text-slate-600 leading-relaxed" role="status">
+              {broadcastAudience(pushConfirmTpl, pushPreview?.total)}
+            </p> : pushConfirmTpl.is_manual ? <p className="text-xs text-slate-600 leading-relaxed">
               将立即向模板「{pushConfirmTpl.name}」中符合资格且尚未推送的成员发送{pushConfirmTpl.kind === 'notice' ? '通知' : '填报提醒'}。
             </p> : <p className="text-xs text-slate-600 leading-relaxed">
               将立即向模板「
@@ -2433,12 +2449,9 @@ export const TemplatesView: React.FC = () => {
               <br />
               此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 3 秒内不可重复推送。
             </p>}
-            <PushSkipCompleted
-              checked={skipCompleted}
-              onChange={setSkipCompleted}
-              preview={pushPreview}
-              fallbackTotal={pushConfirmTpl.is_manual ? undefined : undefined}
-            />
+            {!isBroadcastNotice(pushConfirmTpl) && (
+              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
+            )}
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -2472,7 +2485,9 @@ export const TemplatesView: React.FC = () => {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            {repushConfirm.tpl.spec?.variable_notice ? <p className="text-xs text-slate-600 leading-relaxed">
+            {isBroadcastNotice(repushConfirm.tpl) ? <p className="text-xs text-slate-600 leading-relaxed" role="status">
+              {broadcastAudience(repushConfirm.tpl, pushPreview?.total ?? repushConfirm.targetCount)}
+            </p> : repushConfirm.tpl.spec?.variable_notice ? <p className="text-xs text-slate-600 leading-relaxed">
               将按已保存的变量表格重新推送专属通知，本次涉及 {repushConfirm.targetCount} 人。
             </p> : <p className="text-xs text-slate-600 leading-relaxed">
               将向当前角色（{repushConfirm.targetCount} 人）再次推送本周期任务；
@@ -2480,7 +2495,9 @@ export const TemplatesView: React.FC = () => {
               （已完成/已回执与已过截止的成员照常收到消息，但链接只读回顾、不会再回到待办；
               未完成成员正常提交；待办与统计按本周期自动去重）
             </p>}
-            <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
+            {!isBroadcastNotice(repushConfirm.tpl) && (
+              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
+            )}
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -2510,7 +2527,6 @@ function PushSkipCompleted({ checked, onChange, preview }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   preview: { total: number; completed: number; unfinished: number } | null;
-  fallbackTotal?: number;
 }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5 space-y-1">

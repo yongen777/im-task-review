@@ -131,6 +131,104 @@ def test_manual_push_skip_completed_filters_and_blocks_when_all_done(ctx):
     assert blocked.status_code == 400 and "全员已完成" in blocked.text
 
 
+@pytest.mark.parametrize(("deadline_type", "canonical", "legacy_day", "outside_day"), [
+    ("month_end", "2026-11", "2026-11-13", "2026-10-31"),
+    ("weekend", "2026-W47", "2026-11-16", "2026-11-15"),
+])
+@pytest.mark.parametrize("daily_batch", [False, True])
+def test_manual_push_filters_legacy_daily_completion(ctx, deadline_type, canonical, legacy_day,
+                                                    outside_day, daily_batch):
+    store, scheduler, notifier, _, owner, _, existing, _ = ctx
+    role_id = existing["role_ids"][0]
+    add_member(store, role_id, SECOND, "第二成员", existing["owner_id"])
+    store.conn.execute("UPDATE delivery_target SET activated_at='2026-10-01 08:00:00' WHERE phone IN (?,?)",
+                       (PHONE, SECOND))
+    response = owner.post("/api/admin/templates", json={
+        "name": "历史周期过滤", "kind": "form", "period": "day", "role_ids": [role_id],
+        "remind_at": "09:00", "has_deadline": True, "deadline_type": deadline_type, "deadline_time": "18:00",
+        "text_tpl": "请{姓名}提交历史周期过滤数据", "need_review": False,
+        "schema_json": [{"key": "qty", "label": "数量", "type": "number", "required": True}],
+    })
+    assert response.status_code == 200, response.text
+    tid = response.json()["template_id"]
+    suffix = "#" + legacy_day.replace("-", "") + "090000" if daily_batch else ""
+    for phone, key in [(PHONE, legacy_day + suffix), (SECOND, outside_day)]:
+        inst = store.ensure_instance(tid, phone, "成员", None, key, "2026-11-30 18:00:00")
+        token = store.issue_h5_token(phone, tid, key, inst["id"])
+        assert store.submit_h5_task(raw_token=token, fields={"qty": "7"}, refs=[], note=None)["ok"]
+
+    base = f"/api/admin/templates/{tid}"
+    preview = owner.get(base + "/push-preview").json()
+    assert (preview["canonical_key"], preview["total"], preview["completed"], preview["unfinished"]) == (canonical, 2, 1, 1)
+    overview = owner.get("/api/admin/stats-panel/overview", params={"template_id": tid, "period_key": canonical})
+    assert overview.json()["kpis"]["done"] == 1
+    pre = owner.post(base + "/push-now?skip_completed=1").json()
+    assert pre["needs_confirm"] and pre["target_count"] == 1 and pre["completed_count"] == 1
+    assert not notifier.sent_messages
+
+    response = owner.post(base + "/push-now?confirmed=1&skip_completed=1")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["queued"] and body["skip_completed"] and body["instance_count"] == 1
+    [remaining] = store.list_instances_for_period(tid, body["period_key"])
+    assert remaining["phone"] == SECOND
+    assert [msg.receive_id for msg in notifier.sent_messages] == [f"union-{SECOND}"]
+
+    token = store.issue_h5_token(SECOND, tid, body["period_key"], remaining["id"])
+    assert store.submit_h5_task(raw_token=token, fields={"qty": "5"}, refs=[], note=None)["ok"]
+    later = NOW + timedelta(seconds=10)
+    store._now_fn = scheduler._now_fn = lambda: later
+    blocked = owner.post(base + "/push-now?confirmed=1&skip_completed=1")
+    assert blocked.status_code == 400 and blocked.json()["code"] == "ALL_COMPLETED"
+    assert [msg.receive_id for msg in notifier.sent_messages] == [f"union-{SECOND}"]
+
+
+@pytest.mark.parametrize("variable", [False, True])
+def test_broadcast_ignores_skip_completed_on_first_push_and_repush(ctx, variable):
+    store, scheduler, notifier, _, owner, _, existing, _ = ctx
+    role_id = existing["role_ids"][0]
+    add_member(store, role_id, SECOND, "第二成员", existing["owner_id"])
+    body = "请{姓名}查阅纯广播通知"
+    spec = {"notice_receipt": {"enabled": False}}
+    if variable:
+        spec["variable_notice"] = {"platform": "zdxlz", "rows": [
+            {"row": 2, "cells": {"手机号": PHONE, "姓名": "测试成员"}},
+            {"row": 3, "cells": {"手机号": SECOND, "姓名": "第二成员"}},
+        ]}
+    saved = owner.post("/api/admin/templates", json={
+        "name": "纯广播通知", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": [] if variable else [role_id], "text_tpl": body, "spec": spec,
+    })
+    assert saved.status_code == 200, saved.text
+    tid = saved.json()["template_id"]
+    base = f"/api/admin/templates/{tid}"
+    first = owner.post(base + "/push-now?skip_completed=1")
+    assert first.status_code == 200, first.text
+    assert first.json()["skip_completed"] is False and first.json()["instance_count"] == 2
+    for tick in range(3):
+        scheduler.run_once(NOW + timedelta(seconds=30 * tick))
+    assert sorted(msg.receive_id for msg in notifier.sent_messages if "纯广播通知" in msg.text) == [
+        "test_recipient", f"union-{SECOND}",
+    ]
+
+    # 模板关闭回执后，历史批次可能仍有回执记录。
+    store.conn.execute("UPDATE task_instance SET receipt_at=? WHERE template_id=? AND phone=?",
+                       (store.now_str(), tid, PHONE))
+    later = NOW + timedelta(minutes=2)
+    store._now_fn = scheduler._now_fn = lambda: later
+    preview = owner.get(base + "/push-preview").json()
+    assert (preview["total"], preview["completed"], preview["unfinished"]) == (2, 0, 2)
+    pre = owner.post(base + "/push-now?skip_completed=1").json()
+    assert pre["needs_confirm"] and pre["target_count"] == 2 and pre["skip_completed"] is False
+    again = owner.post(base + "/push-now?confirmed=1&skip_completed=1")
+    assert again.status_code == 200, again.text
+    assert again.json()["skip_completed"] is False and again.json()["instance_count"] == 2
+    assert again.json()["synced_completed"] == 0
+    assert sorted(msg.receive_id for msg in notifier.sent_messages if "纯广播通知" in msg.text) == [
+        "test_recipient", "test_recipient", f"union-{SECOND}", f"union-{SECOND}",
+    ]
+
+
 # ── 3. 逾期任务保留「已逾期」提醒 + 我知道了 ────────────────────────────
 def test_overdue_todo_kept_until_acknowledged(ctx):
     store, scheduler, notifier, _, owner, _, existing, _ = ctx

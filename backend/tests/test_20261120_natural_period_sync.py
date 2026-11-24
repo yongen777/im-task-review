@@ -282,6 +282,37 @@ def test_4_week_repush_full_family_sync(ctx):
     assert overview["kpis"]["total"] == 2 and overview["kpis"]["done"] == 2, overview["kpis"]
 
 
+@pytest.mark.parametrize(("deadline_type", "canonical", "legacy_day", "outside_day"), [
+    ("month_end", "2026-11", "2026-11-13", "2026-10-31"),
+    ("weekend", "2026-W47", "2026-11-16", "2026-11-15"),
+])
+def test_completion_sync_shares_legacy_daily_batches_bidirectionally(ctx, deadline_type, canonical,
+                                                                    legacy_day, outside_day):
+    store, scheduler, _, _, owner, _, existing, _ = ctx
+    role_id, owner_id = existing["role_ids"][0], existing["owner_id"]
+    add_member(store, role_id, SECOND, owner_id)
+    store.conn.execute("UPDATE delivery_target SET activated_at='2026-10-01 08:00:00' WHERE phone IN (?,?)",
+                       (PHONE, SECOND))
+    tid = make_form(owner, role_id, name="历史日批次完成同步", deadline_type=deadline_type)
+    legacy_key = f"{legacy_day}#{legacy_day.replace('-', '')}090000"
+    a = store.ensure_instance(tid, PHONE, "甲", None, legacy_key, "2026-11-30 18:00:00")
+    b = store.ensure_instance(tid, SECOND, "乙", None, legacy_key, "2026-11-30 18:00:00")
+    outside = store.ensure_instance(tid, SECOND, "乙", None, outside_day, "2026-11-30 18:00:00")
+    assert submit(store, PHONE, tid, a, qty="8")["ok"]
+
+    prep = scheduler.push_now_prepare(tid, reprocess=True)
+    assert prep["period_key"].split("#")[0] == canonical and prep["synced_completed"] == 1
+    a_current = inst_of(store, tid, PHONE, prep["period_key"])
+    b_current = inst_of(store, tid, SECOND, prep["period_key"])
+    assert a_current["status"] == "approved" and b_current["status"] == "pending"
+    assert store.latest_family_submission(tid, PHONE, prep["period_key"])["fields"]["qty"] == "8"
+    assert store.latest_family_submissions(tid, [PHONE], prep["period_key"])[PHONE]["fields"]["qty"] == "8"
+
+    assert submit(store, SECOND, tid, b, qty="5")["ok"]
+    assert store.get_instance(b_current["id"])["status"] == "approved"
+    assert store.get_instance(outside["id"])["status"] == "pending"
+
+
 # ── ⑤ 周三当天截止：周四手推全员闭口、过周日夜进下周重开 ─────────────
 def test_5_wed_deadline_closed_after_cutoff_reopens_next_week(ctx):
     store, scheduler, notifier, _, owner, _, m_tpl, _ = ctx

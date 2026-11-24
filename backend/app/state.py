@@ -5004,25 +5004,50 @@ class StateStore:
             return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE template_id = ? AND period_key = ? ORDER BY id ASC", (template_id, period_key)).fetchall()]
 
     # ── 2026-11-19 需求一：同日多次手动推送（新批次） ──────────────────
+    @staticmethod
+    def supports_push_completion_filter(template: Dict[str, Any]) -> bool:
+        from .notice_media import notice_receipt_config
+
+        return template["kind"] != "notice" or bool(notice_receipt_config(template)[0])
+
+    def _completion_period_where(self, template_id: str, period_key: str, *,
+                                 alias: str = "", template: Optional[Dict[str, Any]] = None) -> tuple:
+        """从实例键定位归属周期，并与统计共用该周期的实例匹配条件。"""
+        canonical = canonical_part((period_key or "").strip())
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", canonical):
+            template = template or self.get_template(template_id)
+            if template and not template.get("is_adhoc"):
+                from .scheduler import canonical_period_kind, period_key as make_period_key
+
+                kind = canonical_period_kind(template)
+                if kind in ("week", "month"):
+                    canonical = make_period_key(kind, canonical)
+        try:
+            return self._stats_period_where(canonical, alias=alias)
+        except BizError:
+            # 自主上报等独立实例键继续按原键匹配其批次。
+            column = f"{alias}.period_key" if alias else "period_key"
+            return f"({column} = ? OR {column} LIKE ?)", [canonical, self._stats_like_escape(canonical) + "#%"]
+
     def period_completed_phones(self, template_id: str, period_key: str) -> set:
         """本归属周期内已完成（upload）/已回执（notice）的手机号集合。
 
         2026-11-21 需求二：手动推送 `skip_completed=1` 时据此过滤——
-        周期 = canonical 键 + 其全部 `#批次`（同周期多批次共享完成态，
-        由 sync_family_completion / sync_batch_completion 保证一致）。
+        周期内的历史日键与全部批次共享完成态。
         """
         clean = (template_id or "").strip()
         pk = (period_key or "").strip()
         if not clean or not pk:
             return set()
         tpl = self.get_template(clean, include_deleted=False)
-        canon = canonical_part(pk)
-        cond = ("receipt_at IS NOT NULL" if (tpl and tpl.get("kind") == "notice")
+        if not tpl or not self.supports_push_completion_filter(tpl):
+            return set()
+        period_where, period_params = self._completion_period_where(clean, pk, template=tpl)
+        cond = ("receipt_at IS NOT NULL" if tpl["kind"] == "notice"
                 else "status IN ('submitted','approved')")
         rows = self.conn.execute(
             "SELECT DISTINCT phone FROM task_instance WHERE template_id = ? "
-            "AND (period_key = ? OR period_key LIKE ?) AND " + cond,
-            (clean, canon, canon + "#%")).fetchall()
+            f"AND {period_where} AND {cond}", (clean, *period_params)).fetchall()
         return {str(r["phone"]) for r in rows}
 
     def push_skip_completed_preview(self, template_id: str, canonical_key: str) -> Dict[str, Any]:
@@ -5075,17 +5100,18 @@ class StateStore:
 
         canonical_key 由调用方按模板口径算好传入（manual='once'、periodic=当期键）——
         `period_key()` 在 scheduler 里，state 反向 import 会成环，故不做隐式推导。
-        重推批次键形如 `{canonical}#YYYYMMDDHHMMSS`，用 `#` 前缀匹配判「推过」。
+        匹配同周期的主批次、历史日键与重推批次。
         """
         clean = (template_id or "").strip()
         tpl = self.get_template(clean, include_deleted=False)
         if not tpl:
             raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
         canonical = (canonical_key or "").strip() or "once"
+        period_where, period_params = self._completion_period_where(clean, canonical, template=tpl)
         with self.lock:
             row = self.conn.execute(
-                "SELECT 1 FROM task_instance WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) LIMIT 1",
-                (clean, canonical, canonical + "#%"),
+                f"SELECT 1 FROM task_instance WHERE template_id = ? AND {period_where} LIMIT 1",
+                (clean, *period_params),
             ).fetchone()
         return {
             "pushed_before": row is not None,
@@ -5166,7 +5192,7 @@ class StateStore:
     def sync_batch_completion(self, template_id: str, batch_period_key: str) -> int:
         """同周期「已完成/已回执」状态同步到本批次未完成实例（2026-11-20 切期改造）。
 
-        手动重推全员照推后，把每个成员在本归属周期（canonical + 全部 #批次）内的
+        手动重推全员照推后，把每个成员在本归属周期内的
         完成态（form: submitted/approved；notice: receipt_at 回执）立即回填到本批次的
         pending/overdue/rejected 实例上——闭口展示、待办去重、统计去重共用该状态。
         取源规则：同手机号取**最新一个完成实例**（MAX(id)，与 _stats_dedup_persons
@@ -5176,28 +5202,30 @@ class StateStore:
         pk = (batch_period_key or "").strip()
         if not clean or not pk:
             return 0
-        canon = canonical_part(pk)
         tpl = self.get_template(clean, include_deleted=False)
-        is_notice = bool(tpl and tpl.get("kind") == "notice")
+        if not tpl or not self.supports_push_completion_filter(tpl):
+            return 0
+        period_where, period_params = self._completion_period_where(clean, pk, template=tpl)
+        is_notice = tpl["kind"] == "notice"
         with self.lock, self.conn:
             if is_notice:
                 cur = self.conn.execute(
                     "UPDATE task_instance cur "
                     "JOIN (SELECT phone, MAX(id) AS src_id FROM task_instance "
-                    "      WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) "
+                    f"      WHERE template_id = ? AND {period_where} "
                     "      AND status IN ('pending','sent') AND receipt_at IS NOT NULL "
                     "      GROUP BY phone) pick ON pick.phone = cur.phone "
                     "JOIN task_instance src ON src.id = pick.src_id "
                     "SET cur.receipt_at = src.receipt_at, cur.receipt_text = src.receipt_text "
                     "WHERE cur.template_id = ? AND cur.period_key = ? "
-                    "AND cur.status IN ('pending','sent') AND cur.receipt_at IS NULL",
-                    (clean, canon, canon + "#%", clean, pk),
+                    "AND cur.status IN ('pending','sent') AND cur.receipt_phrase IS NOT NULL AND cur.receipt_at IS NULL",
+                    (clean, *period_params, clean, pk),
                 )
             else:
                 cur = self.conn.execute(
                     "UPDATE task_instance cur "
                     "JOIN (SELECT phone, MAX(id) AS src_id FROM task_instance "
-                    "      WHERE template_id = ? AND (period_key = ? OR period_key LIKE ?) "
+                    f"      WHERE template_id = ? AND {period_where} "
                     "      AND status IN ('submitted','approved') "
                     "      GROUP BY phone) pick ON pick.phone = cur.phone "
                     "JOIN task_instance src ON src.id = pick.src_id "
@@ -5205,7 +5233,7 @@ class StateStore:
                     "cur.late_submit = src.late_submit, cur.reject_reason = NULL "
                     "WHERE cur.template_id = ? AND cur.period_key = ? "
                     "AND cur.status IN ('pending','overdue','rejected')",
-                    (clean, canon, canon + "#%", clean, pk),
+                    (clean, *period_params, clean, pk),
                 )
             return int(cur.rowcount or 0)
 
@@ -5224,7 +5252,6 @@ class StateStore:
         clean_phone = (phone or "").strip()
         if not clean_phone:
             return 0
-        canon = canonical_part(period_key)
         is_receipt_sync = receipt_at is not None
         params: List[Any] = []
         if is_receipt_sync:
@@ -5237,7 +5264,9 @@ class StateStore:
                 return 0
             set_sql = "status = ?, submitted_at = ?, late_submit = ?"
             params.extend([status, submitted_at, int(late_submit or 0)])
-        params.extend([(template_id or "").strip(), clean_phone, canon, canon + "#%"])
+        clean = (template_id or "").strip()
+        period_where, period_params = self._completion_period_where(clean, period_key)
+        params.extend([clean, clean_phone, *period_params])
         extra = ""
         if skip_instance_id is not None:
             extra = " AND id <> ?"
@@ -5250,14 +5279,14 @@ class StateStore:
             if is_receipt_sync:
                 cur = self.conn.execute(
                     f"UPDATE task_instance SET {set_sql} "
-                    f"WHERE template_id = ? AND phone = ? AND (period_key = ? OR period_key LIKE ?) "
-                    f"AND status IN ('pending','sent') AND receipt_at IS NULL{extra}",
+                    f"WHERE template_id = ? AND phone = ? AND {period_where} "
+                    f"AND status IN ('pending','sent') AND receipt_phrase IS NOT NULL AND receipt_at IS NULL{extra}",
                     tuple(params),
                 )
             else:
                 cur = self.conn.execute(
                     f"UPDATE task_instance SET {set_sql}, reject_reason = NULL "
-                    f"WHERE template_id = ? AND phone = ? AND (period_key = ? OR period_key LIKE ?) "
+                    f"WHERE template_id = ? AND phone = ? AND {period_where} "
                     f"AND status IN {status_set}{extra}",
                     tuple(params),
                 )
@@ -5274,7 +5303,8 @@ class StateStore:
         clean_phone = (phone or "").strip()
         if not clean_phone:
             return None
-        canon = canonical_part(period_key)
+        clean = (template_id or "").strip()
+        period_where, period_params = self._completion_period_where(clean, period_key, alias="i")
         extra, extra_params = "", []
         if exclude_instance_id is not None:
             extra = " AND i.id <> ?"
@@ -5283,9 +5313,9 @@ class StateStore:
             row = self.conn.execute(
                 "SELECT s.* FROM submission s JOIN task_instance i ON i.id = s.instance_id "
                 "WHERE i.template_id = ? AND i.phone = ? "
-                "AND (i.period_key = ? OR i.period_key LIKE ?) AND s.status != 'rejected'"
+                f"AND {period_where} AND s.status != 'rejected'"
                 + extra + " ORDER BY s.id DESC LIMIT 1",
-                ((template_id or "").strip(), clean_phone, canon, canon + "#%", *extra_params),
+                (clean, clean_phone, *period_params, *extra_params),
             ).fetchone()
         if not row:
             return None
@@ -5303,7 +5333,8 @@ class StateStore:
         clean_phones = [str(p or "").strip() for p in phones if str(p or "").strip()]
         if not clean_phones:
             return {}
-        canon = canonical_part(period_key)
+        clean = (template_id or "").strip()
+        period_where, period_params = self._completion_period_where(clean, period_key, alias="i")
         out: Dict[str, Dict[str, Any]] = {}
         for start in range(0, len(clean_phones), 900):
             chunk = clean_phones[start:start + 900]
@@ -5312,9 +5343,9 @@ class StateStore:
                 "SELECT s.*, i.phone AS member_phone FROM submission s "
                 "JOIN task_instance i ON i.id = s.instance_id "
                 f"WHERE i.template_id = ? AND i.phone IN ({ph}) "
-                "AND (i.period_key = ? OR i.period_key LIKE ?) AND s.status != 'rejected' "
+                f"AND {period_where} AND s.status != 'rejected' "
                 "ORDER BY s.id ASC",
-                ((template_id or "").strip(), *chunk, canon, canon + "#%"),
+                (clean, *chunk, *period_params),
             ).fetchall()
             for r in rows:
                 d = dict(r)
@@ -5926,7 +5957,7 @@ class StateStore:
         批次（`{canonical}#YYYYMMDDHHMMSS` 前缀 LIKE）一起纳入，配合
         _stats_dedup_persons 按手机号去重（同周期推 N 次 = 1 人次）。
         日 'YYYY-MM-DD' → 日键 + 当日批次；ISO 周 'YYYY-Www' → 周内 7 个日键
-        （legacy 按日推送的 weekend 任务）+ 周键 + 周批次；月 'YYYY-MM' → 月键 +
+        及日批次 + 周键 + 周批次；月 'YYYY-MM' → 月键 +
         'YYYY-MM-' 日键前缀（legacy）+ 月批次；仍支持直接传单个批次键精确查看
         （管理后台实例页保留批次对账能力）。
         """
@@ -5944,9 +5975,9 @@ class StateStore:
             jan4 = datetime(year, 1, 4)
             week1_mon = jan4 - timedelta(days=jan4.isoweekday() - 1)
             monday = week1_mon + timedelta(weeks=week - 1)
-            keys = [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-            keys.append(pk)
-            return {"keys": keys, "likes": [pk + "#"]}
+            days = [(monday + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+            keys = [*days, pk]
+            return {"keys": keys, "likes": [key + "#" for key in keys]}
         m = re.match(r"^(\d{4})-(\d{2})$", pk)
         if m:
             return {"keys": [pk], "likes": [pk + "-", pk + "#"]}

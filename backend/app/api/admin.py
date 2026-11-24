@@ -1776,6 +1776,7 @@ def create_admin_router(
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         if _tpl.get("is_adhoc"):
             return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
+        skip_completed = skip_completed and state.supports_push_completion_filter(_tpl)
         variable = bool(variable_notice_config(_tpl))
 
         # 2026-11-19 需求一：本周期/历史上已推送过 → 先回一次「要不要新建批次」。
@@ -1837,7 +1838,8 @@ def create_admin_router(
             logger.exception("push_now prepare 异常 template=%s", template_id)
             return error_response(500, "PUSH_FAILED", "推送准备阶段异常，请稍后重试")
         attempted_at = prep["pushed_at"] if variable else guard["attempted_at"]
-        return _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at, skip_completed)
+        return _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at,
+                                     bool(prep.get("skip_completed")))
 
     def _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at, skip_completed):
         def _bg_deliver() -> None:
