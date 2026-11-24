@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="format-detection" content="telephone=no">
-  <title>新建任务 · 个人任务工作台</title>
+  <title>IMTask</title>
 <style>
     :root {
       --blue: #15558a;
@@ -66,9 +66,7 @@
     }
 
     @media (max-width: 374px) {
-      header .header-inner { padding: 14px 12px 10px; }
-      header h1 { font-size: 18px; }
-      .header-top { gap: 8px; }
+      header.topbar { padding: 10px 12px; }
       nav { padding: 8px 12px; }
       nav button { font-size: 12.5px; padding: 6px 2px; }
       main { padding: 12px 12px calc(24px + env(safe-area-inset-bottom, 0px)); }
@@ -118,40 +116,31 @@
     header {
       background: var(--paper);
       border-top: 3px solid var(--blue);
+      border-bottom: 1px solid var(--line);
     }
-    header .header-inner {
-      padding: 16px 16px 12px;
-    }
-    .header-top {
+    /* ── 2026-11-24：顶栏完全对齐 task.html 标准（3px 品牌蓝边条 + 44×44 线性返回 +
+          居中加粗品牌 + 右侧浅灰页面名「创建任务」）───────────────────────── */
+    header.topbar {
       display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .header-brand {
-      min-width: 0;
-      flex: 1;
-    }
-    .admin-icon-btn {
-      display: inline-flex;
       align-items: center;
-      justify-content: center;
-      width: 44px;
-      height: 44px;
-      flex: none;
-      margin: -6px -10px 0 0;
-      padding: 0;
-      border: 0;
-      border-radius: 50%;
-      background: transparent;
+      justify-content: space-between;
+      padding: 12px 16px;
+    }
+    .topbar-brand {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: 0.01em;
+    }
+    .topbar-sub {
+      font-size: 12px;
       color: var(--muted);
-      transition: background-color 150ms ease, color 150ms ease, transform 120ms ease;
     }
-    .admin-icon-btn svg {
-      width: 22px;
-      height: 22px;
+    header .page-back {
+      margin: -8px 0 -8px -10px;
+      color: var(--blue);
     }
-    /* 2026-11-21 需求四：二级视图统一左上角返回图标（线性左箭头，触控热区 44×44） */
+    /* 2026-11-24：返回图标对齐 task.html（44×44 触控热区、线性左箭头、品牌蓝色） */
     .page-back {
       display: inline-flex;
       align-items: center;
@@ -164,7 +153,7 @@
       border: 0;
       border-radius: 12px;
       background: transparent;
-      color: var(--ink);
+      color: var(--blue);
       cursor: pointer;
     }
     .page-back:active { background: var(--blue-soft); }
@@ -173,28 +162,7 @@
       width: 22px;
       height: 22px;
     }
-    .admin-icon-btn:hover { background: var(--blue-soft); color: var(--blue); }
-    .admin-icon-btn:active { background: #e3eef8; color: var(--blue-active); transform: scale(0.96); }
-    header small {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 500;
-      letter-spacing: 0.02em;
-    }
-    h1 {
-      font-size: 20px;
-      line-height: 1.3;
-      letter-spacing: -0.01em;
-      margin: 4px 0 0;
-      color: var(--ink);
-    }
-    .intro {
-      margin: 6px 0 0;
-      color: var(--secondary);
-      font-size: 13px;
-      line-height: 1.5;
-    }
+    /* 2026-11-24：旧顶栏的 header small / h1 / intro 随大标题顶栏一并下线 */
     h2 {
       font-size: 16px;
       line-height: 1.35;
@@ -1171,19 +1139,12 @@
 </head>
 <body>
   <div class="shell">
-    <header>
-      <div class="header-inner">
-        <div class="header-top">
-          <button type="button" id="page-back" class="page-back" aria-label="返回工作台" title="返回工作台">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
-          </button>
-          <div class="header-brand">
-            <small>德阳量密助手</small>
-            <h1>新建任务</h1>
-          </div>
-        </div>
-        <p class="intro">发布上传任务或通知提醒：选人、执行周期与回执配置都在这一页完成。</p>
-      </div>
+    <header class="topbar">
+      <button type="button" id="page-back" class="page-back" aria-label="返回工作台" title="返回工作台">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <span class="topbar-brand">德阳量密助手</span>
+      <span class="topbar-sub">创建任务</span>
     </header>
     <div class="mode-switch" role="tablist" aria-label="任务类型">
       <button type="button" data-mode="upload" class="active" role="tab" aria-pressed="true">上传任务</button>

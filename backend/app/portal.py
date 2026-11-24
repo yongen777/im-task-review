@@ -528,6 +528,25 @@ class PortalService:
             records.append(record)
         return records
 
+    def submission_history_count(self, ident):
+        """提交记录总数（只读聚合，2026-11-24 工作台二级 Tab「提交记录 (M)」用）。
+
+        WHERE 与 submission_history 完全同源（含跨平台 adhoc 与模板角色平台过滤），
+        不 LIMIT/OFFSET，仅取 COUNT。
+        """
+        params = [ident['phone'], ident['platform'], f"adhoc-{ident['platform']}-%", ident['platform']]
+        row = self.s.conn.execute(
+            "SELECT COUNT(*) AS c FROM task_instance i "
+            "LEFT JOIN task_template t ON t.template_id=i.template_id LEFT JOIN portal_task p ON p.task_id=i.template_id "
+            "WHERE i.phone=? AND EXISTS (SELECT 1 FROM submission s WHERE s.instance_id=i.id) "
+            "AND (p.task_id IS NOT NULL OR t.kind!='notice') "
+            "AND (p.platform=? OR (t.template_id IS NOT NULL AND (i.period_key LIKE ? OR "
+            "(i.period_key NOT REGEXP '^adhoc-(zdxlz|wecom)-' AND EXISTS "
+            "(SELECT 1 FROM role r WHERE r.platform=? AND JSON_CONTAINS(t.role_ids,JSON_QUOTE(r.role_id))))))) ",
+            tuple(params),
+        ).fetchone()
+        return int((row['c'] if row else 0) or 0)
+
     def submission_history_link(self, ident, instance_id, *, edit=False):
         records = self.submission_history(ident, instance_id=instance_id, limit=1)
         if not records:

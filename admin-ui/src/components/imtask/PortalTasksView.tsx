@@ -530,6 +530,12 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
   const [publisherId, setPublisherId] = useState('');
   const [taskId, setTaskId] = useState('');
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  /* 2026-11-24：页头按钮与 PortalTaskMonitor 的同步信号（正经 props/回调数据流）：
+     refreshSignal → Catalog 列表 + Monitor 的 KPI 概览与成员明细一起重拉；
+     exportSignal → Monitor 导出，exporting 由 Monitor 经回调上报，页头真实置灰。 */
+  const [refreshSignal, setRefreshSignal] = useState(0);
+  const [exportSignal, setExportSignal] = useState(0);
+  const [exporting, setExporting] = useState(false);
 
   /* 2026-11-24：彻底移除 30 秒自动刷新（头部提示与定时器），仅保留手动「刷新」。 */
   const load = async () => {
@@ -582,16 +588,16 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
             {grantCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{grantCount}</span>}
           </button>
         )}
-        <button type="button" onClick={() => void load()} disabled={refreshing}
-          title="手动刷新发布人任务列表"
+        <button type="button" onClick={() => { void load(); setRefreshSignal((n) => n + 1); }} disabled={refreshing}
+          title="刷新发布人任务列表与下方概览、成员明细"
           className={secondaryButton}>
           <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
         </button>
-        <button type="button" onClick={() => document.getElementById('portal-export-button')?.click()}
-          disabled={!task}
+        <button type="button" onClick={() => setExportSignal((n) => n + 1)}
+          disabled={!task || exporting}
           title="导出当前选中任务、归属周期和部门范围内的全量数据"
           className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
-          <Download className="h-3.5 w-3.5" /> 导出 Excel
+          <Download className="h-3.5 w-3.5" /> {exporting ? '导出中…' : '导出 Excel'}
         </button>
       </>} />
     {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}
@@ -625,7 +631,8 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
           {task.mode === 'once' ? '一次性推送' : <>执行周期 {execCycleText(task)}{task.remind_at ? ' · 执行时间 ' + task.remind_at : ''}</>}
         </span>}
       </label>
-      {task ? <PortalTaskMonitor key={task.task_id} task={task} /> : (
+      {task ? <PortalTaskMonitor key={task.task_id} task={task}
+        refreshSignal={refreshSignal} exportSignal={exportSignal} onExportingChange={setExporting} /> : (
         <div className="md:col-span-2">
           {!loading && !error && !!data?.tasks?.length && !tasks.length && (
             <div className={panelClass + ' px-5 py-10 text-center text-sm text-slate-500'} role="status">该发布人暂无任务</div>
@@ -689,7 +696,17 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
   </section>;
 }
 
-function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
+/* 2026-11-24：页头与明细区的刷新/导出全部走 props+回调的正经数据流
+   （废弃 getElementById 隐藏按钮转发反模式）：
+   · refreshSignal：页头「刷新」→ Catalog 自身列表 + 本组件 revision（KPI 概览与成员明细一起重拉）；
+   · exportSignal：页头「导出 Excel」→ 触发本组件导出逻辑；
+   · onExportingChange：导出中状态回传页头，按钮真实置灰并显示「导出中…」。 */
+function PortalTaskMonitor({ task, refreshSignal, exportSignal, onExportingChange }: {
+  task: PortalTaskMeta;
+  refreshSignal: number;
+  exportSignal: number;
+  onExportingChange: (busy: boolean) => void;
+}) {
   const toast = useToast();
   const [chosenPeriod, setChosenPeriod] = useState<string>();
   const [deptPath, setDeptPath] = useState('');
@@ -698,7 +715,6 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState({ query: '', page: 1 });
   const [revision, setRevision] = useState(0);
-  const [exporting, setExporting] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   /* 2026-11-20 需求 C：附件图片点开走原生全屏看图层（缩放/拖拽/Esc） */
   const [viewerSource, setViewerSource] = useState<{ url: string; alt?: string } | null>(null);
@@ -778,10 +794,25 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
     setFilter((current) => ({ ...current, page: 1 }));
   }
 
-  /* 2026-11-24：刷新移至页头（Catalog 层），Monitor 内不再单独提供。 */
+  /* 2026-11-24：页头驱动的刷新/导出信号（跳过首次挂载，避免与 usePanelQuery 的
+     初次自动拉取重复请求）。exportXlsx 为函数声明，存在提升，可在此前置引用。 */
+  const firstRefreshSignal = useRef(true);
+  useEffect(() => {
+    if (firstRefreshSignal.current) { firstRefreshSignal.current = false; return; }
+    setRevision((n) => n + 1);
+  }, [refreshSignal]);
+  const firstExportSignal = useRef(true);
+  useEffect(() => {
+    if (firstExportSignal.current) { firstExportSignal.current = false; return; }
+    void exportXlsx();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exportSignal]);
 
+  const exportBusy = useRef(false);
   async function exportXlsx() {
-    setExporting(true);
+    if (exportBusy.current) return;
+    exportBusy.current = true;
+    onExportingChange(true);
     try {
       const response = await fetch(`${base}/export?` + scope, { credentials: 'same-origin', cache: 'no-store' });
       if (!response.ok) {
@@ -800,7 +831,8 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
     } catch (err) {
       toast.error(plainError(String(err)));
     } finally {
-      setExporting(false);
+      exportBusy.current = false;
+      onExportingChange(false);
     }
   }
 
@@ -921,7 +953,8 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
     )}
 
     {/* 成员提交明细：全部/已完成/未完成 + 实时搜索 + 提交内容与附件全屏
-        （2026-11-24：刷新与导出移至页头（StatisticsView 同款位置），此处仅保留搜索与隐藏的导出锚点） */}
+        （2026-11-24：刷新与导出全部由页头驱动（StatisticsView 同款位置），
+          经 props/信号 +回调同步，不再有 DOM 转发锚点） */}
     <section className={panelClass + ' overflow-hidden md:col-span-4'} aria-busy={roster.loading || searching}>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
         <div className="flex items-center gap-2">
@@ -936,11 +969,6 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
             {search && <button type="button" aria-label="清除搜索" onClick={() => setSearch('')}
               className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
           </div>
-          <button type="button" id="portal-export-button" onClick={() => void exportXlsx()} disabled={exporting || overview.loading || !!overview.error}
-            title="导出当前任务、归属周期和部门范围内的全量数据（含部门汇总与成员明细）"
-            className="sr-only" aria-hidden="true" tabIndex={-1}>
-            <Download className="h-3.5 w-3.5" /> {exporting ? '导出中…' : '导出 Excel'}
-          </button>
         </div>
       </div>
       <div className="flex flex-wrap gap-1.5 border-b border-slate-100 px-4 py-2.5">

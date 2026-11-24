@@ -88,7 +88,9 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
                 return {'ok': True, 'can_create': bool(p.grants(ident)), 'todos': p.todos(ident),
                         'admins': p.admin_contacts(ident),
                         'adhoc': state.list_adhoc_menu_items(ident['phone'], platform=ident['platform']),
-                        'adhoc_history': p.submission_history(ident, adhoc_only=True, limit=10)}
+                        'adhoc_history': p.submission_history(ident, adhoc_only=True, limit=10),
+                        # 2026-11-24：工作台「提交记录 (M)」徽标计数（只读聚合，同 history 口径）
+                        'history_count': p.submission_history_count(ident)}
             if action == 'open':
                 return p.task_link(ident, int(data.get('instance_id', 0)))
             if action == 'notice-open':

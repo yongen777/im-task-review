@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
-  <title>通知确认</title>
+  <title>IMTask</title>
   <style>
     :root {
       color-scheme: light;
@@ -30,6 +30,25 @@
     button { cursor: pointer; }
     a { color: var(--accent); }
     :focus-visible { outline: 2px solid #377fb5; outline-offset: 3px; }
+    /* ── 2026-11-24：顶栏完全对齐 task.html 标准（3px 品牌蓝边条 + 44×44 线性返回 +
+          居中品牌 + 右侧浅灰页面名「通知确认」）───────────────────────────── */
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      width: 100%; max-width: 480px; margin-inline: auto;
+      padding: 12px 16px;
+      background: var(--surface);
+      border-top: 3px solid #15558a;
+      border-bottom: 1px solid var(--line);
+      box-sizing: border-box;
+    }
+    .topbar-brand {
+      font-size: 13px; font-weight: 700; color: var(--ink); letter-spacing: 0.01em;
+    }
+    .topbar-sub { font-size: 12px; color: var(--muted); }
+    .topbar .page-back {
+      margin: -8px 0 -8px -10px; color: #15558a; background: none; border-radius: 12px;
+    }
+    .topbar .page-back:active { background: rgba(29, 78, 137, .08); }
     main { width: 100%; max-width: 480px; margin-inline: auto; padding: 14px 14px 8px; }
     .notice-card {
       margin: 0 0 14px; padding: 26px 22px 24px;
@@ -49,12 +68,12 @@
     }
     .rule { height: 1px; margin: 18px 0 20px; background: var(--line); }
     #body { white-space: pre-wrap; line-height: 1.9; color: #2b3540; }
-    /* 2026-11-21 需求四：二级页面统一左上角返回图标（线性左箭头，触控热区 44×44） */
+    /* 2026-11-24：返回图标并入顶栏（44×44 触控热区，样式由 .topbar .page-back 对齐 task.html） */
     .page-back {
       display: inline-flex; align-items: center; justify-content: center;
-      width: 44px; height: 44px; margin: 0 0 2px -8px; padding: 0;
-      border: 0; border-radius: 12px; background: none; color: var(--accent);
-      cursor: pointer;
+      width: 44px; height: 44px; margin: 0; padding: 0;
+      border: 0; border-radius: 12px; background: none; color: #15558a;
+      cursor: pointer; flex: none;
     }
     .page-back:active { background: rgba(29, 78, 137, .08); }
     .page-back[hidden] { display: none; }
@@ -116,10 +135,14 @@
   </style>
 </head>
 <body>
-  <main>
+  <header class="topbar">
     <button type="button" id="page-back" class="page-back" aria-label="返回上一级" hidden>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
     </button>
+    <span class="topbar-brand">德阳量密助手</span>
+    <span class="topbar-sub">通知确认</span>
+  </header>
+  <main>
     <div class="notice-card" id="loading" role="status">正在读取通知…</div>
     <article id="notice" hidden>
       <section class="notice-card">
@@ -368,7 +391,7 @@
     async function render() {
       try {
         data = await request('info');
-        document.title = data.title + ' · 通知确认';
+        /* 2026-11-24：网页标题统一 IMTask，不再按通知标题动态改页头标题 */
         $('title').textContent = data.title;
         $('body').textContent = data.body;
         $('body-card').hidden = !data.body;

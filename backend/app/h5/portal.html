@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="referrer" content="no-referrer">
-  <title>个人任务工作台</title>
+  <title>IMTask</title>
   <style>
     :root {
       --blue: #15558a;
@@ -271,22 +271,77 @@
     }
     .task-info { min-width: 0; }
     .task-card p { margin: 6px 0 0; }
-    .receipt-card, .history-card { grid-template-columns: minmax(0, 1fr); }
-    .task-card .receipt-note {
-      margin-top: 10px;
-      padding: 10px 12px;
+    .task-card .task-title-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .task-card .task-title-row h3 {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .task-card .task-title-row .tag { flex: none; }
+    .task-card .task-deadline {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    /* 2026-11-24 第 3 行统一提示条：同圆角/字号/内边距，配色按语义区分
+       （驳回原因=琥珀、文本回复引导=蓝、逾期说明=浅红） */
+    .task-note {
+      margin: 10px 0 0;
+      padding: 9px 12px;
       border-radius: var(--control);
-      background: var(--blue-soft);
-      color: var(--blue);
-      font-size: 14px;
+      font-size: 13px;
       line-height: 1.6;
       overflow-wrap: anywhere;
     }
+    /* 覆盖 .task-card p 的 6px 行距（提示条独立节奏） */
+    .task-card .task-note { margin: 10px 0 0; }
+    .task-note-info { background: var(--blue-soft); color: var(--blue); }
+    .task-note-warn { background: #fef8ee; border: 1px solid #f7e1bd; color: #7c470b; }
+    .task-note-overdue { background: #fdf4f3; border: 1px solid #f6d7d3; color: #9b2c2c; }
+    .history-card { grid-template-columns: minmax(0, 1fr); }
     .history-actions { display: flex; justify-content: flex-end; gap: 8px; }
-    #home-history { margin-top: 24px; scroll-margin-top: 80px; }
+    #home-history { margin-top: 4px; scroll-margin-top: 80px; }
     @media (min-width: 480px) {
       .history-card { grid-template-columns: minmax(0, 1fr) auto; }
     }
+
+    /* 2026-11-24：「我的待办」页签内的二级切换胶囊（当前待办 N ｜ 提交记录 M） */
+    .todo-switch {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 4px;
+      padding: 4px;
+      margin: 0 0 12px;
+      background: var(--track);
+      border-radius: 10px;
+    }
+    .todo-switch button {
+      min-height: 44px;
+      padding: 6px 4px;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--secondary);
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      transition: background-color 160ms ease, color 160ms ease, box-shadow 160ms ease;
+    }
+    .todo-switch button.active {
+      color: var(--blue);
+      background: var(--paper);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(24, 37, 48, 0.08), 0 0 0 1px rgba(24, 37, 48, 0.04);
+    }
+    .todo-switch button:focus-visible { outline-offset: -3px; }
 
     .muted {
       color: var(--muted);
@@ -304,22 +359,7 @@
     }
     .meta-dot { color: var(--line-strong); }
     .meta-time { margin-top: 4px !important; font-size: 12.5px; }
-
-    .reject-note {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: baseline;
-      gap: 6px;
-      margin-top: 8px;
-      padding: 8px 10px;
-      background: #fef8ee;
-      border: 1px solid #f7e1bd;
-      border-radius: var(--control);
-      font-size: 12.5px;
-      line-height: 1.5;
-      color: #7c470b;
-    }
-    .reject-reason { overflow-wrap: anywhere; }
+    /* 2026-11-24：旧驳回提示框样式已并入统一 .task-note 提示条骨架 */
 
     .tag {
       display: inline-flex;
@@ -337,6 +377,9 @@
     .tag-rejected, .tag-warn { background: #fef6e8; color: #8a4f0e; border-color: #f7dfba; }
     .tag-overdue, .tag-expired { background: #fdf1f0; color: #9b2c2c; border-color: #f6d2cf; }
     .tag-cancelled, .tag-pending { background: #f0f3f6; color: #51606e; border-color: #dde3ea; }
+    /* 2026-11-24 状态胶囊配色：待重交=浅橙、待回复=浅蓝（与 .tag 同尺寸/圆角） */
+    .tag-resubmit { background: #fdf3ec; color: #a3541f; border-color: #f6dcc3; }
+    .tag-reply { background: var(--blue-soft); color: var(--blue); border-color: var(--blue-line); }
 
     .row {
       display: flex;
@@ -1504,53 +1547,46 @@
         toast(error.message);
       }
     }
-    function show(preserveHistory = false) {
-      if (expired || !info) return;
-      if (tab === 'create') { creator(); return; }
-      setPageBack(null);
-      const todo = tab === 'todo';
-      const rows = todo ? info.todos : info.adhoc;
-      const focusKey = document.activeElement?.dataset.open;
-      let list = todo ? document.getElementById('home-todos') : null;
-      if (!list) {
-        list = document.createElement('section');
-        if (todo) list.id = 'home-todos';
-        main.replaceChildren(list);
+    /* ── 2026-11-24 四种待办状态卡片统一骨架 ─────────────────────────────────
+       第 1 行 = 任务标题 + 状态胶囊（已逾期浅红/待重交浅橙/待回复浅蓝/待确认浅琥珀，
+       同一 .tag 尺寸圆角）+ 右侧统一对齐的操作按钮（纯文本回复无按钮）；
+       第 2 行 = 单行浅灰截止时间；第 3 行 = 可选统一提示条（驳回原因/文本回复引导/
+       逾期说明，同一圆角字号与内边距）。 */
+    function todoCardShell(title, pill, deadlineHtml, noteHtml, buttonHtml) {
+      return '<article class="card task-card"><div class="task-info">' +
+        '<div class="task-title-row"><h3>' + esc(title) + '</h3>' + (pill || '') + '</div>' +
+        (deadlineHtml || '') + (noteHtml || '') + '</div>' + (buttonHtml || '') + '</article>';
+    }
+    function todoCard(row, todo) {
+      const key = todo ? row.id : row.template_id;
+      if (todo && row.receipt_phrase) {
+        if (row.receipt_mode === 'link') {
+          return todoCardShell(row.template_name, '<span class="tag tag-warn">待确认</span>', '', '',
+            '<button type="button" class="primary" data-open="' + esc(key) + '" data-receipt>去查看确认</button>');
+        }
+        return todoCardShell(row.template_name, '<span class="tag tag-reply">待回复</span>', '',
+          '<p class="task-note task-note-info">请返回聊天框回复德阳量密助手<strong>「' + esc(row.receipt_phrase) +
+            '」</strong>完成确认</p>', '');
       }
-      list.innerHTML =
-        '<div class="row section-row"><h2>' + (todo ? '当前待办' : '自主上报事项') + '</h2>' +
-        (todo ? '' :
-          '<span class="section-count">' + rows.length + ' 项</span>') + '</div>' +
-        (rows.length ? rows.map(row => {
-          const key = todo ? row.id : row.template_id;
-          if (todo && row.receipt_phrase) {
-            if (row.receipt_mode === 'link') {
-              return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
-                '<div class="task-meta"><span class="tag tag-warn">待确认</span></div></div>' +
-                '<button type="button" class="primary" data-open="' + esc(key) + '" data-receipt>去查看确认</button></article>';
-            }
-            return '<article class="card task-card receipt-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
-              '<div class="task-meta"><span class="tag tag-warn">待回复</span></div>' +
-              '<p class="receipt-note">请返回聊天框回复德阳量密助手<strong>「' + esc(row.receipt_phrase) +
-              '」</strong>完成确认</p></div></article>';
-          }
-          const deadline = todo ? '<p class="muted">截止 ' + esc(row.deadline_at.startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
-          const review = todo && row.status === 'rejected' ? '<div class="reject-note"><span class="tag tag-warn">待重交</span>' +
-            (row.reject_reason ? '<span class="reject-reason">驳回原因：' + esc(row.reject_reason) + '</span>' : '') + '</div>' : '';
-          /* 2026-11-21 需求三：已过截止且本周期未完成 → 逾期提醒，无去完成通道，点「我知道了」即移除 */
-          if (todo && row.overdue) {
-            return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name) + '</h3>' +
-              '<div class="task-meta"><span class="tag tag-overdue">已逾期</span></div>' +
-              deadline + '<p class="muted">已过截止时间仍未完成；本条为提醒，不影响后台统计</p></div>' +
-              '<button type="button" class="secondary" data-ack="' + esc(row.template_id) + '">我知道了</button></article>';
-          }
-          return '<article class="card task-card"><div class="task-info"><h3>' + esc(row.template_name || row.name) +
-            '</h3>' + deadline + review + '</div><button type="button" class="primary" data-open="' + esc(key) + '">' +
-            (todo ? '去完成' : '进入上报') + '</button></article>';
-        }).join('') : '<div class="card empty">' +
-          (todo ? '当前暂无待办' : '当前暂无可自主上报的任务事项') + '</div>');
+      const deadline = todo ? '<p class="muted task-deadline">截止 ' +
+        esc(String(row.deadline_at || '').startsWith('9999') ? '不限' : row.deadline_at) + '</p>' : '';
+      /* 2026-11-21 需求三：已过截止且本周期未完成 → 逾期提醒，无去完成通道，点「我知道了」即移除 */
+      if (todo && row.overdue) {
+        return todoCardShell(row.template_name, '<span class="tag tag-overdue">已逾期</span>', deadline,
+          '<p class="task-note task-note-overdue">已过截止时间仍未完成</p>',
+          '<button type="button" class="secondary" data-ack="' + esc(row.template_id) + '">我知道了</button>');
+      }
+      if (todo && row.status === 'rejected') {
+        return todoCardShell(row.template_name, '<span class="tag tag-resubmit">待重交</span>', deadline,
+          row.reject_reason ? '<p class="task-note task-note-warn">驳回原因：' + esc(row.reject_reason) + '</p>' : '',
+          '<button type="button" class="primary" data-open="' + esc(key) + '">去完成</button>');
+      }
+      return todoCardShell(row.template_name || row.name, '', deadline, '',
+        '<button type="button" class="primary" data-open="' + esc(key) + '">' + (todo ? '去完成' : '进入上报') + '</button>');
+    }
+    function bindTodoCards(scope, focusKey) {
       /* 2026-11-21：逾期提醒「我知道了」——持久化已读后立即从待办移除，刷新/重进不再复现 */
-      list.querySelectorAll('[data-ack]').forEach(button => {
+      scope.querySelectorAll('[data-ack]').forEach(button => {
         button.onclick = async () => {
           button.disabled = true;
           try {
@@ -1564,14 +1600,14 @@
           }
         };
       });
-      list.querySelectorAll('[data-open]').forEach(button => {
+      scope.querySelectorAll('[data-open]').forEach(button => {
         if (focusKey === button.dataset.open) button.focus({ preventScroll: true });
         button.onclick = async () => {
           button.disabled = true;
           try {
             const key = button.dataset.open;
-            const action = button.hasAttribute('data-receipt') ? 'notice-open' : todo ? 'open' : 'adhoc';
-            const result = await api(action, todo ? { instance_id: Number(key) } : { template_id: key });
+            const action = button.hasAttribute('data-receipt') ? 'notice-open' : (tab === 'todo' ? 'open' : 'adhoc');
+            const result = await api(action, tab === 'todo' ? { instance_id: Number(key) } : { template_id: key });
             location.href = portalJump(result.url);
           } catch (error) {
             toast(error.message);
@@ -1579,9 +1615,70 @@
           }
         };
       });
-      if (todo) {
-        if (!preserveHistory || !document.getElementById('home-history')) showHistory();
+    }
+    let todoView = 'todo'; /* 'todo' | 'history'：我的待办二级视图（2026-11-24） */
+    function renderTodoView() {
+      const focusKey = document.activeElement?.dataset.open;
+      if (jumpToHistory) { jumpToHistory = false; todoView = 'history'; }
+      const head = document.createElement('section');
+      head.innerHTML = '<div class="todo-switch" role="tablist" aria-label="我的待办视图切换">' +
+        '<button type="button" role="tab" aria-selected="' + (todoView === 'todo') + '" data-view="todo"' +
+        (todoView === 'todo' ? ' class="active"' : '') + '>当前待办 (' + (info.todos?.length || 0) + ')</button>' +
+        '<button type="button" role="tab" aria-selected="' + (todoView === 'history') + '" data-view="history"' +
+        (todoView === 'history' ? ' class="active"' : '') + '>提交记录 (' + (info.history_count ?? 0) + ')</button></div>';
+      head.querySelectorAll('[data-view]').forEach(button => {
+        button.onclick = () => {
+          if (todoView === button.dataset.view) return;
+          todoView = button.dataset.view;
+          renderTodoView();
+        };
+      });
+      const body = document.createElement('section');
+      if (todoView === 'todo') {
+        body.id = 'home-todos';
+        body.innerHTML = (info.todos?.length
+          ? info.todos.map(row => todoCard(row, true)).join('')
+          : '<div class="card empty">当前暂无待办</div>');
+        bindTodoCards(body, focusKey);
       }
+      main.replaceChildren(head, body);
+      if (todoView === 'history') showHistory();
+    }
+    /* 2026-11-24 二级视图左右手势滑动切换：水平位移 ≥64px、水平显著大于垂直
+       （|dx| ≥ 1.6×|dy|，避免上下滚动列表误触）、700ms 内完成才生效。 */
+    let swipeStart = null;
+    main.addEventListener('touchstart', event => {
+      swipeStart = (tab === 'todo' && event.touches && event.touches.length === 1)
+        ? { x: event.touches[0].clientX, y: event.touches[0].clientY, at: Date.now() }
+        : null;
+    }, { passive: true });
+    main.addEventListener('touchend', event => {
+      if (!swipeStart || tab !== 'todo') { swipeStart = null; return; }
+      const touch = event.changedTouches && event.changedTouches[0];
+      const start = swipeStart;
+      swipeStart = null;
+      if (!touch) return;
+      const dx = touch.clientX - start.x, dy = touch.clientY - start.y, dt = Date.now() - start.at;
+      if (dt > 700 || Math.abs(dx) < 64 || Math.abs(dx) < Math.abs(dy) * 1.6) return;
+      const target = dx < 0 ? 'history' : 'todo';
+      if (todoView !== target) { todoView = target; renderTodoView(); }
+    }, { passive: true });
+
+    function show(preserveHistory = false) {
+      if (expired || !info) return;
+      if (tab === 'create') { creator(); return; }
+      setPageBack(null);
+      if (tab === 'todo') { renderTodoView(); return; }
+      const rows = info.adhoc;
+      const focusKey = document.activeElement?.dataset.open;
+      const list = document.createElement('section');
+      main.replaceChildren(list);
+      list.innerHTML =
+        '<div class="row section-row"><h2>自主上报事项</h2>' +
+        '<span class="section-count">' + rows.length + ' 项</span></div>' +
+        (rows.length ? rows.map(row => todoCard(row, false)).join('')
+          : '<div class="card empty">当前暂无可自主上报的任务事项</div>');
+      bindTodoCards(list, focusKey);
     }
 
     const tabs = document.querySelectorAll('[data-tab]');
