@@ -22,11 +22,13 @@ except ImportError:  # pragma: no cover
     APIRouter = Request = UploadFile = HTMLResponse = JSONResponse = None  # type: ignore[assignment,misc]
     FileResponse = None  # type: ignore[assignment]
 
+from ..config import parse_dt
 from ..h5log import H5_ACCESS_META
 from ..scheduler import NotifierProtocol, format_deadline_display
 from ..state import (
-    BizError, StateStore, TaskUpload, calc_resubmit_deadline, format_deadline_rule,
-    effective_h5_modules, submission_expired_message, task_attachment_limits, task_upload_max_mb,
+    BizError, H5_LINK_EXPIRED_MESSAGE, H5_TOKEN_TTL_BY_PURPOSE, StateStore, TaskUpload, effective_instance_deadline,
+    format_deadline_rule, effective_h5_modules, is_rejected_submission, submission_expired_message,
+    task_attachment_limits, task_upload_max_mb,
 )
 
 
@@ -34,6 +36,7 @@ from ..state import (
 ALLOWED_EXTENSIONS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "jpg", "jpeg", "png", "webp", "bmp", "gif"}
 IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "bmp", "gif"}
 UPLOAD_READ_CHUNK_BYTES = 64 * 1024
+NOTICE_ATTACHMENT_EXPIRED_MESSAGE = "附件链接已过期或不存在。"
 
 # 2026-10-29 P2-2：绑定接口按 IP 限流（内存计数，单进程生效；默认 5 次/分钟，设 0 关闭）
 _BIND_RATE_LOCK = threading.Lock()
@@ -177,9 +180,7 @@ def _check_submission_window(
     # H5 显示只读提示；提交侧 submit_h5_task 还有服务端硬拦截兜底。
     if inst["status"] == "cancelled":
         return False, "该任务已被取消（成员已移出分组），无需提交"
-    # 2026-11-12 任务E2/E3：截止即关窗——到点后统一提示
-    # 「当前任务已过期（截止时间：…），无法提交」（用户拍板，不区分链接过期与任务截止）。
-    # rejected 走 is_instance_window_closed 的重交截止分支（驳回重交机制保留）。
+    # 令牌仍有效时，超过业务截止只关闭提交窗口。
     if state.is_instance_window_closed(inst):
         return False, submission_expired_message(inst)
     return True, None
@@ -306,19 +307,8 @@ def _resolve_token_and_instance(
         return None, None, (401, {"code": "TOKEN_INVALID", "message": "无效的 H5 访问令牌"})
     if on_instance_resolved is not None and tok.get("instance_id") is not None:
         on_instance_resolved(int(tok["instance_id"]))
-    if tok["expires_at"] < state.now_str():
-        # 2026-11-12 任务E2：链接过期提示与任务截止统一口径（用户拍板「不区分」），
-        # 尽力解析实例拿真实截止时间；实例都没了才说「令牌已过期」。
-        expired_inst: Optional[Dict[str, Any]] = None
-        if tok.get("instance_id") is not None:
-            expired_inst = state.get_instance(int(tok["instance_id"]))
-        if expired_inst is None and tok.get("template_id") and tok.get("period_key"):
-            expired_inst = state.get_instance_by_key(tok["template_id"], tok["phone"], tok["period_key"])
-        if expired_inst is not None:
-            if on_instance_resolved is not None and tok.get("instance_id") is None:
-                on_instance_resolved(int(expired_inst["id"]))
-            return None, None, (401, {"code": "TOKEN_EXPIRED", "message": submission_expired_message(expired_inst)})
-        return None, None, (401, {"code": "TOKEN_EXPIRED", "message": "H5 访问令牌已过期"})
+    if tok["expires_at"] <= state.now_str():
+        return None, None, (401, {"code": "TOKEN_EXPIRED", "message": H5_LINK_EXPIRED_MESSAGE})
 
     inst: Optional[Dict[str, Any]] = None
     if tok.get("instance_id") is not None:
@@ -364,13 +354,16 @@ def _completed_message(state: StateStore, inst: Dict[str, Any], tpl: Dict[str, A
 
 def _completed_submission(state: StateStore, instance: Dict[str, Any], *, history=False) -> Optional[Dict[str, Any]]:
     """Expose saved values and attachment metadata for this instance only."""
-    if not history and instance["status"] not in ("submitted", "approved"):
+    completed = instance["status"] in ("submitted", "approved")
+    rejected = is_rejected_submission(instance)
+    if not history and not completed and not rejected:
         return None
-    saved = state.get_latest_valid_submission(instance["id"])
-    if history and instance["status"] not in ("submitted", "approved"):
+    if completed:
+        saved = state.get_latest_valid_submission(instance["id"])
+    else:
         records = state.list_submissions_for_instance(instance["id"])
         saved = records[-1] if records else None
-    if not saved:
+    if not saved and not rejected:
         # 2026-11-20 切期改造：手动重推的「已完成闭口副本」实例自身没有提交行 →
         # 回查同归属周期（含全部重推批次）内该成员的原提交做只读回看。
         saved = state.latest_family_submission(
@@ -527,8 +520,8 @@ def process_h5_task_info(
         window_reason = None
     # 2026-10-28：驳回后重交场景，前端要显示「重交截止」；统一在这里算好下发，
     # 避免页面自己猜重交窗口（与服务端 is_instance_window_closed 保持同一算法）。
-    if inst.get("status") == "rejected":
-        inst["resubmit_deadline"] = calc_resubmit_deadline(inst["deadline_at"], inst.get("reviewed_at"))
+    if is_rejected_submission(inst):
+        inst["resubmit_deadline"] = effective_instance_deadline(inst)
     adhoc = bool(tpl.get("is_adhoc") or inst["period_key"].startswith("adhoc-"))
     submission = _completed_submission(state, inst, history=history)
     if history and submission and not inst.get("submitted_at"):
@@ -555,7 +548,7 @@ def process_h5_task_info(
             "deadline_rule": format_deadline_rule(tpl),
             # 2026-11-13：实例级具体截止（"11月30日 17:00" / "不限"）——前端徽章优先用它，
             # 避免月末任务在 12 月打开的 11 月旧周期链接顶部漂成「12月31日」。
-            "deadline_display": format_deadline_display(str(inst.get("deadline_at") or "")),
+            "deadline_display": format_deadline_display(effective_instance_deadline(inst)),
             "has_deadline": tpl.get("has_deadline"),
             "deadline_type": tpl.get("deadline_type"),
             "deadline_time": tpl.get("deadline_time"),
@@ -667,7 +660,7 @@ def create_h5_router(
                    "Referrer-Policy": "no-referrer"}
         tok = state.get_h5_token(token) if re.fullmatch(r"[A-Za-z0-9_-]{32}", token) else None
         if not tok or tok["purpose"] != "notice_asset" or tok["consumed"] or tok["expires_at"] <= state.now_str():
-            return HTMLResponse("附件链接无效或已过期", status_code=401, headers=headers)
+            return HTMLResponse(NOTICE_ATTACHMENT_EXPIRED_MESSAGE, status_code=401, headers=headers)
         instance = state.get_instance(tok["instance_id"]) if tok["instance_id"] else None
         tpl = state.get_template(tok["template_id"])
         asset = get_asset(state, tok["period_key"])
@@ -730,14 +723,23 @@ a{{display:inline-flex;align-items:center;min-height:44px;margin-top:12px;color:
         if FileResponse is None or HTMLResponse is None:  # pragma: no cover
             return JSONResponse(status_code=500, content={"code": "UNAVAILABLE", "message": "服务未就绪"})
         clean = (name or "").strip().lower()
+        unavailable = HTMLResponse(NOTICE_ATTACHMENT_EXPIRED_MESSAGE, status_code=404, headers={"Cache-Control": "no-store"})
         if not re.fullmatch(r"[0-9a-f]{32}\.(?:jpg|jpeg|png|webp)", clean):
-            return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
+            return unavailable
         img_dir = (uploads_dir.parent / "public_img").resolve()
         target = (img_dir / clean).resolve()
         if not target.is_file() or not target.is_relative_to(img_dir):
-            return JSONResponse(status_code=404, content={"code": "NOT_FOUND", "message": "图片不存在"})
+            return unavailable
+        # 旧图片链接按发布副本的写入时间计算，与令牌版通知附件共用 7 天期限。
+        try:
+            expires = target.stat().st_mtime + H5_TOKEN_TTL_BY_PURPOSE["notice_asset"] * 3600
+        except OSError:
+            return unavailable
+        remaining = expires - parse_dt(state.now_str()).timestamp()
+        if remaining <= 0:
+            return unavailable
         if (raw or "").strip().lower() in ("1", "true", "yes"):
-            return FileResponse(str(target), headers={"Cache-Control": "public, max-age=86400"})
+            return FileResponse(str(target), headers={"Cache-Control": f"public, max-age={min(86400, int(remaining))}"})
         # H5 图文页：标题取发布时写入的同名 .title 文件（管理员填写的图片名称）
         title = "数据图片"
         try:

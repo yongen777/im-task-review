@@ -561,7 +561,7 @@ class TestStage2B(unittest.TestCase):
         self.store.advance_instance_statuses(self.current_dt)
         r_sub_old = self.pub_client.post("/api/h5/task/submit", json={"token": tok_img, "payload": {"refs": [ref_png]}, "note": "出差补交"})
         self.assertEqual((r_sub_old.status_code, r_sub_old.json()["code"]), (400, "SUBMISSION_CLOSED"))
-        self.assertIn("当前任务已过期（截止时间：2026-10-25 18:00:00），无法提交", r_sub_old.json()["message"])
+        self.assertEqual(r_sub_old.json()["message"], "当前任务已过期，无法提交。")
 
         self.current_dt = make_dt("2026-10-28 18:30:00")
         tok_file_late = self.store.issue_h5_token("13600000001", tpl_file["template_id"], "2026-10-25", inst_file["id"])

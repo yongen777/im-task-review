@@ -7,7 +7,7 @@
       停用 → 「任务已关闭」、重新启用自动恢复；已完成历史隔离；创建默认无需审核。
   二  立即推送覆盖 submitted/approved（冷却保留）；定时推送仍跳过已提交；
       H5 对已提交/已审核通过**打开放行**，仅最后一步提交终审拦「已上传，请勿重复提交」。
-  三  驳回重交 = 驳回时刻 + 24h（无截止 → 无限期）；链接寿命与 24h 窗口对齐。
+  三  驳回重交 = 驳回时刻 + 24h（无截止 → 无限期）；链接有额外 24h 查看窗口。
   四  五类失效统一拦截「任务已关闭」（删除/停用/移出角色/移除角色/成员停用），
       模板物理删除后靠保留的 h5_token 行识别，不再是「无效令牌」技术报错。
 
@@ -132,8 +132,7 @@ def test_sync2_extend_deadline_restores_overdue_and_extends_token() -> None:
         tpl = _tpl(store, rid)
         insts = _ensure(store, tpl, "2026-11-12", "2026-11-12 18:00:00")
         inst = insts[P1]
-        # 直接签发默认 72h（issue_h5_token 的保守缺省）；调度链真实推送走动态 TTL。
-        # 用 30h 短令牌制造「旧寿命 < 新寿命」场景，验证截止延后时的只延不缩顺延。
+        # 用 30h 的测试令牌，验证截止延后后按新的截止重算。
         raw = store.issue_h5_token(P1, tpl["template_id"], "2026-11-12", inst["id"], ttl_hours=30)
         old_exp = store.get_h5_token(raw)["expires_at"]
 
@@ -187,19 +186,19 @@ def test_sync3_shorten_deadline_to_past_blocks_immediately() -> None:
         assert fresh["status"] == "overdue", "截止提前必须立即 overdue"
         code, info = process_h5_task_info(state=store, raw_token=raw)
         assert code == 200 and info["window_open"] is False, (code, info)
-        assert info["window_reason"] == "当前任务已过期（截止时间：2026-11-12 10:00:00），无法提交", info
+        assert info["window_reason"] == "当前任务已过期，无法提交。", info
         try:
             store.submit_h5_task(raw_token=raw, fields={"summary": "晚了"})
             raise AssertionError("提前截止后必须拒绝提交")
         except BizError as exc:
-            assert exc.code == "SUBMISSION_CLOSED" and "2026-11-12 10:00:00" in exc.message, exc
+            assert exc.code == "SUBMISSION_CLOSED" and exc.message == "当前任务已过期，无法提交。", exc
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()
 
 
 def test_sync4_no_deadline_restore_and_sentinel_token() -> None:
-    """截止改为「无截止」→ overdue 恢复 pending、deadline_at=哨兵、令牌寿命顺延到哨兵（永不过期）。"""
+    """改为无截止后待办恢复，未消费令牌从编辑时刻起有效 30 天。"""
     store = _store()
     try:
         rid = _seed_two(store)
@@ -220,7 +219,7 @@ def test_sync4_no_deadline_restore_and_sentinel_token() -> None:
 
         fresh = store.get_instance(insts[P1]["id"])
         assert fresh["status"] == "pending" and fresh["deadline_at"] == NO_DEADLINE_SENTINEL, fresh
-        assert store.get_h5_token(raw)["expires_at"] == NO_DEADLINE_SENTINEL
+        assert store.get_h5_token(raw)["expires_at"] == "2026-12-12 19:00:00"
         code, info = process_h5_task_info(state=store, raw_token=raw)
         assert code == 200 and info["window_open"] is True and info["template"]["deadline_rule"] == "不限", info
     finally:
@@ -422,7 +421,7 @@ def test_h5_completed_instances_open_readonly_and_keep_submissions() -> None:
 # ════════════════════ 三：驳回重交 24h / 无截止无限期 / TTL 对齐 ════════════════════
 
 def test_resubmit_window_24h_and_token_alignment() -> None:
-    """有截止模板：驳回 → 重交截止=驳回+24h；rejected 链接 TTL=24h；超窗 advance 转 expired。"""
+    """驳回后 24h 可重交，随后仍有 24h 可查看。"""
     store = _store()
     try:
         rid = _seed_two(store)
@@ -437,14 +436,13 @@ def test_resubmit_window_24h_and_token_alignment() -> None:
         rd = calc_resubmit_deadline(fresh["deadline_at"], fresh["reviewed_at"])
         assert rd == "2026-11-13 12:00:00", rd
 
-        # rejected 链接寿命与 24h 窗口对齐（调度链 build_h5_submit_url 同款动态 TTL）
-        assert calc_h5_token_ttl_hours(fresh, CLOCK["now"]) == 24.0
+        assert calc_h5_token_ttl_hours(fresh, CLOCK["now"]) == 48.0
         raw2 = store.issue_h5_token(
             P1, tpl["template_id"], "2026-11-12", insts[P1]["id"],
             ttl_hours=calc_h5_token_ttl_hours(fresh, CLOCK["now"]),
         )
         tok = store.get_h5_token(raw2)
-        assert tok["expires_at"] == "2026-11-13 12:00:00", tok["expires_at"]
+        assert tok["expires_at"] == "2026-11-14 12:00:00", tok["expires_at"]
 
         # 窗口内可重交；跨过重交截止 1s → advance 转 expired，提交按过期拦截
         res = store.submit_h5_task(raw_token=raw2, fields={"summary": "重交了"})

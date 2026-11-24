@@ -1199,7 +1199,6 @@
           method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
           body: JSON.stringify(data), cache: 'no-store', signal: controller.signal,
         });
-        if (r.status === 401) { expired = true; throw Error('链接已过期'); }
         if (attachment && r.ok) {
           const disposition = r.headers.get('Content-Disposition') || '';
           const encoded = /filename\*=utf-8''([^;]+)/i.exec(disposition);
@@ -1207,6 +1206,7 @@
           return { blob: await r.blob(), filename: filename || '附件' };
         }
         const v = await r.json();
+        if (r.status === 401) expired = true;
         if (!r.ok) throw Error(v.message || '请求失败');
         return v;
       } catch (error) {
@@ -1412,7 +1412,7 @@
         const on = document.getElementById('has_deadline').checked;
         document.getElementById('deadline-detail').classList.toggle('hidden', !on);
         document.getElementById('deadline-hint').textContent = on
-          ? '到截止时刻后 H5 入口关闭；逾期后统一提示「当前任务已过期」。'
+          ? '到截止时停止提交。已发链接在有效期内仍可打开查看。'
           : '无截止时间：任务长期有效，H5 页面显示「截止 不限」。';
         document.querySelectorAll('[data-dltype]').forEach(btn => {
           btn.classList.toggle('active', btn.dataset.dltype === ui.deadlineType);

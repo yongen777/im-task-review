@@ -23,12 +23,9 @@ logger = logging.getLogger(__name__)
 
 PBKDF2_ITERATIONS = 260_000
 SESSION_TTL_HOURS = 24 * 7
-H5_TOKEN_TTL_HOURS = 72
 
 # ── 2026-11-12 任务E1：截止与 Token 有效期口径（用户拍板） ──────────────
-# 无截止模板的实例截止时间哨兵：deadline_at 列 NOT NULL 不动，存该哨兵后
-# 所有「now > deadline_at」的字符串比较天然永不为真 → 永不过期；
-# 展示层（H5/后台/消息文案）统一特判显示「不限」。
+# deadline_at 的「无业务截止时间」哨兵。令牌有效期独立计算。
 NO_DEADLINE_SENTINEL = "9999-12-31 23:59:59"
 # Token 有效期保守策略：有截止 = min(截止后 24h, 720h)；无截止 = 720h（30 天）。
 H5_TOKEN_TTL_CAP_HOURS = 720
@@ -36,6 +33,8 @@ H5_TOKEN_TTL_GRACE_HOURS = 24
 # 有效期下限（小时）：截止已过等极端场景仍保证链接能打开看到「任务已过期」提示，
 # 而不是「链接无效」；提交侧另有窗口硬拦截，这里只管链接寿命。
 H5_TOKEN_TTL_FLOOR_HOURS = 1.0
+H5_TOKEN_TTL_BY_PURPOSE = {"portal": 168, "notice_asset": 168, "report_history": 1}
+H5_LINK_EXPIRED_MESSAGE = "链接已过期，请返回聊天框向德阳量密助手发送任意消息获取最新工作台入口。"
 
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
 HHMM_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
@@ -192,7 +191,7 @@ def effective_instance_deadline(instance: Dict[str, Any]) -> str:
     · 其余：实例自身的 deadline_at（无截止模板 = 哨兵，永不过期）。
     """
     deadline_at = str(instance.get("deadline_at") or "")
-    if str(instance.get("status") or "") == "rejected":
+    if is_rejected_submission(instance):
         return calc_resubmit_deadline(deadline_at, instance.get("reviewed_at"))
     return deadline_at
 
@@ -202,47 +201,32 @@ def is_no_deadline(deadline_at: Optional[str]) -> bool:
     return str(deadline_at or "").strip() >= NO_DEADLINE_SENTINEL
 
 
-def submission_expired_message(instance: Dict[str, Any]) -> str:
-    """2026-11-12 任务E2/E3：到点后的统一提示（用户拍板，不区分链接过期与任务截止）。
+def is_rejected_submission(instance: Dict[str, Any]) -> bool:
+    """驳回后的重交窗口即使已流转为 expired，仍保留最后一次驳回。"""
+    status = instance.get("status")
+    return status == "rejected" or (
+        status == "expired" and bool(instance.get("reviewed_at") and instance.get("reject_count"))
+    )
 
-    例：当前任务已过期（截止时间：2026-11-12 18:00:00），无法提交
-    """
-    deadline_at = effective_instance_deadline(instance)
-    if is_no_deadline(deadline_at):
-        deadline_at = "不限"
-    return f"当前任务已过期（截止时间：{deadline_at}），无法提交"
+
+def submission_expired_message(instance: Dict[str, Any]) -> str:
+    if is_rejected_submission(instance):
+        return "已过重交截止时间，无法提交。"
+    return "当前任务已过期，无法提交。"
 
 
 def calc_h5_token_ttl_hours(instance: Optional[Dict[str, Any]], now_dt: Optional[datetime] = None) -> float:
-    """2026-11-12 任务E1：H5 Token 动态有效期（小时）。
-
-    用户拍板口径（保守策略）：
-      · 无截止时间（哨兵）→ 720h（30 天）；
-      · 有截止时间 → min(截止 + 24h, 720h)；
-      · 驳回重交（2026-11-12 下午拍板）：链接有效期与 **24h 重交窗口对齐**
-        （= 重交截止 − 当前时刻；驳回后立刻签发即 24h，越晚签发越短），保底 1h、封顶 720h；
-    从「签发时刻」起算；已过期场景保底 1h，让用户能打开页面看到过期提示。
-    """
+    """填报和重交共用截止后 24 小时的查看窗，寿命限制在 1 小时至 30 天。"""
     if not instance:
-        return float(H5_TOKEN_TTL_HOURS)
-    now_dt = now_dt or default_now()
-    inst_status = str(instance.get("status") or "")
+        return float(H5_TOKEN_TTL_CAP_HOURS)
+    ref_dt = parse_dt(format_dt(now_dt or default_now()))
     deadline_at = effective_instance_deadline(instance)
     if is_no_deadline(deadline_at):
         return float(H5_TOKEN_TTL_CAP_HOURS)
     try:
-        end_dt = parse_dt(deadline_at)
-        # 2026-11-12 下午：rejected 的链接寿命严格对齐 24h 重交窗口（不再额外 +24h 宽限）
-        if inst_status != "rejected":
-            end_dt = end_dt + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)
-    except Exception:
-        return float(H5_TOKEN_TTL_HOURS)
-    # parse_dt 返回带 Asia/Shanghai 时区的 datetime；测试注入的 now 可能是 naive，统一对齐
-    ref_dt = now_dt
-    if end_dt.tzinfo is not None and ref_dt.tzinfo is None:
-        ref_dt = ref_dt.replace(tzinfo=end_dt.tzinfo)
-    elif end_dt.tzinfo is None and ref_dt.tzinfo is not None:
-        end_dt = end_dt.replace(tzinfo=ref_dt.tzinfo)
+        end_dt = parse_dt(deadline_at) + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)
+    except (ValueError, OverflowError):
+        return float(H5_TOKEN_TTL_CAP_HOURS)
     hours = (end_dt - ref_dt).total_seconds() / 3600.0
     return float(min(max(hours, H5_TOKEN_TTL_FLOOR_HOURS), H5_TOKEN_TTL_CAP_HOURS))
 
@@ -3472,7 +3456,7 @@ class StateStore:
             # 基于各实例原本的派发日（created_at 日期）按新规则重算 deadline_at，旧 H5 链接
             # 顶部截止时间同步更新：
             #   · 延后（含改「无截止」）→ 已逾期(overdue)实例自动恢复 pending（旧链接立即可填报），
-            #     未消耗令牌寿命同步**顺延**（只延不缩），确保新截止前不提前失效；
+            #     未消费令牌按实际新截止双向重算，以此次更新为有效期起点；
             #   · 提前至当前时刻之前 → 立即翻 overdue（旧链接打开/提交按统一过期提示拦截）；
             #   · 已完成（submitted/approved/expired/cancelled）不受影响（历史隔离）；
             #     rejected 的重交窗口按「驳回+24h」已锁定，不随模板截止变化（三口径）。
@@ -3492,6 +3476,15 @@ class StateStore:
                     if _new_dl != str(_r["deadline_at"] or ""):
                         self.conn.execute("UPDATE task_instance SET deadline_at = ? WHERE id = ?", (_new_dl, int(_r["id"])))
                         _deadline_sync["recalced"] = int(_deadline_sync.get("recalced", 0)) + 1
+                        renewed_at = parse_dt(now_s)
+                        hours = calc_h5_token_ttl_hours({"deadline_at": _new_dl}, renewed_at)
+                        new_expiry = format_dt(renewed_at + timedelta(hours=hours))
+                        changed_tokens = self.conn.execute(
+                            "UPDATE h5_token SET created_at = ?, expires_at = ? "
+                            "WHERE instance_id = ? AND purpose = 'submit' AND consumed = 0",
+                            (now_s, new_expiry, int(_r["id"])),
+                        )
+                        _deadline_sync["tokens_recalced"] = _deadline_sync.get("tokens_recalced", 0) + changed_tokens.rowcount
                     if str(_r["status"]) == "pending" and _new_dl <= now_s:
                         self.conn.execute(
                             "UPDATE task_instance SET status = 'overdue' WHERE id = ? AND status = 'pending'",
@@ -3502,16 +3495,6 @@ class StateStore:
                             "UPDATE task_instance SET status = 'pending' WHERE id = ? AND status = 'overdue'",
                             (int(_r["id"]),))
                         _deadline_sync["restored"] = int(_deadline_sync.get("restored", 0)) + 1
-                    # 链接寿命联动（只延不缩）：无截止 → 哨兵（永不过期）
-                    _new_exp_s = (NO_DEADLINE_SENTINEL if is_no_deadline(_new_dl)
-                                  else format_dt(parse_dt(_new_dl) + timedelta(hours=H5_TOKEN_TTL_GRACE_HOURS)))
-                    for _tk in self.conn.execute(
-                        "SELECT token_id, expires_at FROM h5_token WHERE instance_id = ? AND purpose = 'submit' AND consumed = 0",
-                        (int(_r["id"]),)).fetchall():
-                        if str(_tk["expires_at"] or "") < _new_exp_s:
-                            self.conn.execute("UPDATE h5_token SET expires_at = ? WHERE token_id = ?",
-                                              (_new_exp_s, str(_tk["token_id"])))
-                            _deadline_sync["tokens_extended"] = int(_deadline_sync.get("tokens_extended", 0)) + 1
             self._insert_audit_unlocked(actor, "template.update", "task_template", clean_id, {"name": norm["name"], "enabled": bool(norm["enabled"]), "removed_roles": removed_roles, "cancelled_on_disable": cancelled_on_disable, "cancelled_on_unbind": cancelled_on_unbind, "deadline_sync": _deadline_sync}, now_s)
             return self._deserialize_template_row(self.conn.execute("SELECT * FROM task_template WHERE template_id = ?", (clean_id,)).fetchone())
 
@@ -3947,12 +3930,16 @@ class StateStore:
                 out.append({"source_key": d["source_key"], "period_key": d["period_key"], "values": values, "note": d.get("note"), "updated_by": d.get("updated_by"), "updated_at": d["updated_at"]})
             return out
 
-    def issue_h5_token(self, phone: str, template_id: str, period_key: str, instance_id: Optional[int], purpose: str = "submit", ttl_hours: int = H5_TOKEN_TTL_HOURS) -> str:
-        now_dt = self.now()
-        created_at = format_dt(now_dt)
-        expires_at = (NO_DEADLINE_SENTINEL if purpose == "notice_receipt"
-                      else format_dt(now_dt + timedelta(hours=ttl_hours)))
+    def issue_h5_token(self, phone: str, template_id: str, period_key: str, instance_id: Optional[int],
+                       purpose: str = "submit", ttl_hours: Optional[float] = None) -> str:
         with self.lock, self.conn:
+            created_at = self.now_str()
+            now_dt = parse_dt(created_at)
+            limit = H5_TOKEN_TTL_BY_PURPOSE.get(purpose, H5_TOKEN_TTL_CAP_HOURS)
+            if purpose == "submit" and instance_id is not None:
+                limit = calc_h5_token_ttl_hours(self.get_instance(instance_id), now_dt)
+            hours = limit if ttl_hours is None else min(ttl_hours, limit)
+            expires_at = format_dt(now_dt + timedelta(hours=hours))
             while True:
                 raw_token = secrets.token_urlsafe(24)
                 token_id = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
@@ -3971,7 +3958,18 @@ class StateStore:
         token_id = hashlib.sha256(clean.encode("utf-8")).hexdigest()
         with self.lock:
             row = self.conn.execute("SELECT * FROM h5_token WHERE token_id = ?", (token_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            token = dict(row)
+            # 存量永久或超期令牌按签发时间收口。模板更改截止时，未消费填报令牌
+            # 的 created_at 随有效期一起重置，作为该次续期的起点。
+            hours = H5_TOKEN_TTL_BY_PURPOSE.get(token["purpose"], H5_TOKEN_TTL_CAP_HOURS)
+            try:
+                cap = format_dt(parse_dt(token["created_at"]) + timedelta(hours=hours))
+            except (ValueError, OverflowError):
+                cap = ""
+            token["expires_at"] = min(token["expires_at"], cap)
+            return token
 
     def consume_h5_token(self, token_id: str) -> None:
         with self.lock, self.conn:
@@ -4233,7 +4231,7 @@ class StateStore:
         draft = self.adhoc_report_draft({"phone": phone, "period_key": period_key}, tpl)
         if draft is None:
             raise BizError(403, "FORBIDDEN", "您没有该事项的填报权限")
-        return self.issue_h5_token(phone, template_id, period_key, None, purpose="adhoc_submit", ttl_hours=24)
+        return self.issue_h5_token(phone, template_id, period_key, None, purpose="adhoc_submit")
 
     def adhoc_report_draft(self, token, template):
         if not template or not template.get("is_adhoc") or not template.get("enabled") or template.get("deleted"):
@@ -4487,8 +4485,8 @@ class StateStore:
 
     def h5_edit_target(self, token, *, for_update=False):
         if (not token or token['purpose'] != 'report_history' or not token['instance_id']
-                or token['expires_at'] < self.now_str()):
-            raise BizError(401, 'TOKEN_EXPIRED', '链接已过期，请从工作台重新打开')
+                or token['expires_at'] <= self.now_str()):
+            raise BizError(401, 'TOKEN_EXPIRED', H5_LINK_EXPIRED_MESSAGE)
         row = self.conn.execute('SELECT * FROM task_instance WHERE id=?' + (' FOR UPDATE' if for_update else ''),
                                 (token['instance_id'],)).fetchone()
         instance = dict(row) if row else None
@@ -4608,6 +4606,8 @@ class StateStore:
             on_instance_resolved(int(tok["instance_id"]))
         cur_dt = self.now()
         now_s = format_dt(cur_dt)
+        if tok["expires_at"] <= now_s:
+            raise BizError(401, "TOKEN_EXPIRED", H5_LINK_EXPIRED_MESSAGE)
         self.advance_instance_statuses(cur_dt)
 
         draft = tok["purpose"] == "adhoc_submit" and tok["instance_id"] is None
@@ -4627,9 +4627,6 @@ class StateStore:
         # 旧链接令牌已消耗（提交过一次）→ 同口径按重复提交拦截
         if bool(tok["consumed"]):
             raise BizError(400, "ALREADY_SUBMITTED", "已上传，请勿重复提交")
-        # 2026-11-12 任务E2：链接过期统一口径（用户拍板，与任务截止不作区分）
-        if tok["expires_at"] < now_s:
-            raise BizError(400, "TOKEN_EXPIRED", submission_expired_message(inst))
         if inst["status"] == "expired":
             # 提前流转（模板删除/72h 过期等）也已关窗，统一提示
             raise BizError(400, "SUBMISSION_CLOSED", submission_expired_message(inst))

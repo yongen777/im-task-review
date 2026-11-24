@@ -859,7 +859,8 @@
           document.getElementById("headDeadline").hidden = data.template.is_adhoc;
           document.getElementById("headDesc").textContent = String(data.template.text_tpl || "").replace(/\\n/g, "\n");
 
-          if (!editing && (data.readonly_history || ["submitted", "approved"].includes(data.instance.status))) {
+          const closedResubmission = !data.window_open && Boolean(data.instance.resubmit_deadline);
+          if (!editing && (data.readonly_history || ["submitted", "approved"].includes(data.instance.status) || closedResubmission)) {
             const area = document.getElementById("dynamicArea");
             const tipText = data.window_reason || (data.instance.status === "submitted"
               ? "本任务已提交，正在等待管理员审核"
@@ -871,9 +872,16 @@
               tip.textContent = tipText;
               contentEl.insertBefore(tip, area);
             }
+            if (closedResubmission && data.instance.reject_reason) {
+              const reason = document.createElement("p");
+              reason.className = "locked-tip warning";
+              reason.textContent = "驳回原因：" + data.instance.reject_reason;
+              contentEl.insertBefore(reason, area);
+            }
             renderSavedSubmission(data.submission, data.template, area);
             submitBtn.disabled = true;
-            submitBtn.hidden = true;
+            submitBtn.hidden = !closedResubmission || data.readonly_history;
+            if (closedResubmission) submitBtn.textContent = "重新提交";
             if (data.can_edit) {
               const editButton = document.createElement("button");
               editButton.type = "button";
@@ -1151,40 +1159,21 @@
           if (!h5Modules.length && data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
           if (editing) document.getElementById("noteInput").value = data.submission.note || "";
 
-          const dl = String(data.instance.deadline_at || "");
-          const noDeadline = dl.startsWith("9999-12-31");
-          const __status = data.instance.status;
-          const __canResubmit = __status === "rejected" && !!data.window_open;
-          if (__canResubmit) {
+          if (data.instance.status === "rejected" && data.window_open) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
             tip.classList.add("warning");
-            tip.textContent = data.instance.resubmit_deadline
-              ? "该提交已被驳回，请按审核意见修改后重新提交（重交截止：" + data.instance.resubmit_deadline + "）。"
-              : "该提交已被驳回，请按审核意见修改后重新提交。";
+            tip.textContent = "该提交已被驳回，请按审核意见修改后重新提交。";
             if (data.instance.reject_reason) tip.textContent += " 驳回原因：" + data.instance.reject_reason;
+            submitBtn.textContent = "重新提交";
             contentEl.insertBefore(tip, taskActions);
-          } else if (!editing && __status !== "pending") {
-            const LOCKED_TEXT = {
-              rejected: "该提交已被驳回，且已超过重交期限，无法再提交。",
-              /* 2026-11-12 任务E2：逾期/过期统一口径文案（与后端校验同句式） */
-              overdue: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
-              expired: "当前任务已过期" + (noDeadline ? "" : "（截止时间：" + dl + "）") + "，无法提交。",
-              cancelled: "任务已关闭。",
-            };
+          } else if (!editing && !data.window_open) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
-            tip.textContent = LOCKED_TEXT[__status] || (data.window_reason || "当前状态不可提交。");
-            const content = document.getElementById("content");
-            content.insertBefore(tip, taskActions);
-            content.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
+            tip.textContent = data.window_reason || "当前任务提交窗口已关闭";
+            contentEl.insertBefore(tip, taskActions);
+            contentEl.querySelectorAll("input, textarea, select").forEach((el) => { el.disabled = true; });
             submitBtn.disabled = true;
-            submitBtn.style.display = "none";
-          }
-
-          if (!editing && !data.window_open) {
-            submitBtn.disabled = true;
-            showMsg(data.window_reason || "当前任务提交窗口已关闭", "error");
           }
           syncActionsVisibility();
         })
@@ -1221,7 +1210,7 @@
         if (h5Modules.indexOf("file") >= 0 && !((refsByModule["file"] || []).length)) {
           return showMsg("请上传文件后再提交", "error");
         }
-        const idleLabel = editing ? "保存修改" : "提交任务";
+        const idleLabel = submitBtn.textContent;
         const saved = new Set((taskInfo.submission?.attachments || []).map(item => item.ref));
         const requestBody = editing ? {
           revision: taskInfo.submission.revision,
@@ -1236,6 +1225,15 @@
           headers: { "Content-Type": "application/json", "X-H5-Token": token },
           body: JSON.stringify(requestBody)
         }).then(({ ok, data }) => {
+          if (!ok && data.code === "TOKEN_EXPIRED") {
+            contentEl.style.display = "none";
+            showFatalError(data.message);
+            return;
+          }
+          if (!ok && data.code === "SUBMISSION_CLOSED") {
+            switchView(false);
+            return;
+          }
           if (!ok) throw Error(data.message || "提交失败");
           switchView(false, editing ? "saved" : "done");
         }).catch(error => {

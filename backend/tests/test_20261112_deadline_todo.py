@@ -4,8 +4,7 @@
 E1 —— db + scheduler：has_deadline / deadline_type(same_day|weekend|month_end) / deadline_time；
     无截止存哨兵 9999-12-31 23:59:59（展示层「不限」）；Token 有效期 = min(截止+24h, 720h)，
     无截止 = 720h；提交后即刻 consumed=1。
-E2 —— H5 三道门禁：token 已消耗只读、截止硬拦截统一提示
-    「当前任务已过期（截止时间：{deadline_at}），无法提交」（不区分链接过期与任务截止）。
+E2 —— H5 三道门禁：token 已消耗只读、任务截止和链接过期分别提示。
 E3 —— 「申请补交」全链路彻底下线（rejected 驳回重交保留）。
 E4 —— 私聊【待办】：剥【】[] 匹配「待办/我的任务/未完成」→ 查 pending|rejected 未截止
     （封顶 5 条）逐项签发动态 TTL 链接；常规 ack 末尾追加【待办】指引。
@@ -38,7 +37,8 @@ from app.state import (  # noqa: E402
 
 PHONE = "13900001001"
 CLOCK = {"now": datetime(2026, 11, 12, 9, 0, 0)}
-UNIFIED_PREFIX = "当前任务已过期（截止时间："
+TASK_EXPIRED = "当前任务已过期，无法提交。"
+LINK_EXPIRED = "链接已过期，请返回聊天框向德阳量密助手发送任意消息获取最新工作台入口。"
 
 
 def _store() -> StateStore:
@@ -224,8 +224,8 @@ def test_e1_token_ttl_dynamic_strategy() -> None:
         assert calc_h5_token_ttl_hours(expired, datetime(2026, 11, 12, 11, 0, 0)) == 23.0
         # 超出 +24h 宽限 → 保底 1h（页面还能打开看到过期提示）
         assert calc_h5_token_ttl_hours(expired, datetime(2026, 11, 13, 12, 0, 0)) == 1.0
-        # None → 兜底 72h（函数签名兼容旧调用点）
-        assert calc_h5_token_ttl_hours(None) == 72.0
+        # 未传入实例时使用 30 天上限。
+        assert calc_h5_token_ttl_hours(None) == 720.0
     finally:
         store.close()
 
@@ -249,25 +249,25 @@ def test_e2_overdue_unified_message_and_submit_closed() -> None:
             raise AssertionError("到点后必须拒绝提交")
         except BizError as exc:
             assert exc.status_code == 400 and exc.code == "SUBMISSION_CLOSED", (exc.code, exc.message)
-            assert exc.message == UNIFIED_PREFIX + "2026-11-12 10:00:00），无法提交", exc.message
+            assert exc.message == TASK_EXPIRED, exc.message
 
         # info 端同样提示（H5 黄条）
         code, info = process_h5_task_info(state=store, raw_token=raw_token)
         assert code == 200
         assert info["window_open"] is False
-        assert info["window_reason"] == UNIFIED_PREFIX + "2026-11-12 10:00:00），无法提交", info["window_reason"]
+        assert info["window_reason"] == TASK_EXPIRED, info["window_reason"]
 
         # REST 层走 process_h5_task_submit → 同一文案
         code2, body2 = process_h5_task_submit(state=store, raw_token=raw_token, data={"payload": {"fields": {"summary": "x"}}})
         assert (code2, body2["code"]) == (400, "SUBMISSION_CLOSED")
-        assert body2["message"].startswith(UNIFIED_PREFIX)
+        assert body2["message"] == TASK_EXPIRED
 
-        # 链接本身过期（ttl 极短）→ TOKEN_EXPIRED 且文案同口径（不区分链接过期与任务截止）
+        # 链接本身过期时提示重新获取工作台入口。
         short = store.issue_h5_token(PHONE, tpl["template_id"], "2026-11-12", inst["id"], ttl_hours=0.01)
         CLOCK["now"] = datetime(2026, 11, 12, 10, 30, 0)
         code3, body3 = process_h5_task_info(state=store, raw_token=short)
         assert (code3, body3["code"]) == (401, "TOKEN_EXPIRED")
-        assert body3["message"] == UNIFIED_PREFIX + "2026-11-12 10:00:00），无法提交", body3["message"]
+        assert body3["message"] == LINK_EXPIRED, body3["message"]
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()
@@ -422,10 +422,9 @@ def test_e4_todo_rejected_counts_and_link_ttl_covers_rewindow() -> None:
 
         items = store.list_pending_todo(PHONE, platform="zdxlz", now_dt=CLOCK["now"])
         assert [i["template_name"] for i in items] == ["驳回重交"], items
-        # 待办签发的链接 TTL 与 24h 重交窗口严格对齐：
-        # 重交截止 = 11-13 12:00（驳回+24h），(11-13 12:00) - (11-12 12:00) = 24h。
+        # 待办签发的链接包含重交窗口和截止后 24h 的查看窗口。
         ttl = calc_h5_token_ttl_hours(inst, CLOCK["now"])
-        assert ttl == 24.0, ttl
+        assert ttl == 48.0, ttl
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()

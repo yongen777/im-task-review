@@ -168,7 +168,7 @@ def test_m3_midnight_deadline_window_e2e() -> None:
             raise AssertionError("跨过 0 点后必须拒绝提交")
         except BizError as exc:
             assert exc.status_code == 400 and exc.code == "SUBMISSION_CLOSED", (exc.status_code, exc.code)
-            assert exc.message == "当前任务已过期（截止时间：2026-11-13 00:00:00），无法提交", exc.message
+            assert exc.message == "当前任务已过期，无法提交。", exc.message
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 14, 0, 0)
         store.close()

@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 
 from .config import canonical_part, format_dt
-from .state import BizError, calc_h5_token_ttl_hours, effective_instance_deadline
+from .state import BizError, H5_LINK_EXPIRED_MESSAGE, effective_instance_deadline
 
 
 def _norm_dept_path(raw):
@@ -63,15 +63,15 @@ class PortalService:
     def issue(self, phone, platform):
         if not self.members(platform, phone=phone):
             raise BizError(403, 'NOT_REGISTERED', '当前成员不可用')
-        return self.s.issue_h5_token(phone, '', platform, None, purpose='portal', ttl_hours=168)
+        return self.s.issue_h5_token(phone, '', platform, None, purpose='portal')
 
     def authenticate(self, raw):
         tok = self.s.get_h5_token(raw)
         if not tok or tok['purpose'] != 'portal' or tok['consumed'] or tok['expires_at'] <= self.s.now_str():
-            raise BizError(401, 'PORTAL_EXPIRED', '链接已过期，请回到聊天框向机器人发送任意消息重新获取最新工作台入口')
+            raise BizError(401, 'PORTAL_EXPIRED', H5_LINK_EXPIRED_MESSAGE)
         identity = {'phone': tok['phone'], 'platform': tok['period_key']}
         if not self.members(identity['platform'], phone=identity['phone']):
-            raise BizError(401, 'PORTAL_EXPIRED', '链接已过期，请回到聊天框向机器人发送任意消息重新获取最新工作台入口')
+            raise BizError(401, 'PORTAL_EXPIRED', H5_LINK_EXPIRED_MESSAGE)
         return identity
 
     def members(self, platform, owner=None, phone=None):
@@ -481,8 +481,7 @@ class PortalService:
                      if i['id'] == instance_id and not i.get('overdue') and not i.get('receipt_phrase')), None)
         if inst is None:
             raise BizError(403, 'TASK_UNAVAILABLE', '任务不在可提交窗口内')
-        raw = self.s.issue_h5_token(inst['phone'], inst['template_id'], inst['period_key'], inst['id'],
-                                    ttl_hours=calc_h5_token_ttl_hours(inst, self.s.now()))
+        raw = self.s.issue_h5_token(inst['phone'], inst['template_id'], inst['period_key'], inst['id'])
         return {'ok': True, 'url': '/h5/task#t=' + raw}
 
     def notice_receipt_link(self, ident, instance_id):
@@ -555,7 +554,7 @@ class PortalService:
         if edit and not report['can_edit']:
             raise BizError(403, 'TASK_CLOSED', '这条提交已关闭编辑')
         raw = self.s.issue_h5_token(ident['phone'], report['template_id'], report['period_key'], report['id'],
-                                    purpose='report_history', ttl_hours=1)
+                                    purpose='report_history')
         return {'ok': True, 'url': '/h5/task#t=' + raw + ('&edit=1' if edit else '')}
 
     def tasks(self, ident=None, owner=None, platform=None):

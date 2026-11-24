@@ -209,8 +209,20 @@
         method: 'POST', cache: 'no-store', headers: { 'Authorization': 'Bearer ' + token },
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.message || '通知暂不可用');
+      if (!response.ok) {
+        const error = new Error(result.message || '通知暂不可用');
+        error.code = result.code;
+        throw error;
+      }
       return result;
+    }
+
+    function showUnavailable(message) {
+      $('notice').hidden = true;
+      $('actions').hidden = true;
+      $('loading').hidden = false;
+      $('loading').setAttribute('role', 'alert');
+      $('loading').textContent = message;
     }
 
     function mediaUrl(id, download = false) {
@@ -382,6 +394,10 @@
         $('hint').textContent = '确认成功';
         updateButton();
       } catch (error) {
+        if (error.code === 'NOTICE_TOKEN_EXPIRED') {
+          showUnavailable(error.message);
+          return;
+        }
         confirming = false;
         updateButton();
         $('hint').textContent = error.message;
@@ -403,7 +419,7 @@
         window.addEventListener('scroll', updateButton, { passive: true });
         window.addEventListener('resize', updateButton);
       } catch (error) {
-        $('loading').textContent = error.message;
+        showUnavailable(error.message);
       }
     }
     render();

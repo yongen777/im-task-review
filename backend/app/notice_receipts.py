@@ -9,6 +9,7 @@ from .state import BizError
 PURPOSE = "notice_receipt"
 PAGE = "/h5/notice-receipt"
 MEDIA_ROOTS = {"notice_assets", "notice_attach", "dashboards"}
+EXPIRED_MESSAGE = "链接已过期，请返回聊天框给德阳量密助手发送任意消息进入个人工作台继续查看确认。"
 
 
 def load_view(state, instance_id, *, for_update=False):
@@ -35,9 +36,10 @@ def issue_link(state, instance):
 
 def read_target(state, raw):
     token = state.get_h5_token(raw) if re.fullmatch(r"[A-Za-z0-9_-]{32}", raw or "") else None
-    if (not token or token["purpose"] != PURPOSE or token["consumed"]
-            or token["expires_at"] <= state.now_str()):
+    if not token or token["purpose"] != PURPOSE or token["consumed"]:
         raise BizError(401, "INVALID_NOTICE_TOKEN", "通知确认链接无效")
+    if token["expires_at"] <= state.now_str():
+        raise BizError(401, "NOTICE_TOKEN_EXPIRED", EXPIRED_MESSAGE)
     instance = state.get_instance(token["instance_id"]) if token["instance_id"] else None
     if (not instance or instance["receipt_mode"] != "link" or not instance["receipt_prompt_at"]
             or any(instance[key] != token[key] for key in ("phone", "template_id", "period_key"))):

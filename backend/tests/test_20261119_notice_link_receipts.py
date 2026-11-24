@@ -9,7 +9,6 @@ from PIL import Image
 from app.api.events import handle_inbound_text
 from app.config import format_dt
 from app.portal import PortalService
-from app.state import NO_DEADLINE_SENTINEL
 from test_20261117_manual_mark_submitted import NOW, ctx
 from test_20261119_notice_media import movie, upload
 
@@ -67,7 +66,7 @@ def test_link_notice_media_auth_and_receipt_lifecycle(ctx, movie, manual):
     assert len(set(tokens.values())) == 2 and all(tokens.values())
     token = tokens["test_recipient"]
     credentials = auth(token)
-    assert state.get_h5_token(token)["expires_at"] == NO_DEADLINE_SENTINEL
+    assert state.get_h5_token(token)["expires_at"] == format_dt(NOW + timedelta(days=30))
     assert "点击「确认已读」" in links["test_recipient"].text
     # 2026-11-20：确认链接不再拼正文摘要（正文已在上一步完整投递），只剩
     # 「您收到《…》通知。」+ 引导语 + 链接三行，既不重复正文也不再出现截断省略号。
@@ -115,6 +114,12 @@ def test_link_notice_media_auth_and_receipt_lifecycle(ctx, movie, manual):
 
     state._now_fn = lambda: NOW + timedelta(days=400)
     state.advance_instance_statuses(state.now())
+    expired = client.post(API + "/info", headers=credentials)
+    assert expired.status_code == 401 and expired.json()["code"] == "NOTICE_TOKEN_EXPIRED"
+    portal_auth = auth(portal.issue(first["phone"], "zdxlz"))
+    fresh = client.post("/api/h5/portal/notice-open", json=open_data, headers=portal_auth)
+    assert fresh.status_code == 200
+    credentials = auth(fresh.json()["url"].partition("#t=")[2])
     reply = []
     handle_inbound_text(state=state, user_id="test_recipient", msg_text="确认已读", platform="zdxlz",
                         event_id="link-is-not-chat-receipt", base_url="http://test",

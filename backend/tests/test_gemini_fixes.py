@@ -125,7 +125,7 @@ def test_h5_overdue_old_link_rejected():
         with pytest.raises(BizError) as err:
             store.submit_h5_task(raw_token=tok, fields={"summary": "补交"})
         assert err.value.code == "SUBMISSION_CLOSED"
-        assert err.value.message == "当前任务已过期（截止时间：2026-10-28 18:00:00），无法提交"
+        assert err.value.message == "当前任务已过期，无法提交。"
 
         # 「申请补交」通道已下线：state 不再有该方法
         assert not hasattr(store, "request_resubmit")

@@ -22,11 +22,9 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 from .channels.zdxlz import SendResult
 from .config import SHANGHAI_TZ, NowFn, canonical_part, default_now, format_dt, parse_dt
 from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例与文档都从 scheduler 导入
-    H5_TOKEN_TTL_HOURS,
     NO_DEADLINE_SENTINEL,
     StateStore,
     BizError,
-    calc_h5_token_ttl_hours,
     calc_resubmit_deadline,
     effective_instance_deadline,
     is_no_deadline,
@@ -642,18 +640,10 @@ class Scheduler:
         return self._now_fn()
 
     def build_h5_submit_url(self, *, phone: str, template_id: str, period_key_val: str, instance_id: int) -> Tuple[str, str]:
-        """§8.1 签发 H5 令牌（库中只存 SHA-256），返回 (h5_url, raw_token)。
-
-        2026-11-12 任务E1：有效期不再硬编码 72h，按实例动态计算（保守策略）：
-        · 无截止（哨兵）→ 720h（30 天）；
-        · 有截止 → min(截止 + 24h, 720h)；
-        · rejected 驳回重交 → 以重交截止 + 24h 封顶（覆盖整个重交窗口）。
-        """
-        inst = self.state.get_instance(int(instance_id))
-        ttl_hours = calc_h5_token_ttl_hours(inst, self.now()) if inst else float(H5_TOKEN_TTL_HOURS)
+        """按实例当前截止或重交窗口签发填报链接。"""
         raw_token = self.state.issue_h5_token(
             phone=phone, template_id=template_id, period_key=period_key_val, instance_id=int(instance_id),
-            purpose="submit", ttl_hours=ttl_hours,
+            purpose="submit",
         )
         return f"{self.public_base_url}/h5/task#t={raw_token}", raw_token
 
@@ -1511,7 +1501,7 @@ class Scheduler:
         if not self.public_base_url:
             return ""
         token = self.state.issue_h5_token(instance["phone"], instance["template_id"], asset_id, int(instance["id"]),
-                                          purpose="notice_asset", ttl_hours=168)
+                                          purpose="notice_asset")
         return f"{self.public_base_url}/h5/notice-media?token={token}"
 
     @staticmethod
