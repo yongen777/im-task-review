@@ -179,6 +179,45 @@ def create_portal_admin_router(state):
         except (ValueError, TypeError):
             return JSONResponse({'message': '请求格式错误'}, status_code=400)
 
+    # ── 2026-11-24 授权成员管理闭环：清单 / 可授权成员搜索（写入沿用上面的
+    #    GET+PUT /portal-grants/{phone}：新增=PUT enabled:true，修改=PUT 新范围，
+    #    取消=PUT enabled:false → H5 新建与定时推送立即停、历史任务统计完整保留）。
+    #    权限与 grant() 完全一致：仅本管理员（sub_admin），超管只读一律 403。
+
+    def _grant_manage_guard(admin, platform):
+        if platform not in ('zdxlz', 'wecom') or (not _is_super_admin(admin)
+                                                  and platform not in (admin.get('allowed_platforms') or [])):
+            raise BizError(403, 'FORBIDDEN', '无权访问该平台')
+        if _is_super_admin(admin):
+            raise BizError(403, 'SUPER_ADMIN_READONLY', '请由成员所属分级管理员配置授权')
+        return int(admin['id'])
+
+    @router.get('/portal-grants')
+    async def grant_list(request: Request, platform: str = 'zdxlz', q: str = ''):
+        """已授权成员清单（姓名/手机号/部门/管辖范围摘要/已发布任务数，可搜索）。"""
+        sess, err = require_session(request, state)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        try:
+            owner = _grant_manage_guard(admin, platform)
+            return {'ok': True, **await asyncio.to_thread(p.grant_members, platform, owner, q)}
+        except BizError as exc:
+            return JSONResponse({'code': exc.code, 'message': exc.message}, status_code=exc.status_code)
+
+    @router.get('/portal-grant-candidates')
+    async def grant_candidate_search(request: Request, platform: str = 'zdxlz', q: str = ''):
+        """可授权成员搜索：本管理员名下已启用且已激活可投递成员。"""
+        sess, err = require_session(request, state)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        try:
+            owner = _grant_manage_guard(admin, platform)
+            return {'ok': True, **await asyncio.to_thread(p.grant_candidates, platform, owner, q)}
+        except BizError as exc:
+            return JSONResponse({'code': exc.code, 'message': exc.message}, status_code=exc.status_code)
+
     # ── 2026-11-20 只读监管面板（按发布人筛选，布局对齐任务数据统计）──────────
     # 权限边界：sub_admin 仅看归属自己授权的领导及任务；super_admin 全局只读
     # （所有平台/管理员下的授权发布任务）；全链路只读，无任何写端点。

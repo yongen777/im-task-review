@@ -611,6 +611,86 @@ class PortalService:
             tuple(args)).fetchone()
         return int((row['c'] if row else 0) or 0)
 
+    # ── 2026-11-24 授权成员管理闭环（新增 → 修改 → 取消，均在「授权成员发布任务」）──
+
+    def grant_members(self, platform, owner, query=''):
+        """本管理员名下全部已授权成员清单（授权管理抽屉用，支持按姓名/手机号过滤）。
+
+        · 姓名/部门取名册**最新一条**档案（同手机号多角色多行时按 id DESC 取首条）；
+        · in_roster = 名册仍有档案行；deliverable = 当前口径可投递（members() 同源）；
+          成员被停用/移出后两标记转 False，管理员可据此决定是否取消授权；
+        · task_count 口径同 publishers()（含已撤授权的历史任务，监管统计完整保留）。
+        """
+        rows = [dict(r) for r in self.s.conn.execute(
+            'SELECT phone, scope_json, updated_at FROM portal_grant '
+            'WHERE owner_id=? AND platform=? AND enabled=1 ORDER BY updated_at DESC, phone',
+            (owner, platform)).fetchall()]
+        if not rows:
+            return {'members': []}
+        phones = [str(r['phone']) for r in rows]
+        profiles = {}
+        for start in range(0, len(phones), 900):
+            chunk = phones[start:start + 900]
+            ph = ','.join('?' for _ in chunk)
+            for m in self.s.conn.execute(
+                    f'SELECT m.id, m.phone, m.name, m.dept_path FROM member m '
+                    f'JOIN role r ON r.role_id = m.role_id '
+                    f'WHERE r.platform=? AND m.owner_id=? AND m.phone IN ({ph}) ORDER BY m.id DESC',
+                    (platform, owner, *chunk)).fetchall():
+                profiles.setdefault(str(m['phone']), dict(m))  # id DESC → 首条即最新
+        deliverable = {m['phone'] for m in self.members(platform, owner)}
+        task_counts = {str(r['creator_phone']): int(r['c']) for r in self.s.conn.execute(
+            'SELECT creator_phone, COUNT(*) AS c FROM portal_task '
+            'WHERE platform=? AND owner_id=? GROUP BY creator_phone', (platform, owner)).fetchall()}
+        role_names = {r['role_id']: r['name'] for r in self.s.list_roles(platform=platform, owner_id=owner)}
+        q = str(query or '').strip()
+        members = []
+        for r in rows:
+            phone = str(r['phone'])
+            profile = profiles.get(phone)
+            try:
+                scope = json.loads(r['scope_json']) or {}
+            except (ValueError, TypeError):
+                scope = {}
+            dept_ids = [str(d) for d in (scope.get('dept_ids') or [])]
+            role_ids = [str(x) for x in (scope.get('role_ids') or [])]
+            name = (profile or {}).get('name') or phone
+            if q and q not in str(name) and q not in phone:
+                continue
+            members.append({
+                'phone': phone, 'name': name,
+                'dept_path': _norm_dept_path((profile or {}).get('dept_path')),
+                'scope_dept_ids': dept_ids, 'scope_role_ids': role_ids,
+                'scope_summary': '、'.join(d.rsplit('/', 1)[-1] or d for d in dept_ids),
+                'role_names': [role_names.get(x, x) for x in role_ids],
+                'task_count': task_counts.get(phone, 0),
+                'in_roster': profile is not None,
+                'deliverable': phone in deliverable,
+                'updated_at': r['updated_at'],
+            })
+        return {'members': members}
+
+    def grant_candidates(self, platform, owner, query='', limit=20):
+        """可授权成员搜索：本管理员名下已启用、已激活可投递成员（按姓名/手机号过滤）。
+
+        与候选唯一数据源 = PortalService.members()（enabled=1、未离职、delivery_target.usable=1），
+        保证「搜得到即能授权」，与 save_grant 的名册校验同一口径。
+        """
+        q = str(query or '').strip()
+        seen, out = set(), []
+        for m in sorted(self.members(platform, owner), key=lambda x: ((x.get('name') or ''), x['phone'])):
+            if m['phone'] in seen:
+                continue
+            if q and q not in str(m.get('name') or '') and q not in m['phone']:
+                continue
+            seen.add(m['phone'])
+            out.append({'phone': m['phone'], 'name': m['name'],
+                        'dept_path': _norm_dept_path(m.get('dept_path'))})
+            if len(out) >= max(1, min(int(limit or 20), 50)):
+                break
+        return {'members': out}
+
+
     def publishers(self, platform=None, owner=None):
         """聚合「授权发布人（领导）」维度：[{phone, name, dept_path, owner_id, task_count}]。
 

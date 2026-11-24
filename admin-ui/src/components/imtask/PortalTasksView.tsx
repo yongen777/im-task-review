@@ -1,11 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, RefreshCw, Search, Users, X } from 'lucide-react';
+import { Building2, Check, ChevronDown, ChevronLeft, ChevronRight, Download, Plus, RefreshCw, Search, Users, X } from 'lucide-react';
 import { plainError } from '../../lib/api';
 import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import { AdminScopeHeader } from './AdminScopeHeader';
-import { DepartmentTree } from './DepartmentTree';
+import { DepartmentTree, type DeptTreeNode } from './DepartmentTree';
 import {
   KpiCard, SubmissionPreview, fieldClass, makeTree, panelClass, parentPath,
   secondaryButton, usePanelQuery,
@@ -30,43 +30,99 @@ type ScopeOptions = {
   grant: null | { enabled: number; scope_json: string };
 };
 
-function DepartmentBranch({ department, selected, toggle, load }: {
-  department: Department;
+/* ── 2026-11-24 授权部门树：复用「部门架构」同款视觉（> / v 线性折叠箭头 +
+      蓝色楼宇图标 + 左侧缩进引导线 + 右对齐人数 + 复选框），替换旧「+」方框树。
+      数据仍走 grant_options（懒加载下级），children 展开即拉取一次后缓存。 ───── */
+function GrantScopeTree({ roots, selected, toggle, load }: {
+  roots: Department[];
   selected: string[];
   toggle: (id: string) => void;
   load: (id: string) => Promise<Department[]>;
 }) {
-  const [open, setOpen] = useState(false);
-  const [children, setChildren] = useState<Department[] | null>(null);
-  const [warning, setWarning] = useState('');
-  const show = async () => {
-    setOpen(!open);
-    if (open || children) return;
-    setWarning('');
-    try { setChildren(await load(department.dept_id)); }
-    catch { setWarning('部门读取失败，请收起后重试。'); }
+  const [childrenOf, setChildrenOf] = useState<Record<string, Department[]>>({});
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loading, setLoading] = useState<Set<string>>(new Set());
+  const [failed, setFailed] = useState<Set<string>>(new Set());
+
+  async function expand(node: Department) {
+    const path = node.dept_id;
+    const nextOpen = !expanded.has(path);
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (nextOpen) next.add(path);
+      else next.delete(path);
+      return next;
+    });
+    if (!nextOpen || childrenOf[path] || loading.has(path)) return;
+    setLoading((current) => new Set(current).add(path));
+    setFailed((current) => { const next = new Set(current); next.delete(path); return next; });
+    try {
+      const children = await load(path);
+      setChildrenOf((current) => ({ ...current, [path]: children }));
+    } catch {
+      setFailed((current) => new Set(current).add(path));
+    } finally {
+      setLoading((current) => { const next = new Set(current); next.delete(path); return next; });
+    }
+  }
+
+  const renderRow = (node: Department): React.ReactNode => {
+    const hasChildren = node.has_children !== false;
+    const isOpen = expanded.has(node.dept_id);
+    const checked = selected.includes(node.dept_id);
+    const busy = loading.has(node.dept_id);
+    const rowBody = <>
+      {hasChildren && <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 shrink-0 text-slate-400 ${isOpen ? 'rotate-90' : ''}`} />}
+      <Building2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-blue-500" />
+      <span className="min-w-0 flex-1 break-words" title={node.dept_id}>{node.name}</span>
+      {typeof node.member_count === 'number'
+        && <span className="shrink-0 text-slate-500 tabular-nums">{node.member_count} 人</span>}
+      <span className="grid size-4 shrink-0 place-items-center rounded border"
+        aria-hidden="true"
+        style={{ borderColor: checked ? '#2563eb' : '#cbd5e1', background: checked ? '#2563eb' : 'transparent' }}>
+        {checked && <Check className="h-3 w-3 text-white" />}
+      </span>
+    </>;
+    return (
+      <li key={node.dept_id}>
+        <div className="flex items-center gap-1">
+          {hasChildren ? (
+            <button type="button" aria-expanded={isOpen} aria-label={`${isOpen ? '收起' : '展开'}${node.name}`}
+              onClick={() => void expand(node)} disabled={busy}
+              className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs hover:bg-slate-50 cursor-pointer disabled:opacity-60">
+              {rowBody}
+            </button>
+          ) : (
+            <label className="flex min-w-0 flex-1 grow cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs hover:bg-slate-50">
+              <input type="checkbox" className="sr-only" checked={checked} onChange={() => toggle(node.dept_id)} />
+              {rowBody}
+            </label>
+          )}
+          {hasChildren && (
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
+              <input type="checkbox" aria-label={`勾选${node.name}（含全部下级）`} checked={checked} onChange={() => toggle(node.dept_id)} />
+              含下级
+            </label>
+          )}
+        </div>
+        {isOpen && hasChildren && (
+          <ul className="ml-4 border-l border-slate-100 pl-2">
+            {failed.has(node.dept_id)
+              ? <li className="py-1.5 text-xs text-rose-700">下级部门读取失败，收起后重试。</li>
+              : busy && !childrenOf[node.dept_id]
+                ? <li role="status" className="py-1.5 text-xs text-slate-500">正在读取下级部门…</li>
+                : (childrenOf[node.dept_id] || []).length
+                  ? (childrenOf[node.dept_id] || []).map(renderRow)
+                  : <li className="py-1.5 text-xs text-slate-500">无下级部门</li>}
+          </ul>
+        )}
+      </li>
+    );
   };
-  return <li className="space-y-1">
-    <div className="flex min-h-9 items-center gap-2">
-      {department.has_children !== false ? <button type="button" aria-expanded={open}
-        aria-label={`${open ? '收起' : '展开'}${department.name}`} onClick={() => void show()}
-        className="size-7 shrink-0 rounded border border-slate-200 text-slate-600">{open ? '−' : '+'}</button>
-        : <span className="w-7" />}
-      <label className="flex grow items-center gap-2 py-1"><input type="checkbox" checked={selected.includes(department.dept_id)}
-        onChange={() => toggle(department.dept_id)} />{department.name}
-        {/* 2026-11-20：部门树按已激活可投递成员裁剪，这里标注该部门（含下级）可选人数 */}
-        {typeof department.member_count === 'number' && <span className="text-slate-500">（{department.member_count} 人）</span>}
-      </label>
-    </div>
-    {open && <ul className="space-y-1 border-l border-slate-200 pl-4">
-      {warning ? <li className="text-rose-700">{warning}</li> : !children ? <li role="status">正在读取下级部门…</li>
-        : children.length ? children.map(child => <DepartmentBranch key={child.dept_id} department={child}
-          selected={selected} toggle={toggle} load={load} />) : <li className="text-slate-500">无下级部门</li>}
-    </ul>}
-  </li>;
+  return <ul className="max-h-72 overflow-y-auto overflow-x-hidden py-1">{roots.map(renderRow)}</ul>;
 }
 
-export function PortalGrantDialog({ phone, platform, onClose }: { phone: string; platform: string; onClose: () => void }) {
+export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone: string; platform: string; onClose: () => void; onSaved?: () => void }) {
   const [options, setOptions] = useState<ScopeOptions | null>(null);
   const [enabled, setEnabled] = useState(false);
   const [depts, setDepts] = useState<string[]>([]);
@@ -127,18 +183,16 @@ export function PortalGrantDialog({ phone, platform, onClose }: { phone: string;
                 onClick={() => setDepts(current => current.filter(did => did !== id))}
                 className="rounded bg-blue-50 px-2 py-1 text-blue-800">{departmentNames[id] || id} ×</button></li>)}
             </ul>}
-            {!departments && !departmentError && <p role="status">正在读取组织架构…</p>}
+            {!departments && !departmentError && <p role="status">正在读取部门架构…</p>}
             {departmentError && <div role="status" className="my-2 rounded bg-amber-50 p-2 text-amber-900">
               {departmentError} <button type="button" onClick={() => setRetry(v => v + 1)} className="underline">重试</button>
             </div>}
-            <ul className="max-h-52 overflow-auto">
-              {departments?.map(d => <DepartmentBranch key={d.dept_id} department={d} selected={depts}
-                toggle={id => setDepts(current => toggleId(current, id))} load={load} />)}
-            </ul>
+            {departments && <GrantScopeTree roots={departments} selected={depts}
+              toggle={id => setDepts(current => toggleId(current, id))} load={load} />}
           </section>
           <section className="rounded-lg border border-slate-200 p-3">
             <h3 className="font-semibold">角色分组</h3>
-            <div className="mt-2 max-h-52 overflow-auto">
+            <div className="mt-2 max-h-72 overflow-auto">
               {options.roles.length ? options.roles.map(r => <label key={r.role_id} className="flex gap-2 py-2">
                 <input type="checkbox" checked={roles.includes(r.role_id)} onChange={() => setRoles(current => toggleId(current, r.role_id))} />{r.name}</label>)
                 : <p className="text-slate-500">暂无角色分组</p>}
@@ -150,7 +204,7 @@ export function PortalGrantDialog({ phone, platform, onClose }: { phone: string;
       <div className="flex justify-end gap-3 border-t border-slate-200 pt-3"><button onClick={onClose} disabled={saving}>取消</button><button className="px-4 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-40" disabled={saving || !options} onClick={async () => {
         /* 2026-11-20：不再在前端拦「什么都没勾」，后端会自动回退到成员当前部门（含下级）。 */
         setSaving(true); setError('');
-        try { await portalAdminRequest(path, 'PUT', { enabled, dept_ids: depts, role_ids: roles }); onClose(); }
+        try { await portalAdminRequest(path, 'PUT', { enabled, dept_ids: depts, role_ids: roles }); onSaved?.(); onClose(); }
         catch (e) { setError((e as Error).message); } finally { setSaving(false); }
       }}>{saving ? '保存中…' : '保存授权'}</button></div>
     </div>
@@ -228,33 +282,274 @@ function execCycleText(task: PortalTaskMeta): string {
 }
 
 export function PortalTasksView() {
-  return <PortalMonitorCatalog />;
+  const [manageOpen, setManageOpen] = useState(false);
+  return <>
+    <PortalMonitorCatalog onManageGrants={() => setManageOpen(true)} />
+    {manageOpen && <PortalGrantDrawer onClose={() => setManageOpen(false)} />}
+  </>;
 }
 
-function PortalMonitorCatalog() {
-  const { platform, isSuperAdmin, setTabFocus } = useAppStore();
+/* ── 2026-11-24 授权成员管理抽屉：已授权清单（搜索）+ 新增授权 + 修改范围 +
+      取消授权（二次确认）。仅分级管理员可见入口；数据全部走本管理员归属接口。 ── */
+type GrantedMember = {
+  phone: string;
+  name: string;
+  dept_path: string;
+  scope_dept_ids: string[];
+  scope_role_ids: string[];
+  scope_summary: string;
+  role_names: string[];
+  task_count: number;
+  in_roster: boolean;
+  deliverable: boolean;
+};
+type Candidate = { phone: string; name: string; dept_path: string };
+
+function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
+  const toast = useToast();
+  const { platform } = useAppStore();
+  const [members, setMembers] = useState<GrantedMember[] | null>(null);
+  const [error, setError] = useState('');
+  const [search, setSearch] = useState('');
+  const [candidateQuery, setCandidateQuery] = useState('');
+  const [candidates, setCandidates] = useState<Candidate[] | null>(null);
+  const [candidateLoading, setCandidateLoading] = useState(false);
+  const [editPhone, setEditPhone] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<GrantedMember | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+
+  const query = search.trim();
+  const load = async () => {
+    try {
+      const base = `portal-grants?platform=${encodeURIComponent(platform)}`
+        + (query ? `&q=${encodeURIComponent(query)}` : '');
+      const result = await portalAdminRequest(base) as { members: GrantedMember[] };
+      setMembers(result.members);
+      setError('');
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  };
+  useEffect(() => { void load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [platform, query]);
+
+  const loadCandidates = async (keyword: string) => {
+    setCandidateLoading(true);
+    try {
+      const result = await portalAdminRequest(
+        `portal-grant-candidates?platform=${encodeURIComponent(platform)}`
+        + (keyword ? `&q=${encodeURIComponent(keyword)}` : '')) as { members: Candidate[] };
+      setCandidates(result.members);
+    } catch (err) {
+      toast.error((err as Error).message);
+      setCandidates([]);
+    } finally {
+      setCandidateLoading(false);
+    }
+  };
+  useEffect(() => { const timer = window.setTimeout(() => void loadCandidates(candidateQuery.trim()), 220);
+    return () => window.clearTimeout(timer); }, [platform, candidateQuery]);
+
+  const granted = new Set((members ?? []).map((row) => row.phone));
+
+  async function confirmCancel() {
+    if (!cancelTarget) return;
+    setCancelling(true);
+    try {
+      await portalAdminRequest(
+        `portal-grants/${encodeURIComponent(cancelTarget.phone)}?platform=${encodeURIComponent(platform)}`,
+        'PUT', { enabled: false });
+      toast.success(`已取消 ${cancelTarget.name} 的创建任务权限，历史任务统计仍完整保留`);
+      setCancelTarget(null);
+      await load();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  return <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50 backdrop-blur-xs" role="dialog"
+    aria-modal="true" aria-label="授权成员管理" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <section className="flex h-full w-full max-w-xl flex-col bg-white shadow-2xl">
+      <header className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+        <div className="flex items-center gap-2">
+          <Users className="h-5 w-5 text-blue-600" />
+          <h2 className="text-base font-bold text-slate-900">授权成员管理</h2>
+          {members && <span className="text-xs text-slate-500">{members.length} 人已授权</span>}
+        </div>
+        <button type="button" aria-label="关闭授权成员管理" onClick={onClose}
+          className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100"><X className="h-5 w-5" /></button>
+      </header>
+
+      <div className="space-y-4 overflow-y-auto px-5 py-4">
+        {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</div>}
+
+        {/* 已授权成员清单 */}
+        <section aria-labelledby="grant-list-title">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 id="grant-list-title" className="text-sm font-semibold text-slate-900">已授权成员</h3>
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
+              <input aria-label="搜索已授权成员" placeholder="搜索姓名或手机号" value={search}
+                onChange={(e) => setSearch(e.target.value)} className={fieldClass + ' w-48 pl-8 pr-8'} />
+              {search && <button type="button" aria-label="清空搜索" onClick={() => setSearch('')}
+                className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
+            </div>
+          </div>
+          <div className="mt-2 overflow-hidden rounded-xl border border-slate-200">
+            <table className="w-full table-fixed text-left text-xs">
+              <thead className="bg-slate-50 text-slate-600">
+                <tr>
+                  <th className="w-[42%] px-3 py-2.5 font-medium">成员</th>
+                  <th className="px-3 py-2.5 font-medium">管辖范围</th>
+                  <th className="w-28 px-3 py-2.5 text-right font-medium">操作</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {members === null ? (
+                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{error ? '加载失败' : '正在读取授权清单…'}</td></tr>
+                ) : !members.length ? (
+                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{query ? '没有匹配的已授权成员' : '还没有授权成员，从下方添加'}</td></tr>
+                ) : members.map((row) => (
+                  <tr key={row.phone} className="align-top hover:bg-slate-50/70">
+                    <td className="px-3 py-3">
+                      <div className="flex items-center gap-1.5 font-semibold text-slate-900">
+                        <span className="min-w-0 truncate" title={row.name}>{row.name}</span>
+                        {!row.deliverable && <span className="shrink-0 rounded border border-amber-200 bg-amber-50 px-1 py-0.5 text-[10px] font-semibold text-amber-700">不可投递</span>}
+                      </div>
+                      <div className="mt-0.5 text-[11px] tabular-nums text-slate-500">{row.phone}</div>
+                      <div className="mt-0.5 truncate text-[11px] text-slate-500" title={row.dept_path}>{row.dept_path || '部门未分配'}</div>
+                    </td>
+                    <td className="px-3 py-3">
+                      <div className="break-words text-slate-700" title={row.scope_dept_ids.join('、')}>
+                        {row.scope_summary ? <span>部门：{row.scope_summary}</span> : <span className="text-slate-400">未勾选部门</span>}
+                      </div>
+                      {row.role_names.length > 0 && (
+                        <div className="mt-0.5 break-words" title={row.role_names.join('、')}>
+                          角色：{row.role_names.join('、')}
+                        </div>
+                      )}
+                      <div className="mt-0.5 text-[11px] text-slate-500">已发布 {row.task_count} 个任务</div>
+                    </td>
+                    <td className="px-3 py-3 text-right">
+                      <div className="flex flex-col items-end gap-1">
+                        <button type="button" onClick={() => setEditPhone(row.phone)}
+                          className="rounded-lg bg-blue-50 px-2.5 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100">修改范围</button>
+                        <button type="button" onClick={() => setCancelTarget(row)}
+                          className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100">取消授权</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-1.5 text-[11px] text-slate-500">取消授权后该成员将无法新建任务、不再定时推送；其历史任务与本面板统计完整保留。</p>
+        </section>
+
+        {/* 新增授权：搜索可授权成员 */}
+        <section aria-labelledby="grant-add-title" className="rounded-xl border border-slate-200 p-4">
+          <h3 id="grant-add-title" className="text-sm font-semibold text-slate-900">新增授权成员</h3>
+          <p className="mt-0.5 text-[11px] text-slate-500">仅列出您名下已启用且已激活可投递的成员；选中后配置管辖范围并保存开通。</p>
+          <div className="relative mt-2">
+            <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
+            <input aria-label="搜索可授权成员" placeholder="搜索姓名或手机号" value={candidateQuery}
+              onChange={(e) => setCandidateQuery(e.target.value)} className={fieldClass + ' pl-8'} />
+          </div>
+          <ul className="mt-2 max-h-52 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-100">
+            {candidates === null || candidateLoading ? (
+              <li role="status" className="px-3 py-6 text-center text-xs text-slate-500">正在搜索可授权成员…</li>
+            ) : !candidates.length ? (
+              <li className="px-3 py-6 text-center text-xs text-slate-500">
+                {candidateQuery.trim() ? '没有匹配的可授权成员' : '您名下暂无已激活可投递成员'}
+              </li>
+            ) : candidates.map((row) => (
+              <li key={row.phone} className="flex items-center gap-2 px-3 py-2.5 hover:bg-slate-50/70">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-xs font-semibold text-slate-900">{row.name}</span>
+                    {granted.has(row.phone) && <span className="shrink-0 rounded border border-blue-200 bg-blue-50 px-1 py-0.5 text-[10px] font-semibold text-blue-700">已授权</span>}
+                  </div>
+                  <div className="mt-0.5 truncate text-[11px] tabular-nums text-slate-500" title={row.dept_path}>
+                    {row.phone} · {row.dept_path || '部门未分配'}
+                  </div>
+                </div>
+                <button type="button" onClick={() => setEditPhone(row.phone)}
+                  className="shrink-0 rounded-lg bg-blue-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
+                  {granted.has(row.phone) ? '修改范围' : '配置授权'}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-slate-500">
+            <Plus className="h-3.5 w-3.5" />搜索并在结果里点「配置授权」即可开通
+          </div>
+        </section>
+      </div>
+
+      {editPhone && (
+        <PortalGrantDialog key={platform + editPhone} phone={editPhone} platform={platform}
+          onClose={() => setEditPhone(null)}
+          onSaved={() => { void load(); void loadCandidates(candidateQuery.trim()); }} />
+      )}
+
+      {/* 取消授权二次确认 */}
+      {cancelTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs"
+          role="dialog" aria-modal="true" aria-labelledby="grant-cancel-title"
+          onClick={(e) => { if (e.target === e.currentTarget) setCancelTarget(null); }}>
+          <section className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl">
+            <h3 id="grant-cancel-title" className="text-base font-bold text-slate-900">确认取消授权？</h3>
+            <p className="mt-2 text-sm leading-6 text-slate-700">
+              取消后，<strong className="font-semibold">{cancelTarget.name}（{cancelTarget.phone}）</strong>
+              将<strong className="font-semibold">无法再新建任务，已发布的周期任务不再定时推送</strong>；
+              但其<strong className="font-semibold">历史已发布任务与统计数据仍完整保留</strong>，本面板可继续只读查看与导出。
+            </p>
+            <div className="mt-5 flex justify-end gap-2.5">
+              <button type="button" onClick={() => setCancelTarget(null)} disabled={cancelling}
+                className="rounded-xl px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100">再想想</button>
+              <button type="button" onClick={() => void confirmCancel()} disabled={cancelling}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50">
+                <X className="h-3.5 w-3.5" />{cancelling ? '取消中…' : '确认取消授权'}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </section>
+  </div>;
+}
+
+function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }) {
+  const { platform, isSuperAdmin } = useAppStore();
   const [data, setData] = useState<{ publishers: PublisherRow[]; tasks: PortalTaskMeta[] } | null>(null);
   const [grantCount, setGrantCount] = useState(0);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [publisherId, setPublisherId] = useState('');
   const [taskId, setTaskId] = useState('');
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  useEffect(() => {
-    let live = true;
-    const load = () => portalAdminRequest(`portal-tasks?platform=${platform}`)
-      .then((result: { publishers?: PublisherRow[]; tasks?: PortalTaskMeta[]; grant_count?: number }) => {
-        if (!live) return;
-        setData({ publishers: result.publishers || [], tasks: result.tasks || [] });
-        setGrantCount(result.grant_count || 0);
-        setError('');
-      })
-      .catch((err: Error) => { if (live) setError(err.message); })
-      .finally(() => { if (live) setLoading(false); });
-    void load();
-    const timer = window.setInterval(() => { if (!document.hidden) void load(); }, 30000);
-    return () => { live = false; window.clearInterval(timer); };
-  }, [platform]);
+  /* 2026-11-24：彻底移除 30 秒自动刷新（头部提示与定时器），仅保留手动「刷新」。 */
+  const load = async () => {
+    setRefreshing(true);
+    try {
+      const result = await portalAdminRequest(`portal-tasks?platform=${platform}`) as {
+        publishers?: PublisherRow[]; tasks?: PortalTaskMeta[]; grant_count?: number;
+      };
+      setData({ publishers: result.publishers || [], tasks: result.tasks || [] });
+      setGrantCount(result.grant_count || 0);
+      setError('');
+      setLastUpdated(new Date());
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+  useEffect(() => { void load(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [platform]);
 
   const publishers = data?.publishers ?? [];
   const tasks = useMemo(
@@ -273,10 +568,35 @@ function PortalMonitorCatalog() {
   const showEmpty = !loading && !error && !hasAnyTask;
   return <section className="space-y-4">
     <AdminScopeHeader title="授权成员发布任务"
-      description={<>只读监管 · 按授权发布人筛选任务 · 每 30 秒自动刷新</>} />
+      description={<>
+        只读监管 · 按授权发布人筛选任务
+        {lastUpdated && <span className="ml-2 whitespace-nowrap text-slate-500">更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}</span>}
+      </>}
+      actions={<>
+        {/* 2026-11-24：分级管理员专属授权管理入口（超管严格隐藏，纯只读）。 */}
+        {!isSuperAdmin && (
+          <button type="button" onClick={onManageGrants}
+            title="新增、修改或取消成员的 H5 创建任务权限"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-100">
+            <Users className="h-3.5 w-3.5" />授权成员管理
+            {grantCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{grantCount}</span>}
+          </button>
+        )}
+        <button type="button" onClick={() => void load()} disabled={refreshing}
+          title="手动刷新发布人任务列表"
+          className={secondaryButton}>
+          <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
+        </button>
+        <button type="button" onClick={() => document.getElementById('portal-export-button')?.click()}
+          disabled={!task}
+          title="导出当前选中任务、归属周期和部门范围内的全量数据"
+          className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+          <Download className="h-3.5 w-3.5" /> 导出 Excel
+        </button>
+      </>} />
     {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs text-rose-700">{error}</div>}
     {showEmpty
-      ? <PortalMonitorEmpty authorized={grantCount} isSuperAdmin={isSuperAdmin} onConfigure={() => setTabFocus('roles')} />
+      ? <PortalMonitorEmpty authorized={grantCount} isSuperAdmin={isSuperAdmin} onConfigure={onManageGrants} />
       : <div className={panelClass + ' grid items-start gap-3 p-4 md:grid-cols-[minmax(0,1.4fr)_minmax(0,2fr)_minmax(0,1fr)_minmax(0,1.35fr)]'}>
       <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
         发布人（授权领导）
@@ -318,14 +638,14 @@ function PortalMonitorCatalog() {
 }
 
 /* 2026-11-23：空状态卡片——柔和蓝灰双色线性图标 + 主副标题 + 三步引导条；
-   分级管理员（sub_admin）底部给「前往成员名册配置授权」主操作，超管保持纯只读摘要。 */
+   2026-11-24：分级管理员主操作改为就地把用户引导至「授权管理入口」（管理弹窗在父级打开）。 */
 function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
   authorized: number;
   isSuperAdmin: boolean;
   onConfigure: () => void;
 }) {
   const steps = [
-    { title: '授权领导', desc: '在角色名册为指定成员开放 H5 建任务权限' },
+    { title: '授权领导', desc: '用右上角「授权成员管理」为指定成员开通 H5 建任务权限' },
     { title: '手机发布', desc: '授权领导在个人工作台下发上传或通知任务' },
     { title: '实时监管', desc: '此处按领导与部门实时查看统计并导出报表' },
   ];
@@ -344,7 +664,7 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
       <h3 id="portal-empty-title" className="mt-5 text-lg font-bold text-slate-900">还没有授权成员发布任务</h3>
       <p className="mt-1.5 max-w-xl text-sm leading-6 text-slate-500">
         {isSuperAdmin
-          ? '超管只读：授权由成员所属分级管理员在名册内完成，领导在手机工作台发布后，这里会自动出现可监管的统计与报表。'
+          ? '超管只读：授权由成员所属分级管理员完成，领导在手机工作台发布后，这里会自动出现可监管的统计与报表。'
           : '按三步开通：先给领导开放 H5 建任务权限，领导在手机工作台发布上传或通知任务，发布后这里实时汇总统计。'}
       </p>
       <ol className="mt-7 grid w-full max-w-3xl gap-3 text-left sm:grid-cols-3">
@@ -361,7 +681,7 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
       {!isSuperAdmin && (
         <button type="button" onClick={onConfigure}
           className="mt-7 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700">
-          <Users className="size-4" />前往成员名册配置授权
+          <Users className="size-4" />授权成员管理
           {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">已授权 {authorized} 人</span>}
         </button>
       )}
@@ -435,11 +755,7 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
       }).sort((a, b) => b.rate - a.rate || b.done - a.done || a.name.localeCompare(b.name, 'zh-CN'))
     : [];
 
-  /* 30 秒轮询刷新监管口径（只读，不写任何状态） */
-  useEffect(() => {
-    const timer = window.setInterval(() => { if (!document.hidden) setRevision((n) => n + 1); }, 30000);
-    return () => window.clearInterval(timer);
-  }, []);
+  /* 2026-11-24：移除 30 秒轮询定时器，仅保留页头手动「刷新」。 */
 
   useEffect(() => {
     if (list && page > totalPages) setFilter((current) => ({ ...current, page: totalPages }));
@@ -462,9 +778,7 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
     setFilter((current) => ({ ...current, page: 1 }));
   }
 
-  function refresh() {
-    setRevision((n) => n + 1);
-  }
+  /* 2026-11-24：刷新移至页头（Catalog 层），Monitor 内不再单独提供。 */
 
   async function exportXlsx() {
     setExporting(true);
@@ -606,7 +920,8 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
       </section>
     )}
 
-    {/* 成员提交明细：全部/已完成/未完成 + 实时搜索 + 提交内容与附件全屏 */}
+    {/* 成员提交明细：全部/已完成/未完成 + 实时搜索 + 提交内容与附件全屏
+        （2026-11-24：刷新与导出移至页头（StatisticsView 同款位置），此处仅保留搜索与隐藏的导出锚点） */}
     <section className={panelClass + ' overflow-hidden md:col-span-4'} aria-busy={roster.loading || searching}>
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 px-4 py-3">
         <div className="flex items-center gap-2">
@@ -621,12 +936,9 @@ function PortalTaskMonitor({ task }: { task: PortalTaskMeta }) {
             {search && <button type="button" aria-label="清除搜索" onClick={() => setSearch('')}
               className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
           </div>
-          <button type="button" onClick={refresh} disabled={refreshing} className={secondaryButton}>
-            <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
-          </button>
-          <button type="button" onClick={() => void exportXlsx()} disabled={exporting || overview.loading || !!overview.error}
+          <button type="button" id="portal-export-button" onClick={() => void exportXlsx()} disabled={exporting || overview.loading || !!overview.error}
             title="导出当前任务、归属周期和部门范围内的全量数据（含部门汇总与成员明细）"
-            className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+            className="sr-only" aria-hidden="true" tabIndex={-1}>
             <Download className="h-3.5 w-3.5" /> {exporting ? '导出中…' : '导出 Excel'}
           </button>
         </div>
