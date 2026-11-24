@@ -2191,8 +2191,8 @@ def create_admin_router(
 
     @router.post("/roles/{role_id}/members/wecom-bot")
     async def bind_wecom_bot_member(role_id: str, request: Request):
-        from ..channels.wecom_mcp import WecomMcpError, normalize_department_path
-        from ..state import is_valid_phone
+        from ..channels.wecom_mcp import WecomMcpError
+        from ..state import MAX_DEPT_NAME_LEN, is_valid_phone
 
         sess, err = require_session(request, state, check_csrf=True)
         if err is not None:
@@ -2205,22 +2205,27 @@ def create_admin_router(
         body = await _read_json_body(request)
         name = str(body.get("name") or "").strip()
         phone = str(body.get("phone") or "").strip()
-        path = normalize_department_path(body.get("dept_path"))
         userid = str(body.get("userid") or "").strip()
-        if not name or len(name) > 128 or not is_valid_phone(phone) or not path or len(path) > 1024 or len(userid) > 128:
-            return error_response(400, "VALIDATION_FAILED", "请填写姓名、手机号和企微完整部门路径")
+        if not name or len(name) > 128 or len(userid) > 128:
+            return error_response(400, "VALIDATION_FAILED", "请填写有效的企微姓名和账号")
+        if userid and not is_valid_phone(phone):
+            return error_response(400, "PHONE_INVALID", "绑定时请填写有效的手机号")
         mcp = getattr(getattr(state, "wecom_contacts", None), "mcp", None)
         if mcp is None:
             return error_response(503, "CONTACTS_QUERY_FAILED", "尚未配置企微机器人的通讯录授权")
         try:
-            candidates = await asyncio.to_thread(mcp.member_candidates, name, path)
+            candidates = await asyncio.to_thread(mcp.member_candidates, name)
             if not userid:
                 return {"ok": True, "candidates": candidates}
             matched = next((item for item in candidates if item["userid"] == userid), None)
             if matched is None:
-                return error_response(409, "DIRECTORY_CHANGED", "所选企微账号与姓名或部门不匹配，请重新核对")
+                return error_response(409, "DIRECTORY_CHANGED", "所选企微账号已不在同名候选中，请重新查询")
+            path = matched["dept_path"]
+            department = path.rsplit("/", 1)[-1]
+            if len(path) > 1024 or len(department) > MAX_DEPT_NAME_LEN:
+                return error_response(503, "CONTACTS_QUERY_FAILED", "企微返回的部门信息超出名册存储长度")
             profile = {"external_id": userid, "name": matched["name"], "dept_path": path,
-                       "department": path.rsplit("/", 1)[-1]}
+                       "department": department}
             member = await asyncio.to_thread(state.add_role_member, role_id, phone, matched["name"],
                                              source="wecom_mcp", owner_id=admin["id"], actor=sess["username"],
                                              require_directory=True, verified_wecom_user=profile)

@@ -23,7 +23,7 @@ def _setup(ctx, users):
     store.wecom_contacts = WecomContacts(CONFIG, mcp=_mcp(users), mcp_only=True)
     assert not store.wecom_contacts.supports_strict_phone_verify() and not store.wecom_contacts.org_available()
     endpoint = f"/api/admin/roles/{role_id}/members/wecom-bot"
-    body = {"name": "测试成员", "phone": PHONE, "dept_path": DEPARTMENT}
+    body = {"name": "测试成员"}
     return store, super_admin, owner, new_admin, owner_id, role_id, endpoint, body
 
 
@@ -33,7 +33,8 @@ def test_bot_member_binding_and_interactive_delivery(ctx):
     assert preview.status_code == 200, preview.text
     assert [c["userid"] for c in preview.json()["candidates"]] == [USERID]
     assert store.get_delivery_target(PHONE, "wecom") is None
-    bound = owner.post(endpoint, json={**body, "userid": USERID})
+    assert owner.post(endpoint, json={**body, "userid": USERID}).status_code == 400
+    bound = owner.post(endpoint, json={**body, "phone": PHONE, "userid": USERID})
     assert bound.status_code == 200, bound.text
     assert store.get_delivery_target(PHONE, "wecom")["external_id"] == USERID
     assert store.get_delivery_target(PHONE, "zdxlz")["external_id"] == "test_recipient"
@@ -74,19 +75,26 @@ def test_bot_member_binding_and_interactive_delivery(ctx):
 
 def test_bot_member_collision_requires_validated_wecom_account(ctx):
     other = {**WECHAT, "userid": "wecom_member_02", "position": "值班经理"}
-    mismatched = {**WECHAT, "userid": "wecom_member_03", "departments": ["四川分公司/其他分公司/综合部"]}
-    store, admin, owner, new_admin, owner_id, role_id, endpoint, body = _setup(ctx, [WECHAT, other, mismatched])
+    other_dept = "四川分公司/其他分公司/综合部"
+    other_branch = {**WECHAT, "userid": "wecom_member_03", "departments": [other_dept, DEPARTMENT]}
+    mismatched = {**WECHAT, "userid": "wecom_member_04", "name": "测试成员乙"}
+    store, admin, owner, new_admin, owner_id, role_id, endpoint, body = _setup(
+        ctx, [WECHAT, other, other_branch, mismatched])
     result = owner.post(endpoint, json=body)
     assert result.status_code == 200, result.text
-    assert {c["userid"] for c in result.json()["candidates"]} == {USERID, other["userid"]}
+    candidates = {c["userid"]: c for c in result.json()["candidates"]}
+    assert set(candidates) == {USERID, other["userid"], other_branch["userid"]}
+    assert candidates[other_branch["userid"]]["dept_paths"] == [other_dept, DEPARTMENT]
     assert store.list_role_members(role_id)["total"] == 0
     assert admin.post(endpoint, json=body).status_code == 403
     _, outsider = new_admin("bot_binding_other")
     assert outsider.post(endpoint, json=body).status_code == 403
-    assert owner.post(endpoint, json={**body, "userid": mismatched["userid"]}).status_code == 409
-    assert owner.post(endpoint, json={**body, "userid": other["userid"]}).status_code == 200
+    assert owner.post(endpoint, json={**body, "phone": PHONE, "userid": mismatched["userid"]}).status_code == 409
+    assert owner.post(endpoint, json={**body, "phone": PHONE, "userid": other_branch["userid"]}).status_code == 200
+    member = store.conn.execute("SELECT dept_path FROM member WHERE role_id=? AND phone=?", (role_id, PHONE)).fetchone()
+    assert member["dept_path"] == other_dept
     second_role = store.create_role("企微演示另一角色", platform="wecom", owner_id=owner_id)["role_id"]
     second = f"/api/admin/roles/{second_role}/members/wecom-bot"
-    conflict = owner.post(second, json={**body, "phone": "13900009402", "userid": other["userid"]})
+    conflict = owner.post(second, json={**body, "phone": "13900009402", "userid": other_branch["userid"]})
     assert conflict.status_code == 409 and conflict.json()["code"] == "WECOM_BINDING_CONFLICT"
     assert store.list_role_members(second_role)["total"] == 0

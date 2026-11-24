@@ -183,24 +183,29 @@ class WecomMcpContacts:
         users = data.get("users") or []
         return [u for u in users if isinstance(u, dict) and str(u.get("userid") or "").strip()]
 
-    def member_candidates(self, name: str, dept_path: str) -> List[Dict[str, str]]:
-        """姓名、完整部门路径均命中的企微账号，由管理员从候选中确认。"""
-        target, path = normalize_name(name), normalize_department_path(dept_path)
-        if not target or not path:
+    def member_candidates(self, name: str) -> List[Dict[str, Any]]:
+        """列出姓名匹配的企微账号及其官方部门路径。"""
+        target = normalize_name(name)
+        if not target:
             return []
         users = self.search_users(target, strict=True)
         if len(users) >= self.LIST_MODE_TRUNCATION:
             raise WecomMcpError("企微查询结果可能未完整返回，请缩小通讯录授权范围后重试")
         matches = {}
         for user in users:
-            if normalize_name(user.get("name")) != target or path not in {
-                normalize_department_path(raw) for raw in user.get("departments") or []
-            }:
+            if normalize_name(user.get("name")) != target:
                 continue
             userid = str(user["userid"]).strip()
-            matches[userid] = {"userid": userid, "name": str(user["name"]).strip(), "dept_path": path,
-                               "alias": str(user.get("alias") or ""), "position": str(user.get("position") or "")}
-        return list(matches.values())
+            candidate = matches.setdefault(userid, {
+                "userid": userid, "name": str(user["name"]).strip(), "dept_paths": [],
+                "alias": str(user.get("alias") or ""), "position": str(user.get("position") or ""),
+            })
+            for raw_path in user.get("departments") or []:
+                path = normalize_department_path(raw_path)
+                if path and path not in candidate["dept_paths"]:
+                    candidate["dept_paths"].append(path)
+        return [{**candidate, "dept_path": next(iter(candidate["dept_paths"]), "")}
+                for candidate in matches.values()]
 
     def resolve_userid(self, phone: str, name: str, dept: str = "") -> Optional[str]:
         """名册（姓名+部门）→ 企微 userid。唯一命中才返回，其余一律 None。"""
