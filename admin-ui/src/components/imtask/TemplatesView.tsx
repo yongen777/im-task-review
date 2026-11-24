@@ -110,6 +110,8 @@ function broadcastAudience(tpl: TemplateItem, total?: number): string {
   return total === undefined ? `将向${audience}发送通知。` : `将向${audience}共 ${total} 人发送通知。`;
 }
 
+type PushPreview = { total: number; completed: number; unfinished: number };
+
 const NOTICE_KINDS: NoticeContentFormat[] = ['text', 'image', 'file', 'video'];
 const NOTICE_LABELS: Record<NoticeContentFormat, string> = { text: '文本', image: '图片', file: '文件', video: '视频' };
 const NOTICE_UPLOADS = {
@@ -544,10 +546,13 @@ export const TemplatesView: React.FC = () => {
   const [pushingId, setPushingId] = useState<number | null>(null);
   const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
   /* 2026-11-19 需求一：本周期已推送过时的二次确认（新建批次并重推） */
-  const [repushConfirm, setRepushConfirm] = useState<{ tpl: TemplateItem; targetCount: number } | null>(null);
+  const [repushConfirm, setRepushConfirm] = useState<{
+    tpl: TemplateItem; targetCount: number; preview: PushPreview | null;
+  } | null>(null);
   /* 2026-11-21 需求二：推送弹窗「过滤本周期已完成 / 已回执成员」开关（默认开启）与实时人数 */
   const [skipCompleted, setSkipCompleted] = useState(true);
-  const [pushPreview, setPushPreview] = useState<{ total: number; completed: number; unfinished: number } | null>(null);
+  const [pushPreview, setPushPreview] = useState<PushPreview | null>(null);
+  const repushPreview = pushPreview ?? repushConfirm?.preview ?? null;
   const [pushIssues, setPushIssues] = useState<VariableNoticeIssue[]>([]);
   useEffect(() => {
     const tpl = pushConfirmTpl || repushConfirm?.tpl;
@@ -555,7 +560,7 @@ export const TemplatesView: React.FC = () => {
     setPushPreview(null);
     if (!tpl) return;
     let live = true;
-    api.get<{ total: number; completed: number; unfinished: number }>(
+    api.get<PushPreview>(
       `/api/admin/templates/${tpl.id}/push-preview`,
     ).then(res => { if (live) setPushPreview(res); }).catch(err => {
       if (live) {
@@ -1173,6 +1178,8 @@ export const TemplatesView: React.FC = () => {
         queued?: boolean;
         needs_confirm?: boolean;
         target_count?: number;
+        completed_count?: number;
+        unfinished_count?: number;
         new_batch?: boolean;
         synced_completed?: number;
         instance_count?: number;
@@ -1183,8 +1190,12 @@ export const TemplatesView: React.FC = () => {
       if (res?.needs_confirm) {
         /* 2026-11-19 需求一：本周期已推送过 → 关掉首次确认框，改问「是否新建一批」。
            预检不写冷却 marker，用户取消也不影响后续操作。 */
+        const { completed_count: completed, unfinished_count: unfinished } = res;
+        const preview = completed !== undefined && unfinished !== undefined
+          ? { total: completed + unfinished, completed, unfinished } : null;
         setPushConfirmTpl(null);
-        setRepushConfirm({ tpl: target, targetCount: res.target_count ?? 0 });
+        setPushPreview(null);
+        setRepushConfirm({ tpl: target, targetCount: res.target_count ?? 0, preview });
         return;
       }
       if (res?.queued) {
@@ -1229,8 +1240,9 @@ export const TemplatesView: React.FC = () => {
       if (res?.queued) {
         toast.success(
           broadcast ? `向 ${res.instance_count ?? 0} 人重推通知，消息正在后台投递。` :
-            `已按归属周期再推 ${res.instance_count ?? 0} 条实例（已同步本周期完成状态 ${res.synced_completed ?? 0} 条，` +
-            `已完成/已截止成员收到只读回顾链接）；消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。`,
+            `已按归属周期再推 ${res.instance_count ?? 0} 条实例` +
+            (filterCompleted ? '（本周期已完成/已回执成员已过滤）' : `（已同步本周期完成状态 ${res.synced_completed ?? 0} 条）`) +
+            '；消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。',
           '重推已启动',
         );
       } else {
@@ -2472,7 +2484,7 @@ export const TemplatesView: React.FC = () => {
         </div>
       )}
 
-      {/* 2026-11-20 切期改造：本周期已推送过 → 二次确认是否按归属周期再推一次（全员照推） */}
+      {/* 本周期已推送过时，按当前过滤选项确认重推范围。 */}
       {repushConfirm && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
@@ -2486,18 +2498,11 @@ export const TemplatesView: React.FC = () => {
               </button>
             </div>
             {isBroadcastNotice(repushConfirm.tpl) ? <p className="text-xs text-slate-600 leading-relaxed" role="status">
-              {broadcastAudience(repushConfirm.tpl, pushPreview?.total ?? repushConfirm.targetCount)}
-            </p> : repushConfirm.tpl.spec?.variable_notice ? <p className="text-xs text-slate-600 leading-relaxed">
-              将按已保存的变量表格重新推送专属通知，本次涉及 {repushConfirm.targetCount} 人。
-            </p> : <p className="text-xs text-slate-600 leading-relaxed">
-              将向当前角色（{repushConfirm.targetCount} 人）再次推送本周期任务；
-              <br />
-              （已完成/已回执与已过截止的成员照常收到消息，但链接只读回顾、不会再回到待办；
-              未完成成员正常提交；待办与统计按本周期自动去重）
-            </p>}
-            {!isBroadcastNotice(repushConfirm.tpl) && (
-              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
-            )}
+              {broadcastAudience(repushConfirm.tpl, repushPreview?.total ?? repushConfirm.targetCount)}
+            </p> : <>
+              <RepushDescription tpl={repushConfirm.tpl} checked={skipCompleted} preview={repushPreview} />
+              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={repushPreview} />
+            </>}
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
@@ -2521,12 +2526,32 @@ export const TemplatesView: React.FC = () => {
   );
 };
 
+function RepushDescription({ tpl, checked, preview }: { tpl: TemplateItem; checked: boolean; preview: PushPreview | null }) {
+  const audience = tpl.spec?.variable_notice ? '变量表格中' : '当前角色';
+  const notice = tpl.kind === 'notice';
+  const recipients = checked ? preview?.unfinished : preview?.total;
+  return (
+    <p className="text-xs text-slate-600 leading-relaxed">
+      {checked ? `本次将仅向${audience}未完成的` : `本次将向${audience}全部`}
+      {recipients === undefined ? '成员' : <> <strong>{recipients} 人</strong> </>}
+      {notice ? '再次发送本周期通知。' : '再次推送本周期任务。'}
+      <br />
+      （{checked ? <>
+        已完成/已回执{preview ? `的 ${preview.completed} 人` : '的成员'}不打扰；
+        {!notice && '已过截止成员若收到，链接仅供只读回顾；'}
+      </> : notice ? '已回执成员照常收到通知，回执记录保留；' :
+        '已完成/已回执与已过截止的成员照常收到消息，但链接仅供只读回顾，不会回到待办；未完成成员正常提交；'}
+      待办与统计按本周期自动去重。）
+    </p>
+  );
+}
+
 /* 2026-11-21 需求二：推送确认弹窗的「过滤本周期已完成/已回执成员」开关。
    勾选 = 只向本周期未完成人员推送（已完成/已回执不打扰）；实时展示人数。 */
 function PushSkipCompleted({ checked, onChange, preview }: {
   checked: boolean;
   onChange: (next: boolean) => void;
-  preview: { total: number; completed: number; unfinished: number } | null;
+  preview: PushPreview | null;
 }) {
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5 space-y-1">
