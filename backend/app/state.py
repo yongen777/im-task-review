@@ -2948,6 +2948,8 @@ class StateStore:
         if not isinstance(role_ids_raw, list):
             raise BizError(400, "VALIDATION_FAILED", "role_ids 必须为数组")
         role_ids = list(dict.fromkeys(str(rid or "").strip() for rid in role_ids_raw if str(rid or "").strip()))
+        if isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None:
+            role_ids = []
         if role_ids:
             placeholders = ",".join("?" for _ in role_ids)
             roles = {
@@ -2992,6 +2994,15 @@ class StateStore:
             if manual_deadline != (existing or {}).get("manual_deadline_at") and manual_deadline <= self.now_str():
                 raise BizError(400, "INVALID_DEADLINE", "截止时间必须晚于当前时间")
         from .notice_media import get_asset, receipt_key
+        from .variable_notice import validate as validate_variable_notice
+
+        if isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None:
+            if kind != "notice" or not is_manual:
+                raise BizError(400, "INVALID_VARIABLE_NOTICE_MODE", "变量表格仅用于一次性立即推送的通知提醒")
+            if not (existing and set(payload) == {"enabled"} and payload["enabled"] is False):
+                owner = owner_id if owner_id is not None else existing["owner_id"]
+                config, _ = validate_variable_notice(self, owner, text_tpl, _spec_payload["variable_notice"], lock=True)
+                _spec_payload = {**_spec_payload, "variable_notice": config}
 
         if kind == "notice" and isinstance(_spec_payload, dict) and "notice_receipt" in _spec_payload:
             receipt = _spec_payload["notice_receipt"]
@@ -3379,7 +3390,7 @@ class StateStore:
             row = self.conn.execute(sql, ((template_id or "").strip(),)).fetchone()
             return self._deserialize_template_row(row) if row else None
 
-    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20, platform: Optional[str] = None, owner_id: Optional[int] = None) -> Dict[str, Any]:
+    def list_templates(self, q: Optional[str] = None, kind: Optional[str] = None, enabled: Optional[bool] = None, page: int = 1, size: int = 20, platform: Optional[str] = None, owner_id: Optional[int] = None, *, variable_only: bool = False) -> Dict[str, Any]:
         p, s = _clamp_page_size(page, size)
         offset = (p - 1) * s
         where_clauses, params = ["t.deleted = 0"], []
@@ -3395,14 +3406,18 @@ class StateStore:
         if owner_id is not None:
             where_clauses.append("t.owner_id = ?")
             params.append(int(owner_id))
+        from .variable_notice import PLATFORM_SQL, summarize_template
+
+        if variable_only:
+            where_clauses.append(f"{PLATFORM_SQL} IS NOT NULL")
         plat = (platform or "").strip().lower()
         if plat:
             # 任务归属平台 = 模板所选角色所属平台（角色已按平台隔离）
             where_clauses.append(
-                "(t.role_ids = '[]' OR EXISTS "
-                "(SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0))"
+                f"({PLATFORM_SQL} = ? OR ({PLATFORM_SQL} IS NULL AND (t.role_ids = '[]' OR EXISTS "
+                "(SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0))))"
             )
-            params.append(plat)
+            params.extend((plat, plat))
         where_sql = "WHERE " + " AND ".join(where_clauses)
         with self.lock:
             total = int(self.conn.execute(f"SELECT COUNT(1) AS cnt FROM task_template t {where_sql}", tuple(params)).fetchone()["cnt"] or 0)
@@ -3412,14 +3427,17 @@ class StateStore:
             f"{where_sql} ORDER BY t.created_at DESC, t.template_id DESC LIMIT ? OFFSET ?",
             tuple(params + [s, offset]),
         ).fetchall()
-            return {"total": total, "items": [self._deserialize_template_row(r) for r in rows]}
+            return {"total": total, "items": [summarize_template(self._deserialize_template_row(r)) for r in rows]}
 
-    def update_template(self, template_id: str, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
+    def update_template(self, template_id: str, payload: Dict[str, Any], actor: str = "system", *,
+                        owner_id: Optional[int] = None) -> Dict[str, Any]:
         clean_id, now_s = (template_id or "").strip(), self.now_str()
         with self.lock, self.conn:
             row = self.conn.execute("SELECT * FROM task_template WHERE template_id = ? AND deleted = 0 FOR UPDATE", (clean_id,)).fetchone()
             if not row:
                 raise BizError(404, "NOT_FOUND", "任务模板不存在")
+            if owner_id is not None and row["owner_id"] != owner_id:
+                raise BizError(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
             norm = self._validate_and_normalize_template_unlocked(payload, existing=self._deserialize_template_row(row))
             self.conn.execute(
                 "UPDATE task_template SET name = ?, kind = ?, role_ids = ?, schema_json = ?, allow_note = ?, text_tpl = ?, "
@@ -3644,11 +3662,15 @@ class StateStore:
                 })
             return deduped
 
-    def preview_template_targets(self, template_id: str) -> Dict[str, int]:
+    def preview_template_targets(self, template_id: str, *, owner_id: Optional[int] = None) -> Dict[str, int]:
         tpl = self.get_template(template_id, include_deleted=False)
         if not tpl:
             raise BizError(404, "NOT_FOUND", "任务模板不存在")
-        members = self.get_dedup_enabled_members_for_roles(tpl["role_ids"])
+        if owner_id is not None and tpl["owner_id"] != owner_id:
+            raise BizError(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
+        from .variable_notice import config_for
+        members = (self.template_deliverable_members(tpl) if config_for(tpl)
+                   else self.get_dedup_enabled_members_for_roles(tpl["role_ids"]))
         member_count, activated_count = len(members), sum(1 for m in members if m["activated"])
         return {"member_count": member_count, "activated_count": activated_count, "unactivated_count": member_count - activated_count}
 
@@ -4272,6 +4294,19 @@ class StateStore:
         if template.get("portal_task"):
             from .portal import PortalService
             return None if PortalService(self).can_submit(instance, template) else "任务已关闭"
+        if template.get("kind") == "notice" and template.get("is_manual") and instance.get("receipt_platform"):
+            from .notice_receipts import load_view
+            from .variable_notice import eligible_member, roster
+
+            view = instance.get("notice_view") or load_view(self, instance["id"])
+            if view and (platform := view.get("variable_platform")):
+                owner, phone = instance["owner_id"], instance["phone"]
+                member, _ = eligible_member(roster(self, owner, platform, [phone]).get(phone))
+                if (member and platform in self._owner_allowed_platforms(owner)
+                        and (member["external_id"], member["external_type"]) == (view["external_id"], view["external_type"])
+                        and clean_name_for_match(member["name"]) == clean_name_for_match(instance["name_snap"])):
+                    return None
+                return "任务已关闭"
         if not self.is_member_active_for_roles(str(instance.get("phone") or ""), template.get("role_ids") or []):
             return "任务已关闭"
         return None
@@ -4853,6 +4888,10 @@ class StateStore:
         2026-11-19：从 ensure_template_instances 抽出，供「重推预检」计算当前角色人数
         （needs_confirm 响应里的 target_count）复用同一口径，避免两处取数漂移。
         """
+        from .variable_notice import config_for, validate
+
+        if config := config_for(tpl):
+            return validate(self, tpl["owner_id"], tpl["text_tpl"], config)[1]
         roles = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         if not roles:
             return []
@@ -5974,7 +6013,8 @@ class StateStore:
         return f"i.phone {op} ({ph})", phones
 
     def _stats_member_dept_map(self, role_ids: List[str], *, owner_id: Optional[int] = None,
-                               phones: Optional[Iterable[str]] = None) -> Dict[str, str]:
+                               phones: Optional[Iterable[str]] = None,
+                               platform: Optional[str] = None) -> Dict[str, str]:
         """模板角色名册 → {手机号: 完整部门路径}。
 
         同一手机号在多个角色出现时，按模板 role_ids 的顺序优先（先配的角色优先），
@@ -6014,8 +6054,8 @@ class StateStore:
             if phone and not (out.get(phone, (0, ""))[1]) and phone not in missing:
                 missing.append(phone)
         if missing and owner_id is not None:
-            plat = None
-            if roles:
+            plat = platform
+            if roles and not plat:
                 plats = {str(r["platform"] or "").strip() for r in self.conn.execute(
                     f"SELECT DISTINCT platform FROM role WHERE role_id IN ({ph})", tuple(roles)).fetchall()}
                 if len(plats) == 1:
@@ -6041,6 +6081,15 @@ class StateStore:
                     if path:
                         out[phone] = (998, path)  # 兜底优先级低于任何当前角色命中
         return {phone: path for phone, (_, path) in out.items()}
+
+    def _stats_template_dept_map(self, tpl, rows):
+        from .variable_notice import config_for
+
+        platform = (config_for(tpl) or {}).get("platform")
+        return self._stats_member_dept_map(
+            tpl.get("role_ids") or [], owner_id=tpl["owner_id"],
+            phones=(str(row["phone"]) for row in rows), platform=platform,
+        )
 
     @classmethod
     def _stats_phone_path(cls, phone: str, dept_map: Dict[str, str]) -> str:
@@ -6170,8 +6219,7 @@ class StateStore:
         persons = self._stats_dedup_persons([dict(r) for r in rows])
         # 2026-11-19 需求五：用「本期实例里实际出现的手机号」做部门兜底，
         # 模板改绑角色后原角色成员不再变成「未分配部门」。
-        dept_map = self._stats_member_dept_map(
-            role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in persons])
+        dept_map = self._stats_template_dept_map(tpl, persons)
         covered_paths = {str(r["phone"]): self._stats_phone_path(str(r["phone"]), dept_map) for r in persons}
         tree = self._stats_dept_tree(covered_paths)
         # KPI（部门子树过滤；按去重后的人计）
@@ -6237,7 +6285,6 @@ class StateStore:
         tpl = self.stats_panel_guard_template(template_id, owner_id, allow_portal_task=allow_portal_task)
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-        role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         sel = str(dept_path or "").strip().strip("/")
         per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
         from .notice_media import notice_receipt_config
@@ -6275,8 +6322,7 @@ class StateStore:
                 return False
             return True
 
-        dept_map = self._stats_member_dept_map(
-            role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in rows])
+        dept_map = self._stats_template_dept_map(tpl, rows)
         persons = self._stats_dedup_persons(rows)
         scoped: List[Dict[str, Any]] = []
         for r in persons:
@@ -6451,8 +6497,7 @@ class StateStore:
                            else self._stats_delivery_rows(tpl["template_id"], period_key))
             persons = self._stats_dedup_persons(source_rows)
             # 2026-11-19 需求五：导出与明细/下钻共用同一份兜底后的 dept_map
-            dept_map = self._stats_member_dept_map(
-                role_ids, owner_id=owner_id, phones=[str(row["phone"]) for row in persons])
+            dept_map = self._stats_template_dept_map(tpl, persons)
             rows = []
             for row in persons:
                 path = self._stats_phone_path(row["phone"], dept_map)

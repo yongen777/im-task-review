@@ -32,6 +32,7 @@ from .state import (  # calc_resubmit_deadline 在此处 re-export：旧用例�
     is_no_deadline,
     is_valid_hhmm,
 )
+from .variable_notice import config_for as variable_notice_config
 # 2026-11-13 冲刺模块二：受控并发投递（8 线程 + 令牌桶 + 熔断）
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from .throttle import (  # noqa: E402
@@ -1137,7 +1138,8 @@ class Scheduler:
     def push_now_prepare(self, template_id: str, actor: str = "system",  # noqa: ARG002
                          now_dt: Optional[datetime] = None,
                          reprocess: bool = False,
-                         skip_completed: bool = False) -> Dict[str, Any]:
+                         skip_completed: bool = False,
+                         reserve_variable_push: bool = False) -> Dict[str, Any]:
         """2026-11-13 修复一：一键推送·准备段（校验 + 当期实例生成，**不发送任何消息**）。
 
         返回 {template_id, pushed_at, period_key, deadline_at, instance_count}：
@@ -1171,9 +1173,18 @@ class Scheduler:
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
+        if variable_notice_config(tpl) or reserve_variable_push:
+            return self._prepare_variable_notice(template_id, cur_dt, actor, reprocess,
+                                                 skip_completed, reserve_variable_push)
         kind = canonical_period_kind(tpl)
         p_key = canonical_period_key(tpl, cur_dt)
-        if reprocess and self.state.period_has_alive_instances(tpl["template_id"], p_key):
+        variable_history = bool(manual and tpl["kind"] == "notice" and self.state.conn.execute(
+            "SELECT 1 FROM task_instance i JOIN notice_receipt_view v ON v.instance_id=i.id "
+            "WHERE i.template_id=? AND i.period_key=? "
+            "AND JSON_EXTRACT(v.content_json, '$.variable_platform') IS NOT NULL LIMIT 1",
+            (template_id, p_key),
+        ).fetchone())
+        if reprocess and (variable_history or self.state.period_has_alive_instances(tpl["template_id"], p_key)):
             # 主批次仍有存活实例 → 管理员确认的新一轮「全员照推」另起新批次
             p_key = self._next_batch_period_key(template_id, p_key, cur_dt)
         deadline_at = (tpl.get("manual_deadline_at") or NO_DEADLINE_SENTINEL) if manual else canonical_period_deadline(tpl, kind, cur_dt)
@@ -1181,6 +1192,13 @@ class Scheduler:
             deadline_at = format_dt(cur_dt + timedelta(hours=24))
         if manual and deadline_at <= now_s:
             raise BizError(400, "INVALID_DEADLINE", "任务已到截止时间，无法推送")
+        if variable_history and not reprocess:
+            # 旧的变量批次继续使用原快照，当前角色名单只用于新建批次。
+            return {
+                "template_id": template_id, "pushed_at": now_s, "period_key": p_key,
+                "deadline_at": deadline_at, "instance_count": len(self.state.list_instances_for_period(template_id, p_key)),
+                "new_batch": False, "synced_completed": 0, "skip_completed": skip_completed, "variable_notice": True,
+            }
         # 2026-11-21 需求二：勾选「过滤本周期已完成/已回执成员」→ 只给未完成者建实例并推送；
         # 全员已完成时直接明确拒绝（不建空批次、不发消息）。
         unfinished: Optional[set] = None
@@ -1213,6 +1231,73 @@ class Scheduler:
             "deadline_at": deadline_at, "instance_count": len(alive),
             "new_batch": bool(reprocess), "synced_completed": int(synced),
             "skip_completed": bool(skip_completed), "unfinished_count": len(unfinished or ()),
+        }
+
+    def _prepare_variable_notice(self, template_id, now, actor, reprocess, skip_completed, reserve):
+        from .notice_media import notice_receipt_config
+        from .variable_notice import validate
+
+        now_s = format_dt(now)
+        deadline = format_dt(now + timedelta(hours=24))
+        state = self.state
+        with state.lock, state.conn:
+            row = state.conn.execute(
+                "SELECT * FROM task_template WHERE template_id=? AND deleted=0 FOR UPDATE", (template_id,)
+            ).fetchone()
+            if not row or not row["enabled"]:
+                raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
+            tpl = state._deserialize_template_row(row)
+            config = variable_notice_config(tpl)
+            if not config or tpl["kind"] != "notice" or not tpl["is_manual"]:
+                raise BizError(409, "VARIABLE_NOTICE_CHANGED", "模板的变量表格配置已变更，请刷新后重试")
+            _, members = validate(state, tpl["owner_id"], tpl["text_tpl"], config, lock=True)
+            platform = config["platform"]
+            if platform not in (self.notifiers or {state.platform: self.notifier}):
+                raise BizError(503, "PUSH_UNAVAILABLE", "当前办公软件平台的投递通道未就绪")
+            p_key = self._next_batch_period_key(template_id, "once", now) if reprocess else "once"
+            prior = state.list_instances_for_period(template_id, p_key)
+            if reserve:
+                state.check_manual_push_cooldown(template_id, actor=actor, now_dt=now)
+                if prior:
+                    raise BizError(409, "VARIABLE_NOTICE_ALREADY_PUSHED", "该模板已受理推送，请刷新后确认重推")
+            if skip_completed:
+                completed = state.period_completed_phones(template_id, p_key)
+                members = [member for member in members if member["phone"] not in completed]
+                if not members:
+                    raise BizError(400, "ALL_COMPLETED", "本周期全员已完成，无需推送")
+            if not prior:
+                mode, phrase = notice_receipt_config(tpl)
+                receipt = (tpl["spec_json"] or {}).get("notice_receipt") or {}
+                media = self._notice_snapshot_media(tpl, p_key, 1, now_s, {}, capture_keys=True)
+                if media is None:
+                    raise BizError(400, "NOTICE_MEDIA_UNAVAILABLE", "通知附件不可用，请重新上传")
+                state.conn.executemany(
+                    "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, "
+                    "deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) "
+                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+                    [(template_id, m["phone"], m["name"], (m["dept_path"] or m["dept"] or "")[:200] or None, p_key,
+                      deadline, now_s, tpl["owner_id"], phrase, platform, mode) for m in members],
+                )
+                by_phone = {member["phone"]: member for member in members}
+                prior = state.list_instances_for_period(template_id, p_key)
+                snapshots = []
+                for inst in prior:
+                    member = by_phone[inst["phone"]]
+                    snapshots.append((inst["id"], json.dumps({
+                        "title": tpl["name"], "body": member["body"],
+                        "published_at": now_s, "media": media, "variable_platform": platform,
+                        "receipt_guide_text": receipt.get("receipt_guide_text"),
+                        "external_id": member["external_id"], "external_type": member["external_type"],
+                    }, ensure_ascii=False)))
+                # 与每条 task_instance 同事务落库，同一个实例号只对应一份专属正文。
+                state.conn.executemany(
+                    "INSERT INTO notice_receipt_view(instance_id, content_json) VALUES (?, ?)", snapshots,
+                )
+            synced = state.sync_batch_completion(template_id, p_key) if reprocess else 0
+        return {
+            "template_id": template_id, "period_key": p_key, "pushed_at": now_s, "deadline_at": deadline,
+            "instance_count": len(prior), "new_batch": reprocess, "synced_completed": synced,
+            "skip_completed": skip_completed, "variable_notice": True,
         }
 
     def _next_batch_period_key(self, template_id: str, canonical: str, cur_dt: datetime) -> str:
@@ -1253,6 +1338,15 @@ class Scheduler:
         completed_phones = (self.state.period_completed_phones(tpl["template_id"], p_key)
                             if skip_completed else set())
 
+        if prep.get("variable_notice"):
+            rows = self.state.conn.execute(
+                "SELECT v.instance_id, v.content_json FROM notice_receipt_view v "
+                "JOIN task_instance i ON i.id=v.instance_id WHERE i.template_id=? AND i.period_key=?",
+                (template_id, p_key),
+            ).fetchall()
+            views = {row["instance_id"]: json.loads(row["content_json"]) for row in rows}
+            instances = [{**inst, "notice_view": view} for inst in instances
+                         if (view := views.get(inst["id"])) and view.get("variable_platform")]
         if tpl["kind"] == "notice":
             return self._push_manual_notice(tpl, instances, cur_dt, p_key, skip_completed=skip_completed)
 
@@ -1351,6 +1445,8 @@ class Scheduler:
 
     @staticmethod
     def _notice_body(template, instance, now, values):
+        if view := instance.get("notice_view"):
+            return view["body"]
         return render_text_tpl(
             template["text_tpl"], member_name=instance["name_snap"], member_dept=instance.get("dept_snap"),
             template_name=template["name"], deadline_at=None, period=template["period"], ref_dt=now, extra_vars=values,
@@ -1536,7 +1632,8 @@ class Scheduler:
                         prior_prompt = inst.get("receipt_prompt_at")
                         if not phrase or (prior_prompt and (once or prior_prompt >= planned_str)):
                             continue
-                        message = (f"【德阳量密助手】以上为《{tpl['name']}》通知内容，"
+                        title = (inst.get("notice_view") or {}).get("title") or tpl["name"]
+                        message = (f"【德阳量密助手】以上为《{title}》通知内容，"
                                    f"查收后请直接回复「{phrase}」即可完成确认登记。")
                     else:
                         message = self._notice_body(tpl, inst, now, values)
@@ -1575,41 +1672,49 @@ class Scheduler:
                 targets.pop(target)
         return delivered
 
-    def _notice_link_message(self, tpl, period, seq, planned_str, now, values):
+    def _notice_snapshot_media(self, tpl, period, seq, now_s, values, *, capture_keys=False):
         from mimetypes import guess_type
-        from .notice_receipts import issue_link, load_view, media_path, save_view
+        from .notice_receipts import media_path
+
+        root = Path(self.state.data_dir).resolve()
+        media = []
+        for source, asset, key, legacy in self._notice_media_parts(
+            tpl, period, seq, now_s, values, require_available=True,
+        ):
+            if not source or not Path(source).is_relative_to(root):
+                return None
+            relative = Path(source).relative_to(root).as_posix()
+            path = media_path(self.state, relative)
+            if path is None:
+                return None
+            try:
+                size = asset.get("size") or path.stat().st_size
+            except OSError:
+                return None
+            item = {
+                "kind": asset["kind"], "name": asset["file_name"], "relative": relative,
+                "size": int(size), "mime": asset.get("mime") or guess_type(path.name)[0] or "application/octet-stream",
+            }
+            if capture_keys:
+                item.update(key=key, legacy=legacy)
+            media.append(item)
+        return media
+
+    def _notice_link_message(self, tpl, period, seq, planned_str, now, values):
+        from .notice_receipts import issue_link, load_view, save_view
 
         media = None
-        now_s = format_dt(now)
-        root = Path(self.state.data_dir).resolve()
 
         def message(inst):
             nonlocal media
             if not self.public_base_url:
                 return ""
-            view = load_view(self.state, inst["id"])
+            view = inst.get("notice_view") or load_view(self.state, inst["id"])
             if view is None:
                 if media is None:
-                    available = []
-                    for source, asset, _, _ in self._notice_media_parts(
-                        tpl, period, seq, now_s, values, require_available=True,
-                    ):
-                        if not source or not Path(source).is_relative_to(root):
-                            return ""
-                        relative = Path(source).relative_to(root).as_posix()
-                        path = media_path(self.state, relative)
-                        if path is None:
-                            return ""
-                        try:
-                            size = asset.get("size") or path.stat().st_size
-                        except OSError:
-                            return ""
-                        available.append({
-                            "kind": asset["kind"], "name": asset["file_name"], "relative": relative,
-                            "size": size,
-                            "mime": asset.get("mime") or guess_type(path.name)[0] or "application/octet-stream",
-                        })
-                    media = available
+                    media = self._notice_snapshot_media(tpl, period, seq, format_dt(now), values)
+                    if media is None:
+                        return ""
                 view = save_view(self.state, inst["id"], {
                     "title": tpl["name"], "body": self._notice_body(tpl, inst, now, values),
                     "published_at": planned_str, "media": media,
@@ -1623,6 +1728,8 @@ class Scheduler:
             spec = tpl.get("spec_json") if isinstance(tpl.get("spec_json"), dict) else {}
             guide = str(((spec.get("notice_receipt") or {}) if isinstance(spec.get("notice_receipt"), dict) else {})
                         .get("receipt_guide_text") or "").strip()
+            if view.get("variable_platform"):
+                guide = view.get("receipt_guide_text") or ""
             second_line = guide or f"请打开链接阅读完整通知，点击「{inst['receipt_phrase']}」确认。"
             link = self.public_base_url.rstrip("/") + issue_link(self.state, inst)
             return (f"【德阳量密助手】您收到《{view['title']}》通知。\n"
@@ -1639,12 +1746,17 @@ class Scheduler:
           · link 模式 → 追加 1 条 H5 确认链接（正文摘要 + 完整通知入口）。
         与后台预览（NoticePhonePreview）的渲染顺序一一对应，做到所见即所得。
         """
-        platform = self._template_platform(tpl)
+        snapshot = (instances[0].get("notice_view") or {}) if instances else {}
+        platform = snapshot.get("variable_platform") or self._template_platform(tpl)
+        if snapshot and platform not in (self.notifiers or {self.state.platform: self.notifier}):
+            return 0
         targets = {
             (int(inst["id"]), channel): (inst, external_id, external_type, notifier)
             for inst in instances
             for channel, external_id, external_type, notifier in self._targets_for(inst["phone"], only_platform=platform)
             if external_id
+            and (not snapshot or (external_id, external_type) ==
+                 (inst["notice_view"]["external_id"], inst["notice_view"]["external_type"]))
         }
         delivered = set()
         # ① 正文：发给全部 targets（正文为空时 _deliver_notice_text_part 内自然跳过）
@@ -1654,7 +1766,17 @@ class Scheduler:
         # ② 媒体：图片 → 文件 → 视频（原生优先 + H5 链接兜底，顺序不动）
         now_s = format_dt(now)
         if targets:
-            for part in self._notice_media_parts(tpl, period, seq, now_s, values):
+            if snapshot:
+                from .notice_receipts import media_path
+
+                parts = [
+                    (str(path) if (path := media_path(self.state, item["relative"])) else None,
+                     {**item, "file_name": item["name"]}, item["key"], item["legacy"])
+                    for item in snapshot["media"]
+                ]
+            else:
+                parts = self._notice_media_parts(tpl, period, seq, now_s, values)
+            for part in parts:
                 delivered.update(self._deliver_notice_media_part(
                     tpl, targets, period, seq, planned_str, now_s, stats, once, *part,
                 ))

@@ -64,6 +64,12 @@ function clearCsrf() {
 const dataKeysCache = new Map<string, Array<{ key: string; label: string; unit: string }>>();
 
 /* ---------- 基础请求 ---------- */
+export class ApiRequestError extends Error {
+  constructor(message: string, readonly issues?: import('./types').VariableNoticeIssue[]) {
+    super(message);
+  }
+}
+
 async function rawFetch<T = any>(method: string, url: string, body?: any): Promise<T> {
   const opt: RequestInit = { method, credentials: 'same-origin', headers: {} as Record<string, string> };
   if (body instanceof FormData) {
@@ -88,7 +94,7 @@ async function rawFetch<T = any>(method: string, url: string, body?: any): Promi
   }
   if (!res.ok || (data && data.ok === false)) {
     const msg = (data && (data.message || (data.error && data.error.message))) || `HTTP_${res.status}`;
-    throw new Error(msg);
+    throw new ApiRequestError(msg, data?.issues);
   }
   return data as T;
 }
@@ -150,6 +156,7 @@ function tplToMock(t: any): TemplateItem {
     }
     spec.notice_items = items;
     spec.notice_receipt = t.spec_json?.notice_receipt;
+    spec.variable_notice = t.spec_json?.variable_notice;
   } else {
     /* 2026-10-28 修复：优先从 spec_json 恢复完整前端配置，fallback schema_json */
     if (t.spec_json && typeof t.spec_json === 'object') {

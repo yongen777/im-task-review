@@ -51,6 +51,7 @@ from ..state import (
     validate_new_password,
     verify_password,
 )
+from ..variable_notice import VariableTableError, config_for as variable_notice_config, summarize_template
 
 from .h5 import prepare_task_upload, task_upload_limits
 
@@ -191,6 +192,12 @@ def error_response(status_code: int, code: str, message: str) -> JSONResponse:
 
 
 def biz_error_response(exc: BizError) -> JSONResponse:
+    if isinstance(exc, VariableTableError):
+        return JSONResponse(
+            status_code=exc.status_code, headers={"Cache-Control": "no-store"},
+            content={"ok": False, "code": exc.code, "message": exc.message,
+                     "error": {"code": exc.code, "message": exc.message}, "issues": exc.issues},
+        )
     return error_response(exc.status_code, exc.code, exc.message)
 
 
@@ -518,11 +525,10 @@ def _notice_media_admin_url(state: StateStore, *, asset: Optional[Dict[str, Any]
 
 def _build_notice_view(state: StateStore, inst: Dict[str, Any],
                        tpl: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """通知类实例「实际下发内容与附件」：优先该次下发的 notice_receipt_view 快照，
-    无快照（未推送 / text 回执模式未落快照）时回退模板当前正文与附件。
+    """通知实例内容优先读取该实例的 notice_receipt_view 快照。
 
-    · 快照由调度器在发送 H5 确认链接时写入（scheduler._notice_link_message → save_view），
-      含 title / body / published_at / media[{kind,name,relative,size,mime}]；
+    · 变量通知在创建实例时固化快照，普通链接回执在发送确认链接时写入；
+    · 旧实例没有快照时回退到模板正文与附件；
     · media.relative 形如 notice_assets/<asset_id>.<ext>，这里反查 notice_asset 拿
       asset_id，前端才能用 /api/admin/notice-assets/{asset_id} 在线预览/下载。
     """
@@ -708,9 +714,10 @@ def _instance_filter_sql(
     plat = (platform or "").strip().lower()
     if plat:
         where.append(
-            "EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0)"
+            "(EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0) "
+            "OR (t.role_ids = '[]' AND t.kind = 'notice' AND t.is_manual = 1 AND i.receipt_platform = ?))"
         )
-        params.append(plat)
+        params.extend((plat, plat))
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     return from_sql, where_sql, params
@@ -1361,6 +1368,80 @@ def create_admin_router(
         )
         return {"ok": True, "total": res["total"], "items": res["items"]}
 
+    @router.post("/variable-notices/template")
+    async def download_variable_notice_template(request: Request):
+        from ..variable_notice import make_template
+
+        _, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        body = await _read_json_body(request)
+        file_type = body.get("format")
+        try:
+            content, mime = make_template(body.get("body"), file_type)
+        except BizError as exc:
+            return biz_error_response(exc)
+        return Response(content, media_type=mime, headers={
+            "Content-Disposition": f"attachment; filename=variable-notice.{file_type}",
+            "Cache-Control": "no-store",
+        })
+
+    @router.post("/variable-notices/validate")
+    async def validate_variable_notice_table(request: Request):
+        from ..variable_notice import MAX_UPLOAD, read_table, validate
+
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        if _is_super_admin(admin):
+            return error_response(403, "SUPER_ADMIN_READONLY", "仅分级管理员可以导入变量表格")
+
+        async def bounded_body():
+            received = 0
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > MAX_UPLOAD + 65536:
+                    raise MultiPartException("变量表文件大小不得超过 4 MB")
+                yield chunk
+
+        def check_table(raw, filename, body, platform):
+            config = read_table(raw, filename, body, platform)
+            return validate(state, int(admin["id"]), body, config)
+
+        try:
+            content_type = request.headers.get("content-type", "").lower()
+            if content_type.startswith("application/json"):
+                try:
+                    draft = json.loads(b"".join([chunk async for chunk in bounded_body()]))
+                except (ValueError, UnicodeError):
+                    draft = None
+                if not isinstance(draft, dict):
+                    raise BizError(400, "INVALID_VARIABLE_UPLOAD", "变量表格数据无效")
+                config, members = await asyncio.to_thread(
+                    validate, state, int(admin["id"]), draft.get("body"), draft.get("config"),
+                )
+            elif content_type.startswith("multipart/form-data"):
+                form = await MultiPartParser(request.headers, bounded_body(), max_files=1, max_fields=2).parse()
+                try:
+                    upload, body, platform = form.get("file"), form.get("body"), form.get("platform")
+                    if not isinstance(upload, UploadFile):
+                        raise BizError(400, "FILE_REQUIRED", "请选择要上传的变量表格")
+                    config, members = await asyncio.to_thread(
+                        check_table, await upload.read(MAX_UPLOAD + 1), upload.filename or "", body, platform,
+                    )
+                finally:
+                    await form.close()
+            else:
+                raise BizError(400, "FILE_REQUIRED", "请选择要上传的变量表格")
+        except MultiPartException as exc:
+            return error_response(400, "INVALID_VARIABLE_UPLOAD", str(exc))
+        except BizError as exc:
+            return biz_error_response(exc)
+        samples = [{key: member[key] for key in ("phone", "name", "body")} for member in members[:3]]
+        return JSONResponse({"ok": True, "count": len(members), "samples": samples, "config": config},
+                            headers={"Cache-Control": "no-store"})
+
     @router.post("/templates")
     async def create_template(request: Request, background_tasks: BackgroundTasks):
         sess, err = require_session(request, state, check_csrf=True)
@@ -1398,8 +1479,29 @@ def create_admin_router(
 
         if previous := replay():
             return previous
+        spec = body.get("spec") if isinstance(body.get("spec"), dict) else body.get("spec_json")
+        if isinstance(spec, str):
+            try:
+                spec = json.loads(spec)
+            except ValueError:
+                spec = None
+        prep = None
+        scheduler = getattr(request.app.state, "scheduler", None)
+
+        def create_and_prepare_variable():
+            if scheduler is None:
+                raise BizError(503, "PUSH_UNAVAILABLE", "调度器未就绪，请稍后重试")
+            with state.lock, state.conn:
+                tpl = state.create_template(body, actor=sess["username"], owner_id=owner_id, template_id=template_id)
+                prepared = scheduler.push_now_prepare(tpl["template_id"], actor=sess["username"],
+                                                       reserve_variable_push=True)
+            return tpl, prepared
+
         try:
-            tpl = state.create_template(body, actor=sess["username"], owner_id=owner_id, template_id=template_id)
+            if push_on_create and isinstance(spec, dict) and spec.get("variable_notice") is not None:
+                tpl, prep = await asyncio.to_thread(create_and_prepare_variable)
+            else:
+                tpl = state.create_template(body, actor=sess["username"], owner_id=owner_id, template_id=template_id)
         except BizError as exc:
             return biz_error_response(exc)
         except IntegrityError as exc:
@@ -1407,7 +1509,10 @@ def create_admin_router(
                 return previous
             raise
         result = {"ok": True, "template_id": tpl["template_id"], "template": tpl}
-        if push_on_create:
+        if prep:
+            result["push"] = _accept_template_push(tpl["template_id"], background_tasks, scheduler, prep,
+                                                   sess["username"], prep["pushed_at"], False)
+        elif push_on_create:
             queued = await _queue_template_push(tpl["template_id"], request, background_tasks, sess["username"])
             result["push"] = ({"queued": False, **json.loads(queued.body)}
                               if isinstance(queued, JSONResponse) else queued)
@@ -1423,7 +1528,12 @@ def create_admin_router(
         tpl = state.get_template(template_id, include_deleted=False)
         if not tpl:
             return error_response(404, "NOT_FOUND", "任务模板不存在")
-        return {"ok": True, "template": tpl}
+        admin = _admin_profile(state, sess)
+        if not _is_super_admin(admin) and tpl["owner_id"] != admin["id"]:
+            return error_response(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
+        if _is_super_admin(admin):
+            tpl = summarize_template(tpl)
+        return JSONResponse({"ok": True, "template": tpl}, headers={"Cache-Control": "no-store"})
 
     @router.put("/templates/{template_id}")
     async def update_template(template_id: str, request: Request):
@@ -1438,7 +1548,7 @@ def create_admin_router(
         if _scope_err is not None:
             return _scope_err
         try:
-            tpl = state.update_template(template_id, body, actor=sess["username"])
+            tpl = state.update_template(template_id, body, actor=sess["username"], owner_id=int(_admin["id"]))
         except BizError as exc:
             return biz_error_response(exc)
         return {"ok": True, "template": tpl}
@@ -1592,7 +1702,8 @@ def create_admin_router(
         assert sess is not None
 
         try:
-            stats = state.preview_template_targets(template_id)
+            admin = _admin_profile(state, sess)
+            stats = state.preview_template_targets(template_id, owner_id=_owner_filter(admin, None))
         except BizError as exc:
             return biz_error_response(exc)
         return {
@@ -1621,7 +1732,8 @@ def create_admin_router(
                 "请由创建该模板的分级管理员推送",
             )
         return await _queue_template_push(template_id, request, background_tasks, sess["username"],
-                                         confirmed=confirmed, skip_completed=skip_completed)
+                                         confirmed=confirmed, skip_completed=skip_completed,
+                                         owner_id=int(_admin["id"]))
 
     @router.get("/templates/{template_id}/push-preview")
     async def push_preview(template_id: str, request: Request):
@@ -1640,22 +1752,31 @@ def create_admin_router(
             return error_response(404, "NOT_FOUND", "任务模板不存在")
         if _is_super_admin(_admin):
             return error_response(403, "SUPER_ADMIN_READONLY", "请由创建该模板的分级管理员查看")
+        if _tpl["owner_id"] != _admin["id"]:
+            return error_response(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
         canonical = "once" if _tpl.get("is_manual") else canonical_period_key(_tpl, state.now())
-        info = state.push_skip_completed_preview(template_id, canonical)
+        try:
+            info = state.push_skip_completed_preview(template_id, canonical)
+        except BizError as exc:
+            return biz_error_response(exc)
         return {"ok": True, **info}
 
     async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks,
-                                  actor: str, confirmed: bool = False, skip_completed: bool = False):
+                                  actor: str, confirmed: bool = False, skip_completed: bool = False,
+                                  owner_id: Optional[int] = None):
         # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
         _tpl = state.get_template(template_id, include_deleted=False)
         if not _tpl or _tpl.get("deleted"):
             return error_response(404, "NOT_FOUND", "任务模板不存在")
+        if owner_id is not None and _tpl["owner_id"] != owner_id:
+            return error_response(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
         if not _tpl.get("enabled"):
             return error_response(404, "NOT_FOUND", "任务模板已停用，请先启用再推送")
         if _tpl.get("kind") == "notice" and not _tpl.get("is_manual"):
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         if _tpl.get("is_adhoc"):
             return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
+        variable = bool(variable_notice_config(_tpl))
 
         # 2026-11-19 需求一：本周期/历史上已推送过 → 先回一次「要不要新建批次」。
         # ⚠ 预检只读：不写冷却 marker、不建实例、不发消息；前端确认后带 ?confirmed=1 再来。
@@ -1667,11 +1788,12 @@ def create_admin_router(
             canonical = "once" if _tpl.get("is_manual") else canonical_period_key(_tpl, state.now())
             try:
                 info = state.manual_push_repush_info(template_id, canonical)
+                if info["pushed_before"] and not confirmed:
+                    preview = state.push_skip_completed_preview(template_id, info["canonical_key"])
             except BizError as exc:
                 return biz_error_response(exc)
             if info["pushed_before"] and not confirmed:
                 # 2026-11-21 需求二：预检同样按 skip_completed 口径给出「本轮实际推送人数」。
-                preview = state.push_skip_completed_preview(template_id, info["canonical_key"])
                 return {
                     "ok": True, "needs_confirm": True,
                     "target_count": (preview["unfinished"] if skip_completed else info["target_count"]),
@@ -1683,13 +1805,16 @@ def create_admin_router(
             reprocess = bool(info["pushed_before"] and confirmed)
 
         # 软护栏：同模板 3 秒内拒绝重复推送（防手抖双击，2026-11-20 由 2 分钟下调）；通过即记 marker 占位
-        try:
-            guard = state.check_manual_push_cooldown(template_id, actor=actor)
-        except BizError as exc:
-            return biz_error_response(exc)
+        if not variable:
+            try:
+                guard = state.check_manual_push_cooldown(template_id, actor=actor)
+            except BizError as exc:
+                return biz_error_response(exc)
 
         scheduler = getattr(request.app.state, "scheduler", None)
         if scheduler is None or not callable(getattr(scheduler, "push_now", None)):
+            if variable:
+                return error_response(503, "PUSH_UNAVAILABLE", "调度器未就绪，请稍后重试")
             state.record_reminder_log(
                 template_id=template_id, instance_id=None, phone=actor,
                 kind="manual_push", planned_at=guard["attempted_at"], attempted_at=guard["attempted_at"],
@@ -1705,13 +1830,16 @@ def create_admin_router(
         try:
             prep = await asyncio.to_thread(
                 scheduler.push_now_prepare, template_id, actor=actor, reprocess=reprocess,
-                skip_completed=skip_completed)
+                skip_completed=skip_completed, **({"reserve_variable_push": True} if variable else {}))
         except BizError as exc:
             return biz_error_response(exc)
         except Exception:  # noqa: BLE001
             logger.exception("push_now prepare 异常 template=%s", template_id)
             return error_response(500, "PUSH_FAILED", "推送准备阶段异常，请稍后重试")
+        attempted_at = prep["pushed_at"] if variable else guard["attempted_at"]
+        return _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at, skip_completed)
 
+    def _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at, skip_completed):
         def _bg_deliver() -> None:
             """后台投递（线程池执行，事件循环零阻塞）；成功/异常都留痕，绝不向响应传播。"""
             try:
@@ -1721,10 +1849,10 @@ def create_admin_router(
                 try:
                     state.record_reminder_log(
                         template_id=template_id, instance_id=None, phone=actor,
-                        kind="manual_push", planned_at=guard["attempted_at"],
-                        attempted_at=guard["attempted_at"], sent_at=None, result="failed",
+                        kind="manual_push", planned_at=attempted_at,
+                        attempted_at=attempted_at, sent_at=None, result="failed",
                         error=f"BACKGROUND_PUSH_FAILED:{str(exc)[:100]}", retry=0,
-                        idem_key=f"push_bg_failed|{template_id}|{guard['attempted_at']}",
+                        idem_key=f"push_bg_failed|{template_id}|{attempted_at}",
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception("push_now 后台失败留痕异常 template=%s", template_id)
@@ -1732,7 +1860,7 @@ def create_admin_router(
             state.write_audit(
                 username=actor, action="template.push_now", target_type="task_template",
                 target_id=template_id,
-                detail={"pushed_at": guard["attempted_at"], "stats": stats,
+                detail={"pushed_at": attempted_at, "stats": stats,
                         "new_batch": prep.get("new_batch", False),
                         "synced_completed": prep.get("synced_completed", 0)},
             )
@@ -1742,14 +1870,14 @@ def create_admin_router(
         state.write_audit(
             username=actor, action="template.push_now", target_type="task_template",
             target_id=template_id,
-            detail={"phase": "dispatch", "pushed_at": guard["attempted_at"],
+            detail={"phase": "dispatch", "pushed_at": attempted_at,
                     "period_key": prep["period_key"], "instance_count": prep["instance_count"],
                     "new_batch": prep.get("new_batch", False),
                     "synced_completed": prep.get("synced_completed", 0),
                     "skip_completed": bool(skip_completed)},
         )
         return {
-            "ok": True, "queued": True, "pushed_at": guard["attempted_at"],
+            "ok": True, "queued": True, "pushed_at": attempted_at,
             "period_key": prep["period_key"], "deadline_at": prep["deadline_at"],
             "instance_count": prep["instance_count"],
             "new_batch": bool(prep.get("new_batch", False)),
@@ -2712,7 +2840,7 @@ def create_admin_router(
         return {
             "ok": True,
             "instance": inst,
-            "template": tpl,
+            "template": summarize_template(tpl),
             "submissions": submissions,
             "submission_timeline": state.submission_timeline(instance_id, submissions),
             "submission": submission_view,
@@ -3193,8 +3321,17 @@ def create_admin_router(
             raise BizError(403, "SUPER_ADMIN_FORBIDDEN", "任务数据统计仅对分级管理员开放")
         return admin
 
+    def _stats_panel_owner(sess: Dict[str, Any], template_id: str) -> int:
+        admin = _admin_profile(state, sess)
+        if not _is_super_admin(admin):
+            return int(admin["id"])
+        tpl = state.get_template(template_id)
+        if tpl and variable_notice_config(tpl):
+            return tpl["owner_id"]
+        raise BizError(403, "SUPER_ADMIN_FORBIDDEN", "超级管理员可查看变量通知的回执统计")
+
     @router.get("/stats-panel/tasks")
-    async def stats_panel_tasks(request: Request, platform: Optional[str] = None):
+    async def stats_panel_tasks(request: Request, platform: Optional[str] = None, variable_only: bool = False):
         """单任务选择器沿用模板的属主与平台范围。"""
         from ..notice_media import notice_receipt_config
 
@@ -3203,10 +3340,10 @@ def create_admin_router(
             return err
         assert sess is not None
         try:
-            admin = _require_stats_panel_admin(sess)
+            admin = _admin_profile(state, sess) if variable_only else _require_stats_panel_admin(sess)
             res = state.list_templates(
                 q=None, kind=None, enabled=None, page=1, size=500,
-                platform=platform, owner_id=int(admin.get("id") or 0),
+                platform=platform, owner_id=_owner_filter(admin, None), variable_only=variable_only,
             )
             items = []
             for t in res["items"]:
@@ -3249,9 +3386,8 @@ def create_admin_router(
             return err
         assert sess is not None
         try:
-            admin = _require_stats_panel_admin(sess)
             data = state.stats_panel_overview(
-                template_id, period_key, int(admin.get("id") or 0),
+                template_id, period_key, _stats_panel_owner(sess, template_id),
                 dept_path=(dept_path or "").strip(),
             )
             return data
@@ -3275,9 +3411,8 @@ def create_admin_router(
             return err
         assert sess is not None
         try:
-            admin = _require_stats_panel_admin(sess)
             return state.stats_panel_instances(
-                template_id, period_key, int(admin.get("id") or 0),
+                template_id, period_key, _stats_panel_owner(sess, template_id),
                 dept_path=(dept_path or "").strip(),
                 status_group=(status_group or "all").strip().lower(),
                 q=(q or "").strip(), page=page, size=size,
@@ -3323,10 +3458,9 @@ def create_admin_router(
             return err
         assert sess is not None
         try:
-            admin = _require_stats_panel_admin(sess)
             bundle = await asyncio.to_thread(
                 state.stats_panel_export_rows,
-                template_id, period_key, int(admin.get("id") or 0), dept_path=dept_path,
+                template_id, period_key, _stats_panel_owner(sess, template_id), dept_path=dept_path,
             )
         except BizError as exc:
             return biz_error_response(exc)
@@ -3356,8 +3490,7 @@ def create_admin_router(
             return err
         assert sess is not None
         try:
-            admin = _require_stats_panel_admin(sess)
-            state.stats_panel_guard_template(template_id, int(admin.get("id") or 0))
+            state.stats_panel_guard_template(template_id, _stats_panel_owner(sess, template_id))
             return {"ok": True, "items": state.list_push_batches(template_id)}
         except BizError as exc:
             return biz_error_response(exc)

@@ -29,7 +29,9 @@ import {
   BarChart3,
 } from 'lucide-react';
 import { api, plainError } from '../../lib/api';
+import { ApiRequestError } from '../../lib/realApi';
 import { AdminScopeHeader } from './AdminScopeHeader';
+import { VariableNoticeFields, VariableNoticeIssues, VariableNoticeValidation, normalizeVariableBody } from './VariableNoticeFields';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import {
@@ -39,6 +41,8 @@ import {
   NoticeReceiptMode,
   TemplateItem,
   UploadH5Module,
+  VariableNoticeConfig,
+  VariableNoticeIssue,
   getTemplateRoleIds,
 } from '../../lib/types';
 
@@ -535,13 +539,20 @@ export const TemplatesView: React.FC = () => {
   /* 2026-11-21 需求二：推送弹窗「过滤本周期已完成 / 已回执成员」开关（默认开启）与实时人数 */
   const [skipCompleted, setSkipCompleted] = useState(true);
   const [pushPreview, setPushPreview] = useState<{ total: number; completed: number; unfinished: number } | null>(null);
+  const [pushIssues, setPushIssues] = useState<VariableNoticeIssue[]>([]);
   useEffect(() => {
     const tpl = pushConfirmTpl || repushConfirm?.tpl;
+    setPushIssues([]);
     if (!tpl) { setPushPreview(null); return; }
     let live = true;
     api.get<{ total: number; completed: number; unfinished: number }>(
       `/api/admin/templates/${tpl.id}/push-preview`,
-    ).then(res => { if (live) setPushPreview(res); }).catch(() => { if (live) setPushPreview(null); });
+    ).then(res => { if (live) setPushPreview(res); }).catch(err => {
+      if (live) {
+        setPushPreview(null);
+        if (err instanceof ApiRequestError) setPushIssues(err.issues || []);
+      }
+    });
     return () => { live = false; };
   }, [pushConfirmTpl, repushConfirm]);
 
@@ -577,6 +588,15 @@ export const TemplatesView: React.FC = () => {
   const [noticeItems, setNoticeItems] = useState<NoticeMessageItem[]>([]);
   const [noticeKinds, setNoticeKinds] = useState<NoticeContentFormat[]>(['text']);
   const [noticeText, setNoticeText] = useState(DEFAULT_NOTICE_TEXT);
+  const [hasVariableTable, setHasVariableTable] = useState(false);
+  const [variableResult, setVariableResult] = useState<(VariableNoticeValidation & { body: string })>();
+  const [variableIssues, setVariableIssues] = useState<VariableNoticeIssue[]>([]);
+  const [variableBusy, setVariableBusy] = useState(false);
+  const [sampleIndex, setSampleIndex] = useState(0);
+  const variableRequest = useRef(0);
+  const variableEnabled = kind === 'notice' && isManual && hasVariableTable;
+  const variableValidation = variableEnabled && variableResult?.body === normalizeVariableBody(noticeText)
+    && variableResult.config.platform === platform ? variableResult : undefined;
   const [receiptEnabled, setReceiptEnabled] = useState(false);
   const [receiptMode, setReceiptMode] = useState<NoticeReceiptMode>('link');
   const [receiptPhrase, setReceiptPhrase] = useState(DEFAULT_RECEIPT);
@@ -669,6 +689,7 @@ export const TemplatesView: React.FC = () => {
       toast.warning('超级管理员仅负责全平台查看与监管，不可创建任务，请登录分级管理员账号创建');
       return;
     }
+    resetVariableDraft(false);
     setEditingTpl(null);
     setName('');
     setKind(defaultKind);
@@ -712,6 +733,8 @@ export const TemplatesView: React.FC = () => {
   };
 
   const openEditModal = (tpl: TemplateItem) => {
+    const variable = Boolean(tpl.spec?.variable_notice);
+    resetVariableDraft(variable);
     setEditingTpl(tpl);
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
@@ -758,6 +781,7 @@ export const TemplatesView: React.FC = () => {
       }
       const body = summarizeNoticeItemsToText(items) || tpl.text_tpl || '';
       setNoticeText(body.replace(/\\r\\n|\\n/g, '\n'));
+      if (variable) void validateVariableDraft(body, String(tpl.id));
       setNoticeItems(items.filter(item => item.format !== 'text'));
       setNoticeKinds(NOTICE_KINDS.filter(key => key === 'text' ? Boolean(body) : items.some(item => item.format === key)));
       setReceiptEnabled(tpl.spec?.notice_receipt?.enabled === true);
@@ -823,7 +847,7 @@ export const TemplatesView: React.FC = () => {
     try {
       const nextEnabled = !tpl.enabled;
       const tplRoleIds = getTemplateRoleIds(tpl);
-      await api.put(`/api/admin/templates/${tpl.id}`, {
+      await api.put(`/api/admin/templates/${tpl.id}`, tpl.spec?.variable_notice ? { enabled: nextEnabled } : {
         name: tpl.name,
         role_id: tplRoleIds[0] || tpl.role_id,
         role_ids: tplRoleIds,
@@ -859,6 +883,50 @@ export const TemplatesView: React.FC = () => {
     }
   };
 
+  function resetVariableDraft(enabled: boolean) {
+    variableRequest.current += 1;
+    setHasVariableTable(enabled);
+    setVariableBusy(false);
+    setVariableIssues([]);
+    setVariableResult(undefined);
+    setSampleIndex(0);
+  }
+
+  async function validateVariableDraft(rawBody: string, source: File | string) {
+    const request = ++variableRequest.current;
+    const body = normalizeVariableBody(rawBody);
+    setVariableBusy(true);
+    setVariableIssues([]);
+    setVariableResult(undefined);
+    try {
+      let payload: FormData | { body: string; config: VariableNoticeConfig };
+      if (typeof source === 'string') {
+        const { template } = await api.get<{ template: { spec_json: { variable_notice: VariableNoticeConfig } } }>(
+          `/api/admin/templates/${source}`,
+        );
+        if (request !== variableRequest.current) return;
+        payload = { body, config: template.spec_json.variable_notice };
+      } else {
+        payload = new FormData();
+        payload.append('file', source);
+        payload.append('body', body);
+        payload.append('platform', platform);
+      }
+      const result = await api.post<VariableNoticeValidation>('/api/admin/variable-notices/validate', payload);
+      if (request === variableRequest.current) {
+        setVariableResult({ ...result, body });
+        setSampleIndex(0);
+      }
+    } catch (err) {
+      if (request !== variableRequest.current) return;
+      const issues = err instanceof ApiRequestError ? err.issues : undefined;
+      if (issues?.length) setVariableIssues(issues);
+      else toast.error(err instanceof Error ? plainError(err.message) : '变量表格校验失败');
+    } finally {
+      if (request === variableRequest.current) setVariableBusy(false);
+    }
+  }
+
   const handleSaveTemplate = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
@@ -881,6 +949,11 @@ export const TemplatesView: React.FC = () => {
     }
 
     const activeNoticeItems = noticeItems.filter(item => noticeKinds.includes(item.format));
+    if (variableEnabled && !variableValidation) {
+      toast.warning('请先上传变量表格并通过校验');
+      return;
+    }
+    const selectedRoles = variableEnabled ? [] : roleIds;
     let finalTextTpl = '';
     let spec: Record<string, any> = {};
 
@@ -906,6 +979,7 @@ export const TemplatesView: React.FC = () => {
       finalTextTpl = noticeKinds.includes('text') ? noticeText.trim() : '';
       spec = {
         require_review: false,
+        ...(variableValidation ? { variable_notice: variableValidation.config } : {}),
         notice_items: [
           ...(finalTextTpl ? [{ id: 'notice_text', format: 'text', text_content: finalTextTpl }] : []),
           ...activeNoticeItems,
@@ -977,8 +1051,8 @@ export const TemplatesView: React.FC = () => {
       if (editingTpl) {
         await api.put(`/api/admin/templates/${editingTpl.id}`, {
           name: name.trim(),
-          role_id: roleIds[0],
-          role_ids: roleIds,
+          role_id: selectedRoles[0],
+          role_ids: selectedRoles,
           remind_at: isAdhoc || isManual ? '' : remindAt.trim(),
           is_adhoc: kind !== 'notice' && isAdhoc,
           ...manualConfig,
@@ -1006,7 +1080,9 @@ export const TemplatesView: React.FC = () => {
         await refreshTemplates();
         setModalOpen(false);
         toast.success(
-          `任务模板「${name.trim()}」已更新保存（共关联 ${roleIds.length} 个业务角色）。`,
+          variableValidation
+            ? `已保存「${name.trim()}」及 ${variableValidation.config.rows.length} 人的变量表格。`
+            : `任务模板「${name.trim()}」已更新保存（共关联 ${roleIds.length} 个业务角色）。`,
           '编辑已保存',
         );
       } else {
@@ -1014,8 +1090,8 @@ export const TemplatesView: React.FC = () => {
           name: name.trim(),
           kind: kind === 'notice' ? 'notice' : 'upload',
           period: 'day',
-          role_id: roleIds[0],
-          role_ids: roleIds,
+          role_id: selectedRoles[0],
+          role_ids: selectedRoles,
           remind_at: isAdhoc || isManual ? '' : remindAt.trim(),
           is_adhoc: kind !== 'notice' && isAdhoc,
           ...manualConfig,
@@ -1050,6 +1126,10 @@ export const TemplatesView: React.FC = () => {
         await refreshTemplates().catch(() => toast.warning('模板列表刷新失败，可刷新页面查看。'));
       }
     } catch (err) {
+      if (err instanceof ApiRequestError && err.issues?.length) {
+        setVariableResult(undefined);
+        setVariableIssues(err.issues);
+      }
       toast.error(err instanceof Error ? plainError(err.message) : '保存模板未成功');
     } finally {
       setSaving(false);
@@ -1112,6 +1192,7 @@ export const TemplatesView: React.FC = () => {
       setPushConfirmTpl(null);
     } catch (err) {
       // 429 冷却（3 秒内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
+      if (err instanceof ApiRequestError && err.issues?.length) setPushIssues(err.issues);
       toast.error(err instanceof Error ? plainError(err.message) : '推送未成功');
     } finally {
       setPushingId(null);
@@ -1147,6 +1228,7 @@ export const TemplatesView: React.FC = () => {
       }
       setRepushConfirm(null);
     } catch (err) {
+      if (err instanceof ApiRequestError && err.issues?.length) setPushIssues(err.issues);
       toast.error(err instanceof Error ? plainError(err.message) : '重推未成功');
     } finally {
       setPushingId(null);
@@ -1298,7 +1380,7 @@ export const TemplatesView: React.FC = () => {
                         <div className="flex flex-wrap items-center gap-1.5 max-w-[240px]">
                           {tplRoleIds.length === 0 ? (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 font-semibold text-xs">
-                              未分配角色
+                              {tpl.spec?.variable_notice ? `变量表格 · ${tpl.spec.variable_notice.count} 人` : '未分配角色'}
                             </span>
                           ) : (
                             tplRoleIds.map((rid) => (
@@ -1609,7 +1691,7 @@ export const TemplatesView: React.FC = () => {
                     </div>
 
                     {/* 所属角色（支持多选） */}
-                    <div className="sm:col-span-2">
+                    {!variableEnabled && <div className="sm:col-span-2">
                       <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
                         <label className="font-semibold text-slate-700 flex items-center gap-1.5">
                           <span>所属业务角色（支持多选）</span>
@@ -1680,7 +1762,7 @@ export const TemplatesView: React.FC = () => {
                           );
                         })}
                       </div>
-                    </div>
+                    </div>}
 
                     {/* 任务类型切换 */}
                     <div>
@@ -1697,6 +1779,7 @@ export const TemplatesView: React.FC = () => {
                         disabled={Boolean(editingTpl)}
                           onChange={(e) => {
                           setKind(e.target.value as 'notice' | 'upload');
+                          if (e.target.value !== 'notice') resetVariableDraft(false);
                           if (e.target.value === 'notice') setIsAdhoc(false);
                         }}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-slate-800 outline-none focus:bg-white focus:border-blue-500 disabled:opacity-65 disabled:cursor-not-allowed font-semibold"
@@ -1712,13 +1795,26 @@ export const TemplatesView: React.FC = () => {
                         onChange={(event) => {
                           setIsManual(event.target.value === 'manual');
                           if (event.target.value === 'manual') setIsAdhoc(false);
-                          else setPushOnCreate(false);
+                          else {
+                            setPushOnCreate(false);
+                            resetVariableDraft(false);
+                          }
                         }}
                         className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-slate-800 disabled:opacity-70">
                         <option value="scheduled">定时推送</option>
-                        <option value="manual">立即推送</option>
+                        <option value="manual">一次性立即推送</option>
                       </select>
                     </label>
+                    {kind === 'notice' && isManual && (
+                      <label className="flex cursor-pointer items-center gap-2 font-semibold text-slate-700 sm:col-span-2">
+                        <input type="checkbox" className="accent-blue-700" checked={hasVariableTable}
+                          onChange={event => {
+                            resetVariableDraft(event.target.checked);
+                            if (event.target.checked) setNoticeKinds(current => current.includes('text') ? current : [...current, 'text']);
+                          }} />
+                        启用变量表格（千人千面）
+                      </label>
+                    )}
 
                     {kind === 'upload' && !isManual && (
                       <div className="sm:col-span-2 -mt-1">
@@ -1974,6 +2070,7 @@ export const TemplatesView: React.FC = () => {
                           {NOTICE_KINDS.map(key => <label key={key}
                             className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-200 px-3 py-2">
                             <input type="checkbox" className="accent-blue-700" checked={noticeKinds.includes(key)}
+                              disabled={variableEnabled && key === 'text'}
                               onChange={event => setNoticeKinds(current => event.target.checked
                                 ? [...current, key] : current.filter(value => value !== key))} />
                             {NOTICE_LABELS[key]}
@@ -1983,8 +2080,14 @@ export const TemplatesView: React.FC = () => {
                       {noticeKinds.includes('text') && <label className="block space-y-2 font-semibold">
                         <span>通知正文</span>
                         <textarea rows={4} value={noticeText} onChange={event => setNoticeText(event.target.value)}
+                          placeholder={variableEnabled ? '{姓名}您好，您本月得分 {得分} 分' : undefined}
                           className="w-full rounded-xl border border-slate-200 bg-white p-3 font-normal outline-none focus:border-blue-500" />
                       </label>}
+                      {variableEnabled && <VariableNoticeFields body={noticeText} issues={variableIssues}
+                        validation={variableValidation} busy={variableBusy} onUpload={file => validateVariableDraft(noticeText, file)} />}
+                      {variableEnabled && variableResult && !variableValidation && (
+                        <p className="text-xs text-amber-800">正文已修改，请重新导入表格校验。</p>
+                      )}
                       {(Object.keys(NOTICE_UPLOADS) as NoticeAttachmentKind[]).filter(key => noticeKinds.includes(key)).map(key =>
                         <fieldset key={key} className="space-y-2 rounded-xl border border-slate-200 p-3">
                           <legend className="px-1 font-semibold">{NOTICE_LABELS[key]}附件</legend>
@@ -2230,13 +2333,25 @@ export const TemplatesView: React.FC = () => {
                     />
                   </div>
                 )}
-                {kind === 'notice' && platform === 'zdxlz' && (
-                  <div className="lg:col-span-5"><NoticePhonePreview body={noticeKinds.includes('text') ? noticeText : ''}
-                    media={noticeItems.filter(item => noticeKinds.includes(item.format))}
-                    mode={receiptMode}
-                    label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''}
-                    guide={receiptEnabled && receiptMode === 'link' ? receiptGuideText : ''}
-                    title={name} /></div>
+                {kind === 'notice' && (platform === 'zdxlz' || variableEnabled) && (
+                  <div className="space-y-2 lg:col-span-5">
+                    {variableValidation && <label className="flex flex-wrap items-center gap-2 text-xs font-semibold text-slate-700">
+                      专属消息预览
+                      <select value={sampleIndex} onChange={event => setSampleIndex(Number(event.target.value))}
+                        className="rounded-lg border border-slate-200 bg-white px-2 py-1.5">
+                        {variableValidation.samples.map((sample, index) => <option key={sample.phone} value={index}>
+                          {sample.name}（尾号 {sample.phone.slice(-4)}）
+                        </option>)}
+                      </select>
+                    </label>}
+                    <NoticePhonePreview
+                      body={variableEnabled ? variableValidation?.samples[sampleIndex]?.body || '' : noticeKinds.includes('text') ? noticeText : ''}
+                      media={noticeItems.filter(item => noticeKinds.includes(item.format))}
+                      mode={receiptMode}
+                      label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''}
+                      guide={receiptEnabled && receiptMode === 'link' ? receiptGuideText : ''}
+                      title={name} />
+                  </div>
                 )}
               </div>
 
@@ -2250,7 +2365,7 @@ export const TemplatesView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  disabled={saving || uploadingAssetId !== null}
+                  disabled={saving || uploadingAssetId !== null || (variableEnabled && !variableValidation)}
                   className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
                 >
                   {saving ? '正在保存…' : editingTpl ? '保存修改' : isManual && pushOnCreate ? '创建并推送' : '确认创建'}
@@ -2324,6 +2439,7 @@ export const TemplatesView: React.FC = () => {
               preview={pushPreview}
               fallbackTotal={pushConfirmTpl.is_manual ? undefined : undefined}
             />
+            <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setPushConfirmTpl(null)}
@@ -2333,7 +2449,7 @@ export const TemplatesView: React.FC = () => {
               </button>
               <button
                 onClick={handleConfirmPush}
-                disabled={pushingId === pushConfirmTpl.id}
+                disabled={pushingId === pushConfirmTpl.id || Boolean(pushIssues.length)}
                 className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
               >
                 {pushingId === pushConfirmTpl.id ? '推送中…' : '确认推送'}
@@ -2356,13 +2472,16 @@ export const TemplatesView: React.FC = () => {
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-xs text-slate-600 leading-relaxed">
+            {repushConfirm.tpl.spec?.variable_notice ? <p className="text-xs text-slate-600 leading-relaxed">
+              将按已保存的变量表格重新推送专属通知，本次涉及 {repushConfirm.targetCount} 人。
+            </p> : <p className="text-xs text-slate-600 leading-relaxed">
               将向当前角色（{repushConfirm.targetCount} 人）再次推送本周期任务；
               <br />
               （已完成/已回执与已过截止的成员照常收到消息，但链接只读回顾、不会再回到待办；
               未完成成员正常提交；待办与统计按本周期自动去重）
-            </p>
+            </p>}
             <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
+            <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
                 onClick={() => setRepushConfirm(null)}
@@ -2372,7 +2491,7 @@ export const TemplatesView: React.FC = () => {
               </button>
               <button
                 onClick={handleConfirmRepush}
-                disabled={pushingId === repushConfirm.tpl.id}
+                disabled={pushingId === repushConfirm.tpl.id || Boolean(pushIssues.length)}
                 className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-semibold text-xs cursor-pointer disabled:opacity-60"
               >
                 {pushingId === repushConfirm.tpl.id ? '重推中…' : '确认重推'}

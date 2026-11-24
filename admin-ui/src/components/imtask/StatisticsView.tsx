@@ -225,19 +225,21 @@ export function SubmissionPreview({ content, onImageClick }: {
   );
 }
 
-export function StatisticsView() {
+export function StatisticsView({ variableOnly = false }: { variableOnly?: boolean }) {
   const { me, platform, statsFocus, setStatsFocus } = useAppStore();
   const storageKey = `imtask:stats-task:${me.id ?? me.username}:${platform}`;
-  return <StatisticsCatalog key={storageKey} storageKey={storageKey} platform={platform}
+  return <StatisticsCatalog key={storageKey} storageKey={storageKey} platform={platform} variableOnly={variableOnly}
     focusId={statsFocus.id} focusVersion={statsFocus.seq} onTaskChange={setStatsFocus} />;
 }
 
-function StatisticsCatalog({ platform, focusId, focusVersion, storageKey, onTaskChange }: {
-  platform: string; focusId: string; focusVersion: number; storageKey: string; onTaskChange: (id: string) => void;
+function StatisticsCatalog({ platform, focusId, focusVersion, storageKey, variableOnly, onTaskChange }: {
+  platform: string; focusId: string; focusVersion: number; storageKey: string; variableOnly: boolean; onTaskChange: (id: string) => void;
 }) {
   const [rememberedId] = useState(() => sessionStorage.getItem(storageKey));
   const [revision, setRevision] = useState(0);
-  const catalog = usePanelQuery<{ items: PanelTask[] }>('/api/admin/stats-panel/tasks?platform=' + encodeURIComponent(platform), revision);
+  const catalog = usePanelQuery<{ items: PanelTask[] }>(
+    '/api/admin/stats-panel/tasks?platform=' + encodeURIComponent(platform) + (variableOnly ? '&variable_only=1' : ''), revision,
+  );
   const tasks = catalog.data?.items ?? [];
   const task = tasks.find((item) => item.template_id === focusId)
     ?? tasks.find((item) => item.template_id === rememberedId) ?? tasks[0];
