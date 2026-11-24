@@ -8,9 +8,10 @@ export interface DeptTreeNode {
   children: DeptTreeNode[];
 }
 
-export function DepartmentTree({ nodes, selected, onSelect }: {
+export function DepartmentTree({ nodes, selected, checkedPaths, onSelect }: {
   nodes: DeptTreeNode[];
   selected?: string;
+  checkedPaths?: ReadonlySet<string>;
   onSelect?: (path: string) => void;
 }) {
   const [expanded, setExpanded] = useState(() => new Set(nodes.flatMap(function ancestors(node): string[] {
@@ -20,7 +21,7 @@ export function DepartmentTree({ nodes, selected, onSelect }: {
   const render = (branch: DeptTreeNode[]): React.ReactNode => branch.map((node) => {
     const hasChildren = node.children.length > 0;
     const isExpanded = expanded.has(node.path);
-    const active = selected === node.path;
+    const active = checkedPaths ? checkedPaths.has(node.path) : selected === node.path;
     const rowClass = `flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs ${active ? 'bg-blue-50 text-blue-700' : ''}`;
     const label = <>
       {hasChildren && <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 shrink-0 ${isExpanded ? 'rotate-90' : ''}`} />}
@@ -41,12 +42,19 @@ export function DepartmentTree({ nodes, selected, onSelect }: {
               })}>
               {label}
             </button>
-          ) : onSelect ? (
+          ) : onSelect && !checkedPaths ? (
             <button type="button" aria-pressed={active} onClick={() => onSelect(node.path)} className={`${rowClass} hover:bg-blue-50 cursor-pointer`}>
               {label}{active && <Check className="h-3.5 w-3.5 shrink-0" />}
             </button>
           ) : <div className={rowClass}>{label}</div>}
-          {hasChildren && onSelect && (
+          {checkedPaths && onSelect ? (
+            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-slate-600 hover:bg-slate-50">
+              <input type="checkbox" checked={active}
+                aria-label={`勾选${node.name}${hasChildren ? '（含全部下级）' : ''}`}
+                onChange={() => onSelect(node.path)} />
+              {hasChildren && '含下级'}
+            </label>
+          ) : hasChildren && onSelect && (
             <button type="button" aria-label={`选择${node.name}`} aria-pressed={active} onClick={() => onSelect(node.path)}
               className="shrink-0 rounded-lg px-2 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50 cursor-pointer">
               {active ? '已选' : '选择'}

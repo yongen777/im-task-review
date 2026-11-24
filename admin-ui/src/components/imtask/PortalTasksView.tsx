@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Building2, Check, ChevronDown, ChevronLeft, ChevronRight, Download, Plus, RefreshCw, Search, Users, X } from 'lucide-react';
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, Plus, RefreshCw, Search, Users, X } from 'lucide-react';
 import { plainError } from '../../lib/api';
 import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
@@ -24,102 +24,23 @@ export async function portalAdminRequest(path: string, method = 'GET', body?: un
   return data;
 }
 
-type Department = { dept_id: string; name: string; has_children?: boolean; member_count?: number };
+type GrantDepartment = { dept_id: string; name: string; parent_id: string; member_count: number };
 type ScopeOptions = {
   roles: Array<{ role_id: string; name: string }>;
   grant: null | { enabled: number; scope_json: string };
 };
 
-/* ── 2026-11-24 授权部门树：复用「部门架构」同款视觉（> / v 线性折叠箭头 +
-      蓝色楼宇图标 + 左侧缩进引导线 + 右对齐人数 + 复选框），替换旧「+」方框树。
-      数据仍走 grant_options（懒加载下级），children 展开即拉取一次后缓存。 ───── */
-function GrantScopeTree({ roots, selected, toggle, load }: {
-  roots: Department[];
-  selected: string[];
-  toggle: (id: string) => void;
-  load: (id: string) => Promise<Department[]>;
-}) {
-  const [childrenOf, setChildrenOf] = useState<Record<string, Department[]>>({});
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
-  const [loading, setLoading] = useState<Set<string>>(new Set());
-  const [failed, setFailed] = useState<Set<string>>(new Set());
-
-  async function expand(node: Department) {
-    const path = node.dept_id;
-    const nextOpen = !expanded.has(path);
-    setExpanded((current) => {
-      const next = new Set(current);
-      if (nextOpen) next.add(path);
-      else next.delete(path);
-      return next;
-    });
-    if (!nextOpen || childrenOf[path] || loading.has(path)) return;
-    setLoading((current) => new Set(current).add(path));
-    setFailed((current) => { const next = new Set(current); next.delete(path); return next; });
-    try {
-      const children = await load(path);
-      setChildrenOf((current) => ({ ...current, [path]: children }));
-    } catch {
-      setFailed((current) => new Set(current).add(path));
-    } finally {
-      setLoading((current) => { const next = new Set(current); next.delete(path); return next; });
-    }
+function grantDepartmentTree(departments: GrantDepartment[]): DeptTreeNode[] {
+  const nodes = new Map<string, DeptTreeNode>();
+  const roots: DeptTreeNode[] = [];
+  for (const { dept_id, name, member_count } of departments) {
+    nodes.set(dept_id, { name, path: dept_id, count: member_count, children: [] });
   }
-
-  const renderRow = (node: Department): React.ReactNode => {
-    const hasChildren = node.has_children !== false;
-    const isOpen = expanded.has(node.dept_id);
-    const checked = selected.includes(node.dept_id);
-    const busy = loading.has(node.dept_id);
-    const rowBody = <>
-      {hasChildren && <ChevronRight aria-hidden="true" className={`h-3.5 w-3.5 shrink-0 text-slate-400 ${isOpen ? 'rotate-90' : ''}`} />}
-      <Building2 aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-blue-500" />
-      <span className="min-w-0 flex-1 break-words" title={node.dept_id}>{node.name}</span>
-      {typeof node.member_count === 'number'
-        && <span className="shrink-0 text-slate-500 tabular-nums">{node.member_count} 人</span>}
-      <span className="grid size-4 shrink-0 place-items-center rounded border"
-        aria-hidden="true"
-        style={{ borderColor: checked ? '#2563eb' : '#cbd5e1', background: checked ? '#2563eb' : 'transparent' }}>
-        {checked && <Check className="h-3 w-3 text-white" />}
-      </span>
-    </>;
-    return (
-      <li key={node.dept_id}>
-        <div className="flex items-center gap-1">
-          {hasChildren ? (
-            <button type="button" aria-expanded={isOpen} aria-label={`${isOpen ? '收起' : '展开'}${node.name}`}
-              onClick={() => void expand(node)} disabled={busy}
-              className="flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs hover:bg-slate-50 cursor-pointer disabled:opacity-60">
-              {rowBody}
-            </button>
-          ) : (
-            <label className="flex min-w-0 flex-1 grow cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs hover:bg-slate-50">
-              <input type="checkbox" className="sr-only" checked={checked} onChange={() => toggle(node.dept_id)} />
-              {rowBody}
-            </label>
-          )}
-          {hasChildren && (
-            <label className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50">
-              <input type="checkbox" aria-label={`勾选${node.name}（含全部下级）`} checked={checked} onChange={() => toggle(node.dept_id)} />
-              含下级
-            </label>
-          )}
-        </div>
-        {isOpen && hasChildren && (
-          <ul className="ml-4 border-l border-slate-100 pl-2">
-            {failed.has(node.dept_id)
-              ? <li className="py-1.5 text-xs text-rose-700">下级部门读取失败，收起后重试。</li>
-              : busy && !childrenOf[node.dept_id]
-                ? <li role="status" className="py-1.5 text-xs text-slate-500">正在读取下级部门…</li>
-                : (childrenOf[node.dept_id] || []).length
-                  ? (childrenOf[node.dept_id] || []).map(renderRow)
-                  : <li className="py-1.5 text-xs text-slate-500">无下级部门</li>}
-          </ul>
-        )}
-      </li>
-    );
-  };
-  return <ul className="max-h-72 overflow-y-auto overflow-x-hidden py-1">{roots.map(renderRow)}</ul>;
+  for (const { dept_id, parent_id } of departments) {
+    const node = nodes.get(dept_id);
+    if (node) (nodes.get(parent_id)?.children ?? roots).push(node);
+  }
+  return roots;
 }
 
 export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone: string; platform: string; onClose: () => void; onSaved?: () => void }) {
@@ -129,7 +50,7 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
   const [roles, setRoles] = useState<string[]>([]);
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
-  const [departments, setDepartments] = useState<Department[] | null>(null);
+  const [departments, setDepartments] = useState<DeptTreeNode[] | null>(null);
   const [departmentError, setDepartmentError] = useState('');
   const [departmentNames, setDepartmentNames] = useState<Record<string, string>>({});
   const [retry, setRetry] = useState(0);
@@ -151,8 +72,8 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
     setDepartmentError('');
     portalAdminRequest(`${path}&directory=true`).then(d => {
       if (!live) return;
-      setDepartments(d.departments);
-      setDepartmentNames(current => ({ ...current, ...Object.fromEntries(d.selected_departments.map((item: Department) => [item.dept_id, item.name])) }));
+      setDepartments(grantDepartmentTree(d.departments));
+      setDepartmentNames(Object.fromEntries(d.selected_departments.map(({ dept_id, name }: Pick<GrantDepartment, 'dept_id' | 'name'>) => [dept_id, name])));
       if (!options.grant?.enabled && !defaultApplied.current && d.default_dept_ids.length) {
         defaultApplied.current = true;
         setDepts(current => [...new Set([...current, ...d.default_dept_ids])]);
@@ -161,11 +82,6 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
     }).catch(e => { if (live) setDepartmentError(e.name === 'TimeoutError' ? '组织架构读取超时，请重试。' : e.message); });
     return () => { live = false; };
   }, [enabled, options, path, retry]);
-  const load = async (id: string) => {
-    const result = await portalAdminRequest(`${path}&directory=true&parent_id=${encodeURIComponent(id)}`);
-    setDepartmentNames(current => ({ ...current, ...Object.fromEntries(result.departments.map((item: Department) => [item.dept_id, item.name])) }));
-    return result.departments;
-  };
   const toggleId = (current: string[], id: string) => current.includes(id) ? current.filter(x => x !== id) : [...current, id];
   return <div className="fixed inset-0 bg-black/35 flex items-center justify-center z-50 p-4" role="dialog" aria-modal="true" aria-label="H5 创建任务授权">
     <div className="bg-white rounded-xl p-6 w-full max-w-2xl max-h-[85vh] overflow-auto space-y-4 text-slate-900">
@@ -174,21 +90,26 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
         onChange={e => setEnabled(e.target.checked)} />开放创建任务权限</label>
       {!options && !error && <p role="status" className="text-sm text-slate-600">正在读取现有授权…</p>}
       {options && enabled && <>
-        <fieldset disabled={saving} className="grid gap-3 sm:grid-cols-2 text-sm">
-          <section className="rounded-lg border border-slate-200 p-3">
-            <h3 className="font-semibold">组织部门</h3>
+        <fieldset disabled={saving} className="grid gap-3 text-sm sm:grid-cols-[minmax(0,1fr)_11rem]">
+          <section className="min-w-0 rounded-lg border border-slate-200 p-3">
+            <h3 className="font-semibold">部门架构</h3>
             <p className="mb-2 text-slate-500">首次授权默认选中当前部门。选中部门包含全部下级；<strong>不勾选任何部门/角色时自动授权该成员当前所在部门（含全部下级）</strong>。</p>
             {!!depts.length && <ul className="mb-2 flex flex-wrap gap-1">
-              {depts.map(id => <li key={id}><button type="button" aria-label={`移除 ${departmentNames[id] || id}`}
-                onClick={() => setDepts(current => current.filter(did => did !== id))}
-                className="rounded bg-blue-50 px-2 py-1 text-blue-800">{departmentNames[id] || id} ×</button></li>)}
+              {depts.map(id => {
+                const label = departmentNames[id] || id.split('/').join(' / ');
+                return <li key={id}><button type="button" aria-label={`移除 ${label}`}
+                  onClick={() => setDepts(current => current.filter(did => did !== id))}
+                  className="rounded bg-blue-50 px-2 py-1 text-blue-800">{label} ×</button></li>;
+              })}
             </ul>}
             {!departments && !departmentError && <p role="status">正在读取部门架构…</p>}
             {departmentError && <div role="status" className="my-2 rounded bg-amber-50 p-2 text-amber-900">
               {departmentError} <button type="button" onClick={() => setRetry(v => v + 1)} className="underline">重试</button>
             </div>}
-            {departments && <GrantScopeTree roots={departments} selected={depts}
-              toggle={id => setDepts(current => toggleId(current, id))} load={load} />}
+            {departments && (departments.length ? <div className="max-h-72 overflow-y-auto py-1">
+              <DepartmentTree nodes={departments} checkedPaths={new Set(depts)}
+                onSelect={id => setDepts(current => toggleId(current, id))} />
+            </div> : <p className="text-xs text-slate-500">当前可授权名册暂无部门数据</p>)}
           </section>
           <section className="rounded-lg border border-slate-200 p-3">
             <h3 className="font-semibold">角色分组</h3>
