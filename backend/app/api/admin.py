@@ -2189,6 +2189,47 @@ def create_admin_router(
             "global_reused_phones": [_phone] if _global_reused else [],
         }
 
+    @router.post("/roles/{role_id}/members/wecom-bot")
+    async def bind_wecom_bot_member(role_id: str, request: Request):
+        from ..channels.wecom_mcp import WecomMcpError, normalize_department_path
+        from ..state import is_valid_phone
+
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        role = state.get_role(role_id)
+        if (admin.get("role_level") != "sub_admin" or not _platform_allowed(admin, "wecom") or not role
+                or role["platform"] != "wecom" or role["owner_id"] != admin["id"]):
+            return error_response(403, "FORBIDDEN", "仅能绑定自己名下的企微角色")
+        body = await _read_json_body(request)
+        name = str(body.get("name") or "").strip()
+        phone = str(body.get("phone") or "").strip()
+        path = normalize_department_path(body.get("dept_path"))
+        userid = str(body.get("userid") or "").strip()
+        if not name or len(name) > 128 or not is_valid_phone(phone) or not path or len(path) > 1024 or len(userid) > 128:
+            return error_response(400, "VALIDATION_FAILED", "请填写姓名、手机号和企微完整部门路径")
+        mcp = getattr(getattr(state, "wecom_contacts", None), "mcp", None)
+        if mcp is None:
+            return error_response(503, "CONTACTS_QUERY_FAILED", "尚未配置企微机器人的通讯录授权")
+        try:
+            candidates = await asyncio.to_thread(mcp.member_candidates, name, path)
+            if not userid:
+                return {"ok": True, "candidates": candidates}
+            matched = next((item for item in candidates if item["userid"] == userid), None)
+            if matched is None:
+                return error_response(409, "DIRECTORY_CHANGED", "所选企微账号与姓名或部门不匹配，请重新核对")
+            profile = {"external_id": userid, "name": matched["name"], "dept_path": path,
+                       "department": path.rsplit("/", 1)[-1]}
+            member = await asyncio.to_thread(state.add_role_member, role_id, phone, matched["name"],
+                                             source="wecom_mcp", owner_id=admin["id"], actor=sess["username"],
+                                             require_directory=True, verified_wecom_user=profile)
+            return {"ok": True, "member": member}
+        except WecomMcpError as exc:
+            return error_response(503, "CONTACTS_QUERY_FAILED", str(exc))
+        except BizError as exc:
+            return biz_error_response(exc)
+
     @router.get("/members/{phone}/roles")
     async def list_member_roles(phone: str, request: Request):
         """某人当前所在的全部角色（一人多角色：前端弹窗把已加入的角色置灰）。"""

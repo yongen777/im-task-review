@@ -40,11 +40,11 @@ class WecomContacts:
     """企微 userid 反查门面：按凭证择优（getuserid 手机号精确 → MCP 姓名匹配）。"""
 
     def __init__(self, cfg: Any, client: Optional[Any] = None,
-                 mcp: Optional[Any] = None) -> None:
+                 mcp: Optional[Any] = None, *, mcp_only: bool = False) -> None:
         self.cfg = cfg
-        self.corpid = str(getattr(cfg, "wecom_corpid", "") or "").strip()
-        self.secret = str(getattr(cfg, "wecom_secret", "") or "").strip()
-        agentid = str(getattr(cfg, "wecom_agentid", "") or "").strip()
+        self.corpid = "" if mcp_only else str(getattr(cfg, "wecom_corpid", "") or "").strip()
+        self.secret = "" if mcp_only else str(getattr(cfg, "wecom_secret", "") or "").strip()
+        agentid = "" if mcp_only else str(getattr(cfg, "wecom_agentid", "") or "").strip()
         # agentid 对 getuserid 不是必需（只有 message/send 需要）；传空串不报错，只是不可发消息
         self.client = client or WecomClient(self.corpid, agentid, self.secret)
         apikey = str(getattr(cfg, "wecom_mcp_apikey", "") or "").strip()

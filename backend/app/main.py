@@ -142,17 +142,18 @@ def create_apps(
 
         contacts = ZdxlzContacts(cfg, chan)
     store.contacts = contacts
-    # 2026-11-10 企微镜像（导入即激活）：自建应用凭证 或 智能机器人 MCP apikey 任一齐备即装配。
-    # ⚠️ 只走 HTTP（gettoken/getuserid/MCP 通讯录），绝不建 WebSocket —— 不会抢生产 aibot 的长连接。
+    _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
+    wecom_bot_configured = bool(cfg.wecom_bot_id.strip() and cfg.wecom_bot_secret.strip())
+    wecom_bot_mode = wecom_bot_configured or _channel == "wecom_aibot"
+    # 机器人模式使用独立的 MCP 通讯录授权，旧自建应用凭证不参与查询。
     wecom_contacts = None
     if channel is None and state is None and (
-        (cfg.wecom_corpid.strip() and cfg.wecom_secret.strip()) or cfg.wecom_mcp_apikey.strip()
+        cfg.wecom_mcp_apikey.strip() or (not wecom_bot_mode and cfg.wecom_corpid.strip() and cfg.wecom_secret.strip())
     ):
         from .channels.wecom_contacts import WecomContacts  # noqa: PLC0415
 
-        wecom_contacts = WecomContacts(cfg)
+        wecom_contacts = WecomContacts(cfg, mcp_only=wecom_bot_mode)
     store.wecom_contacts = wecom_contacts
-    _channel = str(getattr(cfg, "channel", "zdxlz") or "zdxlz").strip().lower()
 
     # 2026-11-02 多通道并行（用户拍板 B：双绑定双发）：
     # 构建 platform -> notifier 注册表；enabled_channels 决定实际投递哪些平台。
@@ -163,7 +164,7 @@ def create_apps(
     else:
         if chan.configured:
             notifiers["zdxlz"] = chan
-        if cfg.wecom_bot_id.strip() and cfg.wecom_bot_secret.strip():
+        if wecom_bot_configured:
             from .channels.wecom_aibot import WecomAibotNotifier
 
             def _aibot_inbound(user_id: str, msg_text: str, send) -> None:
@@ -283,8 +284,8 @@ def create_apps(
         create_wecom_router(
             store,
             _channel_notifier(notifiers, "wecom", active_notifier),
-            token=getattr(cfg, "wecom_token", ""),
-            aes_key=getattr(cfg, "wecom_aes_key", ""),
+            token="" if wecom_bot_mode else cfg.wecom_token,
+            aes_key="" if wecom_bot_mode else cfg.wecom_aes_key,
             corpid=getattr(cfg, "wecom_corpid", ""),
             public_base_url=cfg.public_base_url,
         )

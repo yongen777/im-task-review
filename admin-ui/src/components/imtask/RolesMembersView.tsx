@@ -23,6 +23,7 @@ import { api, plainError } from '../../lib/api';
 import { DepartmentTree, type DeptTreeNode } from './DepartmentTree';
 import { AdminScopeHeader } from './AdminScopeHeader';
 import { OrgPickerModal } from './OrgPickerModal';
+import { WecomBotMemberForm } from './WecomBotMemberForm';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 
@@ -1162,7 +1163,9 @@ export const RolesMembersView: React.FC = () => {
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  管理该角色下的派单人员名单；添加或导入手机号时自动全局匹配已激活人员，免二次激活
+                  {platform === 'wecom'
+                    ? '企微账号绑定后，员工须先给机器人发一条私聊消息，之后才能收到主动推送。'
+                    : '管理该角色下的派单人员名单；添加或导入手机号时自动全局匹配已激活人员，免二次激活'}
                 </p>
               </div>
 
@@ -1195,7 +1198,7 @@ export const RolesMembersView: React.FC = () => {
                         setImportModalOpen(true);
                       }}
                       className="px-3 py-1.5 rounded-xl bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200/80 font-semibold text-xs flex items-center gap-1.5 cursor-pointer transition-colors shrink-0"
-                      title="手机号必填，姓名选填。核验后自动回填姓名和部门。"
+                      title={platform === 'wecom' ? '批量复用已绑定的企微成员' : '手机号必填，姓名选填。核验后自动回填姓名和部门。'}
                     >
                       <Upload className="w-3.5 h-3.5" />
                       <span>CSV 批量导入</span>
@@ -1216,7 +1219,11 @@ export const RolesMembersView: React.FC = () => {
             </div>
 
             {/* 第二层：单行快速添加成员表单（仅分级管理员可添加成员） */}
-            {!isSuperAdmin && (
+            {!isSuperAdmin && platform === 'wecom' && (
+              <WecomBotMemberForm key={selectedRoleId} roleId={selectedRoleId}
+                onAdded={() => Promise.all([loadMembers(selectedRoleId), refreshRoles()])} />
+            )}
+            {!isSuperAdmin && platform !== 'wecom' && (
               <form
                 onSubmit={handleAddMember}
                 className="px-4 sm:px-5 py-3 bg-slate-50/70 border-b border-slate-100 flex flex-col lg:flex-row flex-wrap items-stretch lg:items-center gap-2.5 text-xs"
@@ -1395,12 +1402,12 @@ export const RolesMembersView: React.FC = () => {
                                 }`}
                               >
                                 <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                <span>{m.usable === false ? '需重激活' : '已激活'}</span>
+                                <span>{platform === 'wecom' ? '已绑定' : m.usable === false ? '需重激活' : '已激活'}</span>
                               </span>
                             ) : (
                               <span className="inline-flex items-center gap-1.5 text-xs text-slate-500">
                                 <Clock className="w-3.5 h-3.5 shrink-0 text-slate-400" />
-                                <span>未激活</span>
+                                <span>{platform === 'wecom' ? '未绑定' : '未激活'}</span>
                               </span>
                             );
                           })()}

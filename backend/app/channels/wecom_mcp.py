@@ -28,12 +28,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_PHONE_RE = re.compile(r"(?<!\d)1\d{10}(?!\d)")
 _PAREN_SUFFIX_RE = re.compile(r"[（(][^（）()]*[）)]\s*$")
-
-
-def _mask(text: Any) -> str:
-    return _PHONE_RE.sub(lambda m: m.group(0)[:3] + "****" + m.group(0)[7:], str(text or ""))
 
 
 def _strip_paren_suffix(s: str) -> str:
@@ -74,6 +69,10 @@ def _dept_hit(paths: List[Any], dept: str) -> bool:
             if normalize_dept(seg) == target:
                 return True
     return False
+
+
+def normalize_department_path(value: Any) -> str:
+    return "/".join(part.strip() for part in str(value or "").replace("|", "/").split("/") if part.strip())
 
 
 class WecomMcpError(Exception):
@@ -146,7 +145,7 @@ class WecomMcpContacts:
             self._ready = True
 
     # ── 业务层 ──────────────────────────────────────────────────────
-    def search_users(self, keyword: str) -> List[Dict[str, Any]]:
+    def search_users(self, keyword: str, *, strict: bool = False) -> List[Dict[str, Any]]:
         clean = str(keyword or "").strip()
         if not clean:
             return []
@@ -159,10 +158,13 @@ class WecomMcpContacts:
                 id_=self._next_id,
             )
         except Exception as exc:  # noqa: BLE001 - 查询失败不拖垮导入
-            logger.warning("MCP contact_users_search 异常 keyword=%s: %s", _mask(clean), str(exc)[:160])
+            logger.warning("MCP contact_users_search 异常类型=%s", type(exc).__name__)
+            if strict:
+                raise WecomMcpError("企微机器人通讯录查询失败") from None
             return []
-        if isinstance(resp, dict) and resp.get("error"):
-            logger.warning("MCP search 错误: %s", str(resp.get("error"))[:160])
+        if not isinstance(resp, dict) or resp.get("error") or (resp.get("result") or {}).get("isError"):
+            if strict:
+                raise WecomMcpError("企微机器人通讯录查询失败")
             return []
         text = ""
         for c in ((resp or {}).get("result") or {}).get("content") or []:
@@ -171,12 +173,34 @@ class WecomMcpContacts:
         try:
             data = json.loads(text)
         except Exception:  # noqa: BLE001
-            logger.warning("MCP 响应正文非 JSON（截断）：%s", _mask(text)[:160])
+            if strict:
+                raise WecomMcpError("企微机器人通讯录响应异常") from None
             return []
-        if not isinstance(data, dict):
+        if not isinstance(data, dict) or data.get("errcode") not in (None, 0, "0"):
+            if strict:
+                raise WecomMcpError("企微机器人通讯录查询失败")
             return []
         users = data.get("users") or []
         return [u for u in users if isinstance(u, dict) and str(u.get("userid") or "").strip()]
+
+    def member_candidates(self, name: str, dept_path: str) -> List[Dict[str, str]]:
+        """姓名、完整部门路径均命中的企微账号，由管理员从候选中确认。"""
+        target, path = normalize_name(name), normalize_department_path(dept_path)
+        if not target or not path:
+            return []
+        users = self.search_users(target, strict=True)
+        if len(users) >= self.LIST_MODE_TRUNCATION:
+            raise WecomMcpError("企微查询结果可能未完整返回，请缩小通讯录授权范围后重试")
+        matches = {}
+        for user in users:
+            if normalize_name(user.get("name")) != target or path not in {
+                normalize_department_path(raw) for raw in user.get("departments") or []
+            }:
+                continue
+            userid = str(user["userid"]).strip()
+            matches[userid] = {"userid": userid, "name": str(user["name"]).strip(), "dept_path": path,
+                               "alias": str(user.get("alias") or ""), "position": str(user.get("position") or "")}
+        return list(matches.values())
 
     def resolve_userid(self, phone: str, name: str, dept: str = "") -> Optional[str]:
         """名册（姓名+部门）→ 企微 userid。唯一命中才返回，其余一律 None。"""

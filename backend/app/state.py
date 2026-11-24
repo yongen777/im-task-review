@@ -2094,7 +2094,7 @@ class StateStore:
                 "cancelled_instances": cancelled, "revoked_grants": revoked}
 
     def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1,
-                        *, require_directory: bool = False) -> Dict[str, Any]:
+                        *, require_directory: bool = False, verified_wecom_user: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """添加单个角色成员（管理员「快速添加」= 姓名 + 手机号）。
 
         2026-11-13 用户需求一 ·2（写库前严格实名核验，非匹配即拦截、零写入）：
@@ -2123,8 +2123,12 @@ class StateStore:
         _plat_key_pre = str(_role_plat_pre["platform"] or self.platform).strip().lower()
         # ── 严格核验（锁外网络查询；失败/查无/不符都不写库） ──
         resolved_user: Optional[Dict[str, Any]] = None
-        local = self._local_directory_profiles([clean_phone], _plat_key_pre).get(clean_phone)
-        strict_lookup = self._strict_contacts_lookup(_plat_key_pre)
+        if verified_wecom_user is None:
+            local = self._local_directory_profiles([clean_phone], _plat_key_pre).get(clean_phone)
+            strict_lookup = self._strict_contacts_lookup(_plat_key_pre)
+        else:
+            local = None
+            strict_lookup = lambda *_: ("ok", verified_wecom_user)
         if require_directory and local is None and strict_lookup is None:
             raise BizError(503, "CONTACTS_QUERY_FAILED", "当前平台未配置可按手机号查询的官方通讯录")
         if local is not None or strict_lookup is not None:
@@ -2161,8 +2165,20 @@ class StateStore:
                     clean_path = str(_u.get("dept_path") or "").strip() or None
         now_s = self.now_str()
         with self.lock, self.conn:
-            if not self.conn.execute("SELECT 1 FROM role WHERE role_id = ? LOCK IN SHARE MODE", (clean_role_id,)).fetchone():
+            role = self.conn.execute("SELECT platform, owner_id FROM role WHERE role_id = ? LOCK IN SHARE MODE",
+                                     (clean_role_id,)).fetchone()
+            if not role:
                 raise BizError(404, "NOT_FOUND", "角色不存在")
+            if verified_wecom_user is not None:
+                if role["platform"] != "wecom" or int(role["owner_id"]) != int(owner_id):
+                    raise BizError(403, "FORBIDDEN", "仅能绑定自己名下的企微角色")
+                userid = verified_wecom_user["external_id"]
+                bindings = self.conn.execute(
+                    "SELECT phone, external_id, usable FROM delivery_target "
+                    "WHERE platform='wecom' AND (phone=? OR external_id=?) FOR UPDATE", (clean_phone, userid),
+                ).fetchall()
+                if any(row["phone"] != clean_phone or (row["usable"] and row["external_id"] != userid) for row in bindings):
+                    raise BizError(409, "WECOM_BINDING_CONFLICT", "手机号或企微账号已有其他绑定，请核对后重试")
             if self.conn.execute("SELECT 1 FROM member WHERE role_id = ? AND phone = ?", (clean_role_id, clean_phone)).fetchone():
                 raise BizError(409, "DUPLICATE", "该角色下手机号已存在")
             if local and self._local_directory_profiles([clean_phone], _plat_key_pre, lock=True).get(clean_phone) != local:
@@ -2181,7 +2197,7 @@ class StateStore:
             _plat_key = str(_role_plat["platform"] or "zdxlz").lower() if _role_plat else self.platform
             binding = self.get_delivery_target(clean_phone, _plat_key)
             _ext = str(binding["external_id"]) if binding else ""
-            reused_binding = bool(local or (binding and strict_lookup is None))
+            reused_binding = bool(local or (binding and (strict_lookup is None or verified_wecom_user is not None)))
             if resolved_user and local is None:
                 uid = str(resolved_user.get("union_id") or resolved_user.get("external_id") or "").strip()
                 ext_type = "union_id" if _plat_key == "zdxlz" else "user"
