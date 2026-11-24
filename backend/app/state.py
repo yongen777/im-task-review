@@ -1986,6 +1986,7 @@ class StateStore:
                 clear_depts()
         outcomes = self._contacts_verify_batch(phones, platform, fresh=True) or {}
         result = {"ok": True, "total": len(phones), "updated": 0, "left": 0, "failed": 0}
+        left_members = []
         for phone in phones:
             status, user = outcomes.get(phone, ("error", None))
             if status != "ok":
@@ -1993,12 +1994,26 @@ class StateStore:
                 continue
             profile_key = (platform, owner_id, phone, checked_at)
             if user is None:
-                changed = self.conn.execute(
-                    "UPDATE member m JOIN role r ON r.role_id = m.role_id "
-                    f"SET m.is_left_org = 1, m.directory_checked_at = ? WHERE {where}",
-                    (checked_at, *profile_key),
-                )
-                result["left"] += int(bool(changed.rowcount))
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE member m JOIN role r ON r.role_id = m.role_id "
+                        f"SET m.is_left_org = 1, m.directory_checked_at = ? WHERE {where}",
+                        (checked_at, *profile_key),
+                    )
+                    rows = self.conn.execute(
+                        "SELECT m.name, m.dept, m.dept_path, r.role_id, r.name AS role_name "
+                        "FROM member m JOIN role r ON r.role_id=m.role_id "
+                        "WHERE r.platform=? AND r.owner_id=? AND m.phone=? "
+                        "AND m.directory_checked_at=? AND m.is_left_org=1 ORDER BY m.id",
+                        profile_key,
+                    ).fetchall()
+                if rows:
+                    left_members.append({
+                        "phone": phone, "name": rows[0]["name"],
+                        "dept_path": next((r["dept_path"] for r in rows if r["dept_path"]), rows[0]["dept"] or ""),
+                        "role_ids": [r["role_id"] for r in rows],
+                        "role_names": [r["role_name"] for r in rows],
+                    })
                 continue
             external_id = str(user.get("union_id") or user.get("external_id") or "").strip()
             name = str(user.get("name") or "").strip()
@@ -2023,8 +2038,60 @@ class StateStore:
                 result["updated"] += int(bool(changed.rowcount))
             except (BizError, IntegrityError):
                 result["failed"] += 1
+        result["left"] = len(left_members)
         self.write_audit(actor, "member.directory_sync", "role", str(owner_id), {**result, "platform": platform})
-        return result
+        return {**result, "left_members": left_members}
+
+    def cleanup_left_org_members(self, platform: str, owner_id: int, phones: List[str], actor: str) -> Dict[str, Any]:
+        """移出当前名册中仍标记为离职的成员，保留已结案记录。"""
+        if not phones or any(not isinstance(phone, str) or not is_valid_phone(phone) for phone in phones):
+            raise BizError(400, "VALIDATION_FAILED", "请提供有效的手机号列表")
+        phones = sorted({phone.strip() for phone in phones})
+        now_s = self.now_str()
+        removed, skipped = [], []
+        memberships = cancelled = revoked = 0
+        with self.lock, self.conn:
+            for phone in phones:
+                # 同一平台的激活绑定由多个管理员共享，先锁绑定再锁名册。
+                self.conn.execute(
+                    "SELECT phone FROM delivery_target WHERE platform=? AND phone=? FOR UPDATE",
+                    (platform, phone),
+                ).fetchone()
+                rows = self.conn.execute(
+                    "SELECT m.role_id, m.is_left_org FROM member m JOIN role r ON r.role_id=m.role_id "
+                    "WHERE r.platform=? AND r.owner_id=? AND m.phone=? ORDER BY m.id FOR UPDATE",
+                    (platform, owner_id, phone),
+                ).fetchall()
+                if not rows or any(not row["is_left_org"] for row in rows):
+                    skipped.append(phone)
+                    continue
+                for row in rows:
+                    change = self._delete_role_member_unlocked(
+                        row["role_id"], phone, actor, now_s, write_audit=False, binding_platform=platform,
+                    )
+                    cancelled += change["cancelled_instances"]
+                # 角色移除未覆盖已发送的待回执通知，以及无角色的变量通知。
+                cancelled += self.conn.execute(
+                    "UPDATE task_instance SET status='cancelled' "
+                    "WHERE owner_id=? AND phone=? AND receipt_platform=? AND receipt_at IS NULL "
+                    "AND (status='pending' OR (status='sent' AND receipt_phrase IS NOT NULL))",
+                    (owner_id, phone, platform),
+                ).rowcount
+                revoked += self.conn.execute(
+                    "UPDATE portal_grant SET enabled=0, updated_at=? "
+                    "WHERE owner_id=? AND platform=? AND phone=? AND enabled=1",
+                    (now_s, owner_id, platform, phone),
+                ).rowcount
+                memberships += len(rows)
+                removed.append(phone)
+            if removed:
+                self._insert_audit_unlocked(
+                    actor, "member.left_org_cleanup", "role", str(owner_id),
+                    {"platform": platform, "phones": removed, "removed_memberships": memberships,
+                     "cancelled_instances": cancelled, "revoked_grants": revoked}, now_s,
+                )
+        return {"ok": True, "removed": removed, "skipped": skipped, "removed_memberships": memberships,
+                "cancelled_instances": cancelled, "revoked_grants": revoked}
 
     def add_role_member(self, role_id: str, phone: str, name: str, dept: Optional[str] = None, source: str = "manual", actor: str = "system", owner_id: int = 1,
                         *, require_directory: bool = False) -> Dict[str, Any]:
@@ -2134,7 +2201,8 @@ class StateStore:
     def _cancel_pending_scope(self, template_id: str, *, phone: Optional[str] = None,
                               include_rejected: bool = False) -> int:
         statuses = "('pending', 'overdue', 'rejected')" if include_rejected else "('pending')"
-        sql = f"UPDATE task_instance SET status = 'cancelled' WHERE template_id = ? AND status IN {statuses}"
+        sql = (f"UPDATE task_instance SET status = 'cancelled' WHERE template_id = ? "
+               f"AND status IN {statuses} AND receipt_at IS NULL")
         params = (template_id,)
         if phone is not None:
             sql += " AND phone = ?"
@@ -2190,7 +2258,8 @@ class StateStore:
             self._delete_role_member_unlocked(clean_role_id, clean_phone, actor, now_s)
 
     def _delete_role_member_unlocked(
-        self, clean_role_id: str, clean_phone: str, actor: str, now_s: str, *, write_audit: bool = True
+        self, clean_role_id: str, clean_phone: str, actor: str, now_s: str, *, write_audit: bool = True,
+        binding_platform: Optional[str] = None,
     ) -> Dict[str, Any]:
         """⚠️ 调用方必须已握 self.lock 且处于 self.conn 事务内。
 
@@ -2206,24 +2275,28 @@ class StateStore:
         # 用户需重新给机器人发消息、走 H5 登记重新激活（比对新版后台名册）。
         # 人在企微角色里、只是退出密信角色时：只删密信绑定，企微绑定不动。
         removed_bindings: List[str] = []
-        for dt in self.conn.execute(
-            "SELECT platform, external_id FROM delivery_target WHERE phone = ? AND usable = 1",
-            (clean_phone,),
-        ).fetchall():
+        binding_sql = "SELECT platform, external_id FROM delivery_target WHERE phone = ?"
+        if binding_platform is None:
+            bindings = self.conn.execute(binding_sql + " AND usable = 1", (clean_phone,)).fetchall()
+        else:
+            bindings = self.conn.execute(binding_sql + " AND platform = ?", (clean_phone, binding_platform)).fetchall()
+        for dt in bindings:
             plat = str(dt["platform"] or "").strip().lower()
-            still_in_plat_role = self.conn.execute(
+            membership_sql = (
                 "SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
-                "WHERE m.phone = ? AND r.platform = ? LIMIT 1",
-                (clean_phone, plat),
-            ).fetchone() is not None
+                "WHERE m.phone = ? AND r.platform = ? LIMIT 1"
+            )
+            if binding_platform is not None:
+                membership_sql += " FOR UPDATE"
+            still_in_plat_role = self.conn.execute(membership_sql, (clean_phone, plat)).fetchone() is not None
             if still_in_plat_role:
                 continue
             ext_id = str(dt["external_id"] or "").strip()
             if not ext_id:
                 continue
             self.conn.execute(
-                "DELETE FROM delivery_target WHERE platform = ? AND external_id = ?",
-                (plat, ext_id),
+                "DELETE FROM delivery_target WHERE platform = ? AND phone = ? AND external_id = ?",
+                (plat, clean_phone, ext_id),
             )
             removed_bindings.append(f"{plat}:{ext_id[-6:]}")
 
@@ -4954,7 +5027,6 @@ class StateStore:
         # 跨平台模板 → 各平台分别取已激活成员，按手机号去重（任一平台已激活即可）。
         # 2026-11-19：取数抽到 template_deliverable_members（与重推预检同一口径）。
         tpl_plats = sorted(self.role_platforms(tpl.get("role_ids") or [])) or [None]
-        members = self.template_deliverable_members(tpl)
         now_s = now_str or self.now_str()
         trigger = trigger_at or now_s
         from .notice_media import notice_receipt_config
@@ -4963,6 +5035,7 @@ class StateStore:
         receipt_platform = tpl_plats[0] if phrase and len(tpl_plats) == 1 else None
         role_names = self._role_names_snapshot(tpl.get("role_ids"))
         with self.lock, self.conn:
+            members = self.template_deliverable_members(tpl)
             # 2026-11-09：只有「本周期就是今天」时才按激活时刻切分。
             # period_key 是历史日期（补跑）或跨天周期时不做这个过滤 ——
             #   · 历史周期：那天该不该有实例由当时的状态决定，现在补跑就补上

@@ -107,10 +107,28 @@ const POOL_PAGE_SIZE = 10;
 
 const MEMBER_PAGE_SIZE = 20;
 
+interface LeftDirectoryMember {
+  phone: string;
+  name: string;
+  dept_path: string;
+  role_ids: string[];
+  role_names: string[];
+}
+
+interface DirectorySyncResult {
+  total: number;
+  updated: number;
+  left: number;
+  failed: number;
+  left_members?: LeftDirectoryMember[];
+}
+
 export const RolesMembersView: React.FC = () => {
   const {
+    me,
     roles,
     refreshRoles,
+    refreshStats,
     platform,
     isSuperAdmin,
     ownerFilter,
@@ -177,6 +195,14 @@ export const RolesMembersView: React.FC = () => {
   const [deptTree, setDeptTree] = useState<DeptTreeNode[]>([]);
   const [deptTreeLoading, setDeptTreeLoading] = useState(false);
   const [syncingDirectory, setSyncingDirectory] = useState(false);
+  const [directoryReview, setDirectoryReview] = useState<{
+    platform: typeof platform;
+    result: DirectorySyncResult;
+    selected: Set<string>;
+  } | null>(null);
+  const [cleaningDirectory, setCleaningDirectory] = useState(false);
+  const activeDirectoryReview = directoryReview?.platform === platform ? directoryReview : null;
+  const canCleanDirectory = !isSuperAdmin && me.role_level === 'sub_admin';
   const [memberStatusPending, setMemberStatusPending] = useState<string | null>(null);
 
   // 2026-11-12 下午：成员列表批量删除（勾选 + 一次移除，用户要求「不要一个一个删」）
@@ -356,19 +382,51 @@ export const RolesMembersView: React.FC = () => {
 
   const handleSyncDirectory = async () => {
     setSyncingDirectory(true);
+    setDirectoryReview(null);
     try {
-      const result = await api.post<{ total: number; updated: number; left: number; failed: number }>(
+      const result = await api.post<DirectorySyncResult>(
         '/api/admin/directory/sync', { platform },
       );
       const scope = rosterScope.current;
-      await Promise.all([scope.platform === platform && loadMembers(scope.roleId), refreshRoles()]);
-      const summary = `共核查 ${result.total} 人，刷新 ${result.updated} 人，疑似离职 ${result.left} 人，查询失败 ${result.failed} 人。`;
-      if (result.left || result.failed) toast.warning(summary, '通讯录同步完成');
-      else toast.success(summary, '通讯录同步完成');
+      if (scope.platform !== platform) return;
+      const leftMembers = result.left_members ?? [];
+      if (leftMembers.length) {
+        setDirectoryReview({ platform, result, selected: new Set(leftMembers.map((member) => member.phone)) });
+      } else {
+        const summary = `共核查 ${result.total} 人，刷新 ${result.updated} 人，疑似离职 ${result.left} 人，查询失败 ${result.failed} 人。`;
+        if (result.left || result.failed) toast.warning(summary, '通讯录同步完成');
+        else toast.success(summary, '通讯录同步完成');
+      }
+      await Promise.all([loadMembers(scope.roleId), refreshRoles()]);
     } catch (err) {
       toast.error(err instanceof Error ? plainError(err.message) : '通讯录同步失败');
     } finally {
       setSyncingDirectory(false);
+    }
+  };
+
+  const handleCleanupDirectory = async () => {
+    if (!canCleanDirectory || !activeDirectoryReview?.selected.size || cleaningDirectory) return;
+    setCleaningDirectory(true);
+    try {
+      const result = await api.post<{ removed: string[]; skipped: string[]; cancelled_instances: number }>(
+        '/api/admin/directory/cleanup-left', { platform, phones: [...activeDirectoryReview.selected] },
+      );
+      setDirectoryReview(null);
+      const summary = `已移出 ${result.removed.length} 人，取消 ${result.cancelled_instances} 条未结案任务。`;
+      if (result.skipped.length) toast.warning(`${summary}另有 ${result.skipped.length} 人的名册状态已变化，已跳过。`);
+      else toast.success(summary);
+      const scope = rosterScope.current;
+      if (scope.platform === platform) {
+        const removed = new Set(result.removed);
+        setSelectedMemberPhones((selected) => new Set([...selected].filter((phone) => !removed.has(phone))));
+        const refresh = await Promise.allSettled([loadMembers(scope.roleId), refreshRoles(), refreshStats()]);
+        if (refresh.some((item) => item.status === 'rejected')) toast.warning('清理已完成，部分列表刷新失败。');
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? plainError(err.message) : '移出离职成员失败');
+    } finally {
+      setCleaningDirectory(false);
     }
   };
 
@@ -938,7 +996,7 @@ export const RolesMembersView: React.FC = () => {
               {!isSuperAdmin && (
                 <button
                   type="button"
-                  disabled={syncingDirectory}
+                  disabled={syncingDirectory || cleaningDirectory}
                   onClick={() => void handleSyncDirectory()}
                   className="inline-flex items-center gap-1.5 rounded-xl bg-blue-50 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 cursor-pointer disabled:opacity-60"
                 >
@@ -1470,6 +1528,76 @@ export const RolesMembersView: React.FC = () => {
       {/* TODO 2026-11-05：全平台已激活成员总览与「停用/恢复派单」管控功能
            依赖后端 PUT /api/admin/global-activated-members/{phone}/status 端点（当前未实现），
            后端补齐后可恢复此区块（源码见 Google 交付包 RolesMembersView）。 */}
+
+      {activeDirectoryReview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs">
+          <section role="dialog" aria-modal="true" aria-labelledby="left-directory-title"
+            className="flex max-h-[90vh] w-full max-w-3xl flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-6">
+            <header>
+              <h3 id="left-directory-title" className="font-bold text-slate-900">核对离职成员</h3>
+              <p className="mt-2 text-sm text-slate-600">
+                共核查 {activeDirectoryReview.result.total} 人，更新部门档案 {activeDirectoryReview.result.updated} 人，识别疑似离职 {activeDirectoryReview.result.left} 人。
+                {activeDirectoryReview.result.failed > 0 && ` 查询失败 ${activeDirectoryReview.result.failed} 人。`}
+              </p>
+            </header>
+            <div className="min-h-0 overflow-auto rounded-xl border border-slate-200">
+              <table className="w-full text-left text-sm">
+                <thead className="sticky top-0 bg-slate-50 text-xs text-slate-600">
+                  <tr>
+                    {canCleanDirectory && <th scope="col" className="px-3 py-2.5">选择</th>}
+                    <th scope="col" className="whitespace-nowrap px-3 py-2.5">姓名</th>
+                    <th scope="col" className="whitespace-nowrap px-3 py-2.5">手机号</th>
+                    <th scope="col" className="whitespace-nowrap px-3 py-2.5">原部门</th>
+                    <th scope="col" className="whitespace-nowrap px-3 py-2.5">所属角色</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-slate-700">
+                  {activeDirectoryReview.result.left_members?.map((member) => (
+                    <tr key={member.phone}>
+                      {canCleanDirectory && <td className="px-3 py-2.5">
+                        <input type="checkbox" aria-label={`选择 ${member.name} ${member.phone}`}
+                          checked={activeDirectoryReview.selected.has(member.phone)} disabled={cleaningDirectory}
+                          onChange={(event) => {
+                            const checked = event.currentTarget.checked;
+                            setDirectoryReview((review) => {
+                              if (!review) return review;
+                              const selected = new Set(review.selected);
+                              if (checked) selected.add(member.phone);
+                              else selected.delete(member.phone);
+                              return { ...review, selected };
+                            });
+                          }} />
+                      </td>}
+                      <td className="whitespace-nowrap px-3 py-2.5 font-medium">{member.name}</td>
+                      <td className="whitespace-nowrap px-3 py-2.5 tabular-nums">{member.phone}</td>
+                      <td className="min-w-32 px-3 py-2.5">{member.dept_path || '—'}</td>
+                      <td className="min-w-28 px-3 py-2.5">{member.role_names.join('、') || '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {canCleanDirectory && (
+              <p className="text-xs leading-relaxed text-slate-600">
+                将选中的 {activeDirectoryReview.selected.size} 人移出当前平台名册并取消未完成待办。历史提交、回执和附件仍可在统计中查看。
+              </p>
+            )}
+            <footer className="flex flex-wrap justify-end gap-2">
+              <button type="button" disabled={cleaningDirectory} onClick={() => setDirectoryReview(null)}
+                className="rounded-xl px-4 py-2 text-sm font-semibold text-slate-600 hover:bg-slate-100 disabled:opacity-50">
+                暂不处理
+              </button>
+              {canCleanDirectory && (
+                <button type="button" disabled={cleaningDirectory || syncingDirectory || !activeDirectoryReview.selected.size}
+                  onClick={() => void handleCleanupDirectory()}
+                  className="rounded-xl bg-rose-700 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-800 disabled:opacity-50">
+                  {cleaningDirectory ? '正在移出…' : '一键移出角色（保留历史记录）'}
+                </button>
+              )}
+            </footer>
+          </section>
+        </div>
+      )}
 
       {deptModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">

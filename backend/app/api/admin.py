@@ -1941,6 +1941,26 @@ def create_admin_router(
         except BizError as exc:
             return biz_error_response(exc)
 
+    @router.post("/directory/cleanup-left")
+    async def cleanup_directory_left_members(request: Request):
+        sess, err = require_session(request, state, check_csrf=True)
+        if err is not None:
+            return err
+        admin = _admin_profile(state, sess)
+        if admin.get("role_level") != "sub_admin":
+            return error_response(403, "SUPER_ADMIN_READONLY", "请由分级管理员清理自己的名册")
+        body = await _read_json_body(request)
+        plat = str(body.get("platform") or state.platform).strip().lower()
+        if plat not in StateStore.ALL_PLATFORMS or not _platform_allowed(admin, plat):
+            return error_response(403, "FORBIDDEN", "当前账号未授权该平台")
+        phones = body.get("phones")
+        if not isinstance(phones, list):
+            return error_response(400, "VALIDATION_FAILED", "phones 必须是数组")
+        try:
+            return await asyncio.to_thread(state.cleanup_left_org_members, plat, int(admin["id"]), phones, sess["username"])
+        except BizError as exc:
+            return biz_error_response(exc)
+
     # ── 全平台成员池（2026-11-05）：超管按「人」管理的全局名册，操作全局同步到所有管理员名下 ──
     @router.get("/member-pool")
     async def list_member_pool(request: Request, q: Optional[str] = None, size: int = 500, platform: Optional[str] = None):

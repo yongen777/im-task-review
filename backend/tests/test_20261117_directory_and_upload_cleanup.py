@@ -234,7 +234,9 @@ def test_directory_sync_updates_current_roster_and_continues_on_missing_or_outag
         P3: ("error", None),
     })
     res = store.sync_directory_profiles("zdxlz", 1, "tester")
-    assert res == {"ok": True, "total": 3, "updated": 1, "left": 1, "failed": 1}
+    assert res == {"ok": True, "total": 3, "updated": 1, "left": 1, "failed": 1, "left_members": [{
+        "phone": P2, "name": "旧姓名", "dept_path": "总部/旧部门", "role_ids": [first], "role_names": ["甲组"],
+    }]}
     assert sorted(fake.fresh) == [P1, P2, P3] and fake.cached == []
     assert store.get_delivery_target(P1, "zdxlz")["external_id"] == "fresh_uid"
     assert store.get_delivery_target(P1, "zdxlz")["activated_at"] == "2026-10-01 08:00:00"
