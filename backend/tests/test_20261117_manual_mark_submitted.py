@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from openpyxl.utils.units import pixels_to_EMU, points_to_pixels
 from PIL import Image
 
 from app.api.admin import create_admin_router, register_admin_guard
@@ -166,14 +167,13 @@ def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx
     spec = {**tpl["spec_json"], "allow_multiple_images": True}
     store.update_template(tpl["template_id"], {"spec": spec})
     pictures = []
-    for color in ("blue", "orange"):
+    for index in range(10):
         picture = BytesIO()
-        Image.new("RGB", (36, 24), color=color).save(picture, format="PNG")
-        pictures.append(picture.getvalue())
+        Image.new("RGB", (180, 140), color=(20 * index, 40, 180)).save(picture, format="PNG")
+        pictures.append(("attachments", (f"现场{index + 1}.png", picture.getvalue(), "image/png")))
     assert owner.get(f"/api/admin/instances/{inst['id']}").json()["instance"]["attachment_limits"] == {"image": 10, "file": 1}
     response = owner.post(endpoint(inst), data={"payload": '{"fields":{"qty":0},"note":"线下统一代交"}'}, files=[
-        ("attachments", ("现场.jpg", pictures[0], "image/jpeg")),
-        ("attachments", ("结果.png", pictures[1], "image/png")),
+        *pictures,
         ("attachments", ("清单.pdf", b"%PDF-1.7\nexample", "application/pdf")),
     ])
     assert response.status_code == 200, response.text
@@ -184,7 +184,7 @@ def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx
     assert saved["source"] == "admin"
     assert saved["form_values"] == {"qty": 0}
     assert saved["note"] == "线下统一代交"
-    assert [a["mime"] for a in saved["attachments"]] == ["image/png", "image/png", "application/pdf"]
+    assert [a["mime"] for a in saved["attachments"]] == ["image/png"] * 10 + ["application/pdf"]
     for attachment in saved["attachments"]:
         assert store.get_upload_ref(attachment["ref"])["consumed"]
         assert owner.get(attachment["url"]).status_code == 200
@@ -198,10 +198,19 @@ def test_mark_optional_fields_and_attachments_show_in_detail_stats_and_excel(ctx
     assert exported.status_code == 200, exported.text
     rows = list(load_workbook(BytesIO(exported.content), read_only=True).active.values)
     assert any("已完成" in row and PHONE in row for row in rows)
-    assert rows[0][-4:] == ("图片数量", "上报图片", "上报图片 2", "文件是否上传")
-    assert rows[1][-4] == 2 and rows[1][-1] == "已上传"
-    images = load_workbook(BytesIO(exported.content)).active._images
-    assert len(images) == 2 and [image.anchor._from.row for image in images] == [1, 1]
+    assert [header for header in rows[0] if "图片" in header] == ["图片"]
+    assert rows[0][-2:] == ("图片", "文件是否上传") and rows[1][-1] == "已上传"
+    sheet = load_workbook(BytesIO(exported.content)).active
+    anchors = [image.anchor for image in sheet._images]
+    assert len(anchors) == 10
+    assert {(anchor._from.row, anchor._from.col) for anchor in anchors} == {(1, rows[0].index("图片"))}
+    assert len({(anchor._from.rowOff, anchor._from.colOff) for anchor in anchors}) == 10
+    height = pixels_to_EMU(points_to_pixels(sheet.row_dimensions[2].height))
+    assert all(anchor._from.rowOff + anchor.ext.cy <= height for anchor in anchors)
+    for index, a in enumerate(anchors):
+        for b in anchors[index + 1:]:
+            assert (a._from.colOff + a.ext.cx <= b._from.colOff or b._from.colOff + b.ext.cx <= a._from.colOff
+                    or a._from.rowOff + a.ext.cy <= b._from.rowOff or b._from.rowOff + b.ext.cy <= a._from.rowOff)
     assert not notifier.sent_messages
 
 

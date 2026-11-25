@@ -67,6 +67,36 @@ def _thumbnail(root: Path, rel_path: str):
         return None
 
 
+def _embed_row_images(ws, row: int, column: int, uploads: list, root: Path) -> float:
+    """在同一个 Excel 单元格内按两列网格放置独立图片。"""
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+    from openpyxl.drawing.xdr import XDRPositiveSize2D
+    from openpyxl.styles import Alignment
+    from openpyxl.utils.units import pixels_to_EMU, pixels_to_points, points_to_pixels
+
+    images = [image for upload in uploads if (image := _thumbnail(root, str(upload.get('rel_path') or ''))) is not None]
+    missing = len(uploads) - len(images)
+    note_height = 22 if missing else 0
+    grid_rows = (len(images) + 1) // 2
+    slot_height = min(100, (points_to_pixels(409) - note_height - 4) // grid_rows) if grid_rows else 0
+    for index, image in enumerate(images):
+        offset_row, offset_column = divmod(index, 2)
+        scale = min(1, max(1, slot_height - 8) / image.height)
+        width = max(1, round(image.width * scale))
+        height = max(1, round(image.height * scale))
+        image.anchor = OneCellAnchor(
+            _from=AnchorMarker(row=row - 1, col=column - 1,
+                               colOff=pixels_to_EMU(4 + offset_column * 144),
+                               rowOff=pixels_to_EMU(4 + offset_row * slot_height)),
+            ext=XDRPositiveSize2D(pixels_to_EMU(width), pixels_to_EMU(height)),
+        )
+        ws.add_image(image)
+    if missing:
+        cell = ws.cell(row=row, column=column, value=f'{missing} 张图片无法读取')
+        cell.alignment = Alignment(vertical='bottom', wrap_text=True)
+    return pixels_to_points(grid_rows * slot_height + note_height + 4)
+
+
 def _wrapped_lines(value: Any, width: int) -> int:
     return sum(max(1, math.ceil(sum(2 if east_asian_width(char) in ('W', 'F') else 1 for char in line) / (width - 2)))
                for line in str(value or '').splitlines())
@@ -132,7 +162,7 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
     has_note = bundle['has_note_col']
     images_by_row = [[upload for upload in row['uploads'] if str(upload['mime']).startswith('image/')] for row in rows]
     has_file_col = 'file' in bundle['modules'] or any(len(row['uploads']) > len(images) for row, images in zip(rows, images_by_row))
-    image_columns = max([int('image' in bundle['modules']), *(len(images) for images in images_by_row)])
+    has_image_col = 'image' in bundle['modules'] or any(images_by_row)
     headers = ['序号', '姓名', '手机号', '所属部门（末级）', '完整部门路径', '完成状态', '提交时间']
     widths = [6, 16, 15, 20, 44, 24, 19]
     headers.extend(str(field.get('label') or field['key']) for field in fields)
@@ -140,10 +170,10 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
     if has_note:
         headers.append('补充说明')
         widths.append(40)
-    if image_columns:
-        headers.append('图片数量')
-        headers.extend('上报图片' if i == 1 else f'上报图片 {i}' for i in range(1, image_columns + 1))
-        widths.extend([10] + [22] * image_columns)
+    image_column = len(headers) + 1
+    if has_image_col:
+        headers.append('图片')
+        widths.append(44)
     if has_file_col:
         headers.append('文件是否上传')
         widths.append(16)
@@ -169,25 +199,18 @@ def build_stats_xlsx(bundle: dict, uploads_dir: Path) -> bytes:
         values.extend(_field_value(row.get('fields', {}).get(str(field['key'])), field.get('type')) for field in fields)
         if has_note:
             values.append(_safe_text(row.get('note')))
-        first_image_column = len(values) + 2
-        if image_columns:
-            values.extend([len(images)] + [None] * image_columns)
+        if has_image_col:
+            values.append(None)
         if has_file_col:
             values.append('已上传' if len(row['uploads']) > len(images) else '未上传')
         ws.append(values)
         excel_row = index + 1
         for cell in ws[excel_row]:
             cell.alignment = wrap
-        for offset, upload in enumerate(images):
-            cell = ws.cell(row=excel_row, column=first_image_column + offset)
-            image = _thumbnail(root, str(upload.get('rel_path') or ''))
-            if image is None:
-                cell.value = '图片无法读取'
-            else:
-                ws.add_image(image, cell.coordinate)
         line_count = max(_wrapped_lines(value, width) for value, width in zip(values, widths))
-        if images or line_count > 1:
-            ws.row_dimensions[excel_row].height = min(409, max(76 if images else 17, 14 * line_count + 5))
+        image_height = _embed_row_images(ws, excel_row, image_column, images, root) if images else 0
+        if image_height or line_count > 1:
+            ws.row_dimensions[excel_row].height = min(409, max(image_height, 14 * line_count + 5))
     ws.auto_filter.ref = f'A1:{get_column_letter(len(headers))}{len(rows) + 1}'
     out = io.BytesIO()
     wb.save(out)
