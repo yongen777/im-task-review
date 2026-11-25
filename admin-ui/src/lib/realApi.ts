@@ -89,6 +89,9 @@ async function rawFetch<T = any>(method: string, url: string, body?: any): Promi
     /* 非 JSON 响应 */
   }
   if (res.status === 401) {
+    if (method === 'POST' && url === '/api/admin/login' && data?.code === 'BAD_CREDENTIALS') {
+      throw new ApiRequestError('INVALID_CREDENTIALS');
+    }
     clearCsrf();
     throw new Error('UNAUTHORIZED');
   }
