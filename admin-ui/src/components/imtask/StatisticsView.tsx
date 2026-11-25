@@ -150,7 +150,7 @@ export function makeTree(nodes: TreeNode[]): DeptTreeNode[] {
 }
 
 export function usePanelQuery<T>(url: string, revision: number) {
-  const [result, setResult] = useState<{ url: string; revision: number; data?: T; error?: string } | null>(null);
+  const [result, setResult] = useState<{ url: string; revision: number; data?: T; receivedAt?: Date; error?: string } | null>(null);
   useEffect(() => {
     if (!url) {
       setResult(null);
@@ -158,13 +158,13 @@ export function usePanelQuery<T>(url: string, revision: number) {
     }
     let active = true;
     api.get<T>(url).then(
-      (data) => { if (active) setResult({ url, revision, data }); },
+      (data) => { if (active) setResult({ url, revision, data, receivedAt: new Date() }); },
       (error) => { if (active) setResult({ url, revision, error: plainError(error.message) }); },
     );
     return () => { active = false; };
   }, [url, revision]);
   const current = result?.url === url ? result : null;
-  return { data: current?.data, error: current?.revision === revision ? current?.error : undefined, loading: current?.revision !== revision };
+  return { data: current?.data, receivedAt: current?.receivedAt, error: current?.revision === revision ? current?.error : undefined, loading: current?.revision !== revision };
 }
 
 /* 2026-11-20：以下常量/组件导出给「授权成员发布任务」只读监管面板（PortalTasksView）
@@ -279,6 +279,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const [filter, setFilter] = useState({ query: '', page: 1 });
   const [revision, setRevision] = useState(0);
   const [exporting, setExporting] = useState(false);
+  const [exportingChart, setExportingChart] = useState(false);
   const [copying, setCopying] = useState(false);
   const [detail, setDetail] = useState<DetailTarget | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
@@ -388,6 +389,30 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
     }
   }
 
+  async function exportChart() {
+    if (overview.loading || overviewData?.mode !== 'periodic' || !overview.receivedAt || !overviewData.kpis.total) return;
+    setExportingChart(true);
+    try {
+      const { downloadStatisticsChart } = await import('./statisticsChart');
+      await downloadStatisticsChart({
+        task: task.name,
+        period: task.is_manual ? '一次性推送' : periodKey
+          .replace(/^(\d{4})-(\d{2})$/, '$1年$2月')
+          .replace(/^(\d{4})-W(\d{2})$/, '$1年第$2周'),
+        department: deptName,
+        receivedAt: overview.receivedAt,
+        isReceipt: !!isReceipt,
+        total: overviewData.kpis.total,
+        done: overviewData.kpis.done,
+        children: deptChildren,
+      });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '统计图生成失败，请重试。');
+    } finally {
+      setExportingChart(false);
+    }
+  }
+
   async function copyTodoList() {
     setCopying(true);
     try {
@@ -426,6 +451,11 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           <button type="button" onClick={refresh} disabled={refreshing} className={secondaryButton}>
             <RefreshCw className={'h-3.5 w-3.5 ' + (refreshing ? 'animate-spin' : '')} /> 刷新
           </button>
+          {!task.is_adhoc && <button type="button" onClick={() => void exportChart()}
+            disabled={exportingChart || overview.loading || overviewData?.mode !== 'periodic' || !overviewData.kpis.total}
+            title="按当前任务、统计周期和覆盖部门生成 PNG 统计图" className={secondaryButton}>
+            <BarChart3 className="h-3.5 w-3.5" /> {exportingChart ? '生成中…' : '生成统计图'}
+          </button>}
           <button type="button" onClick={() => void exportXlsx()} disabled={exporting || overview.loading || !!overview.error}
             title="导出当前任务、统计周期和部门范围内的全量数据"
             className="inline-flex items-center gap-1.5 rounded-xl bg-blue-600 px-3 py-2 text-xs font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
