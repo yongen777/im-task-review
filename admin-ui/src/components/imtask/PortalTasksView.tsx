@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, Plus, RefreshCw, Search, Users, X } from 'lucide-react';
+import { Building2, ChevronDown, ChevronLeft, ChevronRight, Download, Pencil, RefreshCw, Search, Users, X } from 'lucide-react';
 import { plainError } from '../../lib/api';
 import { ImageViewer } from '../../lib/ImageViewer';
 import { useAppStore } from '../../lib/store';
@@ -83,17 +83,18 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
     return () => { live = false; };
   }, [enabled, options, path, retry]);
   const toggleId = (current: string[], id: string) => current.includes(id) ? current.filter(x => x !== id) : [...current, id];
-  return <div className="fixed inset-0 bg-black/35 flex items-center justify-center z-50 p-4" role="dialog" aria-modal="true" aria-label="H5 创建任务授权">
+  return <div className="fixed inset-0 bg-black/35 flex items-center justify-center z-50 p-4" role="dialog" aria-modal="true" aria-label="修改成员发布范围">
     <div className="bg-white rounded-xl p-6 w-full max-w-2xl max-h-[85vh] overflow-auto space-y-4 text-slate-900">
-      <h2 className="font-bold text-lg">H5 创建任务权限</h2>
+      <h2 className="font-bold text-lg">修改成员发布范围</h2>
       <label className="flex gap-2 items-center"><input type="checkbox" checked={enabled} disabled={!options || saving}
-        onChange={e => setEnabled(e.target.checked)} />开放创建任务权限</label>
-      {!options && !error && <p role="status" className="text-sm text-slate-600">正在读取现有授权…</p>}
+        onChange={e => setEnabled(e.target.checked)} />启用自定义发布范围</label>
+      {options && !enabled && <p className="text-xs text-slate-500">勾选后可配置部门和角色。保存为未勾选时，将禁用该成员发布任务。</p>}
+      {!options && !error && <p role="status" className="text-sm text-slate-600">正在读取发布范围…</p>}
       {options && enabled && <>
         <fieldset disabled={saving} className="grid gap-3 text-sm sm:grid-cols-[minmax(0,1fr)_11rem]">
           <section className="min-w-0 rounded-lg border border-slate-200 p-3">
             <h3 className="font-semibold">部门架构</h3>
-            <p className="mb-2 text-slate-500">首次授权默认选中当前部门。选中部门包含全部下级；<strong>不勾选任何部门/角色时自动授权该成员当前所在部门（含全部下级）</strong>。</p>
+            <p className="mb-2 text-slate-500">自定义选择的部门包含全部下级。部门和角色均留空时，保存为成员本人部门及其下级。</p>
             {!!depts.length && <ul className="mb-2 flex flex-wrap gap-1">
               {depts.map(id => {
                 const label = departmentNames[id] || id.split('/').join(' / ');
@@ -109,7 +110,7 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
             {departments && (departments.length ? <div className="max-h-72 overflow-y-auto py-1">
               <DepartmentTree nodes={departments} checkedPaths={new Set(depts)}
                 onSelect={id => setDepts(current => toggleId(current, id))} />
-            </div> : <p className="text-xs text-slate-500">当前可授权名册暂无部门数据</p>)}
+            </div> : <p className="text-xs text-slate-500">当前名册暂无部门数据</p>)}
           </section>
           <section className="rounded-lg border border-slate-200 p-3">
             <h3 className="font-semibold">角色分组</h3>
@@ -127,7 +128,7 @@ export function PortalGrantDialog({ phone, platform, onClose, onSaved }: { phone
         setSaving(true); setError('');
         try { await portalAdminRequest(path, 'PUT', { enabled, dept_ids: depts, role_ids: roles }); onSaved?.(); onClose(); }
         catch (e) { setError((e as Error).message); } finally { setSaving(false); }
-      }}>{saving ? '保存中…' : '保存授权'}</button></div>
+      }}>{saving ? '保存中…' : '保存设置'}</button></div>
     </div>
   </div>;
 }
@@ -210,8 +211,7 @@ export function PortalTasksView() {
   </>;
 }
 
-/* ── 2026-11-24 授权成员管理抽屉：已授权清单（搜索）+ 新增授权 + 修改范围 +
-      取消授权（二次确认）。仅分级管理员可见入口；数据全部走本管理员归属接口。 ── */
+/* 发布范围管理仅对分级管理员开放，数据通过当前管理员的归属接口读取和修改。 */
 type GrantedMember = {
   phone: string;
   name: string;
@@ -279,7 +279,7 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
       await portalAdminRequest(
         `portal-grants/${encodeURIComponent(cancelTarget.phone)}?platform=${encodeURIComponent(platform)}`,
         'PUT', { enabled: false });
-      toast.success(`已取消 ${cancelTarget.name} 的创建任务权限，历史任务统计仍完整保留`);
+      toast.success(`已禁用 ${cancelTarget.name} 在您管理范围内的任务发布`);
       setCancelTarget(null);
       await load();
     } catch (err) {
@@ -290,29 +290,27 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
   }
 
   return <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50 backdrop-blur-xs" role="dialog"
-    aria-modal="true" aria-label="授权成员管理" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    aria-modal="true" aria-label="发布范围管理" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
     <section className="flex h-full w-full max-w-xl flex-col bg-white shadow-2xl">
       <header className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
         <div className="flex items-center gap-2">
           <Users className="h-5 w-5 text-blue-600" />
-          <h2 className="text-base font-bold text-slate-900">授权成员管理</h2>
-          {members && <span className="text-xs text-slate-500">{members.length} 人已配置</span>}
+          <h2 className="text-base font-bold text-slate-900">发布范围管理</h2>
+          {members && <span className="text-xs text-slate-500">{members.length} 人已自定义</span>}
         </div>
-        <button type="button" aria-label="关闭授权成员管理" onClick={onClose}
+        <button type="button" aria-label="关闭发布范围管理" onClick={onClose}
           className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100"><X className="h-5 w-5" /></button>
       </header>
 
       <div className="space-y-4 overflow-y-auto px-5 py-4">
-        <p className="text-xs leading-relaxed text-slate-500">成员默认可向本人部门发布任务。跨部门或按后台角色发布，请在此配置范围。</p>
         {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</div>}
 
-        {/* 已授权成员清单 */}
         <section aria-labelledby="grant-list-title">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h3 id="grant-list-title" className="text-sm font-semibold text-slate-900">已授权成员</h3>
+            <h3 id="grant-list-title" className="text-sm font-semibold text-slate-900">已自定义范围成员</h3>
             <div className="relative">
               <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
-              <input aria-label="搜索已授权成员" placeholder="搜索姓名或手机号" value={search}
+              <input aria-label="搜索已自定义范围成员" placeholder="搜索姓名或手机号" value={search}
                 onChange={(e) => setSearch(e.target.value)} className={fieldClass + ' w-48 pl-8 pr-8'} />
               {search && <button type="button" aria-label="清空搜索" onClick={() => setSearch('')}
                 className="absolute right-2 top-2 rounded p-0.5 text-slate-500 hover:bg-slate-100"><X className="h-3.5 w-3.5" /></button>}
@@ -323,15 +321,15 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
               <thead className="bg-slate-50 text-slate-600">
                 <tr>
                   <th className="w-[42%] px-3 py-2.5 font-medium">成员</th>
-                  <th className="px-3 py-2.5 font-medium">管辖范围</th>
+                  <th className="px-3 py-2.5 font-medium">发布范围</th>
                   <th className="w-28 px-3 py-2.5 text-right font-medium">操作</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {members === null ? (
-                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{error ? '加载失败' : '正在读取授权清单…'}</td></tr>
+                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{error ? '加载失败' : '正在读取自定义范围成员…'}</td></tr>
                 ) : !members.length ? (
-                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{query ? '没有匹配的已授权成员' : '还没有授权成员，从下方添加'}</td></tr>
+                  <tr><td colSpan={3} className="px-3 py-8 text-center text-slate-500">{query ? '没有匹配的已自定义范围成员' : '暂无已自定义范围成员'}</td></tr>
                 ) : members.map((row) => (
                   <tr key={row.phone} className="align-top hover:bg-slate-50/70">
                     <td className="px-3 py-3">
@@ -358,7 +356,7 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
                         <button type="button" onClick={() => setEditPhone(row.phone)}
                           className="rounded-lg bg-blue-50 px-2.5 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100">修改范围</button>
                         <button type="button" onClick={() => setCancelTarget(row)}
-                          className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100">取消授权</button>
+                          className="rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs font-semibold text-rose-700 hover:bg-rose-100">禁用发布</button>
                       </div>
                     </td>
                   </tr>
@@ -366,31 +364,30 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
               </tbody>
             </table>
           </div>
-          <p className="mt-1.5 text-[11px] text-slate-500">取消授权后该成员将无法新建任务、不再定时推送；其历史任务与本面板统计完整保留。</p>
+          <p className="mt-1.5 text-[11px] text-slate-500">禁用后，该成员在您的管理范围内无法新建任务，已发布的周期任务停止定时推送。历史任务和统计仍可查看。</p>
         </section>
 
-        {/* 新增授权：搜索可授权成员 */}
         <section aria-labelledby="grant-add-title" className="rounded-xl border border-slate-200 p-4">
-          <h3 id="grant-add-title" className="text-sm font-semibold text-slate-900">新增授权成员</h3>
-          <p className="mt-0.5 text-[11px] text-slate-500">仅列出您名下已启用且已激活可投递的成员；选中后配置管辖范围并保存开通。</p>
+          <h3 id="grant-add-title" className="text-sm font-semibold text-slate-900">修改成员发布范围</h3>
+          <p className="mt-0.5 text-[11px] text-slate-500">成员默认仅可向本人部门发布。需跨部门或按角色发布时，请点击「修改范围」。</p>
           <div className="relative mt-2">
             <Search className="pointer-events-none absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" />
-            <input aria-label="搜索可授权成员" placeholder="搜索姓名或手机号" value={candidateQuery}
+            <input aria-label="搜索成员" placeholder="搜索姓名或手机号" value={candidateQuery}
               onChange={(e) => setCandidateQuery(e.target.value)} className={fieldClass + ' pl-8'} />
           </div>
           <ul className="mt-2 max-h-52 divide-y divide-slate-100 overflow-y-auto rounded-lg border border-slate-100">
             {candidates === null || candidateLoading ? (
-              <li role="status" className="px-3 py-6 text-center text-xs text-slate-500">正在搜索可授权成员…</li>
+              <li role="status" className="px-3 py-6 text-center text-xs text-slate-500">正在搜索成员…</li>
             ) : !candidates.length ? (
               <li className="px-3 py-6 text-center text-xs text-slate-500">
-                {candidateQuery.trim() ? '没有匹配的可授权成员' : '您名下暂无已激活可投递成员'}
+                {candidateQuery.trim() ? '没有匹配的成员' : '您名下暂无已激活可投递成员'}
               </li>
             ) : candidates.map((row) => (
               <li key={row.phone} className="flex items-center gap-2 px-3 py-2.5 hover:bg-slate-50/70">
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <span className="truncate text-xs font-semibold text-slate-900">{row.name}</span>
-                    {granted.has(row.phone) && <span className="shrink-0 rounded border border-blue-200 bg-blue-50 px-1 py-0.5 text-[10px] font-semibold text-blue-700">已授权</span>}
+                    {granted.has(row.phone) && <span className="shrink-0 rounded border border-blue-200 bg-blue-50 px-1 py-0.5 text-[10px] font-semibold text-blue-700">已自定义</span>}
                   </div>
                   <div className="mt-0.5 truncate text-[11px] tabular-nums text-slate-500" title={row.dept_path}>
                     {row.phone} · {row.dept_path || '部门未分配'}
@@ -398,13 +395,13 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
                 </div>
                 <button type="button" onClick={() => setEditPhone(row.phone)}
                   className="shrink-0 rounded-lg bg-blue-600 px-2.5 py-1.5 text-xs font-semibold text-white hover:bg-blue-700">
-                  {granted.has(row.phone) ? '修改范围' : '配置授权'}
+                  修改范围
                 </button>
               </li>
             ))}
           </ul>
           <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-slate-500">
-            <Plus className="h-3.5 w-3.5" />搜索并在结果里点「配置授权」即可开通
+            <Pencil className="h-3.5 w-3.5" />搜索成员并点「修改范围」调整其可发布范围
           </div>
         </section>
       </div>
@@ -415,24 +412,23 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
           onSaved={() => { void load(); void loadCandidates(candidateQuery.trim()); }} />
       )}
 
-      {/* 取消授权二次确认 */}
       {cancelTarget && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs"
           role="dialog" aria-modal="true" aria-labelledby="grant-cancel-title"
           onClick={(e) => { if (e.target === e.currentTarget) setCancelTarget(null); }}>
           <section className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl">
-            <h3 id="grant-cancel-title" className="text-base font-bold text-slate-900">确认取消授权？</h3>
+            <h3 id="grant-cancel-title" className="text-base font-bold text-slate-900">确认禁用发布？</h3>
             <p className="mt-2 text-sm leading-6 text-slate-700">
-              取消后，<strong className="font-semibold">{cancelTarget.name}（{cancelTarget.phone}）</strong>
-              将<strong className="font-semibold">无法再新建任务，已发布的周期任务不再定时推送</strong>；
-              但其<strong className="font-semibold">历史已发布任务与统计数据仍完整保留</strong>，本面板可继续只读查看与导出。
+              禁用后，<strong className="font-semibold">{cancelTarget.name}（{cancelTarget.phone}）</strong>
+              将<strong className="font-semibold">无法在您的管理范围内新建任务，包括向本人部门发布</strong>。
+              该范围内已发布的周期任务将停止定时推送，历史任务和统计仍可查看与导出。
             </p>
             <div className="mt-5 flex justify-end gap-2.5">
               <button type="button" onClick={() => setCancelTarget(null)} disabled={cancelling}
                 className="rounded-xl px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100">再想想</button>
               <button type="button" onClick={() => void confirmCancel()} disabled={cancelling}
                 className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50">
-                <X className="h-3.5 w-3.5" />{cancelling ? '取消中…' : '确认取消授权'}
+                <X className="h-3.5 w-3.5" />{cancelling ? '禁用中…' : '确认禁用发布'}
               </button>
             </div>
           </section>
@@ -506,7 +502,7 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
           <button type="button" onClick={onManageGrants}
             title="配置成员的跨部门或角色发布范围"
             className="inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-100">
-            <Users className="h-3.5 w-3.5" />授权成员管理
+            <Users className="h-3.5 w-3.5" />发布范围管理
             {grantCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{grantCount}</span>}
           </button>
         )}
@@ -605,8 +601,8 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
       {!isSuperAdmin && (
         <button type="button" onClick={onConfigure}
           className="mt-7 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700">
-          <Users className="size-4" />授权成员管理
-          {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">已配置 {authorized} 人</span>}
+          <Users className="size-4" />发布范围管理
+          {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">{authorized} 人已自定义</span>}
         </button>
       )}
     </div>
