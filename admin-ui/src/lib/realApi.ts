@@ -422,6 +422,10 @@ export async function realApi<T = any>(method: 'GET' | 'POST' | 'PUT' | 'DELETE'
     rawPath = path.slice(0, qi);
     queryText = path.slice(qi + 1);
   }
+  // 手动推送的附加提醒属于本次操作，直接透传请求体，避免被模板编辑字段映射丢弃。
+  if (method === 'POST' && /^\/api\/admin\/templates\/[^/]+\/push-now$/.test(rawPath)) {
+    return rawFetch<T>(method, path, body);
+  }
   const query = new URLSearchParams(queryText || '');
 
   /* 登录：映射响应字段并保存 CSRF */
