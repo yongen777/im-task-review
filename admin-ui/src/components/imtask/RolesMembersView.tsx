@@ -1586,7 +1586,7 @@ export const RolesMembersView: React.FC = () => {
             </div>
             {canCleanDirectory && (
               <p className="text-xs leading-relaxed text-slate-600">
-                将选中的 {activeDirectoryReview.selected.size} 人移出当前平台名册并取消未完成待办。历史提交、回执和附件仍可在统计中查看。
+                将选中的 {activeDirectoryReview.selected.size} 人移出当前平台名册并取消未完成待办。成员从任务统计和导出中移除，原始提交、回执和附件留存。
               </p>
             )}
             <footer className="flex flex-wrap justify-end gap-2">
@@ -1668,7 +1668,7 @@ export const RolesMembersView: React.FC = () => {
                 <p className="text-[11px] text-emerald-800">
                   该手机号在当前办公软件下若还有其它角色分组，激活绑定保持不动；若已无任何角色归属，
                   该平台绑定一并清除，后续需重新导入（导入即自动反查通讯录重新激活）。
-                  其未完成的任务实例转「已取消」，已完成的按既定口径一并清除。
+                  若该成员已无该任务的角色归属，未完成待办将取消，已完成和未完成的记录均从任务统计和导出中移除。
                 </p>
               </div>
             </div>
@@ -1722,7 +1722,7 @@ export const RolesMembersView: React.FC = () => {
             <div className="p-3 rounded-xl bg-rose-50/80 border border-rose-200/80 text-rose-900 space-y-1 text-xs leading-relaxed">
               <p className="font-semibold">移除后果（与单个移除同款）：</p>
               <p>· 名册行立即删除；该成员在当前平台已无其它角色归属时，激活绑定一并清除（后续重新导入即自动反查激活）。</p>
-              <p>· 未完成任务实例转「已取消」，已完成实例按既定口径一并清除。</p>
+              <p>· 失去任务角色归属的成员将退出该任务统计和导出，未完成待办同时取消。</p>
               <p>· 单个成员移除失败不影响其余成员，结果逐条回报。</p>
             </div>
             <div className="pt-2 flex justify-end gap-2 text-xs">

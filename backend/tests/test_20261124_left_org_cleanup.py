@@ -105,6 +105,7 @@ def test_cleanup_removes_only_current_scope_pending_work_and_preserves_history(c
                                      PERIOD, PERIOD + " 18:00:00")
 
     approved = _historical_submission(store, template, "approved", "2026-11-15")
+    store.conn.execute("UPDATE task_instance SET role_name_snapshot=NULL WHERE id=?", (approved[0]["id"],))
     store.update_template(template_id, {"need_review": True})
     submitted = _historical_submission(store, template, "submitted", "2026-11-16")
     solo = store.ensure_instance(template_id, SOLO, "离职成员", "旧部门", PERIOD, PERIOD + " 18:00:00")
@@ -134,7 +135,10 @@ def test_cleanup_removes_only_current_scope_pending_work_and_preserves_history(c
         [saved] = store.list_submissions_for_instance(instance["id"])
         assert store.submission_refs(saved) == list(attachments)
         assert all(path.is_file() and store.get_upload_ref(ref)["consumed"] for ref, path in attachments.items())
-        assert _report(owner, template_id, instance["period_key"])[1:] == ({PHONE}, {PHONE})
+        kpis, roster, excel = _report(owner, template_id, instance["period_key"])
+        assert kpis["total"] == kpis["done"] == 0 and roster == excel == set()
+        overview = store.stats_panel_overview(template_id, instance["period_key"], owner_id)
+        assert overview["dept_stats"] == {} and overview["dept_tree"] == []
 
     grants = store.conn.execute("SELECT owner_id, platform, enabled FROM portal_grant WHERE phone=?", (PHONE,)).fetchall()
     assert {(row["owner_id"], row["platform"]): row["enabled"] for row in grants} == {
@@ -167,7 +171,35 @@ def test_cleanup_cancels_unacknowledged_notices_and_keeps_receipts(ctx):
     assert store.get_instance(by_phone[PHONE]["id"])["status"] == "cancelled"
     acknowledged = store.get_instance(by_phone[SOLO]["id"])
     assert acknowledged["status"] == "pending" and acknowledged["receipt_text"] == "已知悉"
-    assert _report(owner, notice["template_id"])[1:] == ({SOLO}, {SOLO})
+    kpis, roster, excel = _report(owner, notice["template_id"])
+    assert kpis["expected_replies"] == kpis["replied"] == 0 and roster == excel == set()
+
+
+def test_role_removal_only_hides_members_who_lose_their_task_roles(ctx):
+    store, _, _, _, owner, _, template, pending = ctx
+    owner_id, template_id = template["owner_id"], template["template_id"]
+    first = template["role_ids"][0]
+    second = role(store, "同一任务角色", owner_id=owner_id)
+    unrelated = role(store, "无关角色", owner_id=owner_id)
+    for rid in (second, unrelated):
+        seed(store, rid, PHONE, "测试成员", owner_id=owner_id)
+    seed(store, first, SOLO, "待交成员", owner_id=owner_id)
+    store.update_template(template_id, {"role_ids": [first, second]})
+    historical, _ = _historical_submission(store, template, "approved", "2026-11-15")
+    waiting = store.ensure_instance(template_id, SOLO, "待交成员", "旧部门", PERIOD, PERIOD + " 18:00:00")
+
+    assert owner.delete(f"/api/admin/roles/{first}/members/{PHONE}").status_code == 200
+    assert _report(owner, template_id, historical["period_key"])[1:] == ({PHONE}, {PHONE})
+    for rid, phone in ((first, SOLO), (second, PHONE)):
+        response = owner.post(f"/api/admin/roles/{rid}/members/batch-delete", json={"phones": [phone]})
+        assert response.status_code == 200 and response.json()["deleted"] == [phone]
+
+    assert store.list_role_members(unrelated)["total"] == 1
+    assert _report(owner, template_id, historical["period_key"])[1:] == (set(), set())
+    assert _report(owner, template_id)[1:] == (set(), set())
+    assert store.get_instance(historical["id"])["status"] == "approved"
+    assert store.get_instance(pending["id"])["status"] == "cancelled"
+    assert store.get_instance(waiting["id"])["status"] == "cancelled"
 
 
 def test_cleanup_denies_super_admin_and_uses_session_owner(ctx):

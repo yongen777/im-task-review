@@ -402,6 +402,15 @@ def test_adhoc_overview_trend_and_day_list() -> None:
         # 智能周期元数据：is_adhoc 任务在清单里可被判别
         items = sa1.get("/api/admin/stats-panel/tasks").json()["items"]
         assert any(it["template_id"] == tpl and it["is_adhoc"] for it in items)
+        store.delete_role_member(ctx["rid"], P_ZS)
+        filtered = _q(sa1, f"stats-panel/overview?template_id={tpl}&period_key={PK_DAY}").json()
+        assert filtered["kpis"] == {"day_count": 0, "day_unique": 0, "total_count": 1, "total_unique": 1}
+        assert filtered["trend"][-1]["count"] == 0
+        assert _q(sa1, f"stats-panel/submissions-day?template_id={tpl}&date={PK_DAY}").json()["items"] == []
+        export = _q(sa1, f"stats-panel/export?template_id={tpl}&period_key={PK_DAY}")
+        assert export.status_code == 200
+        assert load_workbook(io.BytesIO(export.content)).active.max_row == 1
+        assert store.list_submissions_for_instance(older["instance_id"])
     finally:
         ctx["store"].close()
 

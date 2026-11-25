@@ -6003,18 +6003,70 @@ class StateStore:
             raise BizError(403, "FORBIDDEN_OWNER", "只能查看自己名下任务的统计数据")
         return tpl
 
-    def _stats_receipt_rows(self, template_id: str, period: str) -> List[Dict[str, Any]]:
-        per_sql, params = self._stats_period_where(period.strip(), alias="")
+    def _stats_roster_scope_sql(self, tpl: Dict[str, Any]) -> tuple:
+        """统计排除已从任务范围移出的成员，保留原始任务和提交用于追溯。"""
+        from .variable_notice import config_for
+
+        if tpl.get("portal_task"):
+            return "1=1", ()
+        owner_id = tpl["owner_id"]
+        if variable := config_for(tpl):
+            return (
+                "EXISTS (SELECT 1 FROM member m JOIN role r ON r.role_id = m.role_id "
+                "WHERE m.phone = i.phone AND r.owner_id = ? AND r.platform = ?)",
+                (owner_id, variable["platform"]),
+            )
+
+        roles = tuple(tpl.get("role_ids") or [])
+        role_params = ",".join("?" for _ in roles) or "NULL"
+        platforms = tuple(sorted(self.role_platforms(list(roles))))
+        platform_sql = ""
+        if platforms:
+            platform_sql = "AND r.platform IN (" + ",".join("?" for _ in platforms) + ") "
+        # 显式移除由审计识别，避免把仅因模板改绑角色而脱离当前范围的历史提交一起排除。
+        return (
+            f"(EXISTS (SELECT 1 FROM member m WHERE m.phone = i.phone AND m.role_id IN ({role_params})) "
+            "OR NOT EXISTS (SELECT 1 FROM role r WHERE r.owner_id = ? "
+            f"{platform_sql}AND (r.role_id IN ({role_params}) OR "
+            "INSTR(CONCAT('、', COALESCE(i.role_name_snapshot, ''), '、'), CONCAT('、', r.name, '、')) > 0) "
+            "AND NOT EXISTS (SELECT 1 FROM member m WHERE m.phone = i.phone AND m.role_id = r.role_id) "
+            "AND (EXISTS (SELECT 1 FROM admin_audit a WHERE a.target_type = 'member' "
+            "AND a.target_id = CONCAT(r.role_id, ':', i.phone) AND a.action = 'member.delete') "
+            "OR EXISTS (SELECT 1 FROM admin_audit a WHERE a.target_type = 'role' AND a.target_id = ? "
+            "AND a.action = 'member.left_org_cleanup' AND JSON_VALID(a.detail) "
+            "AND JSON_UNQUOTE(JSON_EXTRACT(a.detail, '$.platform')) = r.platform "
+            "AND JSON_CONTAINS(a.detail, JSON_QUOTE(i.phone), '$.phones')))))",
+            (*roles, owner_id, *platforms, *roles, str(owner_id)),
+        )
+
+    def _stats_period_rows(self, tpl: Dict[str, Any], period: str, *, has_receipt: bool) -> List[Dict[str, Any]]:
+        if has_receipt:
+            return self._stats_receipt_rows(tpl, period)
+        if tpl["kind"] == "notice":
+            return self._stats_delivery_rows(tpl, period)
+        per_sql, params = self._stats_period_where(period.strip())
+        roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
+        return [dict(row) for row in self.conn.execute(
+            "SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at, i.late_submit "
+            "FROM task_instance i "
+            f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled' AND {roster_sql}",
+            (tpl["template_id"], *params, *roster_params),
+        ).fetchall()]
+
+    def _stats_receipt_rows(self, tpl: Dict[str, Any], period: str) -> List[Dict[str, Any]]:
+        per_sql, params = self._stats_period_where(period.strip())
+        roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
         return [dict(row) for row in self.conn.execute(
             "SELECT id, phone, name_snap, dept_snap, receipt_at, receipt_text, "
             "COALESCE(receipt_mode, 'text') AS receipt_mode, "
             "CASE WHEN receipt_at IS NULL THEN 'pending' ELSE 'approved' END AS status, "
-            "receipt_at AS submitted_at FROM task_instance "
-            f"WHERE template_id = ? AND {per_sql} AND status != 'cancelled' AND receipt_phrase IS NOT NULL",
-            (template_id, *params),
+            "receipt_at AS submitted_at FROM task_instance i "
+            f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled' "
+            f"AND i.receipt_phrase IS NOT NULL AND {roster_sql}",
+            (tpl["template_id"], *params, *roster_params),
         ).fetchall()]
 
-    def _stats_delivery_rows(self, template_id: str, period: str) -> List[Dict[str, Any]]:
+    def _stats_delivery_rows(self, tpl: Dict[str, Any], period: str) -> List[Dict[str, Any]]:
         """纯广播通知的送达口径：sent/approved = 已送达，其余未送达（2026-11-23）。"""
         per_sql, params = self._stats_period_where(period.strip(), alias="i")
         return [dict(row) for row in self.conn.execute(
@@ -6028,7 +6080,7 @@ class StateStore:
             "           'notice_file', 'notice_video', 'notice_img_link', 'notice_file_link', 'notice_vid_link') "
             "           GROUP BY instance_id) quiet ON quiet.instance_id = i.id "
             f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled'",
-            (template_id, *params),
+            (tpl["template_id"], *params),
         ).fetchall()]
 
     @staticmethod
@@ -6282,8 +6334,10 @@ class StateStore:
             tree = self._stats_dept_tree({p: self._stats_phone_path(p, dept_map) for p in dept_map})
             ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
             ex_and = f" AND {ex_sql}" if ex_sql else ""
-            base = "FROM submission s JOIN task_instance i ON i.id = s.instance_id WHERE i.template_id = ?"
-            base_params: List[Any] = [tpl["template_id"]]
+            roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
+            base = ("FROM submission s JOIN task_instance i ON i.id = s.instance_id "
+                    f"WHERE i.template_id = ? AND {roster_sql}")
+            base_params: List[Any] = [tpl["template_id"], *roster_params]
             if ex_sql:
                 base += ex_and
                 base_params += ex_params
@@ -6322,18 +6376,9 @@ class StateStore:
         # ── 定期（模式A）──
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-        per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
-        if tpl_meta["is_receipt"]:
-            rows = self._stats_receipt_rows(tpl["template_id"], period_key)
-        elif tpl_meta["is_notice"]:
-            rows = self._stats_delivery_rows(tpl["template_id"], period_key)
-        else:
-            rows = self.conn.execute(
-                "SELECT id, phone, name_snap, dept_snap, status, submitted_at, deadline_at "
-                f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
-                (tpl["template_id"], *per_params)).fetchall()
+        rows = self._stats_period_rows(tpl, period_key, has_receipt=tpl_meta["is_receipt"])
         # 周/月聚合视角：同人多实例去重成一人一行（日视图唯一键保证恒等）
-        persons = self._stats_dedup_persons([dict(r) for r in rows])
+        persons = self._stats_dedup_persons(rows)
         # 2026-11-19 需求五：用「本期实例里实际出现的手机号」做部门兜底，
         # 模板改绑角色后原角色成员不再变成「未分配部门」。
         dept_map = self._stats_template_dept_map(tpl, persons)
@@ -6403,18 +6448,9 @@ class StateStore:
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
         sel = str(dept_path or "").strip().strip("/")
-        per_sql, per_params = self._stats_period_where(period_key.strip(), alias="")
         from .notice_media import notice_receipt_config
         has_receipt = tpl["kind"] == "notice" and bool(notice_receipt_config(tpl)[0])
-        if has_receipt:
-            rows = self._stats_receipt_rows(tpl["template_id"], period_key)
-        elif tpl["kind"] == "notice":
-            rows = self._stats_delivery_rows(tpl["template_id"], period_key)
-        else:
-            rows = [dict(r) for r in self.conn.execute(
-                "SELECT id, phone, name_snap, dept_snap, status, submitted_at, late_submit "
-                f"FROM task_instance WHERE template_id = ? AND {per_sql} AND status != 'cancelled'",
-                (tpl["template_id"], *per_params)).fetchall()]
+        rows = self._stats_period_rows(tpl, period_key, has_receipt=has_receipt)
 
         def _keep(r: Dict[str, Any]) -> bool:
             group = str(status_group or "all").strip().lower()
@@ -6558,9 +6594,9 @@ class StateStore:
             raise BizError(400, "VALIDATION_FAILED", "请选择具体日期（YYYY-MM-DD）")
         date_str = date_str.strip()
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
-        where = ["i.template_id = ?",
-                 "s.created_at >= ?", "s.created_at <= ?"]
-        params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
+        roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
+        where = ["i.template_id = ?", "s.created_at >= ?", "s.created_at <= ?", roster_sql]
+        params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59", *roster_params]
         dept_map = self._stats_member_dept_map(role_ids)
         ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, dept_path)
         if ex_sql:
@@ -6603,15 +6639,13 @@ class StateStore:
         """按任务、周期和部门范围装配完整明细及提交附件。"""
         tpl = self.stats_panel_guard_template(template_id, owner_id, allow_portal_task=allow_portal_task)
         role_ids = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
-        dept_map = self._stats_member_dept_map(role_ids, owner_id=owner_id)
         sel = str(dept_path or "").strip().strip("/")
         if tpl["kind"] == "notice":
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
             from .notice_media import notice_receipt_config
             has_receipt = bool(notice_receipt_config(tpl)[0])
-            source_rows = (self._stats_receipt_rows(tpl["template_id"], period_key) if has_receipt
-                           else self._stats_delivery_rows(tpl["template_id"], period_key))
+            source_rows = self._stats_period_rows(tpl, period_key, has_receipt=has_receipt)
             persons = self._stats_dedup_persons(source_rows)
             # 2026-11-19 需求五：导出与明细/下钻共用同一份兜底后的 dept_map
             dept_map = self._stats_template_dept_map(tpl, persons)
@@ -6634,13 +6668,14 @@ class StateStore:
             date_str = (period_key or "").strip()
             if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
                 raise BizError(400, "VALIDATION_FAILED", "不定期任务导出需要具体日期（YYYY-MM-DD）")
-            params: List[Any] = [tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59"]
+            roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
             rows = self.conn.execute(
                 "SELECT i.id AS instance_id, s.fields_json, s.note, s.refs_json, s.file_ref, s.created_at AS submitted_at, "
                 "i.phone, i.name_snap, s.status AS status, i.dept_snap "
                 "FROM submission s JOIN task_instance i ON i.id = s.instance_id "
-                "WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? ORDER BY s.created_at DESC, s.id DESC",
-                tuple(params)).fetchall()
+                f"WHERE i.template_id = ? AND s.created_at >= ? AND s.created_at <= ? AND {roster_sql} "
+                "ORDER BY s.created_at DESC, s.id DESC",
+                (tpl["template_id"], f"{date_str} 00:00:00", f"{date_str} 23:59:59", *roster_params)).fetchall()
             dept_map = self._stats_member_dept_map(
                 role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in rows])
             out_rows: List[Dict[str, Any]] = []
@@ -6659,26 +6694,11 @@ class StateStore:
         else:
             if not (period_key or "").strip():
                 raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-            per_sql, per_params = self._stats_period_where(period_key.strip())
-            # 2026-11-19 需求五：先取本期实际出现的手机号做部门兜底，再按部门筛选，
-            # 保证「日历改了绑定角色」的历史成员不会被部门下钻筛掉。
-            covered = self.conn.execute(
-                f"SELECT DISTINCT i.phone FROM task_instance i "
-                f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled'",
-                (tpl["template_id"], *per_params)).fetchall()
-            dept_map = self._stats_member_dept_map(
-                role_ids, owner_id=owner_id, phones=[str(r["phone"]) for r in covered])
-            ex_sql, ex_params = self._stats_dept_filter_sql(dept_map, sel)
-            where = ["i.template_id = ?", per_sql, "i.status != 'cancelled'"]
-            params: List[Any] = [tpl["template_id"], *per_params]
-            if ex_sql:
-                where.append(ex_sql)
-                params += ex_params
-            where_sql = "WHERE " + " AND ".join(where)
-            raw_rows = [dict(r) for r in self.conn.execute(
-                f"SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at "
-                f"FROM task_instance i {where_sql}", tuple(params)).fetchall()]
-            persons = self._stats_dedup_persons(raw_rows)
+            persons = self._stats_dedup_persons(self._stats_period_rows(tpl, period_key, has_receipt=False))
+            dept_map = self._stats_template_dept_map(tpl, persons)
+            if sel:
+                persons = [r for r in persons if self._stats_phone_path(r["phone"], dept_map) == sel
+                           or self._stats_phone_path(r["phone"], dept_map).startswith(sel + "/")]
             # 按代表实例取最近一次实际提交，保留被驳回的原始内容。
             instance_ids = [int(r["id"]) for r in persons]
             subs: Dict[int, Dict[str, Any]] = {}
