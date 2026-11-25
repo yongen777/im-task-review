@@ -12,6 +12,7 @@ import type { TaskInstanceItem } from '../../lib/types';
 import { AdminScopeHeader } from './AdminScopeHeader';
 import { DepartmentTree, type DeptTreeNode } from './DepartmentTree';
 import { getInstanceStatusMeta, InstanceDetailDialog } from './InstanceDetailDialog';
+import { downloadStatisticsChart } from './statisticsChart';
 
 const PAGE_SIZE = 50;
 const periodLabel = { day: '日期', week: '周', month: '月份' };
@@ -393,7 +394,6 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
     if (overview.loading || overviewData?.mode !== 'periodic' || !overview.receivedAt || !overviewData.kpis.total) return;
     setExportingChart(true);
     try {
-      const { downloadStatisticsChart } = await import('./statisticsChart');
       await downloadStatisticsChart({
         task: task.name,
         period: task.is_manual ? '一次性推送' : periodKey

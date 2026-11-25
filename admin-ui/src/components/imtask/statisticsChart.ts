@@ -1,3 +1,5 @@
+import JSZip from 'jszip';
+
 interface DepartmentCounts {
   name: string;
   covered: number;
@@ -159,7 +161,6 @@ export async function downloadStatisticsChart(chart: StatisticsChart) {
     blob = await renderPng(chart, rows, 1, pages);
     extension = '.png';
   } else {
-    const { default: JSZip } = await import('jszip');
     const zip = new JSZip();
     for (let index = 0; index < pages; index++) {
       const png = await renderPng(chart, rows.slice(index * ROWS_PER_PAGE, (index + 1) * ROWS_PER_PAGE), index + 1, pages);
