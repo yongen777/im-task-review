@@ -1438,7 +1438,7 @@
     function shanghaiToday() {
       return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Shanghai' });
     }
-    let historyDate = shanghaiToday();
+    let historyDate = '';
     const historyCalendar = document.getElementById('history-calendar');
     const calendarYear = document.getElementById('calendar-year');
     const calendarMonth = document.getElementById('calendar-month');
@@ -1473,7 +1473,7 @@
 
     function openHistoryCalendar() {
       const latestYear = Number(shanghaiToday().slice(0, 4));
-      const [selectedYear, selectedMonth] = historyDate.split('-').map(Number);
+      const [selectedYear, selectedMonth] = (historyDate || shanghaiToday()).split('-').map(Number);
       calendarYear.innerHTML = Array.from({ length: latestYear - 1899 }, (_, index) => {
         const year = latestYear - index;
         return '<option value="' + year + '">' + year + '年</option>';
@@ -1493,7 +1493,7 @@
     }
 
     function chooseHistoryDate(date) {
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '') || date > shanghaiToday()) return;
+      if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date > shanghaiToday())) return;
       closeHistoryCalendar();
       historyDate = date;
       showHistory();
@@ -1516,10 +1516,12 @@
       section.id = 'home-history';
       section.innerHTML = '<div class="row section-row"><h2>我的提交记录</h2></div>' +
         '<div class="history-filter"><span>日期</span><button type="button" class="secondary history-date-trigger" ' +
-        'data-history-date aria-haspopup="dialog"><span>' + displayHistoryDate(date) + '</span>' + CHEVRON_SVG +
-        '</button></div>' +
-        '<div data-history-results><div class="card empty">正在读取提交记录…</div></div>';
+        'data-history-date aria-haspopup="dialog"><span>' + (date ? displayHistoryDate(date) : '全部日期') + '</span>' + CHEVRON_SVG +
+        '</button>' + (date ? '<button type="button" class="secondary" data-history-all>清除</button>' : '') + '</div>' +
+        '<div data-history-results>' + historyCards(previousItems, true) + '<div class="card empty">正在读取提交记录…</div></div>';
       section.querySelector('[data-history-date]').onclick = openHistoryCalendar;
+      const clear = section.querySelector('[data-history-all]');
+      if (clear) clear.onclick = () => chooseHistoryDate('');
       const previous = document.getElementById('home-history');
       if (previous) previous.replaceWith(section); else main.appendChild(section);
       if (jumpToHistory) {
@@ -1527,29 +1529,22 @@
         section.scrollIntoView();
       }
       const results = section.querySelector('[data-history-results]');
-      const matched = [...previousItems];
-      let cursor = offset;
-      let hasMore = false;
+      bindHistory(results);
       try {
-        for (let page = 0; page < 10; page++) {
-          const result = await api('history', { offset: cursor });
-          if (!section.isConnected) return;
-          const items = result.items || [];
-          matched.push(...items.filter(row => String(row.submitted_at || '').slice(0, 10) === date));
-          const lastDay = String(items[items.length - 1]?.submitted_at || '').slice(0, 10);
-          hasMore = Boolean(result.has_more && lastDay && lastDay >= date);
-          cursor += 30;
-          if (!hasMore) break;
-        }
+        const result = await api('history', date ? { offset, date } : { offset });
+        if (!section.isConnected) return;
+        const items = result.items || [];
+        const matched = [...previousItems, ...items];
         results.innerHTML = (matched.length ? historyCards(matched, true) : '<div class="card empty">' +
-          (hasMore ? '已加载的记录中暂无这一天的提交' : '这一天暂无提交记录') + '</div>') +
-          (hasMore ? '<div class="pager"><button type="button" class="secondary">继续查找记录</button></div>' : '');
+          (date ? '这一天暂无提交记录' : '暂无提交记录') + '</div>') +
+          (result.has_more ? '<div class="pager"><button type="button" class="secondary">加载更多</button></div>' : '');
         bindHistory(results);
         const more = results.querySelector('.pager button');
-        if (more) more.onclick = () => showHistory(cursor, matched);
+        if (more) more.onclick = () => showHistory(offset + items.length, matched);
       } catch (error) {
         if (!section.isConnected) return;
-        results.innerHTML = '<div class="card empty"><p></p><button type="button" class="secondary">重试</button></div>';
+        results.innerHTML = historyCards(previousItems, true) + '<div class="card empty"><p></p><button type="button" class="secondary">重试</button></div>';
+        bindHistory(results);
         results.querySelector('.empty p').textContent = error.message;
         results.querySelector('.empty button').onclick = () => showHistory(offset, previousItems);
         toast(error.message);
@@ -1696,7 +1691,7 @@
       button.onclick = () => {
         if (expired || !info) return;
         if (button.dataset.tab === 'create' && !info.can_create) {
-          toast('您还未开放此权限，具体请找相关管理员');
+          toast('当前无法确定可发布范围，请联系所属管理员');
           return;
         }
         if (tab === button.dataset.tab) return;

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import date
 from pathlib import Path
 
 from fastapi import APIRouter, Request, BackgroundTasks
@@ -103,7 +104,10 @@ def create_portal_router(state, scheduler=None, uploads_dir=None):
                 offset = int(data.get('offset', 0))
                 if not 0 <= offset <= 2_147_483_647:
                     raise ValueError
-                rows = p.submission_history(ident, offset=offset)
+                submitted_date = data.get('date', '')
+                if not isinstance(submitted_date, str) or (submitted_date and date.fromisoformat(submitted_date).isoformat() != submitted_date):
+                    raise ValueError
+                rows = p.submission_history(ident, submitted_date=submitted_date, offset=offset)
                 return {'ok': True, 'items': rows[:30], 'has_more': len(rows) > 30}
             if action == 'history-open':
                 return p.submission_history_link(ident, int(data.get('instance_id', 0)), edit=data.get('edit') is True)

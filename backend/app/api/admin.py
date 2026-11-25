@@ -1731,9 +1731,22 @@ def create_admin_router(
                 403, "SUPER_ADMIN_READONLY",
                 "请由创建该模板的分级管理员推送",
             )
+        body = await request.body()
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError:
+            return error_response(400, "VALIDATION_ERROR", "请求格式错误")
+        if not isinstance(payload, dict):
+            return error_response(400, "VALIDATION_ERROR", "请求格式错误")
+        push_note = payload.get("push_note", "")
+        if not isinstance(push_note, str):
+            return error_response(400, "VALIDATION_ERROR", "附加提醒必须为字符串")
+        push_note = push_note.strip()
+        if len(push_note) > 200:
+            return error_response(400, "VALIDATION_ERROR", "附加提醒不能超过 200 字")
         return await _queue_template_push(template_id, request, background_tasks, sess["username"],
                                          confirmed=confirmed, skip_completed=skip_completed,
-                                         owner_id=int(_admin["id"]))
+                                         owner_id=int(_admin["id"]), push_note=push_note)
 
     @router.get("/templates/{template_id}/push-preview")
     async def push_preview(template_id: str, request: Request):
@@ -1763,7 +1776,7 @@ def create_admin_router(
 
     async def _queue_template_push(template_id: str, request: Request, background_tasks: BackgroundTasks,
                                   actor: str, confirmed: bool = False, skip_completed: bool = False,
-                                  owner_id: Optional[int] = None):
+                                  owner_id: Optional[int] = None, push_note: str = ""):
         # 先验模板形态（notice 按时刻自动发，不占冷却 marker），再进软护栏
         _tpl = state.get_template(template_id, include_deleted=False)
         if not _tpl or _tpl.get("deleted"):
@@ -1837,11 +1850,15 @@ def create_admin_router(
         except Exception:  # noqa: BLE001
             logger.exception("push_now prepare 异常 template=%s", template_id)
             return error_response(500, "PUSH_FAILED", "推送准备阶段异常，请稍后重试")
+        if push_note:
+            prep["push_note"] = push_note
         attempted_at = prep["pushed_at"] if variable else guard["attempted_at"]
         return _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at,
                                      bool(prep.get("skip_completed")))
 
     def _accept_template_push(template_id, background_tasks, scheduler, prep, actor, attempted_at, skip_completed):
+        note_detail = {"push_note": prep["push_note"]} if prep.get("push_note") else {}
+
         def _bg_deliver() -> None:
             """后台投递（线程池执行，事件循环零阻塞）；成功/异常都留痕，绝不向响应传播。"""
             try:
@@ -1864,7 +1881,7 @@ def create_admin_router(
                 target_id=template_id,
                 detail={"pushed_at": attempted_at, "stats": stats,
                         "new_batch": prep.get("new_batch", False),
-                        "synced_completed": prep.get("synced_completed", 0)},
+                        "synced_completed": prep.get("synced_completed", 0), **note_detail},
             )
 
         background_tasks.add_task(_bg_deliver)
@@ -1876,7 +1893,7 @@ def create_admin_router(
                     "period_key": prep["period_key"], "instance_count": prep["instance_count"],
                     "new_batch": prep.get("new_batch", False),
                     "synced_completed": prep.get("synced_completed", 0),
-                    "skip_completed": bool(skip_completed)},
+                    "skip_completed": bool(skip_completed), **note_detail},
         )
         return {
             "ok": True, "queued": True, "pushed_at": attempted_at,

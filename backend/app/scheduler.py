@@ -1327,6 +1327,7 @@ class Scheduler:
 
         # 2026-11-21 需求二：勾选过滤时，已完成/已回执成员本轮不推送（只向未完成人员发）。
         skip_completed = bool(prep.get("skip_completed"))
+        push_note = prep.get("push_note", "")
         completed_phones = (self.state.period_completed_phones(tpl["template_id"], p_key)
                             if skip_completed else set())
 
@@ -1340,9 +1341,13 @@ class Scheduler:
             instances = [{**inst, "notice_view": view} for inst in instances
                          if (view := views.get(inst["id"])) and view.get("variable_platform")]
         if tpl["kind"] == "notice":
-            return self._push_manual_notice(tpl, instances, cur_dt, p_key, skip_completed=skip_completed)
+            return self._push_manual_notice(tpl, instances, cur_dt, p_key,
+                                            skip_completed=skip_completed, push_note=push_note)
 
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
+        heading = f"【任务提醒】{tpl['name']}\n"
+        if push_note:
+            heading += f"【补充提醒】{push_note}\n\n"
         push_seq: Dict[str, int] = {}
         for inst in instances:
             inst_status = str(inst["status"] or "")
@@ -1390,19 +1395,19 @@ class Scheduler:
                     done_disp = (format_deadline_display(str(instance.get("submitted_at") or ""), ref_dt=cur_dt)
                                  if instance.get("submitted_at") else "")
                     return (
-                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                        f"{heading}{rendered.rstrip()}\n\n"
                         f"截止时间：{dl_disp}\n"
                         + (f"你已在本周期完成该任务（{done_disp}）。\n" if done_disp else "你已在本周期完成该任务。\n")
                         + f"点击链接可查看已提交内容：\n{h5_url}"
                     )
                 if ro == "closed":
                     return (
-                        f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                        f"{heading}{rendered.rstrip()}\n\n"
                         f"任务已截止（截止时间：{dl_disp}），无法提交。\n"
                         f"点击链接可查看任务详情：\n{h5_url}"
                     )
                 return (
-                    f"【任务提醒】{template['name']}\n{rendered.rstrip()}\n\n"
+                    f"{heading}{rendered.rstrip()}\n\n"
                     f"截止时间：{dl_disp}\n"
                     f"提交入口（点击链接打开上传任务）：\n{h5_url}"
                 )
@@ -1610,7 +1615,7 @@ class Scheduler:
         return delivered
 
     def _deliver_notice_text_part(self, tpl, targets, period, seq, planned_str, now, stats, *,
-                                  values, once, receipt=False, link_message=None):
+                                  values, once, receipt=False, link_message=None, push_note=""):
         batch, batch_targets = [], []
         now_s = format_dt(now)
         kind = "notice_receipt" if receipt else "notice"
@@ -1629,6 +1634,13 @@ class Scheduler:
                                    f"查收后请直接回复「{phrase}」即可完成确认登记。")
                     else:
                         message = self._notice_body(tpl, inst, now, values)
+                        if push_note:
+                            if message.startswith("【通知提醒】"):
+                                title, _, message = message.partition("\n")
+                            else:
+                                name = (inst.get("notice_view") or {}).get("title") or tpl["name"]
+                                title = f"【通知提醒】{name}"
+                            message = f"{title}\n【补充提醒】{push_note}" + (f"\n\n{message}" if message else "")
                         if not message:
                             continue
                     # 一次性通知正文沿用旧键，已发出的历史通知保持去重。
@@ -1729,7 +1741,7 @@ class Scheduler:
 
         return message
 
-    def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *, once=False):
+    def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *, once=False, push_note=""):
         """通知投递主链：正文 → 媒体 → 收尾（文本回执短语 / H5 确认链接）。
 
         2026-11-19 需求四（link 模式完整投递）：**所有接收人（含 receipt_mode='link'）
@@ -1753,7 +1765,7 @@ class Scheduler:
         delivered = set()
         # ① 正文：发给全部 targets（正文为空时 _deliver_notice_text_part 内自然跳过）
         delivered.update(self._deliver_notice_text_part(
-            tpl, targets, period, seq, planned_str, now, stats, values=values, once=once,
+            tpl, targets, period, seq, planned_str, now, stats, values=values, once=once, push_note=push_note,
         ))
         # ② 媒体：图片 → 文件 → 视频（原生优先 + H5 链接兜底，顺序不动）
         now_s = format_dt(now)
@@ -1795,7 +1807,7 @@ class Scheduler:
         return len(delivered)
 
     def _push_manual_notice(self, tpl, instances, now, period: str = "once",
-                            skip_completed: bool = False):
+                            skip_completed: bool = False, push_note: str = ""):
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         instances = [inst for inst in instances if inst["status"] in ("pending", "sent")
                      and self.state.instance_close_reason(inst, tpl) is None
@@ -1803,7 +1815,7 @@ class Scheduler:
                      and not (skip_completed and inst.get("receipt_at"))]
         values = self.state.get_data_snapshot_values(tpl["template_id"], period_key(tpl["period"], now)) if tpl.get("data_keys") else {}
         stats["pushed_instances"] = self._deliver_notice(
-            tpl, instances, period, 1, format_dt(now), now, values, stats, once=True,
+            tpl, instances, period, 1, format_dt(now), now, values, stats, once=True, push_note=push_note,
         )
         return stats
 

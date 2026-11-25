@@ -296,13 +296,14 @@ function PortalGrantDrawer({ onClose }: { onClose: () => void }) {
         <div className="flex items-center gap-2">
           <Users className="h-5 w-5 text-blue-600" />
           <h2 className="text-base font-bold text-slate-900">授权成员管理</h2>
-          {members && <span className="text-xs text-slate-500">{members.length} 人已授权</span>}
+          {members && <span className="text-xs text-slate-500">{members.length} 人已配置</span>}
         </div>
         <button type="button" aria-label="关闭授权成员管理" onClick={onClose}
           className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100"><X className="h-5 w-5" /></button>
       </header>
 
       <div className="space-y-4 overflow-y-auto px-5 py-4">
+        <p className="text-xs leading-relaxed text-slate-500">成员默认可向本人部门发布任务。跨部门或按后台角色发布，请在此配置范围。</p>
         {error && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</div>}
 
         {/* 已授权成员清单 */}
@@ -496,14 +497,14 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
   return <section className="space-y-4">
     <AdminScopeHeader title="授权成员发布任务"
       description={<>
-        只读监管 · 按授权发布人筛选任务
+        只读监管 · 按发布人筛选任务
         {lastUpdated && <span className="ml-2 whitespace-nowrap text-slate-500">更新于 {lastUpdated.toLocaleTimeString('zh-CN', { hour12: false })}</span>}
       </>}
       actions={<>
         {/* 2026-11-24：分级管理员专属授权管理入口（超管严格隐藏，纯只读）。 */}
         {!isSuperAdmin && (
           <button type="button" onClick={onManageGrants}
-            title="新增、修改或取消成员的 H5 创建任务权限"
+            title="配置成员的跨部门或角色发布范围"
             className="inline-flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-100">
             <Users className="h-3.5 w-3.5" />授权成员管理
             {grantCount > 0 && <span className="rounded-full bg-blue-600 px-1.5 py-0.5 text-[10px] font-bold text-white">{grantCount}</span>}
@@ -526,9 +527,9 @@ function PortalMonitorCatalog({ onManageGrants }: { onManageGrants: () => void }
       ? <PortalMonitorEmpty authorized={grantCount} isSuperAdmin={isSuperAdmin} onConfigure={onManageGrants} />
       : <div className={panelClass + ' grid items-start gap-3 p-4 md:grid-cols-[minmax(0,1.4fr)_minmax(0,2fr)_minmax(0,1fr)_minmax(0,1.35fr)]'}>
       <label className="grid min-w-0 gap-1.5 text-xs font-medium text-slate-600">
-        发布人（授权领导）
+        发布人
         <select className={fieldClass} value={publisherId} onChange={(e) => setPublisherId(e.target.value)}>
-          <option value="">全部授权成员（{publishers.length} 位 · {data?.tasks?.length ?? 0} 个任务）</option>
+          <option value="">全部发布人（{publishers.length} 位 · {data?.tasks?.length ?? 0} 个任务）</option>
           {publishers.map((item) => (
             <option key={item.phone} value={item.phone}>
               {item.name} · {item.dept_path || '部门未分配'} · 已发布 {item.task_count} 个任务
@@ -573,9 +574,9 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
   onConfigure: () => void;
 }) {
   const steps = [
-    { title: '授权领导', desc: '用右上角「授权成员管理」为指定成员开通 H5 建任务权限' },
-    { title: '手机发布', desc: '授权领导在个人工作台下发上传或通知任务' },
-    { title: '实时监管', desc: '此处按领导与部门实时查看统计并导出报表' },
+    { title: '手机发布', desc: '成员在个人工作台向本人部门发布上传或通知任务' },
+    { title: '配置范围', desc: '所属分级管理员可配置跨部门和后台角色范围' },
+    { title: '查看统计', desc: '按发布人和部门查看统计并导出报表' },
   ];
   return <section className={panelClass + ' overflow-hidden'} aria-labelledby="portal-empty-title">
     <div className="flex flex-col items-center px-6 py-12 text-center">
@@ -589,12 +590,7 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
           <path d="m30.6 33.6 2 2 3.6-4" stroke="#1d4e89" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </div>
-      <h3 id="portal-empty-title" className="mt-5 text-lg font-bold text-slate-900">还没有授权成员发布任务</h3>
-      <p className="mt-1.5 max-w-xl text-sm leading-6 text-slate-500">
-        {isSuperAdmin
-          ? '超管只读：授权由成员所属分级管理员完成，领导在手机工作台发布后，这里会自动出现可监管的统计与报表。'
-          : '按三步开通：先给领导开放 H5 建任务权限，领导在手机工作台发布上传或通知任务，发布后这里实时汇总统计。'}
-      </p>
+      <h3 id="portal-empty-title" className="mt-5 text-lg font-bold text-slate-900">暂无工作台发布的任务</h3>
       <ol className="mt-7 grid w-full max-w-3xl gap-3 text-left sm:grid-cols-3">
         {steps.map((step, index) => (
           <li key={step.title} className="rounded-xl border border-slate-100 bg-slate-50/70 px-4 py-3.5">
@@ -610,7 +606,7 @@ function PortalMonitorEmpty({ authorized, isSuperAdmin, onConfigure }: {
         <button type="button" onClick={onConfigure}
           className="mt-7 inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-700">
           <Users className="size-4" />授权成员管理
-          {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">已授权 {authorized} 人</span>}
+          {authorized > 0 && <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs font-medium">已配置 {authorized} 人</span>}
         </button>
       )}
     </div>

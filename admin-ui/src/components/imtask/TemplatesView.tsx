@@ -545,6 +545,7 @@ export const TemplatesView: React.FC = () => {
   const [deleteConfirmTpl, setDeleteConfirmTpl] = useState<TemplateItem | null>(null);
   const [pushingId, setPushingId] = useState<number | null>(null);
   const [pushConfirmTpl, setPushConfirmTpl] = useState<TemplateItem | null>(null);
+  const [pushNote, setPushNote] = useState('');
   /* 2026-11-19 需求一：本周期已推送过时的二次确认（新建批次并重推） */
   const [repushConfirm, setRepushConfirm] = useState<{
     tpl: TemplateItem; targetCount: number; preview: PushPreview | null;
@@ -1186,7 +1187,7 @@ export const TemplatesView: React.FC = () => {
         pushed_at?: string;
         deadline_at?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now?skip_completed=${Number(filterCompleted)}`);
+      }>(`/api/admin/templates/${target.id}/push-now?skip_completed=${Number(filterCompleted)}`, { push_note: pushNote.trim() });
       if (res?.needs_confirm) {
         /* 2026-11-19 需求一：本周期已推送过 → 关掉首次确认框，改问「是否新建一批」。
            预检不写冷却 marker，用户取消也不影响后续操作。 */
@@ -1212,6 +1213,7 @@ export const TemplatesView: React.FC = () => {
         );
       }
       setPushConfirmTpl(null);
+      setPushNote('');
     } catch (err) {
       // 429 冷却（3 秒内已推过）等错误由服务端文案直接透出，不关弹窗让用户看清原因
       if (err instanceof ApiRequestError && err.issues?.length) setPushIssues(err.issues);
@@ -1236,7 +1238,7 @@ export const TemplatesView: React.FC = () => {
         instance_count?: number;
         period_key?: string;
         stats?: { sent?: number; pushed_instances?: number };
-      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1&skip_completed=${Number(filterCompleted)}`);
+      }>(`/api/admin/templates/${target.id}/push-now?confirmed=1&skip_completed=${Number(filterCompleted)}`, { push_note: pushNote.trim() });
       if (res?.queued) {
         toast.success(
           broadcast ? `向 ${res.instance_count ?? 0} 人重推通知，消息正在后台投递。` :
@@ -1253,12 +1255,19 @@ export const TemplatesView: React.FC = () => {
         );
       }
       setRepushConfirm(null);
+      setPushNote('');
     } catch (err) {
       if (err instanceof ApiRequestError && err.issues?.length) setPushIssues(err.issues);
       toast.error(err instanceof Error ? plainError(err.message) : '重推未成功');
     } finally {
       setPushingId(null);
     }
+  };
+
+  const closePushConfirm = () => {
+    setPushConfirmTpl(null);
+    setRepushConfirm(null);
+    setPushNote('');
   };
 
   const addFieldRow = () => {
@@ -1616,7 +1625,7 @@ export const TemplatesView: React.FC = () => {
                             )}
                             {(tpl.is_manual || (tpl.kind !== 'notice' && !tpl.is_adhoc)) && (
                               <button
-                                onClick={() => setPushConfirmTpl(tpl)}
+                                onClick={() => { setPushNote(''); setPushConfirmTpl(tpl); }}
                                 disabled={!tpl.enabled || busyId === tpl.id || pushingId === tpl.id}
                                 title={
                                   tpl.enabled
@@ -2440,11 +2449,12 @@ export const TemplatesView: React.FC = () => {
 
       {pushConfirmTpl && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[calc(100dvh-2rem)] overflow-y-auto p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <h3 className="font-bold text-slate-900 text-base">确认立即推送提醒</h3>
               <button
-                onClick={() => setPushConfirmTpl(null)}
+                onClick={closePushConfirm}
+                disabled={pushingId === pushConfirmTpl.id}
                 className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
               >
                 <X className="w-5 h-5" />
@@ -2457,17 +2467,19 @@ export const TemplatesView: React.FC = () => {
             </p> : <p className="text-xs text-slate-600 leading-relaxed">
               将立即向模板「
               <span className="font-bold text-slate-900">{pushConfirmTpl.name}</span>
-              」当前<b>待提交</b>的成员各推送一条提醒（内容与定时提醒一致）。
+              」当前<b>待提交</b>的成员各推送一条提醒。
               <br />
               此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 3 秒内不可重复推送。
             </p>}
             {!isBroadcastNotice(pushConfirmTpl) && (
               <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
             )}
+            <PushNoteField value={pushNote} onChange={setPushNote} disabled={pushingId === pushConfirmTpl.id} />
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => setPushConfirmTpl(null)}
+                onClick={closePushConfirm}
+                disabled={pushingId === pushConfirmTpl.id}
                 className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-xs cursor-pointer"
               >
                 取消
@@ -2487,11 +2499,12 @@ export const TemplatesView: React.FC = () => {
       {/* 本周期已推送过时，按当前过滤选项确认重推范围。 */}
       {repushConfirm && (
         <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+          <div className="bg-white rounded-2xl max-w-md w-full max-h-[calc(100dvh-2rem)] overflow-y-auto p-6 shadow-2xl border border-slate-200 space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <h3 className="font-bold text-slate-900 text-base">本周期已推送过，仍需再推一次？</h3>
               <button
-                onClick={() => setRepushConfirm(null)}
+                onClick={closePushConfirm}
+                disabled={pushingId === repushConfirm.tpl.id}
                 className="p-1 rounded-lg hover:bg-slate-100 text-slate-400"
               >
                 <X className="w-5 h-5" />
@@ -2503,10 +2516,12 @@ export const TemplatesView: React.FC = () => {
               <RepushDescription tpl={repushConfirm.tpl} checked={skipCompleted} preview={repushPreview} />
               <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={repushPreview} />
             </>}
+            <PushNoteField value={pushNote} onChange={setPushNote} disabled={pushingId === repushConfirm.tpl.id} />
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
               <button
-                onClick={() => setRepushConfirm(null)}
+                onClick={closePushConfirm}
+                disabled={pushingId === repushConfirm.tpl.id}
                 className="px-4 py-2 rounded-xl text-slate-600 hover:bg-slate-100 font-medium text-xs cursor-pointer"
               >
                 取消
@@ -2525,6 +2540,39 @@ export const TemplatesView: React.FC = () => {
     </div>
   );
 };
+
+const pushNotePresets = [
+  ['即将截止提醒', '距离本周期截止时间临近，请尚未完成的同事尽快提交，感谢配合！'],
+  ['最后一天催办', '今天是本周期最后一天，请未完成的同事在截止前务必完成提交！'],
+] as const;
+
+function PushNoteField({ value, onChange, disabled }: {
+  value: string; onChange: (value: string) => void; disabled: boolean;
+}) {
+  const id = React.useId();
+  const note = value.trim();
+  const button = 'rounded-lg bg-slate-100 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-200 disabled:opacity-50';
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <label htmlFor={id} className="text-xs font-semibold text-slate-800">本次推送附加提醒（选填）</label>
+        <span className="text-xs tabular-nums text-slate-500">{value.length}/200</span>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {pushNotePresets.map(([label, text]) => (
+          <button key={label} type="button" disabled={disabled} className={button} onClick={() => onChange(text)}>{label}</button>
+        ))}
+        {value && <button type="button" disabled={disabled} className={button} onClick={() => onChange('')}>清空</button>}
+      </div>
+      <textarea id={id} value={value} onChange={(e) => onChange(e.target.value)} maxLength={200} rows={3} disabled={disabled}
+        className="w-full resize-y rounded-xl border border-slate-200 px-3 py-2 text-xs leading-relaxed text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        placeholder="仅对本次手动推送生效，不会修改原任务模板（留空则按原内容推送）" />
+      {note && <p className="whitespace-pre-wrap break-words rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-700">
+        <span className="mb-0.5 block text-slate-500">员工消息预览</span>【补充提醒】{note}
+      </p>}
+    </div>
+  );
+}
 
 function RepushDescription({ tpl, checked, preview }: { tpl: TemplateItem; checked: boolean; preview: PushPreview | null }) {
   const audience = tpl.spec?.variable_notice ? '变量表格中' : '当前角色';

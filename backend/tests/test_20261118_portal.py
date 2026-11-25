@@ -57,6 +57,81 @@ def test_portal_unauthorized_create():
     assert err.value.status_code == 403
 
 
+def test_default_creation_scope_is_exact_current_department(portal):
+    p, creator, (s, scheduler, notifier, _, owner, _, tpl, _) = portal
+    rid = tpl['role_ids'][0]
+    phone = '13900009404'
+    s.add_role_member(rid, phone, '本部门普通成员', owner_id=tpl['owner_id'])
+    s.upsert_delivery_target(phone, 'same-department-recipient')
+    s.conn.execute('UPDATE member SET dept_path=? WHERE role_id=? AND phone=?', ('本部门', rid, phone))
+    s.conn.commit()
+    ident = {'phone': phone, 'platform': 'zdxlz'}
+    assert p.grant_info('zdxlz', tpl['owner_id'], phone)['grant'] is None
+
+    token = p.issue(phone, 'zdxlz')
+    from fastapi.testclient import TestClient
+    client = TestClient(owner.app, headers={'Authorization': 'Bearer ' + token})
+    assert client.post('/api/h5/portal/info', json={}).json()['can_create'] is True
+    roster = client.post('/api/h5/portal/recipients', json={}).json()
+    assert {m['phone'] for m in roster['members']} == {phone, creator['phone']}
+    assert not roster['roles']
+    assert [d['dept_id'] for d in roster['departments']] == ['本部门']
+
+    for out_of_scope in ('13900009402', '13900009403'):
+        response = client.post('/api/h5/portal/create', json={'name': '越权任务', 'phones': [out_of_scope]})
+        assert response.status_code == 403 and response.json()['code'] == 'RECIPIENT_OUT_OF_SCOPE'
+    publish(p, ident, deadline_at='2026-11-17 18:00')
+    s.update_template(tpl['template_id'], {'enabled': False})
+    for _ in range(3):
+        scheduler.run_once()
+    assert [m.receive_id for m in notifier.sent_messages] == ['same-department-recipient']
+
+    p.save_grant('zdxlz', tpl['owner_id'], phone, {'enabled': True, 'dept_ids': ['跨部门']}, 'tester')
+    roster = client.post('/api/h5/portal/recipients', json={}).json()
+    assert {m['phone'] for m in roster['members']} == {'13900009403'}
+
+
+def test_portal_history_defaults_to_all_and_filters_before_pagination(portal):
+    from fastapi.testclient import TestClient
+
+    p, ident, (s, _, _, _, owner, _, tpl, _) = portal
+    first_day, second_day = '2026-11-15', '2026-11-16'
+    ids = []
+    for phone, day, count in ((ident['phone'], first_day, 31), (ident['phone'], second_day, 1),
+                              ('13900009403', first_day, 1)):
+        for index in range(count):
+            period = f'{day}#20261115080000-{index}'
+            inst = s.ensure_instance(tpl['template_id'], phone, '测试成员', None, period, day + ' 18:00:00')
+            with s.conn:
+                s.conn.execute(
+                    'INSERT INTO submission (instance_id, source, status, created_at) VALUES(?,?,?,?)',
+                    (inst['id'], 'h5', 'approved', day + ' 09:00:00'))
+                s.conn.execute("UPDATE task_instance SET status='approved', submitted_at=? WHERE id=?",
+                               (None if index == 30 else day + ' 09:00:00', inst['id']))
+            if phone == ident['phone'] and day == first_day:
+                ids.append(inst['id'])
+
+    token = p.issue(ident['phone'], 'zdxlz')
+    client = TestClient(owner.app, headers={'Authorization': 'Bearer ' + token})
+    url = '/api/h5/portal/history'
+    assert client.post('/api/h5/portal/info', json={}).json()['history_count'] == 32
+    response = client.post(url, json={})
+    assert response.status_code == 200, response.text
+    first = response.json()
+    assert len(first['items']) == 30 and first['has_more']
+    assert first['items'][0]['submitted_at'].startswith(second_day)
+    rest = client.post(url, json={'offset': 30}).json()
+    assert len(rest['items']) == 2 and not rest['has_more']
+    response = client.post(url, json={'date': first_day})
+    assert response.status_code == 200, response.text
+    filtered = response.json()
+    assert len(filtered['items']) == 30 and filtered['has_more']
+    last = client.post(url, json={'date': first_day, 'offset': 30}).json()
+    assert [row['id'] for row in filtered['items'] + last['items']] == ids[::-1]
+    assert not last['has_more']
+    assert client.post(url, json={'date': '2026-02-30'}).status_code == 400
+
+
 @pytest.mark.parametrize('text', ['你好', '【待办】', '【菜单】', '1', '我的任务', '未完成'])
 def test_all_texts_only_portal_and_callback_retry_once(portal, text):
     p, ident, (s, scheduler, notifier, *_) = portal

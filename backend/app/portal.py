@@ -95,16 +95,30 @@ class PortalService:
     # 打开即毫秒级，不再有「组织架构读取超时」。
 
     def grants(self, ident):
-        rows = self.s.conn.execute('SELECT * FROM portal_grant WHERE phone=? AND platform=? AND enabled=1',
-                                   (ident['phone'], ident['platform'])).fetchall()
-        return [dict(r) for r in rows if self.s._template_owner_enabled(int(r['owner_id']))
-                and ident['platform'] in self.s._owner_allowed_platforms(int(r['owner_id']))
-                and self.members(ident['platform'], int(r['owner_id']), ident['phone'])]
+        phone, platform = ident['phone'], ident['platform']
+        rows = self.s.conn.execute('SELECT * FROM portal_grant WHERE phone=? AND platform=?',
+                                   (phone, platform)).fetchall()
+        overrides = {int(row['owner_id']): dict(row) for row in rows}
+        departments = {}
+        for member in self.members(platform, phone=phone):
+            departments.setdefault(int(member['owner_id']), set()).add(_norm_dept_path(member.get('dept_path')))
+        eligible = {owner: paths for owner, paths in departments.items()
+                    if self.s._template_owner_enabled(owner) and platform in self.s._owner_allowed_platforms(owner)}
+        known = {path for paths in eligible.values() for path in paths if path}
+        default = next(iter(known)) if len(known) == 1 else None
+        grants = []
+        for owner, paths in eligible.items():
+            if owner in overrides:
+                if overrides[owner]['enabled']:
+                    grants.append(overrides[owner])
+            elif default and default in paths:
+                grants.append({'owner_id': owner, 'default_department': default})
+        return grants
 
     def require_creator(self, ident):
         grants = self.grants(ident)
         if not grants:
-            raise BizError(403, 'PORTAL_FORBIDDEN', '您还未开放此权限，具体请找相关管理员')
+            raise BizError(403, 'PORTAL_FORBIDDEN', '当前无法确定可发布范围，请联系所属管理员')
         return grants
 
     def grant_info(self, platform, owner, phone):
@@ -183,24 +197,24 @@ class PortalService:
         return {'ok': True}
 
     def recipients(self, ident):
-        """领导选人页可选范围：**完全走本地名册部门树**（0 次远程通讯录调用）。
+        """选人范围由本平台、本归属管理员的可投递名册决定。
 
-        每条授权独立生效：部门授权 → 该部门子树；未勾部门 → 回退「成员本人部门」
-        子树（2026-11-20 口径不变）；另叠加角色授权。部门 id = 部门全路径，
-        与 grant_options 的树同一口径，授权范围校验与选人 100% 一致。
+        默认只允许本人所在部门。管理员配置的部门授权包含其子树，
+        兼容旧授权的默认部门回退和角色授权。
         """
         grants = self.require_creator(ident)
         all_members, allowed_nodes, node_names, roles = {}, set(), {}, {}
         directory_error = ''
         for grant in grants:
-            scope = json.loads(grant['scope_json'])
+            default_dept = grant.get('default_department')
+            scope = {'dept_ids': [default_dept], 'role_ids': []} if default_dept else json.loads(grant['scope_json'])
             tree = self.local_dept_tree(ident['platform'], grant['owner_id'])
             node_names.update({p: d['name'] for p, d in ((n['dept_id'], n) for n in tree['departments'])})
             ds = set()
             for did in scope['dept_ids']:
                 if did in tree['paths']:
-                    ds |= {p for p in tree['paths'] if p == did or p.startswith(did + '/')}
-            if not ds:
+                    ds |= {p for p in tree['paths'] if p == did or (not default_dept and p.startswith(did + '/'))}
+            if not ds and not default_dept:
                 # 2026-11-23 向下兼容：未勾部门，或历史远程 dept_ids 全部无法本地解析时，
                 # 回退「成员本人当前部门」子树（授权继续生效，不会因升级突然失效）。
                 default = self.local_default_department(ident['platform'], grant['owner_id'], ident['phone'])
@@ -215,13 +229,15 @@ class PortalService:
             rs = set(scope['role_ids']) & set(live_roles)
             roles.update({rid: live_roles[rid] for rid in rs})
             for m in self.members(ident['platform'], grant['owner_id']):
+                path = _norm_dept_path(m.get('dept_path'))
+                if default_dept and path != default_dept:
+                    continue
                 if m['phone'] not in phones and m['role_id'] not in rs:
                     continue
                 item = all_members.setdefault(m['phone'], {'phone': m['phone'], 'name': m['name'],
                     'dept_ids': [], 'role_ids': [], 'owner_ids': [], 'member_role_ids': []})
                 # 2026-11-23 补丁：与 local_dept_tree 同一份规范化——斜杠两侧空格
                 # 不剔除会让祖先路径对不上 allowed_nodes（成员静默丢部门、漏勾选）。
-                path = _norm_dept_path(m.get('dept_path'))
                 ancestors = []
                 acc = []
                 for part in ([p for p in path.split('/') if p] if path else []):
@@ -494,13 +510,16 @@ class PortalService:
             raise BizError(404, 'NOTICE_UNAVAILABLE', '通知暂不可用')
         return {'ok': True, 'url': issue_link(self.s, instance)}
 
-    def submission_history(self, ident, *, instance_id=None, adhoc_only=False, offset=0, limit=31):
+    def submission_history(self, ident, *, instance_id=None, adhoc_only=False, submitted_date="", offset=0, limit=31):
         match, params = [], [ident['phone'], ident['platform'], f"adhoc-{ident['platform']}-%", ident['platform']]
         if instance_id is not None:
             match.append('AND i.id=? ')
             params.append(instance_id)
         if adhoc_only:
             match.append("AND i.period_key LIKE 'adhoc-%' ")
+        if submitted_date:
+            match.append("HAVING DATE(submitted_at)=? ")
+            params.append(submitted_date)
         rows = self.s.conn.execute(
             "SELECT COALESCE(t.name, JSON_UNQUOTE(JSON_EXTRACT(p.template_json,'$.name'))) AS name, "
             "i.id, i.phone, i.template_id, i.period_key, COALESCE(i.submitted_at, "
@@ -787,7 +806,9 @@ def run_portal_tasks(scheduler, now):
     for task in p.tasks():
         if not scheduler.notifiers and s.platform != task['platform']:
             continue
-        if not p.grants({'phone': task['creator_phone'], 'platform': task['platform']}):
+        grant = next((grant for grant in p.grants({'phone': task['creator_phone'], 'platform': task['platform']})
+                      if int(grant['owner_id']) == task['owner_id']), None)
+        if not grant:
             continue
         if task['mode'] != 'once':
             if not is_template_anchor_day(task, now):
@@ -809,7 +830,13 @@ def run_portal_tasks(scheduler, now):
             continue
         is_notice = task.get('kind') == 'notice'
         notice_instances = []
+        default_dept = grant.get('default_department')
+        default_phones = ({m['phone'] for m in p.members(task['platform'], task['owner_id'])
+                           if _norm_dept_path(m.get('dept_path')) == default_dept}
+                          if default_dept else None)
         for m in task['recipients']:
+            if default_phones is not None and m['phone'] not in default_phones:
+                continue
             if not p.can_submit({'phone': m['phone']}, task):
                 continue
             inst = s.ensure_instance(task['template_id'], m['phone'], m['name'], None, pk, deadline)

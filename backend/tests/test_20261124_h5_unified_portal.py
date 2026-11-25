@@ -85,7 +85,7 @@ def test_portal_second_level_switch_and_swipe():
     assert "Math.abs(dy) * 1.6" in portal
     assert "dt > 700" in portal
     # 提交记录视图保留日期筛选与卡片直出按钮
-    assert "history-filter" in portal and "继续查找记录" in portal
+    assert "history-filter" in portal and "全部日期" in portal and "加载更多" in portal
 
 
 def test_info_returns_history_count_matching_records(portal):
