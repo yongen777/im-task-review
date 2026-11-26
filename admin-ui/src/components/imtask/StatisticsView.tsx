@@ -49,6 +49,8 @@ export interface TreeNode {
 
 export interface PeriodicKpis {
   total: number;
+  push_success: number;
+  push_failed: number;
   done: number;
   not_done: number;
   rate: number;
@@ -505,7 +507,14 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
       {overviewData?.mode === 'periodic' && (
         <>
           <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
-            <KpiCard label={isReceipt ? '应回复' : '应参与人数'} value={overviewData.kpis.total} />
+            <KpiCard label={isReceipt ? '应回复' : '应参与人数'} value={overviewData.kpis.total}
+              hint={
+                <span className="flex flex-wrap gap-x-2 gap-y-1"
+                  title="本周期按人去重。有任一批次送达即计成功，有失败记录且从未送达计失败。">
+                  <span className="text-emerald-700">推送成功 {overviewData.kpis.push_success} 人</span>
+                  <span className="text-rose-700">推送失败 {overviewData.kpis.push_failed} 人</span>
+                </span>
+              } />
             <KpiCard label={isReceipt ? '已回复' : '已完成人数'} value={overviewData.kpis.done} color="text-emerald-700"
               hint={!isReceipt && task.need_review ? '待审核 ' + overviewData.kpis.pending_review + ' · 审核通过 ' + overviewData.kpis.approved : undefined} />
             <KpiCard label={isReceipt ? '待回复' : '未完成人数'} value={overviewData.kpis.not_done} color="text-amber-700"

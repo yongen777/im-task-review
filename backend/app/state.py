@@ -6035,25 +6035,34 @@ class StateStore:
             (*roles, owner_id, *platforms, *roles, str(owner_id)),
         )
 
-    def _stats_period_rows(self, tpl: Dict[str, Any], period: str, *, has_receipt: bool) -> List[Dict[str, Any]]:
+    def _stats_period_rows(self, tpl: Dict[str, Any], period: str, *, has_receipt: bool,
+                           include_push: bool = False) -> List[Dict[str, Any]]:
+        push_columns = ""
+        if include_push:
+            kinds_sql = ", ".join(f"'{kind}'" for kind in sorted(self._FIRST_SENT_KINDS))
+            push_columns = (
+                "i.first_sent_at, (i.first_sent_at IS NULL AND EXISTS (SELECT 1 FROM reminder_log r "
+                "WHERE r.instance_id = i.id AND r.result = 'failed' "
+                f"AND r.kind IN ({kinds_sql}))) AS push_failed, "
+            )
         if has_receipt:
-            return self._stats_receipt_rows(tpl, period)
+            return self._stats_receipt_rows(tpl, period, push_columns)
         if tpl["kind"] == "notice":
-            return self._stats_delivery_rows(tpl, period)
+            return self._stats_delivery_rows(tpl, period, push_columns)
         per_sql, params = self._stats_period_where(period.strip())
         roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
         return [dict(row) for row in self.conn.execute(
-            "SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at, i.late_submit "
+            f"SELECT {push_columns}i.id, i.phone, i.name_snap, i.dept_snap, i.status, i.submitted_at, i.late_submit "
             "FROM task_instance i "
             f"WHERE i.template_id = ? AND {per_sql} AND i.status != 'cancelled' AND {roster_sql}",
             (tpl["template_id"], *params, *roster_params),
         ).fetchall()]
 
-    def _stats_receipt_rows(self, tpl: Dict[str, Any], period: str) -> List[Dict[str, Any]]:
+    def _stats_receipt_rows(self, tpl: Dict[str, Any], period: str, push_columns: str) -> List[Dict[str, Any]]:
         per_sql, params = self._stats_period_where(period.strip())
         roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
         return [dict(row) for row in self.conn.execute(
-            "SELECT id, phone, name_snap, dept_snap, receipt_at, receipt_text, "
+            f"SELECT {push_columns}id, phone, name_snap, dept_snap, receipt_at, receipt_text, "
             "COALESCE(receipt_mode, 'text') AS receipt_mode, "
             "CASE WHEN receipt_at IS NULL THEN 'pending' ELSE 'approved' END AS status, "
             "receipt_at AS submitted_at FROM task_instance i "
@@ -6062,11 +6071,11 @@ class StateStore:
             (tpl["template_id"], *params, *roster_params),
         ).fetchall()]
 
-    def _stats_delivery_rows(self, tpl: Dict[str, Any], period: str) -> List[Dict[str, Any]]:
+    def _stats_delivery_rows(self, tpl: Dict[str, Any], period: str, push_columns: str) -> List[Dict[str, Any]]:
         """纯广播通知的送达口径：sent/approved = 已送达，其余未送达（2026-11-23）。"""
         per_sql, params = self._stats_period_where(period.strip(), alias="i")
         return [dict(row) for row in self.conn.execute(
-            "SELECT i.id, i.phone, i.name_snap, i.dept_snap, i.receipt_at, NULL AS receipt_text, "
+            f"SELECT {push_columns}i.id, i.phone, i.name_snap, i.dept_snap, i.receipt_at, NULL AS receipt_text, "
             "'text' AS receipt_mode, "
             "CASE WHEN i.status IN ('sent', 'approved') THEN 'approved' ELSE 'pending' END AS status, "
             "CASE WHEN i.status IN ('sent', 'approved') THEN quiet.at END AS submitted_at "
@@ -6372,7 +6381,7 @@ class StateStore:
         # ── 定期（模式A）──
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
-        rows = self._stats_period_rows(tpl, period_key, has_receipt=tpl_meta["is_receipt"])
+        rows = self._stats_period_rows(tpl, period_key, has_receipt=tpl_meta["is_receipt"], include_push=True)
         # 周/月聚合视角：同人多实例去重成一人一行（日视图唯一键保证恒等）
         persons = self._stats_dedup_persons(rows)
         # 2026-11-19 需求五：用「本期实例里实际出现的手机号」做部门兜底，
@@ -6382,6 +6391,10 @@ class StateStore:
         tree = self._stats_dept_tree(covered_paths)
         # KPI（部门子树过滤；按去重后的人计）
         scoped = [r for r in persons if _phone_in_scope(str(r["phone"]))]
+        scoped_phones = {r["phone"] for r in scoped}
+        # 完成状态取代表实例，推送结果则检查同一成员在所选周期内的所有批次。
+        sent_phones = {r["phone"] for r in rows if r["first_sent_at"] and r["phone"] in scoped_phones}
+        failed_phones = {r["phone"] for r in rows if r["push_failed"] and r["phone"] in scoped_phones}
         total = len(scoped)
         by_status: Dict[str, int] = {}
         for r in scoped:
@@ -6418,6 +6431,7 @@ class StateStore:
             "selected_dept_path": sel,
             "kpis": {
                 "total": total, "done": done, "not_done": not_done, "rate": rate,
+                "push_success": len(sent_phones), "push_failed": len(failed_phones - sent_phones),
                 "need_review": need_review,
                 "pending_review": by_status.get("submitted", 0),
                 "approved": by_status.get("approved", 0),

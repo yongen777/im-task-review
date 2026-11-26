@@ -276,6 +276,60 @@ def test_dept_filter_scopes_kpis() -> None:
         ctx["store"].close()
 
 
+def test_delivery_kpis_dedup_batches_and_preserve_pending_in_completion_rate() -> None:
+    ctx = _seed_main("p")
+    store, tpl = ctx["store"], ctx["tpl_id"]
+    try:
+        by_phone = {row["phone"]: row for row in store.list_instances_for_period(tpl, PK_DAY)}
+        batch_key = "2026-11#20261116120000"
+        batch = store.ensure_instance(tpl, P_ZS, "张三", None, batch_key, "2026-11-30 18:00:00")
+        prior = store.ensure_instance(tpl, P_ZL, "赵六", None, "2026-10", "2026-10-31 18:00:00")
+        store.conn.execute("UPDATE task_instance SET status='pending' WHERE id=?", (by_phone[P_ZL]["id"],))
+        cancelled = next(row for row in by_phone.values() if row["status"] == "cancelled")
+
+        def delivery(row, result, *, kind="manual_push", retry=0):
+            at = "2026-11-16 12:00:00"
+            store.record_reminder_log(
+                template_id=tpl, instance_id=row["id"], phone=row["phone"], kind=kind,
+                planned_at=at, sent_at=at if result == "sent" else None, result=result,
+                error="TEST_FAILURE" if result == "failed" else None,
+                idem_key=f"stats-delivery-{row['id']}-{kind}", retry=retry,
+            )
+
+        delivery(by_phone[P_ZS], "sent")
+        delivery(batch, "failed")
+        delivery(by_phone[P_LS], "sent", kind="remind")
+        delivery(by_phone[P_QQ], "failed")
+        delivery(by_phone[P_QQ], "failed", retry=1)
+        delivery(by_phone[P_WW], "failed")
+        delivery(by_phone[P_ZL], "failed", kind="submit_ack")
+        delivery(prior, "sent")
+        delivery(cancelled, "sent")
+
+        def kpis(period_key="2026-11", dept_path=""):
+            response = ctx["sa1"].get("/api/admin/stats-panel/overview", params={
+                "template_id": tpl, "period_key": period_key, "dept_path": dept_path,
+            })
+            assert response.status_code == 200, response.text
+            return response.json()["kpis"]
+
+        counts = kpis()
+        assert counts["push_success"] == 2 and counts["push_failed"] == 2, counts
+        assert (counts["total"], counts["done"], counts["not_done"], counts["rate"]) == (5, 2, 3, 40.0)
+        assert counts["pending"] == 2
+
+        office = kpis(dept_path=PATH_BEN)
+        assert (office["push_success"], office["push_failed"], office["total"]) == (2, 1, 3)
+        other_dept = kpis(dept_path=PATH_ZQ)
+        assert (other_dept["push_success"], other_dept["push_failed"], other_dept["not_done"]) == (0, 1, 1)
+        unassigned = kpis(dept_path="未分配部门")
+        assert (unassigned["push_success"], unassigned["push_failed"], unassigned["not_done"]) == (0, 0, 1)
+        exact_batch = kpis(batch_key)
+        assert (exact_batch["push_success"], exact_batch["push_failed"], exact_batch["total"]) == (0, 1, 1)
+    finally:
+        store.close()
+
+
 def test_instances_filter_search_pagination_and_preview() -> None:
     ctx = _seed_main("e")
     try:
