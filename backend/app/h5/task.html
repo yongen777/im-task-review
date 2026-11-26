@@ -861,11 +861,16 @@
             const tipText = data.window_reason || (data.instance.status === "submitted"
               ? "本任务已提交，正在等待管理员审核"
               : "");
-            if (tipText) {
+            if (tipText || data.show_edit_guidance) {
               const tip = document.createElement("div");
               tip.className = "locked-tip";
               tip.setAttribute("role", "status");
               tip.textContent = tipText;
+              if (data.show_edit_guidance) {
+                const guidance = document.createElement("div");
+                guidance.textContent = "如需修改记录，请前往「个人任务工作台 → 提交记录」修改提交。";
+                tip.appendChild(guidance);
+              }
               contentEl.insertBefore(tip, area);
             }
             if (closedResubmission && data.instance.reject_reason) {

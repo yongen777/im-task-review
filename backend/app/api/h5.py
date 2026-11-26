@@ -506,6 +506,10 @@ def process_h5_task_info(
         inst["resubmit_deadline"] = effective_instance_deadline(inst)
     adhoc = bool(tpl.get("is_adhoc") or inst["period_key"].startswith("adhoc-"))
     submission = _completed_submission(state, inst, history=history)
+    show_edit_guidance = bool(
+        submission and effective_instance_deadline(inst) > state.now_str()
+        and (can_edit if history else state.h5_submission_editable(inst, tpl))
+    )
     if history and submission and not inst.get("submitted_at"):
         inst["submitted_at"] = submission["submitted_at"]
     return 200, {
@@ -515,6 +519,7 @@ def process_h5_task_info(
         "instance": inst,
         "readonly_history": history,
         "can_edit": can_edit,
+        "show_edit_guidance": show_edit_guidance,
         "submission": submission,
         "published_at": None if adhoc or inst.get("submitted_at") else state.instance_published_at(inst["id"]),
         "template": {

@@ -1332,11 +1332,15 @@ class Scheduler:
                 if ro == "completed":
                     done_disp = (format_deadline_display(str(instance.get("submitted_at") or ""), ref_dt=cur_dt)
                                  if instance.get("submitted_at") else "")
+                    edit_guidance = (
+                        "如需修改提交内容，请前往「个人任务工作台 → 提交记录」修改提交。\n"
+                        if effective_instance_deadline(instance) > now_s else ""
+                    )
                     return (
                         f"{heading}{rendered.rstrip()}\n\n"
                         f"截止时间：{dl_disp}\n"
                         + (f"你已在本周期完成该任务（{done_disp}）。\n" if done_disp else "你已在本周期完成该任务。\n")
-                        + f"点击链接可查看已提交内容：\n{h5_url}"
+                        + f"{edit_guidance}点击链接可查看已提交内容：\n{h5_url}"
                     )
                 if ro == "closed":
                     return (
