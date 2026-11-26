@@ -6058,6 +6058,13 @@ class StateStore:
             (tpl["template_id"], *params, *roster_params),
         ).fetchall()]
 
+    @staticmethod
+    def _stats_push_outcomes(rows: List[Dict[str, Any]]) -> tuple[set[str], set[str]]:
+        """同一成员在所选周期内只计一次，任一批次送达即计成功。"""
+        sent = {r["phone"] for r in rows if r["first_sent_at"]}
+        failed = {r["phone"] for r in rows if r["push_failed"] and r["phone"] not in sent}
+        return sent, failed
+
     def _stats_receipt_rows(self, tpl: Dict[str, Any], period: str, push_columns: str) -> List[Dict[str, Any]]:
         per_sql, params = self._stats_period_where(period.strip())
         roster_sql, roster_params = self._stats_roster_scope_sql(tpl)
@@ -6392,9 +6399,7 @@ class StateStore:
         # KPI（部门子树过滤；按去重后的人计）
         scoped = [r for r in persons if _phone_in_scope(str(r["phone"]))]
         scoped_phones = {r["phone"] for r in scoped}
-        # 完成状态取代表实例，推送结果则检查同一成员在所选周期内的所有批次。
-        sent_phones = {r["phone"] for r in rows if r["first_sent_at"] and r["phone"] in scoped_phones}
-        failed_phones = {r["phone"] for r in rows if r["push_failed"] and r["phone"] in scoped_phones}
+        sent_phones, failed_phones = self._stats_push_outcomes(rows)
         total = len(scoped)
         by_status: Dict[str, int] = {}
         for r in scoped:
@@ -6431,7 +6436,7 @@ class StateStore:
             "selected_dept_path": sel,
             "kpis": {
                 "total": total, "done": done, "not_done": not_done, "rate": rate,
-                "push_success": len(sent_phones), "push_failed": len(failed_phones - sent_phones),
+                "push_success": len(sent_phones & scoped_phones), "push_failed": len(failed_phones & scoped_phones),
                 "need_review": need_review,
                 "pending_review": by_status.get("submitted", 0),
                 "approved": by_status.get("approved", 0),
@@ -6458,12 +6463,16 @@ class StateStore:
         if not (period_key or "").strip():
             raise BizError(400, "VALIDATION_FAILED", "请选择统计周期")
         sel = str(dept_path or "").strip().strip("/")
+        group = str(status_group or "all").strip().lower()
+        only_push_failures = group == "push_failed"
         from .notice_media import notice_receipt_config
         has_receipt = tpl["kind"] == "notice" and bool(notice_receipt_config(tpl)[0])
-        rows = self._stats_period_rows(tpl, period_key, has_receipt=has_receipt)
+        rows = self._stats_period_rows(tpl, period_key, has_receipt=has_receipt, include_push=only_push_failures)
+        if only_push_failures:
+            _, failed_phones = self._stats_push_outcomes(rows)
+            rows = [r for r in rows if r["phone"] in failed_phones]
 
         def _keep(r: Dict[str, Any]) -> bool:
-            group = str(status_group or "all").strip().lower()
             st = str(r["status"])
             if group == "done":
                 if st not in self.STATS_PANEL_DONE:
@@ -6511,7 +6520,7 @@ class StateStore:
         # 当前页代表实例的最近一次提交（内容预览用；不翻全库）
         previews: Dict[int, Dict[str, Any]] = {}
         ids = [int(r["id"]) for r in page_rows]
-        if ids and not has_receipt:
+        if ids and not has_receipt and not only_push_failures:
             ph = ",".join("?" for _ in ids)
             subs = self.conn.execute(
                 f"SELECT instance_id, fields_json, note, refs_json, file_ref FROM submission "

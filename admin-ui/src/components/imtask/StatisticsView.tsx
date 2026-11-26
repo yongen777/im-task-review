@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3, Building2, ChevronDown, ChevronLeft, ChevronRight, Copy, Download,
   Eye, Paperclip, RefreshCw, Search, X,
@@ -188,6 +188,69 @@ export function KpiCard({ label, value, hint, color = 'text-slate-900' }: {
   );
 }
 
+function PushFailuresDialog({ scope, deptName, revision, onClose }: {
+  scope: string; deptName: string; revision: number; onClose: () => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [page, setPage] = useState(1);
+  const params = new URLSearchParams(scope);
+  params.set('status_group', 'push_failed');
+  params.set('page', String(page));
+  params.set('size', String(PAGE_SIZE));
+  const { data, loading, error } = usePanelQuery<ResultList>('/api/admin/stats-panel/instances?' + params, revision);
+  const totalPages = Math.max(1, Math.ceil((data?.total ?? 0) / PAGE_SIZE));
+
+  useEffect(() => { dialog.current?.showModal(); }, []);
+  useEffect(() => {
+    if (data && page > totalPages) setPage(totalPages);
+  }, [data, page, totalPages]);
+
+  return (
+    <dialog ref={dialog} onClose={onClose} aria-labelledby="push-failures-title"
+      className={panelClass + ' fixed inset-0 m-auto w-[min(42rem,94vw)] max-w-none p-0 shadow-2xl backdrop:bg-slate-900/50'}>
+      <div className="flex items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
+        <div>
+          <h3 id="push-failures-title" className="font-bold text-slate-900">推送失败名单</h3>
+          <p className="mt-1 text-xs text-slate-600">{deptName}{data && ' · 共 ' + data.total + ' 人'}</p>
+        </div>
+        <button type="button" aria-label="关闭推送失败名单" onClick={() => dialog.current?.close()}
+          className="rounded-lg p-1 text-slate-500 hover:bg-slate-100"><X className="h-5 w-5" /></button>
+      </div>
+      <div className="max-h-[60vh] overflow-auto">
+        {error ? <p role="alert" className="px-5 py-4 text-sm text-rose-700">{error}</p>
+          : loading ? <p role="status" className="px-5 py-4 text-sm text-slate-600">正在加载名单…</p>
+          : !data?.items.length ? <p className="px-5 py-4 text-sm text-slate-600">当前范围内暂无推送失败成员</p>
+          : (
+            <table className="w-full text-left text-sm">
+              <thead className="sticky top-0 bg-slate-50 text-xs text-slate-600">
+                <tr><th scope="col" className="px-5 py-3">姓名</th><th scope="col" className="px-3 py-3">手机号</th>
+                  <th scope="col" className="px-3 py-3">所属部门</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {data.items.map((item) => (
+                  <tr key={item.phone}>
+                    <td className="px-5 py-3 font-medium text-slate-900">{item.name}</td>
+                    <td className="px-3 py-3 tabular-nums text-slate-700">{item.phone}</td>
+                    <td className="px-3 py-3 text-slate-600">{item.dept_path.replace(/\//g, ' / ') || '未分配部门'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+      </div>
+      {(page > 1 || totalPages > 1) && (
+        <div className="flex items-center justify-end gap-2 border-t border-slate-100 px-4 py-2 text-xs text-slate-600">
+          <button type="button" aria-label="上一页" disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}
+            className={secondaryButton + ' !p-1.5'}><ChevronLeft className="h-3.5 w-3.5" /></button>
+          <span className="tabular-nums">第 {page} / {Math.max(page, totalPages)} 页</span>
+          <button type="button" aria-label="下一页" disabled={page >= totalPages || loading} onClick={() => setPage(page + 1)}
+            className={secondaryButton + ' !p-1.5'}><ChevronRight className="h-3.5 w-3.5" /></button>
+        </div>
+      )}
+    </dialog>
+  );
+}
+
 export function SubmissionPreview({ content, onImageClick }: {
   content: SubmissionContent | null; onImageClick?: (source: { url: string; alt?: string }) => void;
 }) {
@@ -277,6 +340,7 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
   const canonicalKey = chosenPeriod ?? task.current_period_key;
   const [deptPath, setDeptPath] = useState('');
   const [deptOpen, setDeptOpen] = useState(false);
+  const [pushFailuresOpen, setPushFailuresOpen] = useState(false);
   const [status, setStatus] = useState<StatusTab>('all');
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState({ query: '', page: 1 });
@@ -512,7 +576,12 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
                 <span className="flex flex-wrap gap-x-2 gap-y-1"
                   title="本周期按人去重。有任一批次送达即计成功，有失败记录且从未送达计失败。">
                   <span className="text-emerald-700">推送成功 {overviewData.kpis.push_success} 人</span>
-                  <span className="text-rose-700">推送失败 {overviewData.kpis.push_failed} 人</span>
+                  <button type="button" aria-haspopup="dialog" disabled={overviewData.kpis.push_failed === 0}
+                    onClick={() => setPushFailuresOpen(true)}
+                    className="inline-flex items-center gap-0.5 rounded text-rose-700 underline underline-offset-2 hover:text-rose-900 disabled:no-underline disabled:hover:text-rose-700">
+                    推送失败 {overviewData.kpis.push_failed} 人
+                    {overviewData.kpis.push_failed > 0 && <ChevronRight aria-hidden="true" className="h-3 w-3" />}
+                  </button>
                 </span>
               } />
             <KpiCard label={isReceipt ? '已回复' : '已完成人数'} value={overviewData.kpis.done} color="text-emerald-700"
@@ -702,6 +771,8 @@ function StatisticsTask({ task, tasks, onTaskChange, onRefreshTasks }: {
           </section>
         </div>
       )}
+      {pushFailuresOpen && <PushFailuresDialog scope={scope.toString()} deptName={deptName} revision={revision}
+        onClose={() => setPushFailuresOpen(false)} />}
       {detail && <InstanceDetailDialog instanceId={detail.instanceId} submissionId={detail.submissionId}
         onClose={() => setDetail(null)} onChanged={() => setRevision((n) => n + 1)} />}
       <ImageViewer source={viewerSource} onClose={() => setViewerSource(null)} />

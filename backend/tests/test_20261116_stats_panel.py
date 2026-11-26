@@ -326,6 +326,26 @@ def test_delivery_kpis_dedup_batches_and_preserve_pending_in_completion_rate() -
         assert (unassigned["push_success"], unassigned["push_failed"], unassigned["not_done"]) == (0, 0, 1)
         exact_batch = kpis(batch_key)
         assert (exact_batch["push_success"], exact_batch["push_failed"], exact_batch["total"]) == (0, 1, 1)
+
+        endpoint = "/api/admin/stats-panel/instances"
+        params = {"template_id": tpl, "period_key": "2026-11", "status_group": "push_failed"}
+
+        def failure_list(**overrides):
+            response = ctx["sa1"].get(endpoint, params={**params, **overrides})
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        failed = failure_list()
+        assert failed["total"] == counts["push_failed"]
+        assert {item["phone"]: item["dept_path"] for item in failed["items"]} == {
+            P_QQ: PATH_BZ, P_WW: PATH_ZQ,
+        }
+        assert len(failure_list(size=1, page=1)["items"]) == 1
+        assert len(failure_list(size=1, page=2)["items"]) == 1
+        assert failure_list(dept_path=PATH_BEN)["items"][0]["phone"] == P_QQ
+        assert failure_list(dept_path=PATH_WY)["total"] == 0
+        assert failure_list(period_key=batch_key)["items"][0]["phone"] == P_ZS
+        assert ctx["sa2"].get(endpoint, params=params).status_code == 403
     finally:
         store.close()
 
