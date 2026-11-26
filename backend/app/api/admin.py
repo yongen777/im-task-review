@@ -641,19 +641,17 @@ def _instance_filter_sql(
     if period_key and period_key.strip():
         key = period_key.strip()
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", key):
-            # 2026-11-19 需求一：日期视图同时覆盖「当日重推批次」（period_key 形如 2026-11-19#…）
-            # 与手动模板的 once#… 批次；否则按日期筛实例会漏掉重推出的那一批。
-            # 2026-11-23 第二波：手动批次按创建日期过滤改范围条件
-            # （原 LEFT(i.created_at,10)=? 对字段套函数，索引用不上；YYYY-MM-DD HH:MM:SS
-            # 定长字典序与范围比较等价，语义不变）。
+            # 日期视图按日键、创建或首次推送时间查询，自主上报同时保留按提交日查询。
+            day_start = key + " 00:00:00"
             day_end = (datetime.strptime(key, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d") + " 00:00:00"
+            bounds = (day_start, day_end)
             where.append("(i.period_key=? OR i.period_key LIKE ? "
-                         "OR (t.is_manual=1 AND (i.period_key='once' OR i.period_key LIKE 'once#%') "
-                         "AND i.created_at>=? AND i.created_at<?) "
-                         "OR (i.period_key LIKE 'adhoc-%' AND (LEFT(i.submitted_at,10)=? "
+                         "OR (i.created_at>=? AND i.created_at<?) "
+                         "OR (i.first_sent_at>=? AND i.first_sent_at<?) "
+                         "OR (i.period_key LIKE 'adhoc-%' AND ((i.submitted_at>=? AND i.submitted_at<?) "
                          "OR (i.submitted_at IS NULL AND EXISTS (SELECT 1 FROM submission s "
-                         "WHERE s.instance_id=i.id AND LEFT(s.created_at,10)=?)))))")
-            params.extend((key, key + "#%", key + " 00:00:00", day_end, key, key))
+                         "WHERE s.instance_id=i.id AND s.created_at>=? AND s.created_at<?)))))")
+            params.extend((key, key + "#%", *bounds, *bounds, *bounds, *bounds))
         else:
             # 2026-11-20 切期改造：周/月/once 等归属周期键同时覆盖其重推批次
             # （`{key}#YYYYMMDDHHMMSS`），与统计面板的「整个归属周期」口径一致。
@@ -2683,6 +2681,7 @@ def create_admin_router(
         template_id: Optional[str] = None,
         template_name: Optional[str] = None,
         period_key: Optional[str] = None,
+        date: Optional[str] = None,
         status: Optional[str] = None,
         kind: Optional[str] = None,
         role_id: Optional[str] = None,
@@ -2703,7 +2702,7 @@ def create_admin_router(
             state,
             template_id=template_id,
             template_name=template_name,
-            period_key=period_key,
+            period_key=date or period_key,
             status=status,
             kind=kind,
             role_id=role_id,
@@ -3317,6 +3316,7 @@ def create_admin_router(
         template_id: Optional[str] = None,
         template_name: Optional[str] = None,
         period_key: Optional[str] = None,
+        date: Optional[str] = None,
         status: Optional[str] = None,
         kind: Optional[str] = None,
         role_id: Optional[str] = None,
@@ -3336,7 +3336,7 @@ def create_admin_router(
             state,
             template_id=template_id,
             template_name=template_name,
-            period_key=period_key,
+            period_key=date or period_key,
             status=status,
             kind=kind,
             role_id=role_id,

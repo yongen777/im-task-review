@@ -1243,8 +1243,7 @@ class Scheduler:
         """2026-11-13 修复一：一键推送·投递段（后台线程执行，绝不占用事件循环）。
 
         prep 来自 push_now_prepare；p_key/pushed_at 固定（重放同 prep → 幂等 0 新增）。
-        投递走 _deliver_batch_concurrent（8 线程 + 25QPS 桶 + 熔断）：2665 人 ≈ 107s，
-        这段在网络线程池里等待，调用方（后台线程）阻塞无妨，事件循环完全自由。
+        上传任务整批准备后交给 _deliver_batch_concurrent，复用线程上限、令牌桶和熔断。
         """
         cur_dt = parse_dt(str(prep.get("pushed_at") or ""))
         if cur_dt.tzinfo is None:
@@ -1286,6 +1285,8 @@ class Scheduler:
         if push_note:
             heading += f"【补充提醒】{push_note}\n"
         push_seq: Dict[str, int] = {}
+        batch: List[Dict[str, Any]] = []
+        target_platform = self._template_platform(tpl)
         for inst in instances:
             inst_status = str(inst["status"] or "")
             # 2026-11-20 切期改造（用户拍板，方案B「全员照推 + 通道智能闭口」）：
@@ -1349,14 +1350,9 @@ class Scheduler:
                     f"提交入口（点击链接打开上传任务）：\n{h5_url}"
                 )
 
-            # 2026-11-13 冲刺模块二：一键推送改走受控并发引擎（8 线程 + 25QPS 桶 + 熔断）——
-            # 2665 人整点高峰单轮投递压进 2 分钟内；幂等占位/消息渲染/记账全在主线程。
-            # 2026-11-16 方案B：prepare 段包事务（同连接复用）；⛔ 保持「逐实例投递 +
-            # 逐实例 pushed_instances 计数」语义不变（分片聚合会把计数压成每批 1，
-            # test_d_push_now / livesync / fix1_split 三组用例实锤拦截）。
-            batch: List[Dict[str, Any]] = []
+            # 先提交幂等占位和 H5 令牌，再交给工作线程投递。
             with self.state.conn:
-                for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
+                for platform, ext_id, ext_type, nt in self._targets_for(phone, only_platform=target_platform):
                     # 幂等键带推送时刻 + 同号序号：同一次推送内不同实例不撞键；
                     # 同一秒内的重复调用彼此命中同一键 → 被 _resolve_retry_slot 拦下（快速双击防抖）。
                     base_idem = make_idem_key(tpl["template_id"], phone, p_key, "manual_push", seq,
@@ -1366,15 +1362,14 @@ class Scheduler:
                         template_id=tpl["template_id"], instance_id=int(inst["id"]), phone=inst["phone"],
                         external_id=ext_id, kind="manual_push", planned_str=now_s, delay_sec=0,
                         idem_key=idem, msg_text_fn=_make_push_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                        claim=manual, once=manual,
+                        claim=True, once=manual,
                     )
                     if task is None:
                         continue
                     task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
                     batch.append(task)
-            oks = self._deliver_batch_concurrent(batch, stats)
-            if any(oks):
-                stats["pushed_instances"] += 1
+        results = self._deliver_batch_concurrent(batch, stats)
+        stats["pushed_instances"] = len({task["instance_id"] for task, ok in zip(batch, results) if ok})
         return stats
 
     @staticmethod
