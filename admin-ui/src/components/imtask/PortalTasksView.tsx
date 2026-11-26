@@ -707,16 +707,17 @@ function PortalTaskMonitor({ task, refreshSignal, exportSignal, onExportingChang
     setFilter((current) => ({ ...current, page: 1 }));
   }
 
-  /* 2026-11-24：页头驱动的刷新/导出信号（跳过首次挂载，避免与 usePanelQuery 的
-     初次自动拉取重复请求）。exportXlsx 为函数声明，存在提升，可在此前置引用。 */
-  const firstRefreshSignal = useRef(true);
+  // 挂载时的信号是基线。只有页头生成新信号才执行对应操作。
+  const lastRefreshSignal = useRef(refreshSignal);
   useEffect(() => {
-    if (firstRefreshSignal.current) { firstRefreshSignal.current = false; return; }
+    if (lastRefreshSignal.current === refreshSignal) return;
+    lastRefreshSignal.current = refreshSignal;
     setRevision((n) => n + 1);
   }, [refreshSignal]);
-  const firstExportSignal = useRef(true);
+  const lastExportSignal = useRef(exportSignal);
   useEffect(() => {
-    if (firstExportSignal.current) { firstExportSignal.current = false; return; }
+    if (lastExportSignal.current === exportSignal) return;
+    lastExportSignal.current = exportSignal;
     void exportXlsx();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exportSignal]);
