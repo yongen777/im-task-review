@@ -28,10 +28,10 @@ def test_note_on_repush_preserves_original_body_and_template(ctx, notice):
     assert response.status_code == 200, response.text
     after = notifier.sent_messages[count].text
     if notice:
-        assert after == f"【通知提醒】{original['name']}\n【补充提醒】{note}\n\n{before}"
+        assert after == f"【通知提醒】{original['name']}\n【补充提醒】{note}\n{before}"
     else:
         heading, _, body = before.partition("\n")
-        assert after.split("#t=")[0] == f"{heading}\n【补充提醒】{note}\n\n{body.split('#t=')[0]}"
+        assert after.split("#t=")[0] == f"{heading}\n【补充提醒】{note}\n{body.split('#t=')[0]}"
     assert state.get_template(task)["text_tpl"] == original["text_tpl"]
     logs = state.conn.execute(
         "SELECT detail FROM admin_audit WHERE target_id=? AND action='template.push_now' ORDER BY id", (task,),
@@ -58,7 +58,7 @@ def test_variable_notice_note_keeps_recipient_rendering_and_dedupe(ctx):
         "second-union": "第二成员您好，得分 88，再次核对 88，金额 0 元",
     }
     for message in notifier.sent_messages:
-        assert message.text == f"【通知提醒】考核通知\n【补充提醒】请核对{{得分}}\n\n{expected[message.receive_id]}"
+        assert message.text == f"【通知提醒】考核通知\n【补充提醒】请核对{{得分}}\n{expected[message.receive_id]}"
     assert state.get_template(task)["text_tpl"] == BODY
 
 
@@ -87,4 +87,4 @@ def test_manual_upload_note_does_not_leak_into_scheduled_ticks(ctx):
         scheduler.run_once()
     texts = [message.text.split("#t=")[0] for message in notifier.sent_messages]
     assert len(texts) == 2
-    assert texts[0] == texts[1].replace("\n", "\n【补充提醒】本次催办\n\n", 1)
+    assert texts[0] == texts[1].replace("\n", "\n【补充提醒】本次催办\n", 1)

@@ -1284,7 +1284,7 @@ class Scheduler:
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         heading = f"【任务提醒】{tpl['name']}\n"
         if push_note:
-            heading += f"【补充提醒】{push_note}\n\n"
+            heading += f"【补充提醒】{push_note}\n"
         push_seq: Dict[str, int] = {}
         for inst in instances:
             inst_status = str(inst["status"] or "")
@@ -1577,7 +1577,7 @@ class Scheduler:
                             else:
                                 name = (inst.get("notice_view") or {}).get("title") or tpl["name"]
                                 title = f"【通知提醒】{name}"
-                            message = f"{title}\n【补充提醒】{push_note}" + (f"\n\n{message}" if message else "")
+                            message = f"{title}\n【补充提醒】{push_note}" + (f"\n{message}" if message else "")
                         if not message:
                             continue
                     # 一次性通知正文沿用旧键，已发出的历史通知保持去重。

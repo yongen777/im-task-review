@@ -112,9 +112,11 @@ def test_manual_push_skip_completed_filters_and_blocks_when_all_done(ctx):
 
     # 投递也按过滤执行：只发 B
     notifier.sent_messages.clear()
+    prep_skip["push_note"] = "月末催办"
     stats = scheduler.push_now_deliver(tid, prep_skip)
     assert stats["pushed_instances"] == 1
     assert [m.receive_id for m in notifier.sent_messages] == [f"union-{SECOND}"]
+    assert notifier.sent_messages[0].text.splitlines()[1:3] == ["【补充提醒】月末催办", "请第二成员提交今日数据"]
 
     # 全员已完成 → 明确拒绝，不建空批次不发消息
     mark_done(store, tid, SECOND)
