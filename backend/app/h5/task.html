@@ -548,10 +548,6 @@
           </div>
         </div>
         <div id="dynamicArea"></div>
-        <div class="block" id="noteField" style="display:none;">
-          <div class="block-head"><svg class="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="name">备注说明（选填）</span></div>
-          <div class="field"><textarea id="noteInput" rows="3" placeholder="请输入补充说明"></textarea></div>
-        </div>
         <div class="task-actions" id="taskActions"><button class="btn" id="submitBtn" type="button">提交任务</button></div>
       </div>
       <div id="msgBox" class="msg" role="status"></div>
@@ -915,7 +911,6 @@
           }[data.template.kind] || [];
           const attachmentLimits = data.template.attachment_limits || {};
           h5Schema = Array.isArray(data.template.schema_json) ? data.template.schema_json : [];
-          let textModuleOn = false;
 
           /* 统一的模块卡片：图标 + 标题 + 右侧提示 + 内容区 */
           function makeBlock(title, hint) {
@@ -1133,16 +1128,15 @@
                 body.appendChild(wrap);
               });
             }
-            /* 文字说明模块（复用备注输入框） */
+            /* 模板配置的文字说明模块 */
             if (modules.includes("text")) {
-              textModuleOn = true;
               const body = makeBlock(spec.text_label || "文字情况说明", "");
               const ta = document.createElement("textarea");
-              document.getElementById("noteInput").removeAttribute("id");
               ta.id = "noteInput";
               ta.setAttribute("aria-label", spec.text_label || "文字情况说明");
               ta.rows = 4;
               ta.placeholder = spec.text_placeholder || "请填写补充说明…";
+              if (editing) ta.value = data.submission.note || "";
               body.appendChild(ta);
             }
             if (modules.includes("image")) {
@@ -1155,10 +1149,6 @@
               makeUploadBlock("文件上传", "最多 " + (attachmentLimits.file || 1) + " 个", ".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip", false, "file");
             }
           }
-          /* 只有「未勾选文字说明模块」时才显示通用备注框，避免两个输入框重复 */
-          if (!h5Modules.length && data.template.allow_note && !textModuleOn) document.getElementById("noteField").style.display = "block";
-          if (editing) document.getElementById("noteInput").value = data.submission.note || "";
-
           if (data.instance.status === "rejected" && data.window_open) {
             const tip = document.createElement("div");
             tip.className = "locked-tip";
@@ -1191,7 +1181,7 @@
         /* 字段 + 文字说明 + 多附件一起提交（文字说明走 note，图片/文件走 refs） */
         payload = { fields: fieldsObj, refs: uploadedRefs, file_ref: uploadedRefs[0] || "" };
         const noteEl = document.getElementById("noteInput");
-        const note = noteEl ? noteEl.value : "";
+        const note = noteEl ? noteEl.value : undefined;
         /* 2026-10-30 用户口径：管理员选了什么，用户就必须完成什么 —— 缺什么先在这里提示，
            不要让用户点完提交才看到服务端报错（服务端同样有硬校验兜底）。 */
         for (const f of h5Schema) {

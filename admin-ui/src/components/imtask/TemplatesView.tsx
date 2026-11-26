@@ -485,19 +485,6 @@ const UploadFlowPhonePreview: React.FC<UploadH5PreviewProps> = ({
                     </div>
                   )}
 
-                  {/* 备注说明（选填）——H5 noteField 块 */}
-                  <div className="bg-white p-4 rounded-xl border border-[#e2e8ee] shadow-2xs space-y-2">
-                    <div className="flex items-center gap-1.5 text-sm font-semibold text-[#182530]">
-                      <AlignLeft className="w-[18px] h-[18px] text-[#15558a]" />
-                      <span>备注说明（选填）</span>
-                    </div>
-                    <textarea
-                      rows={2}
-                      readOnly
-                      placeholder="请输入补充说明"
-                      className="w-full bg-[#f7f9fb] border border-[#e2e8ee] rounded-lg p-2.5 text-[13px] text-[#182530] placeholder:text-[#8a95a1] resize-none"
-                    />
-                  </div>
                 </div>
               )}
             </div>
