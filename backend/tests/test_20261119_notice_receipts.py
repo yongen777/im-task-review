@@ -51,11 +51,11 @@ def test_notice_receipt_over_chat_and_statistics(ctx):
 
     reply('其他消息', 'portal-entry')
     assert '/h5/portal' in replies[-1][0]
-    reply('已经查阅。', 'same-event')
-    reply('已经查阅。', 'same-event')
-    assert replies[1:] == [
-        ('【德阳量密助手】已收到您的回执「已经查阅」，已同步确认以下 2 条通知：《回执通知甲》《回执通知乙》', 'notice_receipt'),
-    ]
+    _, receipt = reply('已经查阅。', 'same-event')
+    assert receipt['path'] == 'notice_receipt' and receipt['count'] == 2
+    for _ in range(2):
+        assert reply('已经查阅。', 'same-event')[1]['duplicate'] is True
+    assert [tag for _, tag in replies] == ['portal']
     assert not [item for item in portal.todos(ident) if item.get('receipt_phrase')]
     assert not portal.submission_history(ident)
     instance = store.get_instance_by_key(template_id, member['phone'], 'once')
@@ -90,6 +90,6 @@ def test_single_notice_receipt_keeps_workbench_link_for_other_messages(ctx):
                                      platform='zdxlz', event_id=f'event-{index}', base_url='http://local',
                                      send=lambda body, tag: replies.append((body, tag)))
         assert result[0] == 200
-    assert replies[0] == ('【德阳量密助手】已收到您的回执「已经查阅」，已完成《单条通知》的确认登记。', 'notice_receipt')
-    assert '/h5/portal#t=' in replies[1][0] and replies[1][1] == 'portal'
+    [(body, tag)] = replies
+    assert '/h5/portal#t=' in body and tag == 'portal'
     assert store.get_instance(instance['id'])['receipt_at'] > instance['deadline_at']

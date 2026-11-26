@@ -2937,8 +2937,7 @@ def create_admin_router(
 
     # ── 2026-10-29 逾期补交审核（2026-11-12 任务E3 整体下线）──────────────
     # 原 /instances/{id}/resubmit/approve|reject 与 _push_resubmit_message 已删除：
-    # 「申请补交」链路不复存在；驳回重交（review → reject → scheduler.send_reject_notification）
-    # 机制保留，不受影响。
+    # 驳回重交由审核接口更新状态，提交人可从个人工作台重新打开任务。
 
     @router.post("/channel-config/test-send")
     async def channel_test_send(request: Request):
@@ -3086,14 +3085,6 @@ def create_admin_router(
             )
         except BizError as exc:
             return biz_error_response(exc)
-
-        if action == "reject":
-            scheduler = getattr(request.app.state, "scheduler", None)
-            if scheduler is not None:
-                try:
-                    scheduler.send_reject_notification(updated, reason=reason)
-                except Exception:
-                    pass
 
         return {"ok": True, "instance": updated}
 

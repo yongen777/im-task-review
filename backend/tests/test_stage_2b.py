@@ -219,7 +219,7 @@ class TestStage2B(unittest.TestCase):
         self.assertEqual(tok_record["phone"], "13800000001")
         self.assertEqual(tok_record["token_id"], hashlib.sha256(raw_token.encode("utf-8")).hexdigest())
 
-    def test_fix3_r14_overdue_notice_r27_resubmit_and_rejected_expired(self) -> None:
+    def test_fix3_overdue_status_r27_resubmit_and_rejected_expired(self) -> None:
         dl = "2026-10-25 18:00:00"
         # 2026-11-12 下午新口径：重交截止 = 驳回时刻 + 24h（不再取 max(截止+72h, 驳回+24h)）
         self.assertEqual(calc_resubmit_deadline(dl, "2026-10-26 04:00:00"), "2026-10-27 04:00:00")
@@ -256,8 +256,8 @@ class TestStage2B(unittest.TestCase):
 
         self.current_dt = make_dt("2026-10-25 18:10:00")
         s_1810 = self.scheduler.run_once()
-        self.assertEqual(s_1810["sent"], 1)
-        self.assertIn("【工作日报】已逾期", self.notifier.sent_messages[-1].text)
+        self.assertEqual(s_1810["sent"], 0)
+        self.assertEqual(len(self.notifier.sent_messages), 2)
 
         self.current_dt = make_dt("2026-10-25 18:15:00")
         self.assertEqual(self.scheduler.run_once()["sent"], 0)

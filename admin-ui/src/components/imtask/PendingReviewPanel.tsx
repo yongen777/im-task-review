@@ -128,7 +128,7 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
     void runAction(
       item,
       () => api.post(`/api/admin/instances/${item.id}/review`, { action: 'reject', reason }),
-      `已驳回「${item.member_name_snap}」的提交，系统会通知他修改后重交。`,
+      `已驳回「${item.member_name_snap}」的提交，员工可在个人工作台查看原因并重交。`,
     );
   };
 
@@ -203,7 +203,7 @@ export default function PendingReviewPanel({ refreshToken = 0, platform = '', on
               autoFocus
               value={rejectReason}
               onChange={(e) => setRejectReason(e.target.value)}
-              placeholder="请填写驳回原因（至少 2 个字），会随通知发给本人"
+              placeholder="请填写驳回原因（至少 2 个字），员工可在个人工作台查看"
               className="flex-1 min-w-[220px] bg-white border border-rose-200 rounded-lg px-2.5 py-1.5 text-xs text-slate-800 outline-none focus:border-rose-400"
             />
             <button

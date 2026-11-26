@@ -115,11 +115,15 @@ def test_reject_link_preserves_previous_submission_after_business_cutoff(ctx, ha
     ref = uploaded.json()["ref"]
     result = submit(client, original_token, fields={"qty": "7", "summary": "上次提交"}, refs=[ref])
     assert result.status_code == 200 and result.json()["status"] == "submitted", result.text
-    rejected = state.review_instance(instance["id"], "reject", "管理员", "请补充说明")
-    for tick in range(3):
-        scheduler.send_reject_notification(rejected, "请补充说明", NOW + timedelta(seconds=30 * tick))
-    [sent] = [msg for msg in notifier.sent_messages if "提交被驳回" in msg.text]
-    raw = sent.text.split("#t=")[-1]
+    response = client.post(f'/api/admin/instances/{instance["id"]}/review',
+                           json={"action": "reject", "reason": "请补充说明"})
+    assert response.status_code == 200 and response.json()["instance"]["status"] == "rejected", response.text
+    assert not notifier.sent_messages
+    portal = PortalService(state)
+    portal_token = portal.issue(instance["phone"], "zdxlz")
+    opened = client.post(PORTAL_API + "/open", headers=auth(portal_token), json={"instance_id": instance["id"]})
+    assert opened.status_code == 200, opened.text
+    raw = opened.json()["url"].split("#t=")[-1]
     expires = NOW + (timedelta(days=2) if has_deadline else timedelta(days=30))
     assert state.get_h5_token(raw)["expires_at"] == format_dt(expires)
     if has_deadline:

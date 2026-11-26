@@ -271,9 +271,6 @@ def create_apps(
         create_h5_router(
             state=store,
             uploads_dir=cfg.uploads_dir,
-            notifier=active_notifier,
-            # 2026-11-03：H5 绑定回执要按「绑定的那个平台」选通道，否则企微用户收不到回执
-            notifiers=notifiers,
             contacts=contacts,
             scheduler=scheduler,
         )

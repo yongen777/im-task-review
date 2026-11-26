@@ -5530,10 +5530,6 @@ class StateStore:
                 (str(status), int(instance_id)),
             )
 
-    def list_overdue_instances(self) -> List[Dict[str, Any]]:
-        with self.lock:
-            return [dict(r) for r in self.conn.execute("SELECT * FROM task_instance WHERE status = 'overdue' ORDER BY id ASC").fetchall()]
-
     def get_instance(self, instance_id: int) -> Optional[Dict[str, Any]]:
         with self.lock:
             row = self.conn.execute("SELECT * FROM task_instance WHERE id = ?", (int(instance_id),)).fetchone()

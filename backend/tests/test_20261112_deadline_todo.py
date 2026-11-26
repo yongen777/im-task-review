@@ -273,7 +273,7 @@ def test_e2_overdue_unified_message_and_submit_closed() -> None:
         store.close()
 
 
-# ════════════════════ E3：申请补交下线 + 逾期通知文案 ════════════════════
+# ════════════════════ E3：申请补交下线与逾期状态 ════════════════════
 
 def test_e3_resubmit_channel_decommissioned() -> None:
     store = _store()
@@ -302,29 +302,32 @@ def test_e3_resubmit_channel_decommissioned() -> None:
         store.close()
 
 
-def test_e3_scheduler_overdue_notice_pure_deadline_wording() -> None:
+def test_e3_scheduler_updates_overdue_status_without_sending_feedback() -> None:
     store = _store()
     try:
         rid = _seed_member(store)
         tpl = _form_tpl(store, rid, "逾期通知", deadline_time="10:00")
         ntf = FakeNotifier(now_fn=lambda: CLOCK["now"])
         sched = _sched(store, ntf)
-        sched.run_once()
-        assert ntf.sent_messages, "应有提醒"
+        for seconds in (0, 30, 60):
+            CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0) + timedelta(seconds=seconds)
+            sched.run_once()
+        assert len(ntf.sent_messages) == 1
 
-        # 10:10（截止后 10 分钟）→ R14 逾期通知：纯截止告知，无任何补交字样
-        CLOCK["now"] = datetime(2026, 11, 12, 10, 10, 0)
-        sched.run_once()
-        overdue_msgs = [m.text for m in ntf.sent_messages if "已逾期" in m.text]
-        assert overdue_msgs, [m.text for m in ntf.sent_messages]
-        assert "当前任务已过期（截止时间：2026-11-12 10:00:00），无法提交" in overdue_msgs[-1], overdue_msgs[-1]
-        assert "申请补交" not in overdue_msgs[-1], overdue_msgs[-1]
-
-        # 30s 内重复 tick：kind='overdue' 幂等（只发 1 条，不刷屏）
-        CLOCK["now"] = datetime(2026, 11, 12, 10, 10, 30)
-        sched.run_once()
-        again = [m.text for m in ntf.sent_messages if "已逾期" in m.text]
-        assert again == overdue_msgs, f"逾期通知重复发送: {again}"
+        tid = tpl["template_id"]
+        period = "2026-11-12"
+        deadline = "2026-11-12 10:00:00"
+        periods = [period, period + "#20261112092000", period + "#20261112094000"]
+        for batch in periods[1:]:
+            store.ensure_instance(tid, PHONE, "张三", "市场部", batch, deadline)
+        CLOCK["now"] = datetime(2026, 11, 12, 10, 0, 30)
+        assert sched.run_once()["to_overdue"] == 3
+        for seconds in (0, 30, 60):
+            CLOCK["now"] = datetime(2026, 11, 12, 10, 10, 0) + timedelta(seconds=seconds)
+            assert sched.run_once()["sent"] == 0
+        assert all(store.get_instance_by_key(tid, PHONE, batch)["status"] == "overdue" for batch in periods)
+        assert len(ntf.sent_messages) == 1
+        assert all(log["kind"] != "overdue" for log in store.list_reminder_logs(template_id=tid))
     finally:
         CLOCK["now"] = datetime(2026, 11, 12, 9, 0, 0)
         store.close()

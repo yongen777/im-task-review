@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""H5 绑定回执必须走「绑定所在平台」的通道。
-
-2026-11-03：原先回执固定用 active_notifier（实际是密信通道），
-企微用户走 H5 绑定时回执发给密信通道 → external_id 是企微 userid，必然失败且被静默吞掉。
-"""
+"""H5 绑定按平台隔离，绑定成功反馈只在 H5 中展示。"""
 from __future__ import annotations
 
 import tempfile
@@ -29,19 +25,18 @@ def _store() -> StateStore:
     return store
 
 
-def test_h5_bind_receipt_goes_to_bound_platform() -> None:
+def test_h5_bind_records_platform_without_sending_chat_feedback() -> None:
     store = _store()
     try:
         z, w = FakeNotifier(), FakeNotifier()
         code, body = process_h5_bind(
             state=store,
             data={"phone": PHONE, "external_id": "woOC_wecom_uid", "platform": "wecom", "name": "李四", "dept": DEPT},
-            notifier=z,                     # 旧行为会发到这里（错）
+            notifier=z,
             notifiers={"zdxlz": z, "wecom": w},
         )
         assert code == 200 and body.get("bound") is True, body
-        assert len(w.sent_messages) == 1, "企微回执应发 1 条"
-        assert z.sent_messages == [], "⛔ 密信通道不该收到企微用户的回执"
+        assert w.sent_messages == z.sent_messages == []
         assert store.get_delivery_target(PHONE, platform="wecom") is not None
         assert store.get_delivery_target(PHONE, platform="zdxlz") is None
     finally:
@@ -49,7 +44,7 @@ def test_h5_bind_receipt_goes_to_bound_platform() -> None:
 
 
 def test_h5_bind_defaults_to_current_platform() -> None:
-    """请求体没带 platform 时，跟 state.platform 一致（绑定与回执不会错位）。"""
+    """请求体没带 platform 时，绑定使用 state.platform。"""
     store = _store()
     try:
         store.platform = "wecom"
@@ -59,13 +54,13 @@ def test_h5_bind_defaults_to_current_platform() -> None:
             notifier=z, notifiers={"zdxlz": z, "wecom": w},
         )
         assert code == 200
-        assert len(w.sent_messages) == 1 and z.sent_messages == []
+        assert store.get_delivery_target(PHONE, platform="wecom") is not None
+        assert w.sent_messages == z.sent_messages == []
     finally:
         store.close()
 
 
-def test_h5_bind_falls_back_to_single_notifier() -> None:
-    """没传 notifiers（单通道部署/旧调用）时退回原行为，不能因此丢回执。"""
+def test_h5_bind_is_silent_with_legacy_notifier_argument() -> None:
     store = _store()
     try:
         z = FakeNotifier()
@@ -75,6 +70,6 @@ def test_h5_bind_falls_back_to_single_notifier() -> None:
             notifier=z,
         )
         assert code == 200
-        assert len(z.sent_messages) == 1
+        assert z.sent_messages == []
     finally:
         store.close()

@@ -569,7 +569,6 @@ class Scheduler:
     """§6 定时调度核心（惰性生成实例 + 真实 H5 令牌签发 + 提醒/逾期/驳回投递 + 退避重试 + 状态推进）。"""
 
     COMPENSATION_WINDOW_SECONDS = 30 * 60
-    OVERDUE_NOTICE_DELAY_MINUTES = 10
     MAX_RETRIES = 3
     RETRY_DELAYS = (30, 120, 300)
 
@@ -892,7 +891,6 @@ class Scheduler:
             "notice": ("pending", "sent"),
             "notice_receipt": ("pending", "sent"),
             "remind": ("pending",),
-            "overdue": ("overdue",),
             "manual_push": ("pending", "overdue", "rejected", "submitted", "approved"),
         }
         if instance["status"] not in statuses[kind]:
@@ -958,7 +956,7 @@ class Scheduler:
             # 令牌桶挡在**真实网络发送前**（worker 侧全局限流；主线程只负责喂任务不阻塞）
             bucket.acquire()
             if (task.get("instance_id") is not None
-                    and task["kind"] in ("notice", "notice_receipt", "remind", "overdue", "manual_push")
+                    and task["kind"] in ("notice", "notice_receipt", "remind", "manual_push")
                     and not self._instance_still_deliverable(int(task["instance_id"]), task["kind"])):
                 return SendResult(ok=False, result="skipped", error="TASK_CLOSED")
             res = task["send_fn"](task["external_id"], task["msg_text"], task["idem_key"])
@@ -1038,67 +1036,6 @@ class Scheduler:
         active_send = send_fn or self.notifier.send_text
         send_res = active_send(task["external_id"], task["msg_text"], task["idem_key"])
         return self._record_delivery(task, send_res, stats)
-
-    def send_reject_notification(
-        self, instance: Dict[str, Any], reason: str, now_dt: Optional[datetime] = None
-    ) -> Optional[SendResult]:
-        """§11 & R27：审核驳回时向提交人发送重新提交通知（带新签发 H5 令牌与重交截止时间）。"""
-        cur_dt = now_dt or self.now()
-        now_s = format_dt(cur_dt)
-        tpl = self.state.get_template(instance["template_id"])
-        if not tpl:
-            return None
-        reviewed_tag = (instance.get("reviewed_at") or now_s).replace(" ", "T")
-        base_idem = hashlib.sha1(
-            f"{instance['template_id']}|{instance['phone']}|{instance['period_key']}|reject|{reviewed_tag}".encode("utf-8")
-        ).hexdigest()
-
-        h5_url, _ = self.build_h5_submit_url(
-            phone=instance["phone"], template_id=instance["template_id"],
-            period_key_val=instance["period_key"], instance_id=int(instance["id"]),
-        )
-        # 2026-11-12 任务E1：无截止（哨兵）模板被驳回 → 重交窗口同样「不限」，
-        # 文案不带「请在 X 前重交」，避免「请在 不限 前重新提交」的病句。
-        if is_no_deadline(str(instance.get("resubmit_deadline") or instance.get("deadline_at") or "")):
-            window_line = "本任务无截止时间，请按审核意见尽快重新提交。"
-        else:
-            resubmit_disp = format_deadline_display(instance["resubmit_deadline"], ref_dt=cur_dt)
-            window_line = f"请在 {resubmit_disp} 前重新提交。"
-        msg_text = f"【{tpl['name']}】提交被驳回\n原因：{reason}\n{window_line}\n👉 重新提交：{h5_url}"
-
-        # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-        # 2026-11-10 方案A：按绑定的 external_type 传 receive_type（union_id 不依赖会话）。
-        last_res: Optional[SendResult] = None
-        any_target = False
-        for platform, ext_id, ext_type, nt in self._targets_for(instance["phone"], only_platform=self._template_platform(tpl)):
-            any_target = True
-            idem = self._idem_for(base_idem, platform)
-            if not ext_id:
-                self.state.record_reminder_log(
-                    template_id=instance["template_id"], instance_id=int(instance["id"]), phone=instance["phone"],
-                    kind="reject", planned_at=now_s, attempted_at=now_s, sent_at=None, result="skipped",
-                    retry=0, error="UNACTIVATED", idem_key=idem,
-                )
-                continue
-            # 发送前查重：重复触发（重复点驳回、重放）不会二次打扰提交人。
-            if self.state.has_sent_reminder(idem):
-                continue
-            send_res = nt.send_text(ext_id, msg_text, idem, receive_type=ext_type)
-            last_res = send_res
-            self.state.record_reminder_log(
-                template_id=instance["template_id"], instance_id=int(instance["id"]), phone=instance["phone"],
-                kind="reject", planned_at=now_s, attempted_at=now_s, sent_at=now_s if send_res.ok else None,
-                result=send_res.result, retry=0, error=send_res.error, idem_key=idem,
-            )
-            if not send_res.ok and send_res.need_activate:
-                self.state.mark_delivery_target_unusable(instance["phone"], platform)
-        if not any_target:
-            self.state.record_reminder_log(
-                template_id=instance["template_id"], instance_id=int(instance["id"]), phone=instance["phone"],
-                kind="reject", planned_at=now_s, attempted_at=now_s, sent_at=None, result="skipped",
-                retry=0, error="UNACTIVATED", idem_key=base_idem,
-            )
-        return last_res
 
     def push_now(self, template_id: str, actor: str = "system", now_dt: Optional[datetime] = None) -> Dict[str, int]:
         """2026-11-12 任务D：上传任务**一键推送**（创建者分级管理员专属测试按钮）。
@@ -1820,7 +1757,7 @@ class Scheduler:
         return stats
 
     def run_once(self, now_dt: Optional[datetime] = None) -> Dict[str, int]:
-        """执行一轮调度扫描（§6.1 A/B/C/D + R14 逾期通知），返回本轮统计计数。"""
+        """执行定时派发和任务状态流转，返回本轮统计计数。"""
         cur_dt = now_dt or self.now()
         if cur_dt.tzinfo is None:
             cur_dt = cur_dt.replace(tzinfo=SHANGHAI_TZ)
@@ -1953,52 +1890,6 @@ class Scheduler:
         adv = self.state.advance_instance_statuses(cur_dt)
         stats["to_overdue"] = adv["to_overdue"]
         stats["to_expired"] = adv["to_expired"]
-
-        # R14：deadline 后 10 分钟对未交者（overdue）发 1 次逾期通知（kind='overdue'，不重复）
-        # 2026-11-13 冲刺模块二：同样走受控并发引擎（批量收集 → 并发投递）。
-        overdue_batch: List[Dict[str, Any]] = []
-        _overdue = [i for i in self.state.list_overdue_instances()]
-        for _c0 in range(0, len(_overdue), 400):
-            # 2026-11-16 方案B：prepare 段分片事务（每 400 实例一批 commit；同 remind/push/notice）。
-            with self.state.conn:
-                for inst in _overdue[_c0:_c0 + 400]:
-                    deadline_dt = parse_dt(inst["deadline_at"])
-                    overdue_planned_dt = deadline_dt + timedelta(minutes=self.OVERDUE_NOTICE_DELAY_MINUTES)
-                    if cur_dt < overdue_planned_dt:
-                        continue
-                    tpl = self.state.get_template(inst["template_id"])
-                    if not tpl or not tpl.get("enabled") or tpl.get("deleted") or tpl.get("is_manual"):
-                        continue
-
-                    planned_str = format_dt(overdue_planned_dt)
-                    delay_sec = (cur_dt - overdue_planned_dt).total_seconds()
-                    def _make_overdue_msg(instance=inst, template=tpl, dl_dt=deadline_dt) -> str:
-                        # 2026-11-12 任务E3：「申请补交」全链路下线，逾期通知改为纯截止告知
-                        # （不引导任何补交通道）；文案口径与 H5/后端校验统一
-                        # 「当前任务已过期（截止时间：…），无法提交」，不区分链接过期与任务截止。
-                        return (
-                            f"【{template['name']}】已逾期\n"
-                            f"你尚未提交。当前任务已过期（截止时间：{instance['deadline_at']}），无法提交。"
-                        )
-
-                    # 多通道：任务属于哪个办公软件就只发哪个（2026-11-03 口径），各通道独立幂等。
-                    # 2026-11-20 切期改造：逾期通知幂等键改按**归属周期**（剥掉重推批次后缀）——
-                    # 同周期手动重推出的新批次实例不再各来一条逾期通知（刷屏红线）。
-                    for platform, ext_id, ext_type, nt in self._targets_for(inst["phone"], only_platform=self._template_platform(tpl)):
-                        idem_platform = self._idem_for(
-                            make_idem_key(inst["template_id"], inst["phone"], canonical_part(inst["period_key"]), "overdue", 1, planned_str),
-                            platform,
-                        )
-                        task = self._prepare_delivery(
-                            template_id=inst["template_id"], instance_id=int(inst["id"]), phone=inst["phone"], external_id=ext_id,
-                            kind="overdue", planned_str=planned_str, delay_sec=delay_sec, idem_key=idem_platform,
-                            msg_text_fn=_make_overdue_msg, cur_dt=cur_dt, now_s=now_s, stats=stats,
-                        )
-                        if task is None:
-                            continue
-                        task["send_fn"] = functools.partial(nt.send_text, receive_type=ext_type)
-                        overdue_batch.append(task)
-        self._deliver_batch_concurrent(overdue_batch, stats)
 
         return stats
 

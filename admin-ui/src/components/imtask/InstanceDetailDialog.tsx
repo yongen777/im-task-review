@@ -638,7 +638,7 @@ export function InstanceDetailDialog({
       const messages = {
         manual: detailData.instance.need_review ? '任务已提交，等待审核。' : '任务已标记为已完成。',
         edit: '提交内容已更新。',
-        approve: '审核已通过。', reject: '任务已驳回，系统将通知员工重交。',
+        approve: '审核已通过。', reject: '任务已驳回，员工可在个人工作台查看原因并重交。',
       };
       toast.success(messages[action]);
       onChanged();

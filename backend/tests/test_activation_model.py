@@ -7,7 +7,7 @@
 2. H5 登记保留为兜底：比对「手机号+姓名」与本平台名册（部门必填但不拦截比对）；
    · 未导入手机号 → 400 提示「管理员尚未在后台导入你的信息，请联系管理员」；
    · 在册但姓名不符 → 400 提示核对重填；
-   · 一致 → 绑定成功（回执走绑定平台通道）。
+   · 一致 → 绑定成功，在 H5 显示结果。
 3. 从角色移除 → 彻底删除该平台绑定（不再有停用态、无待归纳回收），未完成实例照旧清除。
 """
 
@@ -163,7 +163,7 @@ def test_bind_rejected_when_roster_on_other_platform_only() -> None:
         store.close()
 
 
-def test_bind_receipt_goes_to_bound_platform() -> None:
+def test_bind_shows_success_without_chat_feedback() -> None:
     store = _store()
     try:
         role = store.create_role("企微云中台", actor="t", platform="wecom")["role_id"]
@@ -177,7 +177,7 @@ def test_bind_receipt_goes_to_bound_platform() -> None:
             notifier=z, notifiers={"zdxlz": z, "wecom": w},
         )
         assert code == 200 and body.get("bound") is True, body
-        assert len(w.sent_messages) == 1 and z.sent_messages == []
+        assert w.sent_messages == z.sent_messages == []
     finally:
         store.close()
 
