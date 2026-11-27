@@ -77,11 +77,22 @@ export interface NoticeMessageItem {
 // 统一上传任务的 H5 组件模块类型：字段（报数类型）、文本、图片、文件
 export type UploadH5Module = 'fields' | 'text' | 'image' | 'file';
 
+export interface DataInboxRecord {
+  source_key: string;
+  created_at: string;
+  status: 'waiting' | 'processing' | 'success' | 'failed' | 'skipped';
+  row_count: number | null;
+  error_msg: string | null;
+}
+
 export interface TemplateSpec {
   // 纯通知提醒配置
   notice_items?: NoticeMessageItem[];
   notice_receipt?: { enabled: boolean; mode?: NoticeReceiptMode; phrase?: string; button_label?: string; receipt_guide_text?: string };
   variable_notice?: { platform: string; count: number };
+  data_source_key?: string;
+  max_file_age_hours?: number;
+  min_rows?: number;
   // 统一上传任务配置（下发提醒文本 + 专属 H5 链接 + 上传完成反馈）
   upload_modules?: UploadH5Module[]; // 选择 H5 链接包含的上传项：字段(报数)、文本、图片、文件
   fields?: FormFieldSpec[]; // 报数字段配置

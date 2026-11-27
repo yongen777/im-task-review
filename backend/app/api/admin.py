@@ -713,7 +713,7 @@ def _instance_filter_sql(
     if plat:
         where.append(
             "(EXISTS (SELECT 1 FROM role r WHERE r.platform = ? AND instr(t.role_ids, r.role_id) > 0) "
-            "OR (t.role_ids = '[]' AND t.kind = 'notice' AND t.is_manual = 1 AND i.receipt_platform = ?))"
+            "OR (t.role_ids = '[]' AND t.kind = 'notice' AND i.receipt_platform = ?))"
         )
         params.extend((plat, plat))
 
@@ -1531,7 +1531,11 @@ def create_admin_router(
             return error_response(403, "FORBIDDEN_OWNER", "该任务模板不属于当前管理员")
         if _is_super_admin(admin):
             tpl = summarize_template(tpl)
-        return JSONResponse({"ok": True, "template": tpl}, headers={"Cache-Control": "no-store"})
+        result = {"ok": True, "template": tpl}
+        if (spec := tpl.get("spec_json")) and isinstance(spec, dict) and (key := spec.get("data_source_key")):
+            from ..data_inbox import latest_record
+            result["data_inbox_latest"] = latest_record(state, template_id, key)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @router.put("/templates/{template_id}")
     async def update_template(template_id: str, request: Request):

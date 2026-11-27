@@ -31,10 +31,11 @@ import {
 import { api, plainError } from '../../lib/api';
 import { ApiRequestError } from '../../lib/realApi';
 import { AdminScopeHeader } from './AdminScopeHeader';
-import { VariableNoticeFields, VariableNoticeIssues, VariableNoticeValidation, normalizeVariableBody } from './VariableNoticeFields';
+import { DataInboxDraft, DataInboxFields, VariableNoticeFields, VariableNoticeIssues, VariableNoticeValidation, normalizeVariableBody } from './VariableNoticeFields';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import {
+  DataInboxRecord,
   FormFieldSpec,
   NoticeContentFormat,
   NoticeMessageItem,
@@ -597,8 +598,30 @@ export const TemplatesView: React.FC = () => {
   const [variableBusy, setVariableBusy] = useState(false);
   const [sampleIndex, setSampleIndex] = useState(0);
   const variableRequest = useRef(0);
-  const variableEnabled = kind === 'notice' && isManual && hasVariableTable;
-  const variableValidation = variableEnabled && variableResult?.body === normalizeVariableBody(noticeText)
+  const variableEnabled = kind === 'notice' && hasVariableTable;
+  const automaticVariable = variableEnabled && !isManual;
+  const [inboxDraft, setInboxDraft] = useState<DataInboxDraft>({ key: '', maxAge: '24', minRows: '1' });
+  const [inboxRecord, setInboxRecord] = useState<DataInboxRecord | null>(null);
+  const [inboxRecordState, setInboxRecordState] = useState<'idle' | 'loading' | 'error'>('idle');
+  const savedInboxKey = editingTpl?.spec?.data_source_key;
+  const editingTemplateId = editingTpl?.id;
+
+  useEffect(() => {
+    if (!modalOpen || !savedInboxKey || editingTemplateId === undefined) return;
+    let active = true;
+    setInboxRecordState('loading');
+    api.get<{ data_inbox_latest: DataInboxRecord | null }>(`/api/admin/templates/${editingTemplateId}`).then(result => {
+      if (active) {
+        setInboxRecord(result.data_inbox_latest);
+        setInboxRecordState('idle');
+      }
+    }).catch(() => {
+      if (active) setInboxRecordState('error');
+    });
+    return () => { active = false; };
+  }, [modalOpen, savedInboxKey, editingTemplateId]);
+
+  const variableValidation = variableEnabled && isManual && variableResult?.body === normalizeVariableBody(noticeText)
     && variableResult.config.platform === platform ? variableResult : undefined;
   const [receiptEnabled, setReceiptEnabled] = useState(false);
   const [receiptMode, setReceiptMode] = useState<NoticeReceiptMode>('link');
@@ -738,6 +761,11 @@ export const TemplatesView: React.FC = () => {
   const openEditModal = (tpl: TemplateItem) => {
     const variable = Boolean(tpl.spec?.variable_notice);
     resetVariableDraft(variable);
+    setInboxDraft({
+      key: tpl.spec?.data_source_key || '',
+      maxAge: String(tpl.spec?.max_file_age_hours ?? 24),
+      minRows: String(tpl.spec?.min_rows ?? 1),
+    });
     setEditingTpl(tpl);
     setName(tpl.name);
     setKind(tpl.kind === 'notice' ? 'notice' : 'upload');
@@ -784,7 +812,7 @@ export const TemplatesView: React.FC = () => {
       }
       const body = summarizeNoticeItemsToText(items) || tpl.text_tpl || '';
       setNoticeText(body.replace(/\\r\\n|\\n/g, '\n'));
-      if (variable) void validateVariableDraft(body, String(tpl.id));
+      if (variable && tpl.is_manual) void validateVariableDraft(body, String(tpl.id));
       setNoticeItems(items.filter(item => item.format !== 'text'));
       setNoticeKinds(NOTICE_KINDS.filter(key => key === 'text' ? Boolean(body) : items.some(item => item.format === key)));
       setReceiptEnabled(tpl.spec?.notice_receipt?.enabled === true);
@@ -893,6 +921,9 @@ export const TemplatesView: React.FC = () => {
     setVariableIssues([]);
     setVariableResult(undefined);
     setSampleIndex(0);
+    setInboxRecord(null);
+    setInboxRecordState('idle');
+    if (!enabled) setInboxDraft({ key: '', maxAge: '24', minRows: '1' });
   }
 
   async function validateVariableDraft(rawBody: string, source: File | string) {
@@ -952,8 +983,19 @@ export const TemplatesView: React.FC = () => {
     }
 
     const activeNoticeItems = noticeItems.filter(item => noticeKinds.includes(item.format));
-    if (variableEnabled && !variableValidation) {
+    if (variableEnabled && isManual && !variableValidation) {
       toast.warning('请先上传变量表格并通过校验');
+      return;
+    }
+    const sourceKey = inboxDraft.key.trim();
+    const maxAge = Number(inboxDraft.maxAge);
+    const minRows = Number(inboxDraft.minRows);
+    if (automaticVariable && !/^[A-Za-z0-9_-]{2,64}$/.test(sourceKey)) {
+      toast.warning('请填写 2–64 位英文字母、数字、下划线或连字符作为数据源键');
+      return;
+    }
+    if (automaticVariable && (!Number.isSafeInteger(maxAge) || maxAge < 1 || !Number.isSafeInteger(minRows) || minRows < 1)) {
+      toast.warning('文件有效时长和最低行数须为正整数');
       return;
     }
     const selectedRoles = variableEnabled ? [] : roleIds;
@@ -983,6 +1025,12 @@ export const TemplatesView: React.FC = () => {
       spec = {
         require_review: false,
         ...(variableValidation ? { variable_notice: variableValidation.config } : {}),
+        ...(automaticVariable ? {
+          variable_notice: { platform },
+          data_source_key: sourceKey,
+          max_file_age_hours: maxAge,
+          min_rows: minRows,
+        } : {}),
         notice_items: [
           ...(finalTextTpl ? [{ id: 'notice_text', format: 'text', text_content: finalTextTpl }] : []),
           ...activeNoticeItems,
@@ -1085,7 +1133,8 @@ export const TemplatesView: React.FC = () => {
         toast.success(
           variableValidation
             ? `已保存「${name.trim()}」及 ${variableValidation.config.rows.length} 人的变量表格。`
-            : `任务模板「${name.trim()}」已更新保存（共关联 ${roleIds.length} 个业务角色）。`,
+            : automaticVariable ? `已保存「${name.trim()}」及其数据源 ${sourceKey}。`
+              : `任务模板「${name.trim()}」已更新保存（共关联 ${roleIds.length} 个业务角色）。`,
           '编辑已保存',
         );
       } else {
@@ -1402,7 +1451,8 @@ export const TemplatesView: React.FC = () => {
                         <div className="flex flex-wrap items-center gap-1.5 max-w-[240px]">
                           {tplRoleIds.length === 0 ? (
                             <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-100 text-slate-500 font-semibold text-xs">
-                              {tpl.spec?.variable_notice ? `变量表格 · ${tpl.spec.variable_notice.count} 人` : '未分配角色'}
+                              {tpl.spec?.data_source_key ? `数据源 · ${tpl.spec.data_source_key}`
+                                : tpl.spec?.variable_notice ? `变量表格 · ${tpl.spec.variable_notice.count} 人` : '未分配角色'}
                             </span>
                           ) : (
                             tplRoleIds.map((rid) => (
@@ -1817,17 +1867,14 @@ export const TemplatesView: React.FC = () => {
                         onChange={(event) => {
                           setIsManual(event.target.value === 'manual');
                           if (event.target.value === 'manual') setIsAdhoc(false);
-                          else {
-                            setPushOnCreate(false);
-                            resetVariableDraft(false);
-                          }
+                          else setPushOnCreate(false);
                         }}
                         className="mt-1 block w-full rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-slate-800 disabled:opacity-70">
                         <option value="scheduled">定时推送</option>
                         <option value="manual">一次性立即推送</option>
                       </select>
                     </label>
-                    {kind === 'notice' && isManual && (
+                    {kind === 'notice' && (
                       <label className="flex cursor-pointer items-center gap-2 font-semibold text-slate-700 sm:col-span-2">
                         <input type="checkbox" className="accent-blue-700" checked={hasVariableTable}
                           onChange={event => {
@@ -2106,8 +2153,11 @@ export const TemplatesView: React.FC = () => {
                           className="w-full rounded-xl border border-slate-200 bg-white p-3 font-normal outline-none focus:border-blue-500" />
                       </label>}
                       {variableEnabled && <VariableNoticeFields body={noticeText} issues={variableIssues}
-                        validation={variableValidation} busy={variableBusy} onUpload={file => validateVariableDraft(noticeText, file)} />}
-                      {variableEnabled && variableResult && !variableValidation && (
+                        automatic={automaticVariable} validation={variableValidation} busy={variableBusy}
+                        onUpload={file => validateVariableDraft(noticeText, file)} />}
+                      {automaticVariable && <DataInboxFields value={inboxDraft} onChange={setInboxDraft}
+                        record={inboxRecord} loading={inboxRecordState === 'loading'} loadFailed={inboxRecordState === 'error'} />}
+                      {variableEnabled && isManual && variableResult && !variableValidation && (
                         <p className="text-xs text-amber-800">正文已修改，请重新导入表格校验。</p>
                       )}
                       {(Object.keys(NOTICE_UPLOADS) as NoticeAttachmentKind[]).filter(key => noticeKinds.includes(key)).map(key =>
@@ -2367,7 +2417,7 @@ export const TemplatesView: React.FC = () => {
                       </select>
                     </label>}
                     <NoticePhonePreview
-                      body={variableEnabled ? variableValidation?.samples[sampleIndex]?.body || '' : noticeKinds.includes('text') ? noticeText : ''}
+                      body={variableEnabled && isManual ? variableValidation?.samples[sampleIndex]?.body || '' : noticeKinds.includes('text') ? noticeText : ''}
                       media={noticeItems.filter(item => noticeKinds.includes(item.format))}
                       mode={receiptMode}
                       label={receiptEnabled ? (receiptMode === 'link' ? receiptButtonLabel : receiptPhrase).trim() : ''}
@@ -2387,7 +2437,7 @@ export const TemplatesView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  disabled={saving || uploadingAssetId !== null || (variableEnabled && !variableValidation)}
+                  disabled={saving || uploadingAssetId !== null || (variableEnabled && isManual && !variableValidation)}
                   className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold shadow-xs cursor-pointer disabled:opacity-60"
                 >
                   {saving ? '正在保存…' : editingTpl ? '保存修改' : isManual && pushOnCreate ? '创建并推送' : '确认创建'}

@@ -256,6 +256,10 @@ def create_apps(
     _register_healthz(public_app, store, chan, cfg)
     _register_healthz(admin_app, store, chan, cfg)
 
+    from .api.data_inbox import create_data_inbox_router
+
+    public_app.include_router(create_data_inbox_router(store))
+
     # 业务端口挂载：POST /api/app-events 与 H5 提交/绑定路由
     # 2026-11-03 修复：回调回复/回执必须走**来源平台**的通道，不能跟 active 通道走。
     # 线上实锤：密信回调的回复被发给企微 bot（errcode=93006 invalid chatid），用户侧表现为“完全不回话”。

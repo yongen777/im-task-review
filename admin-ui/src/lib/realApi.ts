@@ -160,6 +160,9 @@ function tplToMock(t: any): TemplateItem {
     spec.notice_items = items;
     spec.notice_receipt = t.spec_json?.notice_receipt;
     spec.variable_notice = t.spec_json?.variable_notice;
+    spec.data_source_key = t.spec_json?.data_source_key;
+    spec.max_file_age_hours = t.spec_json?.max_file_age_hours;
+    spec.min_rows = t.spec_json?.min_rows;
   } else {
     /* 2026-10-28 修复：优先从 spec_json 恢复完整前端配置，fallback schema_json */
     if (t.spec_json && typeof t.spec_json === 'object') {

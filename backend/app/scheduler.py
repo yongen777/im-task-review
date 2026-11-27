@@ -896,7 +896,7 @@ class Scheduler:
         if instance["status"] not in statuses[kind]:
             return False
         template = self.state.get_template(instance["template_id"])
-        if template and template.get("is_manual"):
+        if template and (template.get("is_manual") or variable_notice_config(template)):
             if effective_instance_deadline(instance) <= format_dt(self.now()):
                 return False
             if not self.state._template_owner_enabled(template["owner_id"]) or not self.state._template_platform_allowed(template):
@@ -1162,7 +1162,6 @@ class Scheduler:
         }
 
     def _prepare_variable_notice(self, template_id, now, actor, reprocess, skip_completed, reserve):
-        from .notice_media import notice_receipt_config
         from .variable_notice import validate
 
         now_s = format_dt(now)
@@ -1195,39 +1194,55 @@ class Scheduler:
                 if not members:
                     raise BizError(400, "ALL_COMPLETED", "本周期全员已完成，无需推送")
             if not prior:
-                mode, phrase = notice_receipt_config(tpl)
-                receipt = (tpl["spec_json"] or {}).get("notice_receipt") or {}
-                media = self._notice_snapshot_media(tpl, p_key, 1, now_s, {}, capture_keys=True)
-                if media is None:
-                    raise BizError(400, "NOTICE_MEDIA_UNAVAILABLE", "通知附件不可用，请重新上传")
-                state.conn.executemany(
-                    "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, "
-                    "deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) "
-                    "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
-                    [(template_id, m["phone"], m["name"], (m["dept_path"] or m["dept"] or "")[:200] or None, p_key,
-                      deadline, now_s, tpl["owner_id"], phrase, platform, mode) for m in members],
-                )
-                by_phone = {member["phone"]: member for member in members}
-                prior = state.list_instances_for_period(template_id, p_key)
-                snapshots = []
-                for inst in prior:
-                    member = by_phone[inst["phone"]]
-                    snapshots.append((inst["id"], json.dumps({
-                        "title": tpl["name"], "body": member["body"],
-                        "published_at": now_s, "media": media, "variable_platform": platform,
-                        "receipt_guide_text": receipt.get("receipt_guide_text"),
-                        "external_id": member["external_id"], "external_type": member["external_type"],
-                    }, ensure_ascii=False)))
-                # 与每条 task_instance 同事务落库，同一个实例号只对应一份专属正文。
-                state.conn.executemany(
-                    "INSERT INTO notice_receipt_view(instance_id, content_json) VALUES (?, ?)", snapshots,
-                )
+                prior = self._save_variable_notice_batch(tpl, p_key, now_s, deadline, platform, members)
             synced = state.sync_batch_completion(template_id, p_key) if reprocess else 0
         return {
             "template_id": template_id, "period_key": p_key, "pushed_at": now_s, "deadline_at": deadline,
             "instance_count": len(prior), "new_batch": reprocess, "synced_completed": synced,
             "skip_completed": skip_completed, "variable_notice": True,
         }
+
+    def _save_variable_notice_batch(self, tpl, period, now_s, deadline, platform, members):
+        from .notice_media import notice_receipt_config
+
+        state, template_id = self.state, tpl["template_id"]
+        mode, phrase = notice_receipt_config(tpl)
+        receipt = (tpl["spec_json"] or {}).get("notice_receipt") or {}
+        media = self._notice_snapshot_media(tpl, period, 1, now_s, {}, capture_keys=True)
+        if media is None:
+            raise BizError(400, "NOTICE_MEDIA_UNAVAILABLE", "通知附件不可用，请重新上传")
+        state.conn.executemany(
+            "INSERT INTO task_instance(template_id, phone, name_snap, dept_snap, period_key, status, "
+            "deadline_at, created_at, owner_id, receipt_phrase, receipt_platform, receipt_mode) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            [(template_id, m["phone"], m["name"], (m["dept_path"] or m["dept"] or "")[:200] or None, period,
+              deadline, now_s, tpl["owner_id"], phrase, platform, mode) for m in members],
+        )
+        by_phone = {member["phone"]: member for member in members}
+        instances = state.list_instances_for_period(template_id, period)
+        snapshots = []
+        for inst in instances:
+            member = by_phone[inst["phone"]]
+            snapshots.append((inst["id"], json.dumps({
+                "title": tpl["name"], "body": member["body"],
+                "published_at": now_s, "media": media, "variable_platform": platform,
+                "receipt_guide_text": receipt.get("receipt_guide_text"),
+                "external_id": member["external_id"], "external_type": member["external_type"],
+            }, ensure_ascii=False)))
+        state.conn.executemany(
+            "INSERT INTO notice_receipt_view(instance_id, content_json) VALUES (?, ?)", snapshots,
+        )
+        return instances
+
+    def _load_variable_notice_batch(self, template_id, period):
+        rows = self.state.conn.execute(
+            "SELECT v.instance_id, v.content_json FROM notice_receipt_view v "
+            "JOIN task_instance i ON i.id=v.instance_id WHERE i.template_id=? AND i.period_key=?",
+            (template_id, period),
+        ).fetchall()
+        views = {row["instance_id"]: json.loads(row["content_json"]) for row in rows}
+        return [{**inst, "notice_view": view} for inst in self.state.list_instances_for_period(template_id, period)
+                if (view := views.get(inst["id"])) and view.get("variable_platform")]
 
     def _next_batch_period_key(self, template_id: str, canonical: str, cur_dt: datetime) -> str:
         """批次键同秒碰撞兜底：`…#HHMMSS` 已存在实例则追加 -2 / -3（while 该键已有实例）。"""
@@ -1259,7 +1274,8 @@ class Scheduler:
         # 2026-11-19 需求一：手动模板的 period_key 除 'once' 外还允许重推批次键 once#…
         if (manual and p_key != "once" and not p_key.startswith("once#")) or tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "任务的推送配置已变更")
-        instances = self.state.list_instances_for_period(tpl["template_id"], p_key)
+        instances = (self._load_variable_notice_batch(template_id, p_key) if prep.get("variable_notice")
+                     else self.state.list_instances_for_period(template_id, p_key))
 
         # 2026-11-21 需求二：勾选过滤时，已完成/已回执成员本轮不推送（只向未完成人员发）。
         skip_completed = bool(prep.get("skip_completed"))
@@ -1267,15 +1283,6 @@ class Scheduler:
         completed_phones = (self.state.period_completed_phones(tpl["template_id"], p_key)
                             if skip_completed else set())
 
-        if prep.get("variable_notice"):
-            rows = self.state.conn.execute(
-                "SELECT v.instance_id, v.content_json FROM notice_receipt_view v "
-                "JOIN task_instance i ON i.id=v.instance_id WHERE i.template_id=? AND i.period_key=?",
-                (template_id, p_key),
-            ).fetchall()
-            views = {row["instance_id"]: json.loads(row["content_json"]) for row in rows}
-            instances = [{**inst, "notice_view": view} for inst in instances
-                         if (view := views.get(inst["id"])) and view.get("variable_platform")]
         if tpl["kind"] == "notice":
             return self._push_manual_notice(tpl, instances, cur_dt, p_key,
                                             skip_completed=skip_completed, push_note=push_note)
@@ -1597,6 +1604,7 @@ class Scheduler:
                                 task["claim_id"], sent_at=None, result="failed", error="NOTICE_VIEW_UNAVAILABLE",
                             )
                             stats["failed"] += 1
+                            targets.pop(target)
                             continue
                         task["send_fn"] = functools.partial(notifier.send_text, receive_type=external_type)
                         task["receipt_prompt"] = receipt
@@ -1677,7 +1685,8 @@ class Scheduler:
 
         return message
 
-    def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *, once=False, push_note=""):
+    def _deliver_notice(self, tpl, instances, period, seq, planned_str, now, values, stats, *,
+                        once=False, push_note="", completed=None):
         """通知投递主链：正文 → 媒体 → 收尾（文本回执短语 / H5 确认链接）。
 
         2026-11-19 需求四（link 模式完整投递）：**所有接收人（含 receipt_mode='link'）
@@ -1738,6 +1747,8 @@ class Scheduler:
                     tpl, text_targets, period, seq, planned_str, now, stats, values=values,
                     once=once, receipt=True,
                 ))
+            if completed is not None:
+                completed.update(instance_id for instance_id, _ in (*link_targets, *text_targets))
         for instance_id in delivered:
             self.state.update_instance_status(instance_id, "sent")
         return len(delivered)
@@ -1765,9 +1776,17 @@ class Scheduler:
 
         from .portal import run_portal_tasks
         run_portal_tasks(self, cur_dt)
+        from .data_inbox_dispatch import dispatch, recover
+        recover(self, cur_dt)
 
         for tpl in self.state.list_active_templates(include_notice=True):
-            if not tpl["role_ids"] or not is_template_anchor_day(tpl, cur_dt):
+            if not is_template_anchor_day(tpl, cur_dt):
+                continue
+            spec = tpl.get("spec_json")
+            if tpl["kind"] == "notice" and isinstance(spec, dict) and spec.get("data_source_key"):
+                dispatch(self, tpl, cur_dt, stats)
+                continue
+            if not tpl["role_ids"]:
                 continue
 
             if tpl["kind"] == "notice":

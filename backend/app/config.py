@@ -54,6 +54,11 @@ def resolve_data_dir(dotenv_path: Optional[Path] = None) -> Path:
     return Path(data_dir_raw)
 
 
+def resolve_data_inbox_dir(data_dir: Path) -> Path:
+    configured = os.environ.get("IMT_DATA_INBOX_DIR", "").strip()
+    return (Path(configured) if configured else data_dir / "data_inbox").resolve()
+
+
 def default_now() -> datetime:
     """返回固定 Asia/Shanghai 时区的当前时间。"""
     return datetime.now(SHANGHAI_TZ)

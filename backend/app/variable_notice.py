@@ -3,10 +3,12 @@ import csv
 import json
 import re
 from collections import Counter, defaultdict
+from contextlib import closing, contextmanager
 from io import BytesIO, StringIO
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 from xml.etree.ElementTree import ParseError
+from zlib import error as ZlibError
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import numbers
@@ -38,7 +40,7 @@ def config_for(template):
 
 def summarize_template(template):
     if template and (config := config_for(template)):
-        summary = {"platform": config["platform"], "count": len(config["rows"])}
+        summary = {"platform": config["platform"], "count": len(config.get("rows", ()))}
         return {**template, "spec_json": {**template["spec_json"], "variable_notice": summary}}
     return template
 
@@ -110,42 +112,45 @@ def _file_rows(raw, extension):
             book.close()
 
 
-def read_table(raw, filename, body, platform):
+@contextmanager
+def table_rows(raw, extension):
+    try:
+        with closing(_file_rows(raw, extension)) as stream:
+            yield stream
+    except (BadZipFile, csv.Error, UnicodeError, InvalidFileException, ParseError, ZlibError,
+            KeyError, IndexError, OSError, ValueError, TypeError, AttributeError, RuntimeError, OverflowError) as exc:
+        raise VariableTableError([issue(1, "无法读取表格，请用 Excel 另存为 XLSX 或 CSV 后重新上传")]) from exc
+
+
+def read_table(raw, filename, body, platform, *, max_upload=MAX_UPLOAD):
     extension = Path(filename).suffix.lower()
     if extension not in (".csv", ".xlsx"):
         raise BizError(400, "INVALID_TABLE_FORMAT", "请选择 XLSX 或 CSV 文件")
-    if len(raw) > MAX_UPLOAD:
-        raise BizError(413, "VARIABLE_TABLE_TOO_LARGE", "变量表文件大小不得超过 4 MB")
+    if len(raw) > max_upload:
+        raise BizError(413, "VARIABLE_TABLE_TOO_LARGE", f"变量表文件大小不得超过 {max_upload // (1024 * 1024)} MB")
     required = columns_for(body)
     rows = []
-    try:
-        stream = _file_rows(raw, extension)
-        try:
-            _, header, _ = next(stream, (1, [], set()))
-            header = [cell.strip() for cell in header]
-            duplicates = [name for name, count in Counter(header).items() if name and count > 1]
-            missing = [name for name in required if name not in header]
-            if missing or duplicates:
-                raise VariableTableError(
-                    [issue(1, f"缺少列「{name}」") for name in missing] +
-                    [issue(1, f"重复列「{name}」") for name in duplicates]
-                )
-            indexes = {name: header.index(name) for name in required}
-            for row, values, invalid in stream:
-                if not any(str(value).strip() for value in values):
-                    continue
-                if len(rows) >= IMPORT_ROW_LIMIT:
-                    raise VariableTableError([issue(row, f"单次最多导入 {IMPORT_ROW_LIMIT} 人")])
-                cells = {name: values[index] if index < len(values) else "" for name, index in indexes.items()}
-                row_issues = [f"「{name}」请填写普通值" for name, index in indexes.items() if index in invalid]
-                if any(str(value).strip() for value in values[len(header):]):
-                    row_issues.append("存在无对应表头的数据")
-                rows.append({"row": row, "cells": cells, "file_issues": row_issues})
-        finally:
-            stream.close()
-    except (BadZipFile, csv.Error, UnicodeError, InvalidFileException, ParseError,
-            KeyError, IndexError, OSError, ValueError) as exc:
-        raise VariableTableError([issue(1, "无法读取表格，请用 Excel 另存为 XLSX 或 CSV 后重新上传")]) from exc
+    with table_rows(raw, extension) as stream:
+        _, header, _ = next(stream, (1, [], set()))
+        header = [cell.strip() for cell in header]
+        duplicates = [name for name, count in Counter(header).items() if name and count > 1]
+        missing = [name for name in required if name not in header]
+        if missing or duplicates:
+            raise VariableTableError(
+                [issue(1, f"缺少列「{name}」") for name in missing] +
+                [issue(1, f"重复列「{name}」") for name in duplicates]
+            )
+        indexes = {name: header.index(name) for name in required}
+        for row, values, invalid in stream:
+            if not any(str(value).strip() for value in values):
+                continue
+            if len(rows) >= IMPORT_ROW_LIMIT:
+                raise VariableTableError([issue(row, f"单次最多导入 {IMPORT_ROW_LIMIT} 人")])
+            cells = {name: values[index] if index < len(values) else "" for name, index in indexes.items()}
+            row_issues = [f"「{name}」请填写普通值" for name, index in indexes.items() if index in invalid]
+            if any(str(value).strip() for value in values[len(header):]):
+                row_issues.append("存在无对应表头的数据")
+            rows.append({"row": row, "cells": cells, "file_issues": row_issues})
     return {"platform": platform, "rows": rows}
 
 
@@ -188,16 +193,20 @@ def eligible_member(records):
     return active, ""
 
 
-def validate(state, owner_id, body, config, *, lock=False):
+def validate_platform(state, owner_id, platform):
+    if (not isinstance(platform, str) or platform not in state.ALL_PLATFORMS
+            or platform not in state._owner_allowed_platforms(owner_id)
+            or not state._template_owner_enabled(owner_id)):
+        raise BizError(403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权向该平台推送")
+
+
+def validate(state, owner_id, body, config, *, lock=False, max_config_bytes=MAX_UPLOAD):
     body = normalize_body(body)
     columns = columns_for(body)
     if not isinstance(config, dict):
         raise VariableTableError([issue(1, "请先导入变量表格")])
     platform = config.get("platform")
-    if (not isinstance(platform, str) or platform not in state.ALL_PLATFORMS
-            or platform not in state._owner_allowed_platforms(owner_id)
-            or not state._template_owner_enabled(owner_id)):
-        raise BizError(403, "PLATFORM_NOT_ALLOWED", "当前账号未被授权向该平台推送")
+    validate_platform(state, owner_id, platform)
     rows = config.get("rows")
     if not isinstance(rows, list) or not rows:
         raise VariableTableError([issue(2, "表格没有有效数据行")])
@@ -250,6 +259,6 @@ def validate(state, owner_id, body, config, *, lock=False):
     if issues:
         raise VariableTableError(issues)
     result = {"platform": platform, "rows": normalized}
-    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_UPLOAD:
+    if max_config_bytes is not None and len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > max_config_bytes:
         raise BizError(413, "VARIABLE_TABLE_TOO_LARGE", "变量数据超过 4 MB，请拆分表格")
     return result, members

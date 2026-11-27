@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { getCsrfToken } from '../../lib/realApi';
-import { VariableNoticeConfig, VariableNoticeIssue } from '../../lib/types';
+import { DataInboxRecord, VariableNoticeConfig, VariableNoticeIssue } from '../../lib/types';
 
 export interface VariableNoticeSample {
   phone: string;
@@ -40,12 +40,13 @@ export function VariableNoticeIssues({ issues }: { issues: VariableNoticeIssue[]
   );
 }
 
-export function VariableNoticeFields({ body, issues, validation, busy, onUpload }: {
+export function VariableNoticeFields({ body, issues, validation, busy, onUpload, automatic = false }: {
   body: string;
   issues: VariableNoticeIssue[];
   validation?: VariableNoticeValidation;
   busy: boolean;
   onUpload: (file: File) => void;
+  automatic?: boolean;
 }) {
   const variables = getNoticeVariables(body);
   const [format, setFormat] = useState<'xlsx' | 'csv'>('xlsx');
@@ -79,8 +80,8 @@ export function VariableNoticeFields({ body, issues, validation, busy, onUpload 
           {variables.map(name => <span key={name} className="rounded bg-blue-50 px-2 py-0.5 text-blue-800">{`{${name}}`}</span>)}
         </div>
       ) : <p className="text-amber-800">请在通知正文填写至少一个变量，例如 {'{姓名}'}。</p>}
-      <p className="text-slate-600">上传含手机号、姓名及正文变量的表格。仅可选用当前平台下您名下已启用、已激活的成员。</p>
-      <p className="text-slate-600">每次导入一张表，最多 5,000 人、4 MB。</p>
+      <p className="text-slate-600">表格须包含手机号、姓名和正文变量，收件人须在您名下的当前平台名册中启用并激活。</p>
+      <p className="text-slate-600">每次最多 5,000 人、{automatic ? 20 : 4} MB。</p>
       <div className="flex flex-wrap items-center gap-2">
         <select aria-label="模板格式" value={format} onChange={event => setFormat(event.target.value as 'xlsx' | 'csv')}
           className="rounded-lg border border-slate-200 bg-white px-2 py-1.5">
@@ -91,7 +92,7 @@ export function VariableNoticeFields({ body, issues, validation, busy, onUpload 
           className="rounded-lg border border-blue-200 bg-white px-3 py-1.5 font-medium text-blue-700 disabled:opacity-50">
           下载变量模板
         </button>
-        <label className={`rounded-lg bg-blue-700 px-3 py-1.5 font-medium text-white ${!variables.length || busy ? 'opacity-50' : 'cursor-pointer'}`}>
+        {!automatic && <label className={`rounded-lg bg-blue-700 px-3 py-1.5 font-medium text-white ${!variables.length || busy ? 'opacity-50' : 'cursor-pointer'}`}>
           {busy ? '正在校验…' : validation ? '重新导入' : '上传变量表格'}
           <input type="file" className="sr-only" accept=".xlsx,.csv" disabled={!variables.length || busy}
             onChange={event => {
@@ -99,11 +100,62 @@ export function VariableNoticeFields({ body, issues, validation, busy, onUpload 
               event.target.value = '';
               if (file) onUpload(file);
             }} />
-        </label>
+        </label>}
       </div>
       {downloadError && <p role="alert" className="text-rose-700">{downloadError}</p>}
       {validation && <p role="status" className="font-semibold text-emerald-700">校验通过：共 {validation.config.rows.length} 人</p>}
       <VariableNoticeIssues issues={issues} />
     </section>
+  );
+}
+
+export interface DataInboxDraft {
+  key: string;
+  maxAge: string;
+  minRows: string;
+}
+
+const inboxStatus: Record<DataInboxRecord['status'], string> = {
+  waiting: '等待文件', processing: '投递中', success: '投递成功', failed: '已拦截或投递未完成', skipped: '重复文件已跳过',
+};
+
+export function DataInboxFields({ value, onChange, record, loading, loadFailed }: {
+  value: DataInboxDraft;
+  onChange: (value: DataInboxDraft) => void;
+  record: DataInboxRecord | null;
+  loading: boolean;
+  loadFailed: boolean;
+}) {
+  const inputClass = 'mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2';
+  const key = value.key.trim();
+  const pathKey = /^[A-Za-z0-9_-]{2,64}$/.test(key) ? key : '{source_key}';
+  return (
+    <fieldset className="space-y-2 rounded-xl border border-slate-200 p-3 text-xs">
+      <legend className="px-1 font-semibold">自动数据源接入（选填）</legend>
+      <div className="grid gap-2 sm:grid-cols-3">
+        <label>数据源键
+          <input className={inputClass} value={value.key} maxLength={64} placeholder="例如 scores_01"
+            onChange={event => onChange({ ...value, key: event.target.value })} />
+        </label>
+        <label>文件有效时长（小时）
+          <input className={inputClass} type="number" min={1} step={1} value={value.maxAge}
+            onChange={event => onChange({ ...value, maxAge: event.target.value })} />
+        </label>
+        <label>最低行数
+          <input className={inputClass} type="number" min={1} step={1} value={value.minRows}
+            onChange={event => onChange({ ...value, minRows: event.target.value })} />
+        </label>
+      </div>
+      <p className="text-slate-600">同机文件放入接入目录的 <code>{pathKey}/incoming/</code>。跨机请请求业务端口，携带文件字段 <code>file</code> 和上传令牌。</p>
+      <code className="block break-all text-slate-800">POST /api/data-inbox/{pathKey}/upload</code>
+      {loading && <p role="status">正在读取最近接入记录…</p>}
+      {!loading && (record?.source_key === key ? (
+        <p className="break-words text-slate-700">
+          最近接入 {record.created_at} · {inboxStatus[record.status]}
+          {record.row_count !== null && ` · ${record.row_count} 行`}
+          {record.error_msg && ` · ${record.error_msg}`}
+        </p>
+      ) : <p className="text-slate-500">{loadFailed ? '最近接入记录读取失败' : '暂无接入记录'}</p>)}
+    </fieldset>
   );
 }

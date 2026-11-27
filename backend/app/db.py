@@ -47,16 +47,36 @@ def _is_read_only(sql: str) -> bool:
 # 模板改绑角色后不再随当前 role_ids 漂移）。
 # 3（2026-11-23）：任务实例物化冗余列 first_sent_at / latest_submit_source（消除
 # admin 统计的逐行相关子查询）+ 4 张核心大表高选择性索引（MySQL 5.7.43 幂等补建）。
-SCHEMA_VERSION = 3
+# 4：文件接入记录与定时批次恢复。
+SCHEMA_VERSION = 4
 
 # §16 P6 台账约定：10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit)
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
 BUSINESS_TABLES = (
     "scope", "role", "member", "delivery_target", "task_template",
     "task_instance", "submission", "reminder_log", "upload_ref", "h5_token", "notice_asset", "notice_receipt_view",
-    "admin_user", "admin_session", "admin_audit",
+    "admin_user", "admin_session", "admin_audit", "data_inbox_log",
 )
 VERSION_TABLE = "schema_version"
+
+DATA_INBOX_DDL = """
+CREATE TABLE IF NOT EXISTS data_inbox_log (
+  source_key      VARCHAR(64)   NOT NULL,
+  template_id     VARCHAR(64)   NOT NULL,
+  period_key      VARCHAR(64)   NOT NULL,
+  planned_at      VARCHAR(32)   NOT NULL,
+  file_name       VARCHAR(255)  DEFAULT NULL,
+  sha256          VARCHAR(64)   DEFAULT NULL,
+  row_count       INTEGER       DEFAULT NULL,
+  status          VARCHAR(16)   NOT NULL,
+  error_msg       VARCHAR(512)  DEFAULT NULL,
+  created_at      VARCHAR(32)   NOT NULL,
+  batch_key       VARCHAR(64)   DEFAULT NULL,
+  archive_pending INTEGER       NOT NULL DEFAULT 0,
+  PRIMARY KEY (template_id, planned_at),
+  UNIQUE (template_id, period_key, sha256, planned_at)
+)
+""".strip()
 
 MYSQL_DDL = """
 CREATE TABLE IF NOT EXISTS portal_event (
@@ -385,7 +405,7 @@ CREATE TABLE IF NOT EXISTS dept_option (
   PRIMARY KEY (id),
   UNIQUE KEY uk_dept_option (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-""".strip()
+""".strip() + f"\n{DATA_INBOX_DDL} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
 
 
 def mysql_config_from_env() -> dict:
@@ -808,6 +828,8 @@ def _upgrade_mysql_schema(proxy: "MySQLConnProxy") -> None:
          "ALTER TABLE h5_token ADD INDEX ix_h5tok_expires (expires_at)"),
         ("submission", "ix_sub_inst_status_id",
          "ALTER TABLE submission ADD INDEX ix_sub_inst_status_id (instance_id, status, id)"),
+        ("data_inbox_log", "ix_inbox_recovery",
+         "ALTER TABLE data_inbox_log ADD INDEX ix_inbox_recovery (status, archive_pending, planned_at)"),
     ):
         exists = proxy.execute(
             "SELECT COUNT(1) AS cnt FROM information_schema.statistics "

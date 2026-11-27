@@ -2983,6 +2983,8 @@ class StateStore:
                 _spec_payload = json.loads(_spec_payload)
             except ValueError:
                 _spec_payload = None
+        from .data_inbox import normalize_settings
+        inbox_settings = normalize_settings(_spec_payload) if isinstance(_spec_payload, dict) else {}
 
         # ── 2026-11-12 任务B：kind="upload" 归一 ─────────────────────────────
         # 前端重构后「上传任务」统一传 kind="upload"（不再细分 form/image/file），
@@ -3021,7 +3023,7 @@ class StateStore:
         if not isinstance(role_ids_raw, list):
             raise BizError(400, "VALIDATION_FAILED", "role_ids 必须为数组")
         role_ids = list(dict.fromkeys(str(rid or "").strip() for rid in role_ids_raw if str(rid or "").strip()))
-        if isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None:
+        if inbox_settings or (isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None):
             role_ids = []
         if role_ids:
             placeholders = ",".join("?" for _ in role_ids)
@@ -3067,9 +3069,19 @@ class StateStore:
             if manual_deadline != (existing or {}).get("manual_deadline_at") and manual_deadline <= self.now_str():
                 raise BizError(400, "INVALID_DEADLINE", "截止时间必须晚于当前时间")
         from .notice_media import get_asset, receipt_key
-        from .variable_notice import validate as validate_variable_notice
+        from .variable_notice import columns_for, validate as validate_variable_notice, validate_platform
 
-        if isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None:
+        if inbox_settings:
+            if kind != "notice" or is_manual or is_adhoc:
+                raise BizError(400, "INVALID_DATA_INBOX_MODE", "自动数据源仅用于定时变量通知")
+            owner = owner_id if owner_id is not None else existing["owner_id"]
+            config = _spec_payload.get("variable_notice")
+            platform = config.get("platform") if isinstance(config, dict) else None
+            if not (existing and set(payload) == {"enabled"} and payload["enabled"] is False):
+                columns_for(text_tpl)
+                validate_platform(self, owner, platform)
+            _spec_payload = {**_spec_payload, **inbox_settings, "variable_notice": {"platform": platform}}
+        elif isinstance(_spec_payload, dict) and _spec_payload.get("variable_notice") is not None:
             if kind != "notice" or not is_manual:
                 raise BizError(400, "INVALID_VARIABLE_NOTICE_MODE", "变量表格仅用于一次性立即推送的通知提醒")
             if not (existing and set(payload) == {"enabled"} and payload["enabled"] is False):
@@ -4381,7 +4393,8 @@ class StateStore:
         if template.get("portal_task"):
             from .portal import PortalService
             return None if PortalService(self).can_submit(instance, template) else "任务已关闭"
-        if template.get("kind") == "notice" and template.get("is_manual") and instance.get("receipt_platform"):
+        if (template.get("kind") == "notice" and instance.get("receipt_platform")
+                and (template.get("is_manual") or not template.get("role_ids"))):
             from .notice_receipts import load_view
             from .variable_notice import eligible_member, roster
 
@@ -4977,6 +4990,8 @@ class StateStore:
         from .variable_notice import config_for, validate
 
         if config := config_for(tpl):
+            if (tpl["spec_json"] or {}).get("data_source_key"):
+                return []
             return validate(self, tpl["owner_id"], tpl["text_tpl"], config)[1]
         roles = [str(r).strip() for r in (tpl.get("role_ids") or []) if str(r).strip()]
         if not roles:
