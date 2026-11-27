@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { getCsrfToken } from '../../lib/realApi';
 import { DataInboxRecord, VariableNoticeConfig, VariableNoticeIssue } from '../../lib/types';
 
@@ -126,6 +126,7 @@ export function DataInboxFields({ value, onChange, record, loading, loadFailed }
   loading: boolean;
   loadFailed: boolean;
 }) {
+  const helpId = useId();
   const inputClass = 'mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2';
   const key = value.key.trim();
   const pathKey = /^[A-Za-z0-9_-]{2,64}$/.test(key) ? key : '{source_key}';
@@ -139,12 +140,24 @@ export function DataInboxFields({ value, onChange, record, loading, loadFailed }
         </label>
         <label>文件有效时长（小时）
           <input className={inputClass} type="number" min={1} step={1} value={value.maxAge}
+            aria-describedby={`${helpId}-max-age`}
             onChange={event => onChange({ ...value, maxAge: event.target.value })} />
         </label>
         <label>最低行数
           <input className={inputClass} type="number" min={1} step={1} value={value.minRows}
+            aria-describedby={`${helpId}-min-rows`}
             onChange={event => onChange({ ...value, minRows: event.target.value })} />
         </label>
+      </div>
+      <div className="space-y-1 text-slate-500 leading-relaxed">
+        <p id={`${helpId}-max-age`}>
+          <span className="font-medium text-slate-600">文件有效时长</span>
+          {' · 按文件上传到正式推送的最大间隔填写，与任务周期无关。超时旧表会被拦截，本次不推送。自动定时取数建议填 12–24 小时，提前跨天手工上传可填 72–168 小时。'}
+        </p>
+        <p id={`${helpId}-min-rows`}>
+          <span className="font-medium text-slate-600">最低行数</span>
+          {' · 用于防止空表或残缺表，只计数据行，低于下限会拦截本次推送。固定全员通知建议按正常人数的 70%–80% 取整数，给人员变动留出余量。按动态未完成名单催办时可填 1。'}
+        </p>
       </div>
       <p className="text-slate-600">同机文件放入接入目录的 <code>{pathKey}/incoming/</code>。跨机请请求业务端口，携带文件字段 <code>file</code> 和上传令牌。</p>
       <code className="block break-all text-slate-800">POST /api/data-inbox/{pathKey}/upload</code>
