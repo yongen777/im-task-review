@@ -65,7 +65,7 @@ cd D:\im-task-review && git log -p -- backend/app/state.py   # 看某文件演�
 ① 在 D:\im-task 改后端（+ D:\im-task-admin 改前端源码）
 ② 跑测试（见第六节）
 ③ python scripts/sync_review.py --commit "消息" --push     ← 同步到评审库、提交并推送
-④ 将脚本输出的完整 Commit URL 和 .patch URL 原样附在验收汇报中（推送已获持续授权）
+④ 在验收汇报中原样附上两个完整 URL，并提醒用户可将桌面源码 diff 直接拖给评审端审计
 ⑤ 等用户明确确认验收通过并允许部署后，才执行 python scripts/deploy_remote.py --skip-deps --host <生产地址> ...
 ```
 
@@ -80,7 +80,7 @@ cd D:\im-task-review && git log -p -- backend/app/state.py   # 看某文件演�
 3. `vite build` → 产物同步到两地的 `admin_static/`
 4. 产物对账，并同步根目录 `AGENTS.md` 的验收规范
 
-参数：`--skip-build`（跳过构建，仍同步源码）、`--commit-paths`（列出本轮允许提交的评审库路径，目录以 `/` 结尾）和 `--push`（推送评审库 `main` 并打印验收链接）。`--push` 可与 `--commit` 合用，也可用于重试已提交的推送。
+参数：`--skip-build`（跳过构建，仍同步源码）、`--commit-paths`（列出本轮允许提交的评审库路径，目录以 `/` 结尾）和 `--push`（推送评审库 `main`、打印验收链接并导出桌面源码 diff）。`--push` 可与 `--commit` 合用，也可用于重试已提交的推送。
 
 ### 部署脚本的坑
 
@@ -432,6 +432,8 @@ ssh <生产> "mysql -h127.0.0.1 -P28620 -uimtask -p'<密码见/opt/imtask/.env>'
 
 - Commit 页面 `https://github.com/yongen777/im-task-review/commit/<full_hash>`
 - 纯文本 Diff `https://github.com/yongen777/im-task-review/commit/<full_hash>.patch`
+
+每次推送后还要提醒用户，可把桌面的 `imtask_review_latest.patch` 直接拖给评审端审计。脚本会打印该文件的完整路径。文件包含本次提交的统计和源码 diff，按 UTF-8 无 BOM 保存，diff 正文排除 `.js`、`.css`、`.map` 文件与 `dist/` 目录。
 
 ---
 

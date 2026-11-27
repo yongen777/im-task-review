@@ -9,7 +9,7 @@
 用法：
     python scripts/sync_review.py                 # 同步 + 展示将提交内容
     python scripts/sync_review.py --commit "msg"  # 同步 + git add/commit
-    python scripts/sync_review.py --commit "msg" --push  # 提交、推送并打印完整链接
+    python scripts/sync_review.py --commit "msg" --push  # 推送、打印完整链接并导出桌面源码 diff
 
 它做的事（顺序固定）：
   1. 后端按脱敏规则同步（app/ scripts/ tests/ 全目录比对，不是白名单 ——
@@ -33,11 +33,13 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 WS = Path(r"D:\im-task")
 REPO = Path(r"D:\im-task-review")
 UI_SRC = Path(r"D:\im-task-admin")
 REVIEW_URL = "https://github.com/yongen777/im-task-review"
+REVIEW_PATCH_PATH = Path.home() / "Desktop" / "imtask_review_latest.patch"
 sys.path.insert(0, str(WS / "scripts"))
 from scrub_rules import scrub  # noqa: E402
 
@@ -177,8 +179,31 @@ def verify_static() -> bool:
     return True
 
 
+def export_review_patch(commit: str, destination: Path) -> Path:
+    """导出完整提交统计和排除构建产物的源码 diff。"""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("导出源码 diff 需要完整的 40 位提交哈希")
+    show = ["git", "-C", str(REPO), "show", "--no-color", "--no-ext-diff", "--no-textconv",
+            "--encoding=UTF-8", commit]
+    stats = subprocess.check_output([*show, "--stat"], encoding="utf-8-sig")
+    patch = subprocess.check_output(
+        [*show, "--", ":!*.js", ":!*.css", ":!*.map", ":!dist/*", ":(exclude,glob)**/dist/**"],
+        encoding="utf-8-sig",
+    )
+    draft = None
+    try:
+        with NamedTemporaryFile(dir=destination.parent, prefix=".imtask-review-", delete=False) as stream:
+            draft = Path(stream.name)
+            stream.write((stats.rstrip("\n") + "\n\n" + patch).encode("utf-8"))
+        draft.replace(destination)
+    finally:
+        if draft is not None:
+            draft.unlink(missing_ok=True)
+    return destination
+
+
 def push_review() -> int:
-    """发布评审库 main 上的确切提交，只在 Git 推送成功后打印验收链接。"""
+    """发布评审库 main 上的确切提交，成功后输出链接和桌面源码 diff。"""
     if git_changed():
         print("✗ 评审库有未提交改动，请先核对并提交")
         return 1
@@ -209,13 +234,19 @@ def push_review() -> int:
     print(f"✓ 已推送评审库 main，完整提交哈希 {commit}")
     print(f"Commit URL {commit_url}")
     print(f"Patch URL {commit_url}.patch")
+    try:
+        path = export_review_patch(commit, REVIEW_PATCH_PATH)
+    except (OSError, UnicodeError, subprocess.CalledProcessError) as exc:
+        print(f"✗ 推送已成功，桌面源码 diff 导出失败（{exc}）")
+        return 1
+    print(f"本地源码 Diff {path}")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--commit", help="同步后创建提交并使用该消息")
-    ap.add_argument("--push", action="store_true", help="推送已提交的评审库 main 并打印完整验收链接")
+    ap.add_argument("--push", action="store_true", help="推送评审库 main、打印验收链接并导出桌面源码 diff")
     ap.add_argument("--skip-build", action="store_true", help="跳过前端构建（产物未变时省时间）")
     ap.add_argument("--commit-paths", nargs="+", metavar="PATH",
                     help="限制本次提交范围；目录须以 / 结尾")
