@@ -23,8 +23,9 @@ export async function copyText(text: string): Promise<boolean> {
   }
 
   // ② 兼容方案：iOS Safari / 内网 http 都能用
+  let ta: HTMLTextAreaElement | undefined;
   try {
-    const ta = document.createElement('textarea');
+    ta = document.createElement('textarea');
     ta.value = val;
     ta.setAttribute('readonly', '');
     ta.style.position = 'fixed';
@@ -33,10 +34,10 @@ export async function copyText(text: string): Promise<boolean> {
     document.body.appendChild(ta);
     ta.select();
     ta.setSelectionRange(0, val.length);
-    const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
-    return ok;
+    return document.execCommand('copy');
   } catch {
     return false;
+  } finally {
+    ta?.remove();
   }
 }

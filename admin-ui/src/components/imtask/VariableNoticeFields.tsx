@@ -1,4 +1,6 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
+import { api, plainError } from '../../lib/api';
+import { copyText } from '../../lib/clipboard';
 import { getCsrfToken } from '../../lib/realApi';
 import { DataInboxRecord, VariableNoticeConfig, VariableNoticeIssue } from '../../lib/types';
 
@@ -119,17 +121,134 @@ const inboxStatus: Record<DataInboxRecord['status'], string> = {
   waiting: '等待文件', processing: '投递中', success: '投递成功', failed: '已拦截或投递未完成', skipped: '重复文件已跳过',
 };
 
-export function DataInboxFields({ value, onChange, record, loading, loadFailed }: {
+interface DataInboxTokenStatus {
+  configured: boolean;
+  enabled: boolean;
+  token_prefix: string | null;
+  updated_at: string | null;
+  last_used_at: string | null;
+}
+
+interface IssuedDataInboxToken extends DataInboxTokenStatus {
+  token: string;
+  upload_url: string | null;
+}
+
+function DataInboxTokenFields({ sourceKey }: { sourceKey: string }) {
+  const [status, setStatus] = useState<DataInboxTokenStatus>();
+  const [issued, setIssued] = useState<IssuedDataInboxToken>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [copyFeedback, setCopyFeedback] = useState('');
+  const path = `/api/admin/data-inbox/${encodeURIComponent(sourceKey)}/token`;
+
+  useEffect(() => {
+    let active = true;
+    const timer = window.setTimeout(() => {
+      api.get<DataInboxTokenStatus>(path).then(result => {
+        if (active) setStatus(result);
+      }).catch(err => {
+        if (active) setError(err instanceof Error ? plainError(err.message) : '令牌状态读取失败');
+      });
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [path]);
+
+  async function changeToken(disable: boolean) {
+    if (busy || !status) return;
+    if (status.enabled && !window.confirm(disable
+      ? '停用后，该数据源将拒收 HTTP 上传。确定停用？'
+      : '重置后，旧令牌会立即失效。确定重置？')) return;
+    setBusy(true);
+    setError('');
+    setCopyFeedback('');
+    try {
+      if (disable) {
+        setStatus(await api.delete<DataInboxTokenStatus>(path));
+        setIssued(undefined);
+      } else {
+        const result = await api.post<IssuedDataInboxToken>(path);
+        const { configured, enabled, token_prefix, updated_at, last_used_at } = result;
+        setStatus({ configured, enabled, token_prefix, updated_at, last_used_at });
+        setIssued(result);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? plainError(err.message) : '令牌操作失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function copy(value: string, label: string) {
+    setCopyFeedback(await copyText(value) ? `已复制${label}` : '复制失败，请选中文字手动复制');
+  }
+
+  const uploadUrl = issued?.upload_url?.replace(/'/g, "''");
+  const command = issued && uploadUrl
+    ? `curl.exe -sS -H 'X-Data-Token: ${issued.token}' -F 'file=@C:\\路径\\通知变量表格.xlsx' --url '${uploadUrl}'`
+    : '';
+  const buttonClass = 'rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 disabled:opacity-50';
+
+  return (
+    <section className="space-y-2 border-y border-slate-200 py-2" aria-label="上传令牌">
+      {status ? (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-slate-700">
+            <span className="font-semibold">上传令牌</span>
+            {!status.configured ? ' · 未生成' : status.enabled ? (
+              <> · 已启用 <code>{status.token_prefix}</code> · 最近使用 {status.last_used_at || '暂无'}</>
+            ) : ' · 已停用'}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            <button type="button" className={buttonClass} disabled={busy} onClick={() => void changeToken(false)}>
+              {status.configured ? '重置令牌' : '生成上传令牌'}
+            </button>
+            {status.enabled && (
+              <button type="button" className={buttonClass} disabled={busy} onClick={() => void changeToken(true)}>
+                停用
+              </button>
+            )}
+          </div>
+        </div>
+      ) : !error && <p role="status" className="text-slate-500">正在读取上传令牌状态…</p>}
+      {error && <p role="alert" className="text-rose-700">{error}</p>}
+      {issued && (
+        <div className="space-y-2 rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-amber-900">
+          <p className="font-semibold">明文仅展示一次，遗忘可直接重置</p>
+          <div className="flex flex-wrap items-center gap-2">
+            <code className="min-w-0 break-all">{issued.token}</code>
+            <button type="button" className={buttonClass} onClick={() => void copy(issued.token, '令牌')}>复制令牌</button>
+          </div>
+          {command ? (
+            <>
+              <p>Windows PowerShell 上传命令。将示例文件路径换成实际路径后运行。</p>
+              <code className="block break-all rounded-md bg-white px-2 py-1.5">{command}</code>
+              <button type="button" className={buttonClass} onClick={() => void copy(command, '上传命令')}>复制上传命令</button>
+            </>
+          ) : <p>缺少业务访问地址，暂无法生成上传命令。</p>}
+          {copyFeedback && <p role="status">{copyFeedback}</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function DataInboxFields({ value, onChange, record, loading, loadFailed, canManageToken }: {
   value: DataInboxDraft;
   onChange: (value: DataInboxDraft) => void;
   record: DataInboxRecord | null;
   loading: boolean;
   loadFailed: boolean;
+  canManageToken: boolean;
 }) {
   const helpId = useId();
   const inputClass = 'mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2';
   const key = value.key.trim();
-  const pathKey = /^[A-Za-z0-9_-]{2,64}$/.test(key) ? key : '{source_key}';
+  const validKey = /^[A-Za-z0-9_-]{2,64}$/.test(key);
+  const pathKey = validKey ? key : '{source_key}';
   return (
     <fieldset className="space-y-2 rounded-xl border border-slate-200 p-3 text-xs">
       <legend className="px-1 font-semibold">自动数据源接入（选填）</legend>
@@ -161,6 +280,7 @@ export function DataInboxFields({ value, onChange, record, loading, loadFailed }
       </div>
       <p className="text-slate-600">同机文件放入接入目录的 <code>{pathKey}/incoming/</code>。跨机请请求业务端口，携带文件字段 <code>file</code> 和上传令牌。</p>
       <code className="block break-all text-slate-800">POST /api/data-inbox/{pathKey}/upload</code>
+      {canManageToken && validKey && <DataInboxTokenFields key={key} sourceKey={key} />}
       {loading && <p role="status">正在读取最近接入记录…</p>}
       {!loading && (record?.source_key === key ? (
         <p className="break-words text-slate-700">

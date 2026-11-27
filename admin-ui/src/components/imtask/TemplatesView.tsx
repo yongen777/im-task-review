@@ -2156,7 +2156,8 @@ export const TemplatesView: React.FC = () => {
                         automatic={automaticVariable} validation={variableValidation} busy={variableBusy}
                         onUpload={file => validateVariableDraft(noticeText, file)} />}
                       {automaticVariable && <DataInboxFields value={inboxDraft} onChange={setInboxDraft}
-                        record={inboxRecord} loading={inboxRecordState === 'loading'} loadFailed={inboxRecordState === 'error'} />}
+                        record={inboxRecord} loading={inboxRecordState === 'loading'} loadFailed={inboxRecordState === 'error'}
+                        canManageToken={!isSuperAdmin} />}
                       {variableEnabled && isManual && variableResult && !variableValidation && (
                         <p className="text-xs text-amber-800">正文已修改，请重新导入表格校验。</p>
                       )}

@@ -1366,6 +1366,34 @@ def create_admin_router(
         )
         return {"ok": True, "total": res["total"], "items": res["items"]}
 
+    @router.get("/data-inbox/{source_key:path}/token")
+    @router.post("/data-inbox/{source_key:path}/token")
+    @router.delete("/data-inbox/{source_key:path}/token")
+    def manage_data_inbox_token(source_key: str, request: Request):
+        from ..data_inbox import source_key as validate_source_key
+
+        method = request.method
+        sess, err = require_session(request, state, check_csrf=method != "GET")
+        if err is not None:
+            return err
+        assert sess is not None
+        if method != "GET" and _is_super_admin(_admin_profile(state, sess)):
+            return error_response(403, "SUPER_ADMIN_READONLY", "仅归属分级管理员可以管理上传令牌")
+        try:
+            key = validate_source_key(source_key)
+            owner_id = sess["user_id"]
+            if method == "POST":
+                result = state.rotate_data_inbox_token(key, owner_id, sess["username"])
+                base = public_base_url.strip().rstrip("/")
+                result["upload_url"] = f"{base}/api/data-inbox/{key}/upload" if base else None
+            elif method == "DELETE":
+                result = state.disable_data_inbox_token(key, owner_id, sess["username"])
+            else:
+                result = state.get_data_inbox_token(key, owner_id)
+        except BizError as exc:
+            return biz_error_response(exc)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+
     @router.post("/variable-notices/template")
     async def download_variable_notice_template(request: Request):
         from ..variable_notice import make_template

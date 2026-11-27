@@ -1,5 +1,6 @@
 """文件队列、接入配置与接入日志的共享操作。"""
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,7 +40,7 @@ def normalize_settings(spec):
     return settings
 
 
-def upload_token(key):
+def _legacy_upload_token(key):
     mapping = os.environ.get("IMT_DATA_INBOX_TOKENS")
     if mapping is None:
         return os.environ.get("IMT_DATA_INBOX_TOKEN") or None
@@ -49,6 +50,17 @@ def upload_token(key):
         return None
     token = tokens.get(key) if isinstance(tokens, dict) else None
     return token if isinstance(token, str) and token else None
+
+
+def authorize_upload(state, key, token):
+    supplied = token.encode("utf-8")
+    if state.verify_data_inbox_token(key, hashlib.sha256(supplied).hexdigest()):
+        return
+    expected = _legacy_upload_token(key)
+    if expected is None:
+        raise BizError(403, "DATA_INBOX_TOKEN_NOT_CONFIGURED", "数据源未配置上传密钥")
+    if not hmac.compare_digest(supplied, expected.encode("utf-8")):
+        raise BizError(401, "INVALID_DATA_INBOX_TOKEN", "上传密钥无效")
 
 
 def checked_path(base, *parts):

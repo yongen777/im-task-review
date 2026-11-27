@@ -1,5 +1,4 @@
 """数据源的公共令牌上传入口。"""
-import hmac
 import logging
 
 from fastapi import APIRouter, Request
@@ -8,7 +7,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
-from ..data_inbox import MAX_UPLOAD_BYTES, check_size, publish_upload, source_key as validate_key, upload_token
+from ..data_inbox import MAX_UPLOAD_BYTES, authorize_upload, check_size, publish_upload, source_key as validate_key
 from ..state import BizError
 from ..variable_notice import VariableTableError
 
@@ -38,13 +37,9 @@ def create_data_inbox_router(state):
 
         try:
             key = validate_key(source_key)
-            expected = upload_token(key)
-            if expected is None:
-                return error(403, "DATA_INBOX_TOKEN_NOT_CONFIGURED", "数据源未配置上传密钥")
             scheme, _, bearer = request.headers.get("Authorization", "").partition(" ")
             token = request.headers.get("X-Data-Token") or (bearer if scheme.lower() == "bearer" else "")
-            if not hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
-                return error(401, "INVALID_DATA_INBOX_TOKEN", "上传密钥无效")
+            await run_in_threadpool(authorize_upload, state, key, token)
             content_type = request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type != "multipart/form-data":
                 raise BizError(400, "INVALID_DATA_INBOX_UPLOAD", "请使用 multipart/form-data 上传 file 字段")

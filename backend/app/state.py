@@ -676,6 +676,96 @@ class StateStore:
         with self.lock:
             return [dict(r) for r in self.conn.execute("SELECT * FROM admin_audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
+    def _data_inbox_token_row(self, key: str, *, lock: bool = False):
+        return self.conn.execute(
+            "SELECT * FROM data_inbox_token WHERE source_key=?" + (" FOR UPDATE" if lock else ""), (key,),
+        ).fetchone()
+
+    def _owned_data_inbox_token(self, key: str, owner_id: int, *, lock: bool = False):
+        row = self._data_inbox_token_row(key, lock=lock)
+        if row and row["owner_id"] != owner_id:
+            raise BizError(403, "FORBIDDEN_OWNER", "该数据源属于其他管理员")
+        return row
+
+    def _check_legacy_data_inbox_owner(self, key: str, owner_id: int) -> None:
+        # 先尊重已绑定的旧模板，避免首次生成令牌时接管其他管理员的环境变量数据源。
+        if self.conn.execute(
+            "SELECT 1 FROM task_template WHERE deleted=0 AND kind='notice' AND owner_id<>? "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT(IF(JSON_VALID(spec_json),spec_json,NULL),'$.data_source_key')) "
+            "= BINARY ? LIMIT 1", (owner_id, key),
+        ).fetchone():
+            raise BizError(403, "FORBIDDEN_OWNER", "该数据源已绑定其他管理员的模板")
+
+    @staticmethod
+    def _data_inbox_token_status(row) -> Dict[str, Any]:
+        return {
+            "configured": row is not None, "enabled": bool(row and row["enabled"]),
+            "token_prefix": row["token_prefix"] if row else None,
+            "updated_at": row["updated_at"] if row else None,
+            "last_used_at": row["last_used_at"] if row else None,
+        }
+
+    def get_data_inbox_token(self, key: str, owner_id: int) -> Dict[str, Any]:
+        row = self._owned_data_inbox_token(key, owner_id)
+        if row is None:
+            self._check_legacy_data_inbox_owner(key, owner_id)
+        return self._data_inbox_token_status(row)
+
+    def rotate_data_inbox_token(self, key: str, owner_id: int, actor: str) -> Dict[str, Any]:
+        token = "imt_" + secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        prefix = token[:10] + "..."
+        now = self.now_str()
+        with self.conn:
+            # 唯一键冲突时只取行锁，随后验证归属，再决定是否更新哈希。
+            self.conn.execute(
+                "INSERT INTO data_inbox_token(source_key,owner_id,token_hash,token_prefix,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET source_key=source_key",
+                (key, owner_id, digest, prefix, now, now),
+            )
+            row = self._owned_data_inbox_token(key, owner_id, lock=True)
+            if row["token_hash"] == digest:
+                self._check_legacy_data_inbox_owner(key, owner_id)
+                action = "data_inbox.token.generate"
+            else:
+                self.conn.execute(
+                    "UPDATE data_inbox_token SET token_hash=?,token_prefix=?,enabled=1,updated_at=?,last_used_at=NULL "
+                    "WHERE source_key=?", (digest, prefix, now, key),
+                )
+                action = "data_inbox.token.reset"
+            self._insert_audit_unlocked(actor, action, "data_inbox_token", key)
+            status = self._data_inbox_token_status(self._data_inbox_token_row(key, lock=True))
+        return {**status, "token": token}
+
+    def disable_data_inbox_token(self, key: str, owner_id: int, actor: str) -> Dict[str, Any]:
+        with self.conn:
+            row = self._owned_data_inbox_token(key, owner_id, lock=True)
+            if row is None:
+                self._check_legacy_data_inbox_owner(key, owner_id)
+                raise BizError(404, "DATA_INBOX_TOKEN_NOT_CONFIGURED", "请先生成该数据源的上传令牌")
+            if row["enabled"]:
+                self.conn.execute(
+                    "UPDATE data_inbox_token SET enabled=0,updated_at=? WHERE source_key=?", (self.now_str(), key),
+                )
+                self._insert_audit_unlocked(actor, "data_inbox.token.disable", "data_inbox_token", key)
+            return self._data_inbox_token_status(self._data_inbox_token_row(key, lock=True))
+
+    def verify_data_inbox_token(self, key: str, digest: str) -> bool:
+        """有数据库记录时完成校验，缺记录才允许调用方检查旧环境变量。"""
+        with self.conn:
+            row = self._data_inbox_token_row(key, lock=True)
+            if row is None:
+                return False
+            if not row["enabled"]:
+                raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "该数据源的上传令牌已停用")
+            if not hmac.compare_digest(digest, row["token_hash"]):
+                raise BizError(401, "INVALID_DATA_INBOX_TOKEN", "上传密钥无效")
+            owner = self.conn.execute("SELECT enabled FROM admin_user WHERE id=?", (row["owner_id"],)).fetchone()
+            if not owner or not owner["enabled"]:
+                raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "该数据源所属管理员已停用")
+            self.conn.execute("UPDATE data_inbox_token SET last_used_at=? WHERE source_key=?", (self.now_str(), key))
+        return True
+
     # ── 2026-11-04 多管理员分级（超级管理员 + 分级管理员）────────────────────
     # 口径（用户 2026-11-04 定）：
     #   · admin = 超级管理员：全局只读 + 管理员账号管理（不建角色/模板/成员、不改业务数据）；
@@ -3078,6 +3168,7 @@ class StateStore:
             config = _spec_payload.get("variable_notice")
             platform = config.get("platform") if isinstance(config, dict) else None
             if not (existing and set(payload) == {"enabled"} and payload["enabled"] is False):
+                self._owned_data_inbox_token(inbox_settings["data_source_key"], owner, lock=True)
                 columns_for(text_tpl)
                 validate_platform(self, owner, platform)
             _spec_payload = {**_spec_payload, **inbox_settings, "variable_notice": {"platform": platform}}
