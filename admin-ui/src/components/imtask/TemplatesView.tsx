@@ -106,9 +106,9 @@ function isBroadcastNotice(tpl: TemplateItem): boolean {
   return tpl.kind === 'notice' && !tpl.spec?.notice_receipt?.enabled;
 }
 
-function broadcastAudience(tpl: TemplateItem, total?: number): string {
-  const audience = tpl.spec?.variable_notice ? '变量表格中的成员' : '当前角色中符合资格的成员';
-  return total === undefined ? `将向${audience}发送通知。` : `将向${audience}共 ${total} 人发送通知。`;
+function broadcastAudience(tpl: TemplateItem): string {
+  const audience = tpl.spec?.variable_notice ? '变量表格中的成员' : '当前角色分组中符合资格的成员';
+  return `发送范围为${audience}。`;
 }
 
 type PushPreview = { total: number; completed: number; unfinished: number };
@@ -536,7 +536,7 @@ export const TemplatesView: React.FC = () => {
   const [pushNote, setPushNote] = useState('');
   /* 2026-11-19 需求一：本周期已推送过时的二次确认（新建批次并重推） */
   const [repushConfirm, setRepushConfirm] = useState<{
-    tpl: TemplateItem; targetCount: number; preview: PushPreview | null;
+    tpl: TemplateItem; preview: PushPreview | null;
   } | null>(null);
   /* 2026-11-21 需求二：推送弹窗「过滤本周期已完成 / 已回执成员」开关（默认开启）与实时人数 */
   const [skipCompleted, setSkipCompleted] = useState(true);
@@ -1208,13 +1208,12 @@ export const TemplatesView: React.FC = () => {
   const handleConfirmPush = async () => {
     if (!pushConfirmTpl) return;
     const target = pushConfirmTpl;
-    const filterCompleted = skipCompleted && !isBroadcastNotice(target);
+    const filterCompleted = skipCompleted;
     setPushingId(target.id);
     try {
       const res = await api.post<{
         queued?: boolean;
         needs_confirm?: boolean;
-        target_count?: number;
         completed_count?: number;
         unfinished_count?: number;
         new_batch?: boolean;
@@ -1232,7 +1231,7 @@ export const TemplatesView: React.FC = () => {
           ? { total: completed + unfinished, completed, unfinished } : null;
         setPushConfirmTpl(null);
         setPushPreview(null);
-        setRepushConfirm({ tpl: target, targetCount: res.target_count ?? 0, preview });
+        setRepushConfirm({ tpl: target, preview });
         return;
       }
       if (res?.queued) {
@@ -1264,7 +1263,7 @@ export const TemplatesView: React.FC = () => {
     if (!repushConfirm) return;
     const target = repushConfirm.tpl;
     const broadcast = isBroadcastNotice(target);
-    const filterCompleted = skipCompleted && !broadcast;
+    const filterCompleted = skipCompleted;
     setPushingId(target.id);
     try {
       const res = await api.post<{
@@ -1277,7 +1276,7 @@ export const TemplatesView: React.FC = () => {
       }>(`/api/admin/templates/${target.id}/push-now?confirmed=1&skip_completed=${Number(filterCompleted)}`, { push_note: pushNote.trim() });
       if (res?.queued) {
         toast.success(
-          broadcast ? `向 ${res.instance_count ?? 0} 人重推通知，消息正在后台投递。` :
+          broadcast ? `已受理 ${res.instance_count ?? 0} 人的${filterCompleted ? '补发' : '重推'}，消息正在后台投递。` :
             `已按归属周期再推 ${res.instance_count ?? 0} 条实例` +
             (filterCompleted ? '（本周期已完成/已回执成员已过滤）' : `（已同步本周期完成状态 ${res.synced_completed ?? 0} 条）`) +
             '；消息正在后台逐条投递，可在「提醒日志 / 任务实例」页核对。',
@@ -1662,7 +1661,11 @@ export const TemplatesView: React.FC = () => {
                             )}
                             {(tpl.is_manual || (tpl.kind !== 'notice' && !tpl.is_adhoc)) && (
                               <button
-                                onClick={() => { setPushNote(''); setPushConfirmTpl(tpl); }}
+                                onClick={() => {
+                                  if (isBroadcastNotice(tpl)) setSkipCompleted(true);
+                                  setPushNote('');
+                                  setPushConfirmTpl(tpl);
+                                }}
                                 disabled={!tpl.enabled || busyId === tpl.id || pushingId === tpl.id}
                                 title={
                                   tpl.enabled
@@ -2499,7 +2502,7 @@ export const TemplatesView: React.FC = () => {
               </button>
             </div>
             {isBroadcastNotice(pushConfirmTpl) ? <p className="text-xs text-slate-600 leading-relaxed" role="status">
-              {broadcastAudience(pushConfirmTpl, pushPreview?.total)}
+              {broadcastAudience(pushConfirmTpl)}
             </p> : pushConfirmTpl.is_manual ? <p className="text-xs text-slate-600 leading-relaxed">
               将立即向模板「{pushConfirmTpl.name}」中符合资格且尚未推送的成员发送{pushConfirmTpl.kind === 'notice' ? '通知' : '填报提醒'}。
             </p> : <p className="text-xs text-slate-600 leading-relaxed">
@@ -2509,9 +2512,8 @@ export const TemplatesView: React.FC = () => {
               <br />
               此操作<b>不影响</b>当天已定的定时提醒，两条各发各的；同模板 3 秒内不可重复推送。
             </p>}
-            {!isBroadcastNotice(pushConfirmTpl) && (
-              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={pushPreview} />
-            )}
+            <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted}
+              preview={pushPreview} byDelivery={isBroadcastNotice(pushConfirmTpl)} />
             <PushNoteField value={pushNote} onChange={setPushNote} disabled={pushingId === pushConfirmTpl.id} />
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
@@ -2549,11 +2551,10 @@ export const TemplatesView: React.FC = () => {
               </button>
             </div>
             {isBroadcastNotice(repushConfirm.tpl) ? <p className="text-xs text-slate-600 leading-relaxed" role="status">
-              {broadcastAudience(repushConfirm.tpl, repushPreview?.total ?? repushConfirm.targetCount)}
-            </p> : <>
-              <RepushDescription tpl={repushConfirm.tpl} checked={skipCompleted} preview={repushPreview} />
-              <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted} preview={repushPreview} />
-            </>}
+              {broadcastAudience(repushConfirm.tpl)}
+            </p> : <RepushDescription tpl={repushConfirm.tpl} checked={skipCompleted} preview={repushPreview} />}
+            <PushSkipCompleted checked={skipCompleted} onChange={setSkipCompleted}
+              preview={repushPreview} byDelivery={isBroadcastNotice(repushConfirm.tpl)} />
             <PushNoteField value={pushNote} onChange={setPushNote} disabled={pushingId === repushConfirm.tpl.id} />
             <VariableNoticeIssues issues={pushIssues} />
             <div className="flex justify-end gap-2 pt-2">
@@ -2634,11 +2635,20 @@ function RepushDescription({ tpl, checked, preview }: { tpl: TemplateItem; check
 
 /* 2026-11-21 需求二：推送确认弹窗的「过滤本周期已完成/已回执成员」开关。
    勾选 = 只向本周期未完成人员推送（已完成/已回执不打扰）；实时展示人数。 */
-function PushSkipCompleted({ checked, onChange, preview }: {
+function PushSkipCompleted({ checked, onChange, preview, byDelivery }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   preview: PushPreview | null;
+  byDelivery: boolean;
 }) {
+  const summary = !preview ? (byDelivery ? '正在统计本通知送达情况…' : '正在统计本周期完成情况…')
+    : byDelivery
+      ? (checked
+        ? `补发给尚未送达的 ${preview.unfinished} 人，已送达的 ${preview.completed} 人将跳过（共 ${preview.total} 人）。`
+        : `向当前全部 ${preview.total} 人推送，其中 ${preview.completed} 人已收到过通知。`)
+      : (checked
+        ? `将向未完成 ${preview.unfinished} 人推送；本周期已完成/已回执 ${preview.completed} 人不打扰（共 ${preview.total} 人）。`
+        : `将向全部 ${preview.total} 人照推（其中已完成/已回执 ${preview.completed} 人，链接只读回顾）。`);
   return (
     <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2.5 space-y-1">
       <label className="flex items-start gap-2 text-xs font-medium text-slate-700 cursor-pointer">
@@ -2648,14 +2658,11 @@ function PushSkipCompleted({ checked, onChange, preview }: {
           onChange={event => onChange(event.target.checked)}
           className="mt-0.5 h-4 w-4 rounded border-slate-300 text-blue-600"
         />
-        <span>过滤本周期已完成 / 已回执成员（仅向未完成人员推送）</span>
+        <span>{byDelivery ? '过滤已收到本通知的成员（仅补发给尚未送达的人）'
+          : '过滤本周期已完成 / 已回执成员（仅向未完成人员推送）'}</span>
       </label>
       <p className="pl-6 text-[11px] leading-relaxed text-slate-500" role="status">
-        {preview
-          ? (checked
-            ? `将向未完成 ${preview.unfinished} 人推送；本周期已完成/已回执 ${preview.completed} 人不打扰（共 ${preview.total} 人）。`
-            : `将向全部 ${preview.total} 人照推（其中已完成/已回执 ${preview.completed} 人，链接只读回顾）。`)
-          : '正在统计本周期完成情况…'}
+        {summary}
       </p>
     </div>
   );

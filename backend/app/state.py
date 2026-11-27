@@ -5242,8 +5242,21 @@ class StateStore:
             f"AND {period_where} AND {cond}", (clean, *period_params)).fetchall()
         return {str(r["phone"]) for r in rows}
 
+    def push_excluded_phones(self, tpl: Dict[str, Any], period_key: str) -> set:
+        """一键推送过滤：纯通知按同归属周期的实际送达记录，其他任务按既有完成口径。"""
+        template_id = tpl["template_id"]
+        if self.supports_push_completion_filter(tpl):
+            return self.period_completed_phones(template_id, period_key)
+        period_where, period_params = self._completion_period_where(template_id, period_key, template=tpl)
+        rows = self.conn.execute(
+            "SELECT DISTINCT phone FROM task_instance WHERE template_id=? "
+            f"AND {period_where} AND (first_sent_at IS NOT NULL OR status IN ('sent','approved'))",
+            (template_id, *period_params),
+        ).fetchall()
+        return {str(row["phone"]) for row in rows}
+
     def push_skip_completed_preview(self, template_id: str, canonical_key: str) -> Dict[str, Any]:
-        """手动推送「过滤已完成」预览：当前可投递人数 / 已完成人数 / 未完成人数。
+        """手动推送预览：当前可投递人数 / 已送达或已完成人数 / 过滤后人数。
 
         `canonical_key` 由调用方（API 层）按模板口径算好传入，state 不做隐式推导。
         """
@@ -5253,7 +5266,7 @@ class StateStore:
             raise BizError(404, "NOT_FOUND", "任务模板不存在或未启用")
         members = self.template_deliverable_members(tpl)
         phones = {str(m["phone"]) for m in members}
-        completed = self.period_completed_phones(clean, canonical_key) & phones
+        completed = self.push_excluded_phones(tpl, canonical_key) & phones
         return {
             "total": len(phones),
             "completed": len(completed),

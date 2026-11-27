@@ -11,8 +11,10 @@ H5 逾期任务转「逾期提醒」+ mission 回执已读 · H5 三页统一返
   4. portal_task 已提交记录过截止后仍可编辑（成员在岗、模板未删/未停）；
   5. H5 三页结构契约：统一左上角返回图标，无「返回统计/返回工作台」文字按钮。
 """
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -24,6 +26,7 @@ from test_20261120_portal_panel import panel  # noqa: F401  (fixture 复用)
 
 PHONE = "13900009401"
 SECOND = "13900009402"
+FAILED = "13900009403"
 H5_DIR = Path(__file__).resolve().parents[1] / "app" / "h5"
 
 
@@ -186,16 +189,17 @@ def test_manual_push_filters_legacy_daily_completion(ctx, deadline_type, canonic
 
 
 @pytest.mark.parametrize("variable", [False, True])
-def test_broadcast_ignores_skip_completed_on_first_push_and_repush(ctx, variable):
+def test_broadcast_repush_filters_delivered_but_includes_new_and_failed_members(ctx, variable):
     store, scheduler, notifier, _, owner, _, existing, _ = ctx
     role_id = existing["role_ids"][0]
-    add_member(store, role_id, SECOND, "第二成员", existing["owner_id"])
+    add_member(store, role_id, FAILED, "失败成员", existing["owner_id"])
+    notifier.fail_receive_ids.add(f"union-{FAILED}")
     body = "请{姓名}查阅纯广播通知"
     spec = {"notice_receipt": {"enabled": False}}
     if variable:
         spec["variable_notice"] = {"platform": "zdxlz", "rows": [
             {"row": 2, "cells": {"手机号": PHONE, "姓名": "测试成员"}},
-            {"row": 3, "cells": {"手机号": SECOND, "姓名": "第二成员"}},
+            {"row": 3, "cells": {"手机号": FAILED, "姓名": "失败成员"}},
         ]}
     saved = owner.post("/api/admin/templates", json={
         "name": "纯广播通知", "kind": "notice", "period": "day", "is_manual": True,
@@ -206,29 +210,78 @@ def test_broadcast_ignores_skip_completed_on_first_push_and_repush(ctx, variable
     base = f"/api/admin/templates/{tid}"
     first = owner.post(base + "/push-now?skip_completed=1")
     assert first.status_code == 200, first.text
-    assert first.json()["skip_completed"] is False and first.json()["instance_count"] == 2
-    for tick in range(3):
-        scheduler.run_once(NOW + timedelta(seconds=30 * tick))
-    assert sorted(msg.receive_id for msg in notifier.sent_messages if "纯广播通知" in msg.text) == [
-        "test_recipient", f"union-{SECOND}",
-    ]
+    assert first.json()["skip_completed"] is True and first.json()["instance_count"] == 2
+    assert [msg.receive_id for msg in notifier.sent_messages] == ["test_recipient"]
 
-    # 模板关闭回执后，历史批次可能仍有回执记录。
+    # 纯通知按送达过滤，历史回执字段本身不能替代成功投递。
     store.conn.execute("UPDATE task_instance SET receipt_at=? WHERE template_id=? AND phone=?",
-                       (store.now_str(), tid, PHONE))
+                       (store.now_str(), tid, FAILED))
     later = NOW + timedelta(minutes=2)
     store._now_fn = scheduler._now_fn = lambda: later
+    add_member(store, role_id, SECOND, "第二成员", existing["owner_id"])
+    if variable:
+        spec["variable_notice"]["rows"].append({"row": 4, "cells": {"手机号": SECOND, "姓名": "第二成员"}})
+        updated = owner.put(base, json={"spec": spec})
+        assert updated.status_code == 200, updated.text
+    notifier.fail_receive_ids.clear()
     preview = owner.get(base + "/push-preview").json()
-    assert (preview["total"], preview["completed"], preview["unfinished"]) == (2, 0, 2)
+    assert (preview["total"], preview["completed"], preview["unfinished"]) == (3, 1, 2)
     pre = owner.post(base + "/push-now?skip_completed=1").json()
-    assert pre["needs_confirm"] and pre["target_count"] == 2 and pre["skip_completed"] is False
+    assert pre["needs_confirm"] and pre["target_count"] == 2 and pre["skip_completed"] is True
     again = owner.post(base + "/push-now?confirmed=1&skip_completed=1")
     assert again.status_code == 200, again.text
-    assert again.json()["skip_completed"] is False and again.json()["instance_count"] == 2
-    assert again.json()["synced_completed"] == 0
+    batch = again.json()
+    assert batch["skip_completed"] is True and batch["instance_count"] == 2 and batch["synced_completed"] == 0
+    assert {row["phone"] for row in store.list_instances_for_period(tid, batch["period_key"])} == {SECOND, FAILED}
+    for tick in range(3):
+        scheduler.run_once(later + timedelta(seconds=30 * tick))
+        scheduler.push_now_deliver(tid, {**batch, "variable_notice": variable})
     assert sorted(msg.receive_id for msg in notifier.sent_messages if "纯广播通知" in msg.text) == [
-        "test_recipient", "test_recipient", f"union-{SECOND}", f"union-{SECOND}",
+        "test_recipient", f"union-{SECOND}", f"union-{FAILED}",
     ]
+    store._now_fn = scheduler._now_fn = lambda: later + timedelta(minutes=2)
+    blocked = owner.post(base + "/push-now?confirmed=1&skip_completed=1")
+    assert blocked.status_code == 400 and blocked.json()["code"] == "ALL_SENT"
+    store._now_fn = scheduler._now_fn = lambda: later + timedelta(minutes=3)
+    all_members = owner.post(base + "/push-now?confirmed=1&skip_completed=0")
+    assert all_members.status_code == 200 and all_members.json()["instance_count"] == 3
+    recipients = [msg.receive_id for msg in notifier.sent_messages if "纯广播通知" in msg.text]
+    assert len(recipients) == 6 and all(recipients.count(who) == 2 for who in set(recipients))
+
+
+def test_overlapping_broadcast_batches_with_filter_only_send_once(ctx, monkeypatch):
+    store, scheduler, notifier, _, _, _, existing, _ = ctx
+    tpl = store.create_template({
+        "name": "并发纯通知", "kind": "notice", "period": "day", "is_manual": True,
+        "role_ids": existing["role_ids"], "text_tpl": "纯通知测试",
+    }, owner_id=existing["owner_id"])
+    tid = tpl["template_id"]
+    first = scheduler.push_now_prepare(tid, now_dt=NOW)
+    second = scheduler.push_now_prepare(tid, now_dt=NOW + timedelta(seconds=5), reprocess=True, skip_completed=True)
+    started = Event()
+    another_send = Event()
+    release = Event()
+    send_text = notifier.send_text
+
+    def send(*args, **kwargs):
+        if started.is_set():
+            another_send.set()
+        started.set()
+        assert release.wait(10)
+        return send_text(*args, **kwargs)
+
+    monkeypatch.setattr(notifier, "send_text", send)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sending = pool.submit(scheduler.push_now_deliver, tid, first)
+        try:
+            assert started.wait(5)
+            supplementing = pool.submit(scheduler.push_now_deliver, tid.upper(), second)
+            assert not another_send.wait(1), "补发必须等前一批送达结果落库"
+        finally:
+            release.set()
+        assert sending.result(timeout=10)["pushed_instances"] == 1
+        assert supplementing.result(timeout=10)["pushed_instances"] == 0
+    assert [msg.receive_id for msg in notifier.sent_messages] == ["test_recipient"]
 
 
 # ── 3. 逾期任务保留「已逾期」提醒 + 我知道了 ────────────────────────────

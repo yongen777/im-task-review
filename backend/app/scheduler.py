@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 from .channels.zdxlz import SendResult
@@ -591,6 +592,7 @@ class Scheduler:
         self.notifiers: Dict[str, NotifierProtocol] = dict(notifiers or {})
         self._delivery_bucket = TokenBucket(rate_per_sec=delivery_qps())
         self._delivery_breaker = CircuitBreaker(fail_threshold=breaker_threshold())
+        self._broadcast_push_locks = {}
         self.image_sender = image_sender  # None 时跳过图片投递（文本照发，不阻塞主链路）
 
     def _targets_for(self, phone: str, only_platform: Optional[str] = None) -> List[Tuple[str, Optional[str], str, NotifierProtocol]]:
@@ -1100,20 +1102,20 @@ class Scheduler:
         # 绝不主动推送催报，成员只能通过私聊【菜单】自主获取填报链接。
         if tpl.get("is_adhoc"):
             raise BizError(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
-        skip_completed = skip_completed and self.state.supports_push_completion_filter(tpl)
         if variable_notice_config(tpl) or reserve_variable_push:
             return self._prepare_variable_notice(template_id, cur_dt, actor, reprocess,
                                                  skip_completed, reserve_variable_push)
         kind = canonical_period_kind(tpl)
         p_key = canonical_period_key(tpl, cur_dt)
+        filter_delivered = skip_completed and not self.state.supports_push_completion_filter(tpl)
         variable_history = bool(manual and tpl["kind"] == "notice" and self.state.conn.execute(
             "SELECT 1 FROM task_instance i JOIN notice_receipt_view v ON v.instance_id=i.id "
             "WHERE i.template_id=? AND i.period_key=? "
             "AND JSON_EXTRACT(v.content_json, '$.variable_platform') IS NOT NULL LIMIT 1",
             (template_id, p_key),
         ).fetchone())
-        if reprocess and (variable_history or self.state.period_has_alive_instances(tpl["template_id"], p_key)):
-            # 主批次仍有存活实例 → 管理员确认的新一轮「全员照推」另起新批次
+        if reprocess and (filter_delivered or variable_history or self.state.period_has_alive_instances(template_id, p_key)):
+            # 确认补发或全员重推时，新批次与旧批次独立计幂等。
             p_key = self._next_batch_period_key(template_id, p_key, cur_dt)
         deadline_at = (tpl.get("manual_deadline_at") or NO_DEADLINE_SENTINEL) if manual else canonical_period_deadline(tpl, kind, cur_dt)
         if tpl["kind"] == "notice":
@@ -1131,15 +1133,19 @@ class Scheduler:
         # 全员已完成时直接明确拒绝（不建空批次、不发消息）。
         unfinished: Optional[set] = None
         if skip_completed:
-            completed = self.state.period_completed_phones(tpl["template_id"], p_key)
+            completed = self.state.push_excluded_phones(tpl, p_key)
             deliverable = self.state.template_deliverable_members(tpl)
             unfinished = {str(m["phone"]) for m in deliverable} - completed
             if not unfinished:
+                if filter_delivered:
+                    if not deliverable:
+                        raise BizError(400, "NO_DELIVERABLE_MEMBERS", "当前分组没有可投递成员")
+                    raise BizError(400, "ALL_SENT", "当前可投递成员均已收到本通知，无需补发")
                 raise BizError(400, "ALL_COMPLETED", "本周期全员已完成，无需推送")
         # 非锚点日也补建当期缺的实例（绕过 is_template_anchor_day / planned_dt 时间门）
         # 2026-11-20：canonical 主批次曾被整批取消时，先复活当前成员的已取消行
         # （INSERT OR IGNORE 撞唯一键会被静默吞掉，必须显式 UPDATE）。
-        if reprocess:
+        if reprocess and not filter_delivered:
             self.state.revive_cancelled_batch_rows(tpl["template_id"], p_key, deadline_at)
         instances = self.state.ensure_template_instances(
             tpl["template_id"], p_key, deadline_at, now_str=now_s, trigger_at=now_s,
@@ -1153,7 +1159,8 @@ class Scheduler:
         # instance_count 只数「当轮在册」的实例：随角色变动被取消（cancelled）的
         # 历史行不算本轮推送对象（放空模板 = 0，2026-11-17 口径回归）。
         alive = [i for i in (refreshed or instances)
-                 if str(i.get("status") or "") not in ("cancelled", "expired")]
+                 if str(i.get("status") or "") not in ("cancelled", "expired")
+                 and (not filter_delivered or i["phone"] in unfinished)]
         return {
             "template_id": tpl["template_id"], "pushed_at": now_s, "period_key": p_key,
             "deadline_at": deadline_at, "instance_count": len(alive),
@@ -1177,7 +1184,6 @@ class Scheduler:
             config = variable_notice_config(tpl)
             if not config or tpl["kind"] != "notice" or not tpl["is_manual"]:
                 raise BizError(409, "VARIABLE_NOTICE_CHANGED", "模板的变量表格配置已变更，请刷新后重试")
-            skip_completed = skip_completed and state.supports_push_completion_filter(tpl)
             _, members = validate(state, tpl["owner_id"], tpl["text_tpl"], config, lock=True)
             platform = config["platform"]
             if platform not in (self.notifiers or {state.platform: self.notifier}):
@@ -1189,9 +1195,11 @@ class Scheduler:
                 if prior:
                     raise BizError(409, "VARIABLE_NOTICE_ALREADY_PUSHED", "该模板已受理推送，请刷新后确认重推")
             if skip_completed:
-                completed = state.period_completed_phones(template_id, p_key)
+                completed = state.push_excluded_phones(tpl, p_key)
                 members = [member for member in members if member["phone"] not in completed]
                 if not members:
+                    if not state.supports_push_completion_filter(tpl):
+                        raise BizError(400, "ALL_SENT", "当前可投递成员均已收到本通知，无需补发")
                     raise BizError(400, "ALL_COMPLETED", "本周期全员已完成，无需推送")
             if not prior:
                 prior = self._save_variable_notice_batch(tpl, p_key, now_s, deadline, platform, members)
@@ -1280,13 +1288,19 @@ class Scheduler:
         # 2026-11-21 需求二：勾选过滤时，已完成/已回执成员本轮不推送（只向未完成人员发）。
         skip_completed = bool(prep.get("skip_completed"))
         push_note = prep.get("push_note", "")
-        completed_phones = (self.state.period_completed_phones(tpl["template_id"], p_key)
-                            if skip_completed else set())
 
         if tpl["kind"] == "notice":
+            if not self.state.supports_push_completion_filter(tpl):
+                # 同一纯通知的批次按投递顺序复核，避免前一批投递中时，补发又向同一人发送。
+                with self._broadcast_push_locks.setdefault(tpl["template_id"], Lock()):
+                    if skip_completed:
+                        sent = self.state.push_excluded_phones(tpl, p_key)
+                        instances = [inst for inst in instances if inst["phone"] not in sent]
+                    return self._push_manual_notice(tpl, instances, cur_dt, p_key, push_note=push_note)
             return self._push_manual_notice(tpl, instances, cur_dt, p_key,
                                             skip_completed=skip_completed, push_note=push_note)
 
+        completed_phones = (self.state.period_completed_phones(template_id, p_key) if skip_completed else set())
         stats = {"sent": 0, "skipped": 0, "failed": 0, "pushed_instances": 0}
         heading = f"【任务提醒】{tpl['name']}\n"
         if push_note:

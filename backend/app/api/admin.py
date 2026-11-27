@@ -1780,11 +1780,7 @@ def create_admin_router(
 
     @router.get("/templates/{template_id}/push-preview")
     async def push_preview(template_id: str, request: Request):
-        """2026-11-21 需求二：推送确认弹窗的实时人数预览（只读）。
-
-        返回当前可投递总人数、本归属周期已完成/已回执人数、未完成人数——
-        前端复选框「过滤本周期已完成/已回执成员」切换时直接刷新文案。
-        """
+        """推送确认弹窗的只读人数预览，纯通知按送达，其他任务按完成或回执。"""
         sess, err = require_session(request, state, check_csrf=False)
         if err is not None:
             return err
@@ -1819,7 +1815,6 @@ def create_admin_router(
             return error_response(400, "VALIDATION_FAILED", "通知类模板按通知时刻自动发送，不支持手动推送")
         if _tpl.get("is_adhoc"):
             return error_response(400, "VALIDATION_FAILED", "自主上报不支持推送，请在个人工作台发起上报")
-        skip_completed = skip_completed and state.supports_push_completion_filter(_tpl)
         variable = bool(variable_notice_config(_tpl))
 
         # 2026-11-19 需求一：本周期/历史上已推送过 → 先回一次「要不要新建批次」。
