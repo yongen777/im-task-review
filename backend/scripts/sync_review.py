@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""一键同步：工作区 → 评审库（含脱敏、前端、构建产物、产物对账、提交提示）。
+"""一键同步：工作区 → 评审库（含脱敏、构建对账、提交和可选推送）。
 
 背景（2026-11-09 定稿，取代 .temp/sync_review.py 手工清单）：
   11-09 wb 任务耗时 4 小时，其中约 1 小时耗在「三地同步」结构性摩擦上——
@@ -9,7 +9,7 @@
 用法：
     python scripts/sync_review.py                 # 同步 + 展示将提交内容
     python scripts/sync_review.py --commit "msg"  # 同步 + git add/commit
-    （push 仍手动做——对外发布属敏感操作，不走自动化）
+    python scripts/sync_review.py --commit "msg" --push  # 提交、推送并打印完整链接
 
 它做的事（顺序固定）：
   1. 后端按脱敏规则同步（app/ scripts/ tests/ 全目录比对，不是白名单 ——
@@ -18,7 +18,7 @@
   3. 前端产物构建并同步（vite build → backend/app/admin_static），
      dist 与 admin_static 以 dist 为准（先清后拷，不留陈旧 hash 产物）
   4. 产物对账：工作区 app/admin_static 必须与评审库 admin_static 一致
-  5. 不动 data/、.env、README/requirements 以外的杂项
+  5. 同步根目录 AGENTS.md 的验收规范，保留 data/、.env 等其他工作区文件
 
 为什么「全目录」而不是白名单：白名单模式在 11-09 已实测漏文件（wb 只同步了
 改动过的文件，漏掉被适配的既有测试 → 远程 pytest 27 条失败 → 二次部署）。
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,7 @@ from pathlib import Path
 WS = Path(r"D:\im-task")
 REPO = Path(r"D:\im-task-review")
 UI_SRC = Path(r"D:\im-task-admin")
+REVIEW_URL = "https://github.com/yongen777/im-task-review"
 sys.path.insert(0, str(WS / "scripts"))
 from scrub_rules import scrub  # noqa: E402
 
@@ -79,6 +81,12 @@ def sync_backend() -> None:
             rel = f.relative_to(dst_root)
             if not (src_root / rel).is_file():
                 f.unlink()
+
+    agents_doc = WS / "AGENTS.md"
+    if agents_doc.is_file():
+        (REPO / agents_doc.name).write_bytes(scrub(agents_doc.read_text(encoding="utf-8")).encode("utf-8"))
+
+
 def git_changed() -> list[str]:
     """读取逐文件状态，保留空格、中文与改名涉及的两个路径。"""
     result = subprocess.run(
@@ -169,9 +177,45 @@ def verify_static() -> bool:
     return True
 
 
+def push_review() -> int:
+    """发布评审库 main 上的确切提交，只在 Git 推送成功后打印验收链接。"""
+    if git_changed():
+        print("✗ 评审库有未提交改动，请先核对并提交")
+        return 1
+    git = ["git", "-C", str(REPO)]
+    try:
+        branch = subprocess.check_output([*git, "symbolic-ref", "--quiet", "--short", "HEAD"], text=True).strip()
+        remotes = subprocess.check_output([*git, "remote", "get-url", "--push", "--all", "origin"], text=True).splitlines()
+        commit = subprocess.check_output([*git, "rev-parse", "--verify", "HEAD^{commit}"], text=True).strip()
+    except subprocess.CalledProcessError:
+        print("✗ 无法核对评审库的分支、推送地址或提交")
+        return 1
+    allowed_remotes = {
+        REVIEW_URL, "git@github.com:yongen777/im-task-review", "ssh://git@github.com/yongen777/im-task-review",
+    }
+    if branch != "main" or len(remotes) != 1 or remotes[0].rstrip("/").removesuffix(".git") not in allowed_remotes:
+        print("✗ 推送目标必须是 IMTask 评审库的 origin/main")
+        return 1
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        print("✗ 未读取到完整的 40 位提交哈希")
+        return 1
+
+    result = subprocess.run([*git, "push", "--no-follow-tags", "origin", f"{commit}:refs/heads/main"])
+    if result.returncode != 0:
+        print("✗ 推送失败")
+        return result.returncode
+
+    commit_url = f"{REVIEW_URL}/commit/{commit}"
+    print(f"✓ 已推送评审库 main，完整提交哈希 {commit}")
+    print(f"Commit URL {commit_url}")
+    print(f"Patch URL {commit_url}.patch")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--commit", help="同步后附带 git commit 的消息（push 仍手动）")
+    ap.add_argument("--commit", help="同步后创建提交并使用该消息")
+    ap.add_argument("--push", action="store_true", help="推送已提交的评审库 main 并打印完整验收链接")
     ap.add_argument("--skip-build", action="store_true", help="跳过前端构建（产物未变时省时间）")
     ap.add_argument("--commit-paths", nargs="+", metavar="PATH",
                     help="限制本次提交范围；目录须以 / 结尾")
@@ -181,8 +225,8 @@ def main() -> int:
         print(f"✗ 评审库不存在：{REPO}")
         return 1
 
-    if args.commit and git_changed():
-        print("✗ 评审库已有未提交改动，请核对后再同步提交")
+    if (args.commit or args.push) and git_changed():
+        print("✗ 评审库已有未提交改动，请核对后再同步")
         return 1
 
     print("① 后端全目录同步（脱敏）…")
@@ -228,8 +272,8 @@ def main() -> int:
         if r.returncode != 0:
             print(f"✗ commit 失败：{(r.stdout or '') + (r.stderr or '')}"[:400])
             return 1
-        print(f"✓ 已提交（未推送——push 属对外发布，请手动确认后执行）")
-    return 0
+        print("✓ 已提交")
+    return push_review() if args.push else 0
 
 
 if __name__ == "__main__":

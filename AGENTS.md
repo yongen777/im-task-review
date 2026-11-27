@@ -64,8 +64,8 @@ cd D:\im-task-review && git log -p -- backend/app/state.py   # 看某文件演�
 ```
 ① 在 D:\im-task 改后端（+ D:\im-task-admin 改前端源码）
 ② 跑测试（见第六节）
-③ python scripts/sync_review.py --commit "消息"     ← 同步到评审库并提交
-④ 推送本轮已验证的提交到 GitHub，供用户 / Gemini 验收（用户已于 2026-11-18 持续授权，无需每轮再问）
+③ python scripts/sync_review.py --commit "消息" --push     ← 同步到评审库、提交并推送
+④ 将脚本输出的完整 Commit URL 和 .patch URL 原样附在验收汇报中（推送已获持续授权）
 ⑤ 等用户明确确认验收通过并允许部署后，才执行 python scripts/deploy_remote.py --skip-deps --host <生产地址> ...
 ```
 
@@ -78,9 +78,9 @@ cd D:\im-task-review && git log -p -- backend/app/state.py   # 看某文件演�
 1. 后端 `app/` `scripts/` `tests/` 全目录 → 评审库 `backend/*`（**带脱敏**）
 2. 前端 `D:\im-task-admin\src` → 评审库 `admin-ui/src`
 3. `vite build` → 产物同步到两地的 `admin_static/`
-4. 产物对账
+4. 产物对账，并同步根目录 `AGENTS.md` 的验收规范
 
-参数：`--skip-build`（跳过构建，仍同步源码）、`--commit-paths`（列出本轮允许提交的评审库路径，目录以 `/` 结尾）。
+参数：`--skip-build`（跳过构建，仍同步源码）、`--commit-paths`（列出本轮允许提交的评审库路径，目录以 `/` 结尾）和 `--push`（推送评审库 `main` 并打印验收链接）。`--push` 可与 `--commit` 合用，也可用于重试已提交的推送。
 
 ### 部署脚本的坑
 
@@ -427,6 +427,11 @@ ssh <生产> "mysql -h127.0.0.1 -P28620 -uimtask -p'<密码见/opt/imtask/.env>'
 - 测试 / 构建输出尾部（含计数行；**A 级小改动给专项 pytest 的退出码/计数行即可**，不必凑全量凭证）
 
 **没有凭证只能写「未执行 / 待执行」。** 宁报「我没做」，不报「我做完了」。
+
+每次推送评审仓库成功后，面向用户的验收汇报**必须原样附带脚本输出的两个完整 URL**。两条链接都要使用完整的 40 位提交哈希，供外部评审工具直接拉取纯文本 diff。
+
+- Commit 页面 `https://github.com/yongen777/im-task-review/commit/<full_hash>`
+- 纯文本 Diff `https://github.com/yongen777/im-task-review/commit/<full_hash>.patch`
 
 ---
 
