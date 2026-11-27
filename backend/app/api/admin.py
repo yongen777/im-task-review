@@ -78,7 +78,14 @@ SUPER_ADMIN_WRITE_ALLOW_PREFIXES = (
     "/api/admin/channel-config",
     "/api/admin/member-pool",
 )
-SUPER_ADMIN_WRITE_ALLOW_EXACT = {"/api/admin/change-password", "/api/admin/logout"}
+PERSONAL_INBOX_TOKEN_PATH = "/me/data-inbox-token"
+PERSONAL_INBOX_TOKEN_PATHS = {
+    f"/api/admin{PERSONAL_INBOX_TOKEN_PATH}{suffix}" for suffix in ("", "/rotate", "/disable")
+}
+SUPER_ADMIN_WRITE_ALLOW_EXACT = {
+    "/api/admin/change-password", "/api/admin/logout",
+    f"/api/admin{PERSONAL_INBOX_TOKEN_PATH}/rotate", f"/api/admin{PERSONAL_INBOX_TOKEN_PATH}/disable",
+}
 
 
 def _admin_profile(state: StateStore, sess: Dict[str, Any]) -> Dict[str, Any]:
@@ -338,15 +345,21 @@ def register_admin_guard(app: FastAPI, state: StateStore) -> None:
         path = request.url.path.rstrip("/") or "/"
         method = request.method.upper()
         if path.startswith("/api/admin") and (method, path) != ("POST", "/api/admin/login"):
+            def session_error(status, code, message):
+                response = error_response(status, code, message)
+                if path in PERSONAL_INBOX_TOKEN_PATHS:
+                    response.headers["Cache-Control"] = "no-store"
+                return response
+
             sid = request.cookies.get(COOKIE_NAME, "").strip()
             sess = state.get_admin_session(sid)
             if not sess:
-                return error_response(401, "UNAUTHORIZED", "未登录或登录已过期")
+                return session_error(401, "UNAUTHORIZED", "未登录或登录已过期")
             if bool(sess.get("must_change")) and (
                 method,
                 path,
             ) not in MUST_CHANGE_ALLOWED_ENDPOINTS:
-                return error_response(
+                return session_error(
                     403, "MUST_CHANGE_PASSWORD", "首次登录必须先修改密码"
                 )
             # ── 2026-11-04 多管理员分级 ────────────────────────────────
@@ -1365,6 +1378,29 @@ def create_admin_router(
             owner_id=_owner_filter(_admin, owner_id),
         )
         return {"ok": True, "total": res["total"], "items": res["items"]}
+
+    @router.get(PERSONAL_INBOX_TOKEN_PATH)
+    @router.post(PERSONAL_INBOX_TOKEN_PATH + "/rotate")
+    @router.post(PERSONAL_INBOX_TOKEN_PATH + "/disable")
+    def manage_personal_inbox_token(request: Request):
+        sess, err = require_session(request, state, check_csrf=request.method != "GET")
+        if err is not None:
+            err.headers["Cache-Control"] = "no-store"
+            return err
+        assert sess is not None
+        admin_id = sess["user_id"]
+        try:
+            if request.method == "GET":
+                result = state.get_personal_inbox_token(admin_id)
+            elif request.url.path.endswith("/rotate"):
+                result = state.rotate_personal_inbox_token(admin_id, sess["username"])
+            else:
+                result = state.disable_personal_inbox_token(admin_id, sess["username"])
+        except BizError as exc:
+            response = biz_error_response(exc)
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     @router.get("/data-inbox/{source_key:path}/token")
     @router.post("/data-inbox/{source_key:path}/token")

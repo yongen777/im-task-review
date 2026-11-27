@@ -131,16 +131,19 @@ interface DataInboxTokenStatus {
 
 interface IssuedDataInboxToken extends DataInboxTokenStatus {
   token: string;
-  upload_url: string | null;
+  upload_url?: string | null;
 }
 
-function DataInboxTokenFields({ sourceKey }: { sourceKey: string }) {
+function DataInboxTokenFields({ sourceKey, allSources = false }: { sourceKey?: string; allSources?: boolean }) {
   const [status, setStatus] = useState<DataInboxTokenStatus>();
   const [issued, setIssued] = useState<IssuedDataInboxToken>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [copyFeedback, setCopyFeedback] = useState('');
-  const path = `/api/admin/data-inbox/${encodeURIComponent(sourceKey)}/token`;
+  const personal = sourceKey === undefined;
+  const title = personal && !allSources ? '我的个人上传令牌（名下数据源通用）' : personal ? '我的个人上传令牌' : '单数据源独立令牌';
+  const path = personal ? '/api/admin/me/data-inbox-token'
+    : `/api/admin/data-inbox/${encodeURIComponent(sourceKey)}/token`;
 
   useEffect(() => {
     let active = true;
@@ -160,17 +163,18 @@ function DataInboxTokenFields({ sourceKey }: { sourceKey: string }) {
   async function changeToken(disable: boolean) {
     if (busy || !status) return;
     if (status.enabled && !window.confirm(disable
-      ? '停用后，该数据源将拒收 HTTP 上传。确定停用？'
+      ? `停用后，当前${personal ? '个人' : '单数据源'}令牌将立即失效。确定停用？`
       : '重置后，旧令牌会立即失效。确定重置？')) return;
     setBusy(true);
     setError('');
     setCopyFeedback('');
     try {
       if (disable) {
-        setStatus(await api.delete<DataInboxTokenStatus>(path));
+        setStatus(await (personal ? api.post<DataInboxTokenStatus>(`${path}/disable`)
+          : api.delete<DataInboxTokenStatus>(path)));
         setIssued(undefined);
       } else {
-        const result = await api.post<IssuedDataInboxToken>(path);
+        const result = await api.post<IssuedDataInboxToken>(personal ? `${path}/rotate` : path);
         const { configured, enabled, token_prefix, updated_at, last_used_at } = result;
         setStatus({ configured, enabled, token_prefix, updated_at, last_used_at });
         setIssued(result);
@@ -193,18 +197,22 @@ function DataInboxTokenFields({ sourceKey }: { sourceKey: string }) {
   const buttonClass = 'rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 font-medium text-slate-700 disabled:opacity-50';
 
   return (
-    <section className="space-y-2 border-y border-slate-200 py-2" aria-label="上传令牌">
+    <section className="space-y-2 border-y border-slate-200 py-2" aria-label={title}>
+      <h4 className="font-semibold text-slate-800">{title}</h4>
+      {personal && <p className="text-slate-500">
+        {allSources ? '超级管理员的个人令牌可用于所有数据源。' : '在本机保存一次，后续上传名下已绑定的数据源时可直接复用。'}
+        首次用 Skill 配置时，双击「双击配置令牌.bat」，数据源键留空按回车。
+      </p>}
       {status ? (
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-slate-700">
-            <span className="font-semibold">上传令牌</span>
-            {!status.configured ? ' · 未生成' : status.enabled ? (
-              <> · 已启用 <code>{status.token_prefix}</code> · 最近使用 {status.last_used_at || '暂无'}</>
-            ) : ' · 已停用'}
+            {!status.configured ? '未生成' : (
+              <>{status.enabled ? '已启用' : '已停用'} <code>{status.token_prefix}</code> · 最近使用 {status.last_used_at || '暂无'}</>
+            )}
           </p>
           <div className="flex flex-wrap gap-1.5">
             <button type="button" className={buttonClass} disabled={busy} onClick={() => void changeToken(false)}>
-              {status.configured ? '重置令牌' : '生成上传令牌'}
+              {status.configured ? (personal ? '重置个人令牌' : '重置令牌') : (personal ? '生成个人令牌' : '生成上传令牌')}
             </button>
             {status.enabled && (
               <button type="button" className={buttonClass} disabled={busy} onClick={() => void changeToken(true)}>
@@ -228,12 +236,16 @@ function DataInboxTokenFields({ sourceKey }: { sourceKey: string }) {
               <code className="block break-all rounded-md bg-white px-2 py-1.5">{command}</code>
               <button type="button" className={buttonClass} onClick={() => void copy(command, '上传命令')}>复制上传命令</button>
             </>
-          ) : <p>缺少业务访问地址，暂无法生成上传命令。</p>}
+          ) : !personal && <p>缺少业务访问地址，暂无法生成上传命令。</p>}
           {copyFeedback && <p role="status">{copyFeedback}</p>}
         </div>
       )}
     </section>
   );
+}
+
+export function PersonalDataInboxTokenFields({ allSources = false }: { allSources?: boolean }) {
+  return <DataInboxTokenFields allSources={allSources} />;
 }
 
 export function DataInboxFields({ value, onChange, record, loading, loadFailed, canManageToken }: {
@@ -245,6 +257,7 @@ export function DataInboxFields({ value, onChange, record, loading, loadFailed, 
   canManageToken: boolean;
 }) {
   const helpId = useId();
+  const [independentOpen, setIndependentOpen] = useState(false);
   const inputClass = 'mt-1 block w-full rounded-lg border border-slate-200 bg-white px-2.5 py-2';
   const key = value.key.trim();
   const validKey = /^[A-Za-z0-9_-]{2,64}$/.test(key);
@@ -280,7 +293,13 @@ export function DataInboxFields({ value, onChange, record, loading, loadFailed, 
       </div>
       <p className="text-slate-600">同机文件放入接入目录的 <code>{pathKey}/incoming/</code>。跨机请请求业务端口，携带文件字段 <code>file</code> 和上传令牌。</p>
       <code className="block break-all text-slate-800">POST /api/data-inbox/{pathKey}/upload</code>
-      {canManageToken && validKey && <DataInboxTokenFields key={key} sourceKey={key} />}
+      {canManageToken && <PersonalDataInboxTokenFields />}
+      {canManageToken && validKey && (
+        <details onToggle={event => setIndependentOpen(event.currentTarget.open)}>
+          <summary className="cursor-pointer py-1 font-medium text-slate-600">高级选项 · 单数据源独立令牌</summary>
+          {independentOpen && <DataInboxTokenFields key={key} sourceKey={key} />}
+        </details>
+      )}
       {loading && <p role="status">正在读取最近接入记录…</p>}
       {!loading && (record?.source_key === key ? (
         <p className="break-words text-slate-700">

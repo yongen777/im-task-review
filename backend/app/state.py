@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 PBKDF2_ITERATIONS = 260_000
 SESSION_TTL_HOURS = 24 * 7
+DATA_INBOX_PERSONAL_TOKEN_PREFIX = "imt_u_"
 
 # ── 2026-11-12 任务E1：截止与 Token 有效期口径（用户拍板） ──────────────
 # deadline_at 的「无业务截止时间」哨兵。令牌有效期独立计算。
@@ -687,13 +688,17 @@ class StateStore:
             raise BizError(403, "FORBIDDEN_OWNER", "该数据源属于其他管理员")
         return row
 
-    def _check_legacy_data_inbox_owner(self, key: str, owner_id: int) -> None:
-        # 先尊重已绑定的旧模板，避免首次生成令牌时接管其他管理员的环境变量数据源。
-        if self.conn.execute(
-            "SELECT 1 FROM task_template WHERE deleted=0 AND kind='notice' AND owner_id<>? "
+    def _data_inbox_template_owners(self, key: str) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT owner_id FROM task_template WHERE deleted=0 AND kind='notice' "
             "AND BINARY JSON_UNQUOTE(JSON_EXTRACT(IF(JSON_VALID(spec_json),spec_json,NULL),'$.data_source_key')) "
-            "= BINARY ? LIMIT 1", (owner_id, key),
-        ).fetchone():
+            "= BINARY ? LIMIT 2", (key,),
+        ).fetchall()
+        return {int(row["owner_id"]) for row in rows}
+
+    def _check_legacy_data_inbox_owner(self, key: str, owner_id: int) -> None:
+        # 已绑定的旧模板也占用数据源键，其他管理员不能接管该源。
+        if self._data_inbox_template_owners(key) - {owner_id}:
             raise BizError(403, "FORBIDDEN_OWNER", "该数据源已绑定其他管理员的模板")
 
     @staticmethod
@@ -750,21 +755,95 @@ class StateStore:
                 self._insert_audit_unlocked(actor, "data_inbox.token.disable", "data_inbox_token", key)
             return self._data_inbox_token_status(self._data_inbox_token_row(key, lock=True))
 
-    def verify_data_inbox_token(self, key: str, digest: str) -> bool:
-        """有数据库记录时完成校验，缺记录才允许调用方检查旧环境变量。"""
+    def _personal_inbox_token_row(self, admin_id: int, *, lock: bool = False):
+        return self.conn.execute(
+            "SELECT * FROM data_inbox_admin_token WHERE admin_id=?" + (" FOR UPDATE" if lock else ""),
+            (admin_id,),
+        ).fetchone()
+
+    def get_personal_inbox_token(self, admin_id: int) -> Dict[str, Any]:
+        return self._data_inbox_token_status(self._personal_inbox_token_row(admin_id))
+
+    def rotate_personal_inbox_token(self, admin_id: int, actor: str) -> Dict[str, Any]:
+        token = DATA_INBOX_PERSONAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        prefix = token[:12] + "..."
+        now = self.now_str()
         with self.conn:
-            row = self._data_inbox_token_row(key, lock=True)
+            self.conn.execute(
+                "INSERT INTO data_inbox_admin_token(admin_id,token_hash,token_prefix,created_at,updated_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(admin_id) DO UPDATE SET admin_id=admin_id",
+                (admin_id, digest, prefix, now, now),
+            )
+            row = self._personal_inbox_token_row(admin_id, lock=True)
             if row is None:
-                return False
-            if not row["enabled"]:
+                raise BizError(503, "DATA_INBOX_TOKEN_UNAVAILABLE", "暂时无法生成令牌，请重试")
+            action = "data_inbox.personal_token.generate"
+            if row["token_hash"] != digest:
+                self.conn.execute(
+                    "UPDATE data_inbox_admin_token SET token_hash=?,token_prefix=?,enabled=1,"
+                    "updated_at=?,last_used_at=NULL WHERE admin_id=?", (digest, prefix, now, admin_id),
+                )
+                action = "data_inbox.personal_token.reset"
+            self._insert_audit_unlocked(actor, action, "data_inbox_admin_token", str(admin_id))
+            status = self._data_inbox_token_status(self._personal_inbox_token_row(admin_id, lock=True))
+        return {**status, "token": token}
+
+    def disable_personal_inbox_token(self, admin_id: int, actor: str) -> Dict[str, Any]:
+        with self.conn:
+            row = self._personal_inbox_token_row(admin_id, lock=True)
+            if row and row["enabled"]:
+                self.conn.execute(
+                    "UPDATE data_inbox_admin_token SET enabled=0,updated_at=? WHERE admin_id=?",
+                    (self.now_str(), admin_id),
+                )
+                self._insert_audit_unlocked(
+                    actor, "data_inbox.personal_token.disable", "data_inbox_admin_token", str(admin_id),
+                )
+            return self._data_inbox_token_status(self._personal_inbox_token_row(admin_id, lock=True))
+
+    def _active_inbox_token_admin(self, admin_id: int) -> Dict[str, Any]:
+        account = self.get_admin_by_id(admin_id)
+        if not account or not account["enabled"]:
+            raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "上传令牌所属管理员已停用")
+        return self.parse_admin_account(account)
+
+    def verify_data_inbox_token(self, key: str, digest: str, *, personal: bool) -> bool:
+        """单源优先，个人令牌必须按模板授权。返回 False 表示可以尝试旧环境变量。"""
+        with self.conn:
+            source = self._data_inbox_token_row(key, lock=True)
+            if source and source["enabled"] and hmac.compare_digest(digest, source["token_hash"]):
+                admin = self._active_inbox_token_admin(source["owner_id"])
+                self.conn.execute("UPDATE data_inbox_token SET last_used_at=? WHERE source_key=?",
+                                  (self.now_str(), key))
+                self._insert_audit_unlocked(admin["username"], "data_inbox.upload.authorized", "data_inbox_source",
+                                            key, {"auth_source": "source_token"})
+                return True
+            if personal:
+                row = self.conn.execute(
+                    "SELECT admin_id, token_hash, enabled FROM data_inbox_admin_token "
+                    "WHERE token_hash=? FOR UPDATE", (digest,),
+                ).fetchone()
+                if row and hmac.compare_digest(digest, row["token_hash"]):
+                    if not row["enabled"]:
+                        raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "该个人上传令牌已停用")
+                    admin_id = int(row["admin_id"])
+                    admin = self._active_inbox_token_admin(admin_id)
+                    if admin["role_level"] != self.SUPER_ADMIN:
+                        if ((source and source["owner_id"] != admin_id)
+                                or self._data_inbox_template_owners(key) != {admin_id}):
+                            raise BizError(403, "FORBIDDEN_OWNER", "该数据源未独立归属于当前管理员的模板")
+                    self.conn.execute("UPDATE data_inbox_admin_token SET last_used_at=? WHERE admin_id=?",
+                                      (self.now_str(), admin_id))
+                    self._insert_audit_unlocked(admin["username"], "data_inbox.upload.authorized", "data_inbox_source",
+                                                key, {"auth_source": "personal_token"})
+                    return True
+            if source and not source["enabled"]:
                 raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "该数据源的上传令牌已停用")
-            if not hmac.compare_digest(digest, row["token_hash"]):
+            # 个人前缀专用于数据库，已经重置的个人令牌即使仍在环境变量里也不能复活。
+            if source or personal:
                 raise BizError(401, "INVALID_DATA_INBOX_TOKEN", "上传密钥无效")
-            owner = self.conn.execute("SELECT enabled FROM admin_user WHERE id=?", (row["owner_id"],)).fetchone()
-            if not owner or not owner["enabled"]:
-                raise BizError(403, "DATA_INBOX_TOKEN_DISABLED", "该数据源所属管理员已停用")
-            self.conn.execute("UPDATE data_inbox_token SET last_used_at=? WHERE source_key=?", (self.now_str(), key))
-        return True
+        return False
 
     # ── 2026-11-04 多管理员分级（超级管理员 + 分级管理员）────────────────────
     # 口径（用户 2026-11-04 定）：
@@ -3168,7 +3247,11 @@ class StateStore:
             config = _spec_payload.get("variable_notice")
             platform = config.get("platform") if isinstance(config, dict) else None
             if not (existing and set(payload) == {"enabled"} and payload["enabled"] is False):
-                self._owned_data_inbox_token(inbox_settings["data_source_key"], owner, lock=True)
+                key = inbox_settings["data_source_key"]
+                source = self._owned_data_inbox_token(key, owner, lock=True)
+                old_spec = (existing or {}).get("spec_json")
+                if not source and (not isinstance(old_spec, dict) or old_spec.get("data_source_key") != key):
+                    self._check_legacy_data_inbox_owner(key, owner)
                 columns_for(text_tpl)
                 validate_platform(self, owner, platform)
             _spec_payload = {**_spec_payload, **inbox_settings, "variable_notice": {"platform": platform}}

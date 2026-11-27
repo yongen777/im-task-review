@@ -31,7 +31,7 @@ import {
 import { api, plainError } from '../../lib/api';
 import { ApiRequestError } from '../../lib/realApi';
 import { AdminScopeHeader } from './AdminScopeHeader';
-import { DataInboxDraft, DataInboxFields, VariableNoticeFields, VariableNoticeIssues, VariableNoticeValidation, normalizeVariableBody } from './VariableNoticeFields';
+import { DataInboxDraft, DataInboxFields, PersonalDataInboxTokenFields, VariableNoticeFields, VariableNoticeIssues, VariableNoticeValidation, normalizeVariableBody } from './VariableNoticeFields';
 import { useAppStore } from '../../lib/store';
 import { useToast } from '../../lib/toast';
 import {
@@ -528,6 +528,7 @@ export const TemplatesView: React.FC = () => {
   const [expandedRows, setExpandedRows] = useState<Record<number, boolean>>({});
 
   const [modalOpen, setModalOpen] = useState(false);
+  const [personalTokenOpen, setPersonalTokenOpen] = useState(false);
   const [editingTpl, setEditingTpl] = useState<TemplateItem | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [deleteConfirmTpl, setDeleteConfirmTpl] = useState<TemplateItem | null>(null);
@@ -1352,9 +1353,19 @@ export const TemplatesView: React.FC = () => {
                 <span>新建通知提醒</span>
               </button>
             </>
-          ) : null
+          ) : (
+            <button type="button" aria-expanded={personalTokenOpen} onClick={() => setPersonalTokenOpen(open => !open)}
+              className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs font-semibold text-slate-700 hover:bg-slate-50">
+              个人上传令牌
+            </button>
+          )
         }
       />
+      {isSuperAdmin && personalTokenOpen && (
+        <div className="rounded-xl bg-white px-4 py-2 text-xs">
+          <PersonalDataInboxTokenFields allSources />
+        </div>
+      )}
 
       {/* 筛选栏 + 干净对齐的任务列表 */}
       <div className="bg-white rounded-2xl border border-slate-200/90 shadow-2xs overflow-hidden">

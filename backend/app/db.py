@@ -49,14 +49,15 @@ def _is_read_only(sql: str) -> bool:
 # admin 统计的逐行相关子查询）+ 4 张核心大表高选择性索引（MySQL 5.7.43 幂等补建）。
 # 4：文件接入记录与定时批次恢复。
 # 5：按数据源管理上传令牌。
-SCHEMA_VERSION = 5
+# 6：管理员个人上传令牌。
+SCHEMA_VERSION = 6
 
 # §16 P6 台账约定：10 业务表 + 3 支撑表(admin_user/admin_session/admin_audit)
 # + 1 版本门表(schema_version) + 4 功能表(channel_config/data_snapshot/pending_member/dept_option)
 BUSINESS_TABLES = (
     "scope", "role", "member", "delivery_target", "task_template",
     "task_instance", "submission", "reminder_log", "upload_ref", "h5_token", "notice_asset", "notice_receipt_view",
-    "admin_user", "admin_session", "admin_audit", "data_inbox_log", "data_inbox_token",
+    "admin_user", "admin_session", "admin_audit", "data_inbox_log", "data_inbox_token", "data_inbox_admin_token",
 )
 VERSION_TABLE = "schema_version"
 
@@ -86,6 +87,18 @@ CREATE TABLE IF NOT EXISTS data_inbox_token (
   token_hash   VARCHAR(64) NOT NULL,
   token_prefix VARCHAR(16) NOT NULL,
   enabled      INTEGER     NOT NULL DEFAULT 1,
+  created_at   VARCHAR(32) NOT NULL,
+  updated_at   VARCHAR(32) NOT NULL,
+  last_used_at VARCHAR(32) DEFAULT NULL
+)
+""".strip()
+
+DATA_INBOX_ADMIN_TOKEN_DDL = """
+CREATE TABLE IF NOT EXISTS data_inbox_admin_token (
+  admin_id     INTEGER     NOT NULL PRIMARY KEY,
+  token_hash   VARCHAR(64) NOT NULL UNIQUE,
+  token_prefix VARCHAR(16) NOT NULL,
+  enabled      TINYINT     NOT NULL DEFAULT 1,
   created_at   VARCHAR(32) NOT NULL,
   updated_at   VARCHAR(32) NOT NULL,
   last_used_at VARCHAR(32) DEFAULT NULL
@@ -422,6 +435,7 @@ CREATE TABLE IF NOT EXISTS dept_option (
 """.strip() + (
     f"\n{DATA_INBOX_DDL} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;"
     f"\n{DATA_INBOX_TOKEN_DDL} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;"
+    f"\n{DATA_INBOX_ADMIN_TOKEN_DDL} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;"
 )
 
 

@@ -10,13 +10,14 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 
 from .config import default_now, resolve_data_inbox_dir
-from .state import BizError
+from .state import BizError, DATA_INBOX_PERSONAL_TOKEN_PREFIX
 from .variable_notice import table_rows
 
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 EXTENSIONS = (".csv", ".xlsx")
 SOURCE_KEY = re.compile(r"[A-Za-z0-9_-]{2,64}")
+PERSONAL_TOKEN = re.compile(rf"{DATA_INBOX_PERSONAL_TOKEN_PREFIX}[A-Za-z0-9_-]{{43}}")
 _publish_lock = Lock()
 
 
@@ -54,13 +55,16 @@ def _legacy_upload_token(key):
 
 def authorize_upload(state, key, token):
     supplied = token.encode("utf-8")
-    if state.verify_data_inbox_token(key, hashlib.sha256(supplied).hexdigest()):
+    personal = PERSONAL_TOKEN.fullmatch(token) is not None
+    if state.verify_data_inbox_token(key, hashlib.sha256(supplied).hexdigest(), personal=personal):
         return
     expected = _legacy_upload_token(key)
     if expected is None:
         raise BizError(403, "DATA_INBOX_TOKEN_NOT_CONFIGURED", "数据源未配置上传密钥")
     if not hmac.compare_digest(supplied, expected.encode("utf-8")):
         raise BizError(401, "INVALID_DATA_INBOX_TOKEN", "上传密钥无效")
+    state.write_audit("system", "data_inbox.upload.authorized", "data_inbox_source", key,
+                      {"auth_source": "environment"})
 
 
 def checked_path(base, *parts):
